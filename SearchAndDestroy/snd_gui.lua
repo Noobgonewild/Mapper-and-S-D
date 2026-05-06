@@ -105,6 +105,19 @@ local STATUS_ROW_Y   = 50
 local TARGET_START_Y = 60
 local TAB_HEIGHT     = 22
 
+local AREA_BAND_COLORS = {
+    "<medium_orchid>",
+    "<cornflower_blue>",
+    "<gold>",
+    "<medium_sea_green>",
+    "<salmon>",
+    "<light_sky_blue>",
+    "<dark_orchid>",
+    "<chartreuse>",
+    "<deep_sky_blue>",
+    "<orange_red>",
+}
+
 -------------------------------------------------------------------------------
 -- Action Button Definitions
 -- Mirrors button_1_list from the original plugin
@@ -118,7 +131,7 @@ local actionButtons = {
     {id = "qs",  text = "qs",  cmd = "snd_qs",     rcmd = "snd_qs",   tip = "Quick-scan for current target"},
     {id = "qw",  text = "qw",  cmd = "qw",         rcmd = "qw",       tip = "L: quick-where | R: quick-where"},
     {id = "ht",  text = "ht",  cmd = "ht",         rcmd = "ht cancel", tip = "L: hunt trick | R: cancel hunt"},
-    {id = "ref", text = "ref", cmd = "snd_rel",    rcmd = "snd_ref",  tip = "L: reload (campaign check + quest info) | R: refresh (check + quest info)"},
+    {id = "ref", text = "ref", cmd = "snd_rel",    rcmd = "snd_ref",  tip = "Refresh by active tab (Quest=quest info, CP=cp check, GQ=gq check)"},
 }
 
 -------------------------------------------------------------------------------
@@ -395,18 +408,17 @@ function snd.gui.createWindow()
 		end
 	end
     -----------------------------------------------------------------------
-    -- Noexp Readout (right of buttons)
+    -- AutoCheck Readout (right of buttons)
     -----------------------------------------------------------------------
-    snd.gui.elements.noexp = Geyser.Label:new({
-        name = "sndNoexp",
+    snd.gui.elements.autocheck = Geyser.Label:new({
+        name = "sndAutocheck",
         x = -55, y = BUTTON_ROW_Y + 3,
         width = 50, height = BUTTON_HEIGHT,
     }, snd.gui.elements.main)
-    snd.gui.elements.noexp:setStyleSheet(cssNoexp(s, false))
-    snd.gui.elements.noexp:echo("NX")
-    snd.gui.elements.noexp:setToolTip("TNL cutoff display")
-
-    snd.gui.bindNoexpCallbacks()
+    snd.gui.elements.autocheck:setStyleSheet(cssNoexp(s, false))
+    snd.gui.elements.autocheck:echo("AC:ON")
+    snd.gui.elements.autocheck:setToolTip("L: cycle AutoCheck mode (ON/SMART/OFF)")
+    snd.gui.elements.autocheck:setClickCallback("snd.gui.onAutocheckClick")
 
     -----------------------------------------------------------------------
     -- Target List Area (MiniConsole for proper multi-line colored text)
@@ -505,7 +517,7 @@ function snd.gui.destroy()
     if Geyser and Geyser.Label then
         for _, name in ipairs({
             "sndMain", "sndBorder", "sndTitleBar", "sndMinBtn",
-            "sndQuestTimer", "sndCircle", "sndNoexp",
+            "sndQuestTimer", "sndCircle", "sndAutocheck",
             "sndTargetArea", "sndResizeHandle",
         }) do
             if Geyser.Label.all and Geyser.Label.all[name] then
@@ -534,7 +546,7 @@ end
 
 
 function snd.gui.bindNoexpCallbacks()
-    local labels = {snd.gui.elements.circle, snd.gui.elements.noexp}
+    local labels = {snd.gui.elements.circle}
     for _, label in ipairs(labels) do
         if label and label.setClickCallback then
             label:setClickCallback(function(...)
@@ -560,6 +572,7 @@ function snd.gui.refresh()
 
     snd.gui.updateCircle()
     snd.gui.updateNoexp()
+    snd.gui.updateAutocheck()
     snd.gui.updateQuestTimer()
     snd.gui.updateTargetList()
     snd.gui.applyTabStyles()
@@ -613,10 +626,11 @@ function snd.gui.getTabLabel(tabKey)
     local hasCooldown = snd.quest and snd.quest.nextQuestTime and snd.quest.nextQuestTime > 0
     local availableText = snd.quest and snd.quest.nextQuestText or ""
     local isAvailableByStatus = (qstat == "0" and not hasCooldown)
-    if mins == 0
+    if (snd.quest and snd.quest.available and not hasCooldown)
+        or mins == 0
         or isAvailableByStatus
         or (not (snd.quest and snd.quest.active) and availableText:lower():find("quest available", 1, true)) then
-        return string.format("%s - ⚠️", baseLabel)
+        return string.format("%s [Available] ⚠️", baseLabel)
     end
 
     return baseLabel
@@ -647,7 +661,13 @@ function snd.gui.updateCircle()
 
     snd.gui.elements.circle:setStyleSheet(cssStatusCircle(s, c1, c2))
     snd.gui.elements.circle:echo(text)
-    snd.gui.elements.circle:setToolTip("L: +100 TNL cutoff | R: -100 TNL cutoff")
+    local tip = "L: +100 TNL cutoff | R: -100 TNL cutoff"
+    if auto then
+        tip = tip .. "\nTNL cutoff: " .. cutoff
+    else
+        tip = tip .. "\nNoexp is manual mode"
+    end
+    snd.gui.elements.circle:setToolTip(tip)
 end
 
 -------------------------------------------------------------------------------
@@ -656,23 +676,15 @@ end
 -------------------------------------------------------------------------------
 
 function snd.gui.updateNoexp()
-    if not snd.gui.elements.noexp then return end
-    local s = snd.gui.styles
-    local auto = snd.config.anex and snd.config.anex.automatic
-    local cutoff = snd.config.anex and snd.config.anex.tnlCutoff or 0
-    local noexpOn = snd.char and snd.char.noexp
-
-    if auto then
-        snd.gui.elements.noexp:echo(tostring(cutoff))
-        snd.gui.elements.noexp:setStyleSheet(cssNoexp(s, noexpOn))
-        snd.gui.elements.noexp:setToolTip("TNL cutoff: " .. cutoff)
-    else
-        snd.gui.elements.noexp:echo("man")
-        snd.gui.elements.noexp:setStyleSheet(cssNoexp(s, false))
-        snd.gui.elements.noexp:setToolTip("Noexp is manual mode")
-    end
-
     snd.gui.updateCircle()
+end
+
+function snd.gui.updateAutocheck()
+    if not snd.gui.elements.autocheck then return end
+    local mode = snd.getAutocheckMode and snd.getAutocheckMode() or "on"
+    local label = "AC:" .. string.upper(mode)
+    snd.gui.elements.autocheck:echo(label)
+    snd.gui.elements.autocheck:setToolTip("L: cycle AutoCheck mode (ON/SMART/OFF)")
 end
 
 function snd.gui.applyFontSize()
@@ -714,6 +726,7 @@ function snd.gui.applyFontSize()
         snd.gui.updateCircle()
     end
     snd.gui.updateNoexp()
+    snd.gui.updateAutocheck()
     snd.gui.updateQuestTimer()
     snd.gui.updateTargetList()
 end
@@ -721,25 +734,17 @@ end
 --- Refresh target links - mirrors xgui_RefreshLinks() from original
 -- Sends cp check or gq check depending on current activity
 function snd.gui.refreshTargets()
-    send("quest info", false)
-    if snd.gquest.active then
+    local activeTab = snd.getActiveTab and snd.getActiveTab() or "quest"
+    if activeTab == "gq" then
         send("gq check", false)
-    elseif snd.campaign.active then
+    elseif activeTab == "cp" then
         if snd.cp and snd.cp.requestCheck then
-            snd.cp.requestCheck(0, "gui.refreshTargets:campaign-active")
+            snd.cp.requestCheck(0, "gui.refreshTargets:tab-cp")
         else
-            snd.utils.debugNote("Sending 'cp check' (reason: gui.refreshTargets:campaign-active:fallback)")
             send("cp check", false)
         end
     else
-        -- Try both
-        if snd.cp and snd.cp.requestCheck then
-            snd.cp.requestCheck(0, "gui.refreshTargets:no-activity")
-        else
-            snd.utils.debugNote("Sending 'cp check' (reason: gui.refreshTargets:no-activity:fallback)")
-            send("cp check", false)
-        end
-        send("gq check", false)
+        send("quest info", false)
     end
     -- Maximize window if minimized
     if snd.gui.minimized then
@@ -748,30 +753,33 @@ function snd.gui.refreshTargets()
 end
 
 --- Reload target data - mirrors xgui_ReloadLinks() from original
---- Sends quest info plus campaign check or gq info depending on current activity
+--- Like refreshTargets but uses the heavier `gq info` payload on the GQ tab
+--- so reward/metadata parsing (handled by the gq-info parser) runs.
 function snd.gui.reloadTargets()
-    send("quest info", false)
-    if snd.gquest.active then
+    local activeTab = snd.getActiveTab and snd.getActiveTab() or "quest"
+    if activeTab == "gq" then
         send("gq info", false)
-    elseif snd.campaign.active then
+    elseif activeTab == "cp" then
         if snd.cp and snd.cp.requestCheck then
-            snd.cp.requestCheck(0, "gui.reloadTargets:campaign-active")
+            snd.cp.requestCheck(0, "gui.reloadTargets:tab-cp")
         else
-            snd.utils.debugNote("Sending 'cp check' (reason: gui.reloadTargets:campaign-active:fallback)")
             send("cp check", false)
         end
     else
-        if snd.cp and snd.cp.requestCheck then
-            snd.cp.requestCheck(0, "gui.reloadTargets:no-activity")
-        else
-            snd.utils.debugNote("Sending 'cp check' (reason: gui.reloadTargets:no-activity:fallback)")
-            send("cp check", false)
-        end
-        send("gq info", false)
+        send("quest info", false)
     end
     if snd.gui.minimized then
         snd.gui.maximize()
     end
+end
+
+function snd.gui.onAutocheckClick()
+    local mode = snd.getAutocheckMode and snd.getAutocheckMode() or "on"
+    local nextMode = (mode == "on" and "smart") or (mode == "smart" and "off") or "on"
+    if snd.commands and snd.commands.setAutocheckMode then
+        snd.commands.setAutocheckMode(nextMode)
+    end
+    snd.gui.updateAutocheck()
 end
 -------------------------------------------------------------------------------
 -- Update Quest Timer (in title bar)
@@ -831,6 +839,57 @@ function snd.gui.updateQuestTimer()
 
     snd.gui.elements.questTimer:setStyleSheet(cssQuestTimer(s, color))
     snd.gui.elements.questTimer:echo(text)
+end
+
+function snd.gui.stopQuestTimer()
+    if snd.quest and snd.quest.timerTickerId then
+        killTimer(snd.quest.timerTickerId)
+        snd.quest.timerTickerId = nil
+    end
+end
+
+function snd.gui.startQuestTimer()
+    if not snd.quest then
+        return
+    end
+
+    snd.gui.stopQuestTimer()
+
+    local function tick()
+        if not snd.quest or not snd.quest.timerEndTime or snd.quest.timerEndTime <= 0 then
+            snd.gui.stopQuestTimer()
+            return
+        end
+
+        local remaining = snd.quest.timerEndTime - os.time()
+        if remaining <= 0 then
+            snd.quest.timerEndTime = 0
+            snd.gui.stopQuestTimer()
+            if snd.gui and snd.gui.updateQuestTimer then
+                snd.gui.updateQuestTimer()
+            end
+            return
+        end
+
+        if snd.gui and snd.gui.elements and snd.gui.elements.questTimer then
+            local s = snd.gui.styles
+            local mins = math.floor(remaining / 60)
+            local secs = remaining % 60
+            local color = "#FFFFFF"
+            if remaining < 120 then
+                color = "#FF3B30"
+            elseif remaining < 300 then
+                color = "#FF9500"
+            end
+
+            snd.gui.elements.questTimer:setStyleSheet(cssQuestTimer(s, color))
+            snd.gui.elements.questTimer:echo(string.format("%d:%02d", mins, secs))
+        end
+
+        snd.quest.timerTickerId = tempTimer(1, tick)
+    end
+
+    tick()
 end
 -------------------------------------------------------------------------------
 -- Named color map for cecho (Mudlet named colors)
@@ -1066,7 +1125,17 @@ function snd.gui.updateTargetList()
     ---------------------------------------------------------------------------
     if snd.targets and snd.targets.list then
         local gqDisplayIndex = 0
-        local wroteGqHeader = false
+        local areaColorMap = {}
+        if snd.config.areaColors ~= false then
+            local areaColorNext = 1
+            for _, target in ipairs(snd.targets.list) do
+                local arid = target.arid or ""
+                if arid ~= "" and not areaColorMap[arid] then
+                    areaColorMap[arid] = AREA_BAND_COLORS[areaColorNext]
+                    areaColorNext = (areaColorNext % #AREA_BAND_COLORS) + 1
+                end
+            end
+        end
 
         for index, v in ipairs(snd.targets.list) do
             if lineCount >= maxLines then
@@ -1076,12 +1145,6 @@ function snd.gui.updateTargetList()
             end
 
             if v.activity ~= "quest" and (activeTab == nil or v.activity == activeTab) then
-                if v.activity == "gq" and not wroteGqHeader then
-                    writeTargetText("<yellow>------GQ targets------<reset>\n")
-                    lineCount = lineCount + 1
-                    wroteGqHeader = true
-                end
-
                 -- Determine color
                 local color = TC.normal
                 local isTargeted = snd.gui.isCurrentTarget(v, index)
@@ -1177,7 +1240,13 @@ function snd.gui.updateTargetList()
                 else
                     writeTargetText(mob .. deathTag)
                 end
-                writeTargetText(string.format(" - %s%s%s\n", location, suffix, TC.reset))
+                local bandColor = ""
+                local arid = v.arid or ""
+                if arid ~= "" and areaColorMap[arid]
+                   and not v.lowConfidence and not v.unlikely then
+                    bandColor = areaColorMap[arid]
+                end
+                writeTargetText(string.format(" - %s%s%s%s\n", bandColor, location, suffix, TC.reset))
 
                 lineCount = lineCount + 1
             end

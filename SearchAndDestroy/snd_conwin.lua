@@ -18,6 +18,7 @@ CW.mobs = CW.mobs or {}
 CW.awaiting = CW.awaiting or false
 CW.doneTimer = CW.doneTimer or nil
 CW.lastRoomId = CW.lastRoomId or nil
+CW.mobDetectDispatched = CW.mobDetectDispatched or false
 CW.lastAutoRoomId = CW.lastAutoRoomId or nil
 CW.lastAutoConsiderAt = CW.lastAutoConsiderAt or 0
 CW.lastEnemy = CW.lastEnemy or ""
@@ -26,6 +27,8 @@ CW.killsSinceRefresh = CW.killsSinceRefresh or 0
 CW.currentEnemyMobId = CW.currentEnemyMobId or nil
 CW.lastKnownEnemyPct = CW.lastKnownEnemyPct or nil
 CW.lastTrackedMobId = CW.lastTrackedMobId or nil
+CW.lastKilledMobName = CW.lastKilledMobName or ""
+CW.lastKilledAt = CW.lastKilledAt or 0
 
 local consider_map = {
     {[[^(\(.+\) ?)?(.+) looks a little worried about the idea\.$]], "chartreuse", "-2 to -4"},
@@ -123,6 +126,71 @@ local function tokenizedContainsSafe(info)
     return false
 end
 
+
+local function tokenizedContainsPk(info)
+    local v = tostring(info or ""):lower()
+    if v == "" then return false end
+    for token in v:gmatch("[^,%s]+") do
+        if token == "pk" then return true end
+    end
+    return false
+end
+
+function CW.isCurrentRoomPk()
+    local details = gmcp_get("room.info.details")
+    if details ~= nil and tokenizedContainsPk(details) then return true end
+    local roomId = tostring(gmcp_get("room.info.num") or "")
+    if roomId ~= "" and snd.mapper and type(snd.mapper.getRoomInfo) == "function" then
+        local room = snd.mapper.getRoomInfo(roomId)
+        if room and room.info then
+            return tokenizedContainsPk(room.info)
+        end
+    end
+    return false
+end
+
+function CW.roomHasPlayers()
+    -- TODO:
+    return false
+end
+
+function CW.tryMobDetectConfirmedTarget()
+    if CW.mobDetectDispatched then return false end
+    local mode = tostring(snd and snd.config and snd.config.mobdetect or "off"):lower()
+    if mode == "off" then return false end
+
+    local roomId = tostring(gmcp_get("room.info.num") or "")
+    if roomId == "" or roomId ~= tostring(CW.lastRoomId or "") then return false end
+
+    local current = snd and snd.targets and snd.targets.current or nil
+    if not current then return false end
+    if current.dead or tostring(current.status or ""):lower() == "dead" then return false end
+
+    local targetName = normalizeMobName(current.name or "")
+    local present = false
+    for _, m in ipairs(CW.mobs or {}) do
+        if not m.dead and normalizeMobName(m.name) == targetName then
+            present = true
+            break
+        end
+    end
+    if not present then return false end
+    
+    if snd and snd.mapper and type(snd.mapper.isInCombat) == "function" and snd.mapper.isInCombat() then
+        return false
+    end
+    
+    if mode ~= "always" then
+        if snd and snd.room and snd.room.current and snd.room.current.maze and snd.room.current.maze ~= 0 then return false end
+        if CW.isCurrentRoomPk() then return false end
+        if CW.roomHasPlayers() then return false end
+    end
+
+    CW.mobDetectDispatched = true
+    snd.utils.infoNote("Mobdetect: found cp/quest/gq target in room " .. roomId .. ".")
+   
+    return true
+end
 function CW.clear(_reason)
     CW.mobs = {}
     CW.killsSinceRefresh = 0
@@ -368,7 +436,7 @@ function CW.render()
 
     for i, m in ipairs(CW.mobs) do
         local marker = CW.activityMarkersForMob(m.name)
-        local markerSuffix = formatMarkersColored(marker)
+        local markerPrefix = formatMarkersColored(marker)
         local sword = ""
         local mobName = normalizeMobName(m.name)
         local nameMatchesEnemy = activeEnemy ~= "" and not m.dead and
@@ -396,11 +464,9 @@ function CW.render()
         end
         local linePrefix = string.format("<white>%2d)<reset> ", i)
         local killTag = m.dead and "<ansiLightRed>✗<reset> " or ""
+        local targetName = alignPrefix .. (markerPrefix ~= "" and (markerPrefix .. " ") or "") .. displayName
         local label = string.format("%s%s%s%s <dim_gray>(<%s>%s<dim_gray>)<reset>",
-            linePrefix, killTag, sword, alignPrefix .. displayName, color, m.range or "?")
-        if markerSuffix ~= "" then
-            label = label .. markerSuffix
-        end
+            linePrefix, killTag, sword, targetName, color, m.range or "?")
         if isActive then
             label = label .. string.format(" <white>%3d%%%s<reset>", enemyPct, enemyPct <= 25 and " !!" or "")
         end
@@ -432,6 +498,7 @@ end
 
 function CW.startCapture()
     CW.awaiting = true
+    CW.mobDetectDispatched = false
     CW.clear("start")
 end
 
@@ -439,6 +506,7 @@ function CW.finishCapture()
     CW.awaiting = false
     if CW.doneTimer then killTimer(CW.doneTimer) CW.doneTimer = nil end
     CW.render()
+    CW.tryMobDetectConfirmedTarget()
 end
 
 function CW.deferFinish()
@@ -619,6 +687,8 @@ function CW.onCharStatus()
         CW.currentEnemyMobId = nil
         CW.lastKnownEnemyPct = nil
         if matched then
+            CW.lastKilledMobName = trim(killedMobName)
+            CW.lastKilledAt = os.time()
             CW.killsSinceRefresh = (tonumber(CW.killsSinceRefresh) or 0) + 1
         end
 
@@ -695,6 +765,41 @@ function CW.onCharStatus()
     end
     CW.lastEnemy = enemyNow
     CW.lastTrackedMobId = CW.currentEnemyMobId
+end
+
+function CW.getRecentKilledMobName(maxAgeSeconds)
+    local killedName = trim(CW.lastKilledMobName or "")
+    if killedName == "" then return "" end
+    local ttl = tonumber(maxAgeSeconds) or 3
+    if ttl < 0 then ttl = 0 end
+    local killedAt = tonumber(CW.lastKilledAt) or 0
+    if killedAt <= 0 then return "" end
+    if (os.time() - killedAt) > ttl then return "" end
+    return killedName
+end
+
+function CW.clearRecentKilledMobName()
+    CW.lastKilledMobName = ""
+    CW.lastKilledAt = 0
+end
+
+function CW.getCurrentCombatMobName()
+    local activeEnemy = normalizeMobName(CW.getActiveEnemyName())
+    if activeEnemy == "" then return "" end
+    if CW.currentEnemyMobId then
+        for _, m in ipairs(CW.mobs) do
+            if m.id == CW.currentEnemyMobId and not m.dead and normalizeMobName(m.name) == activeEnemy then
+                return m.name
+            end
+        end
+    end
+    -- Name-only fallback
+    for _, m in ipairs(CW.mobs) do
+        if not m.dead and normalizeMobName(m.name) == activeEnemy then
+            return m.name
+        end
+    end
+    return ""
 end
 
 function CW.onPrompt()

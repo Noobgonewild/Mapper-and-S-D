@@ -11,6 +11,43 @@
 snd = snd or {}
 snd.triggers = snd.triggers or {}
 
+
+local function playConfiguredSound(soundFile, fallbackFile)
+    if snd and snd.config and snd.config.soundEnabled == false then
+        return
+    end
+    if type(playSoundFile) ~= "function" then
+        return
+    end
+
+    local volume = tonumber(snd and snd.config and snd.config.soundVolume) or 100
+    volume = math.max(0, math.min(100, math.floor(volume + 0.5)))
+
+    local candidates = {}
+
+    if type(getMudletHomeDir) == "function" then
+        local base = getMudletHomeDir()
+        if base and base ~= "" then
+            table.insert(candidates, base .. "/" .. soundFile)
+            if fallbackFile and fallbackFile ~= "" and fallbackFile ~= soundFile then
+                table.insert(candidates, base .. "/" .. fallbackFile)
+            end
+        end
+    end
+
+    table.insert(candidates, soundFile)
+    if fallbackFile and fallbackFile ~= "" and fallbackFile ~= soundFile then
+        table.insert(candidates, fallbackFile)
+    end
+
+    for _, soundPath in ipairs(candidates) do
+        local ok = pcall(playSoundFile, {name = soundPath, volume = volume})
+        if ok then return end
+        ok = pcall(playSoundFile, soundPath, volume)
+        if ok then return end
+    end
+end
+
 local function scheduleCpInfoEnd()
     if not (snd.cp and snd.cp.parsing and snd.cp.parsing.infoActive) then
         return
@@ -474,6 +511,7 @@ function snd.triggers.questCooldownMinutes(matches)
         end
     end
     snd.quest.active = false
+    snd.quest.available = false
     snd.quest.target.status = "0"
     snd.quest.setCooldown(minutes, {lessThanMinute = false, text = ""})
     if snd.gui and snd.gui.refresh then
@@ -488,6 +526,7 @@ function snd.triggers.questCooldownLessThanMinute()
         end
     end
     snd.quest.active = false
+    snd.quest.available = false
     snd.quest.target.status = "0"
     snd.quest.setCooldown(1, {lessThanMinute = true, text = "Less than a minute remaining"})
     if snd.gui and snd.gui.refresh then
@@ -496,32 +535,15 @@ function snd.triggers.questCooldownLessThanMinute()
 end
 
 local function playQuestReadyWarning()
-    if snd and snd.config and snd.config.soundEnabled == false then
-        return
-    end
+    playConfiguredSound("SearchAndDestroy/quest_ready.wav", "sounds/quest_ready.wav")
+end
 
-    if type(playSoundFile) ~= "function" then
-        return
-    end
+function snd.triggers.gqAboutToStart()
+    playConfiguredSound("SearchAndDestroy/GQ about to start.wav")
+end
 
-    local candidates = {
-        "sounds/quest_ready.wav",
-        "quest_ready.wav"
-    }
-
-    if type(getMudletHomeDir) == "function" then
-        local base = getMudletHomeDir()
-        if base and base ~= "" then
-            table.insert(candidates, 1, base .. "/sounds/quest_ready.wav")
-        end
-    end
-
-    for _, soundPath in ipairs(candidates) do
-        local ok = pcall(playSoundFile, soundPath)
-        if ok then
-            return
-        end
-    end
+function snd.triggers.targetKilledSound()
+    playConfiguredSound("SearchAndDestroy/target_killed.wav")
 end
 
 function snd.triggers.questReady()
@@ -531,6 +553,7 @@ function snd.triggers.questReady()
         end
     end
     snd.quest.active = false
+    snd.quest.available = true
     snd.quest.target.status = "0"
     snd.quest.setCooldown(0, {lessThanMinute = false, text = ""})
     playQuestReadyWarning()

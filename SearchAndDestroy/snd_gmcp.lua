@@ -224,10 +224,6 @@ function snd.gmcp.onRoomInfo()
         terrain = ri.terrain or "",
     }
 
-    if snd.mapper and snd.mapper.persistDiscoveredRoom then
-        snd.mapper.persistDiscoveredRoom(ri)
-    end
-    
     -- Only process if room actually changed
     if snd.room.current.rmid ~= snd.room.previous.rmid then
         -- Defensive init in case state restore or load order omits room history.
@@ -241,6 +237,23 @@ function snd.gmcp.onRoomInfo()
         --     rmid = snd.room.previous.rmid,
         --     arid = snd.room.previous.arid,
         -- })
+
+        if snd.mapper then
+            local navigating = (snd.nav.goingToRoom or snd.mapper.goingToRoom) ~= nil
+            if navigating then
+                if snd.mapper.bufferRoomPersist then
+                    snd.mapper.bufferRoomPersist(ri)
+                end
+            else
+                -- Not navigating: flush any orphaned buffer then persist immediately.
+                if snd.mapper.flushPendingPersists then
+                    snd.mapper.flushPendingPersists()
+                end
+                if snd.mapper.persistDiscoveredRoom then
+                    snd.mapper.persistDiscoveredRoom(ri)
+                end
+            end
+        end
 
         -- Notify main module of room change
         snd.onRoomChange()
@@ -272,6 +285,37 @@ function snd.gmcp.onCommQuest()
     end
     
     snd.utils.debugNote("comm.quest - action: " .. tostring(action))
+
+    local questTimerActions = {
+        start = true,
+        killed = true,
+        warning = true,
+    }
+    local isActiveStatusPayload = (action == "status" and (q.targ or q.target == "killed"))
+    local shouldTrackQuestCountdown = questTimerActions[action] or isActiveStatusPayload
+
+    if shouldTrackQuestCountdown then
+        local timerMinutes = tonumber(q.timer)
+        if action == "killed" or q.target == "killed" then
+            timerMinutes = tonumber(q.time) or timerMinutes
+        elseif action == "warning" then
+            timerMinutes = tonumber(q.time) or timerMinutes
+        end
+
+        if timerMinutes and timerMinutes > 0 then
+            snd.quest.timerEndTime = os.time() + (timerMinutes * 60)
+            if snd.gui and snd.gui.startQuestTimer then
+                snd.gui.startQuestTimer()
+            end
+        end
+    end
+
+    local status = type(q.status) == "string" and q.status:lower() or q.status
+    if status == "available" or status == "ready" then
+        snd.quest.available = true
+    elseif action == "start" or action == "killed" or action == "comp" or action == "fail" or action == "timeout" then
+        snd.quest.available = false
+    end
     
     if action == "start" then
         -- New quest started
@@ -334,6 +378,7 @@ function snd.gmcp.onQuestStart(q)
     end
 
     snd.quest.active = true
+    snd.quest.available = false
     snd.quest.target = {
         mob = q.targ or "",
         area = q.area or "",
@@ -489,6 +534,11 @@ function snd.gmcp.onQuestComplete(q)
     snd.gmcp.queueQuestReward(qp, gold, tp, trains, pracs)
     
     snd.quest.active = false
+    snd.quest.available = false
+    snd.quest.timerEndTime = 0
+    if snd.gui and snd.gui.stopQuestTimer then
+        snd.gui.stopQuestTimer()
+    end
     snd.quest.target = {mob = "", area = "", room = "", keyword = "", status = "0"}
     snd.quest.setCooldown(q.wait)
     clearQuestQuickWhereCache()
@@ -578,6 +628,11 @@ function snd.gmcp.onQuestFail(q)
     end
     
     snd.quest.active = false
+    snd.quest.available = false
+    snd.quest.timerEndTime = 0
+    if snd.gui and snd.gui.stopQuestTimer then
+        snd.gui.stopQuestTimer()
+    end
     snd.quest.target = {mob = "", area = "", room = "", keyword = "", status = "0"}
     snd.quest.setCooldown(q.wait)
     clearQuestQuickWhereCache()
@@ -607,6 +662,11 @@ function snd.gmcp.onQuestTimeout(q)
     end
     
     snd.quest.active = false
+    snd.quest.available = false
+    snd.quest.timerEndTime = 0
+    if snd.gui and snd.gui.stopQuestTimer then
+        snd.gui.stopQuestTimer()
+    end
     snd.quest.target = {mob = "", area = "", room = "", keyword = "", status = "0"}
     snd.quest.setCooldown(q.wait)
     clearQuestQuickWhereCache()
@@ -632,6 +692,11 @@ end
 function snd.gmcp.onQuestReady(q)
     snd.quest.setCooldown(0)
     snd.quest.nextQuestText = "Quest Available"
+    snd.quest.available = true
+    snd.quest.timerEndTime = 0
+    if snd.gui and snd.gui.stopQuestTimer then
+        snd.gui.stopQuestTimer()
+    end
     snd.gmcp.unregisterQuestTargetTrigger()
     
     if snd.gui and snd.gui.refresh then
@@ -646,6 +711,11 @@ function snd.gmcp.onQuestReset(q)
     end
 
     snd.quest.setCooldown(q.timer)
+    snd.quest.available = false
+    snd.quest.timerEndTime = 0
+    if snd.gui and snd.gui.stopQuestTimer then
+        snd.gui.stopQuestTimer()
+    end
     clearQuestQuickWhereCache()
     
     if snd.gui and snd.gui.refresh then
@@ -660,6 +730,11 @@ function snd.gmcp.onQuestStatus(q)
 
     if waitMinutes and waitMinutes > 0 then
         snd.quest.active = false
+        snd.quest.available = false
+        snd.quest.timerEndTime = 0
+        if snd.gui and snd.gui.stopQuestTimer then
+            snd.gui.stopQuestTimer()
+        end
         snd.quest.target.status = "0"
         snd.quest.setCooldown(waitMinutes)
         clearQuestQuickWhereCache()
@@ -675,6 +750,11 @@ function snd.gmcp.onQuestStatus(q)
         snd.quest.active = false
         snd.quest.setCooldown(0)
         snd.quest.nextQuestText = "Quest Available"
+        snd.quest.available = true
+        snd.quest.timerEndTime = 0
+        if snd.gui and snd.gui.stopQuestTimer then
+            snd.gui.stopQuestTimer()
+        end
         clearQuestQuickWhereCache()
         snd.gmcp.removeQuestFromTargetList()
         if snd.targets.current and snd.targets.current.activity == "quest" then
@@ -687,12 +767,14 @@ function snd.gmcp.onQuestStatus(q)
     elseif q.targ == "missing" then
         -- On quest but target is missing
         snd.quest.active = true
+        snd.quest.available = false
         snd.quest.target.status = "missing"
         snd.quest.timer = tonumber(q.timer) or 0
         snd.quest.setCooldown(0)
     elseif q.target == "killed" then
         -- On quest, target killed, waiting to return
         snd.quest.active = true
+        snd.quest.available = false
         snd.quest.target.status = "killed"
         snd.quest.timer = tonumber(q.time) or 0
         snd.quest.setCooldown(0)
@@ -705,6 +787,7 @@ function snd.gmcp.onQuestStatus(q)
     elseif q.targ then
         -- Currently on a quest
         snd.quest.active = true
+        snd.quest.available = false
         snd.quest.target = {
             mob = q.targ or "",
             area = q.area or "",

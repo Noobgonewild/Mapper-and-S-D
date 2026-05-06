@@ -307,6 +307,19 @@
             </Trigger>
             
             <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>gq_about_to_start</name>
+                <script>snd.triggers.gqAboutToStart()</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^Global Quest: See 'Help Global Quests', or, type 'Gquest Join \d+' to take part\.?\s*$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+            
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
                 <name>gq_started</name>
                 <script>snd.triggers.gqStarted(matches)</script>
                 <mCommand></mCommand>
@@ -437,8 +450,34 @@
             </Trigger>
             
             <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>campaign_mob_killed</name>
+                <script>snd.triggers.targetKilledSound()</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^[Cc][Oo][Nn][Gg][Rr][Aa][Tt][Uu][Ll][Aa][Tt][Ii][Oo][Nn][Ss], that was one of your CAMPAIGN mobs\!$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>campaign_return_to_questmaster</name>
+                <script>snd.triggers.targetKilledSound()</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^Return to the questmaster before your time runs out\.$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
                 <name>gq_mob_killed</name>
-                <script>snd.triggers.gqMobKilled()</script>
+                <script>snd.triggers.gqMobKilled() snd.triggers.targetKilledSound()</script>
                 <mCommand></mCommand>
                 <packageName></packageName>
                 <regexCodeList>

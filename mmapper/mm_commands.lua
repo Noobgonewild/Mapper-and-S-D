@@ -333,6 +333,17 @@ local function handle_command_inline(line)
     return true
   end
 
+  local portallevel_args = line:match("^mapper portallevel%s+(.+)$")
+  if portallevel_args then
+    local ok, err = mm.set_portal_level(portallevel_args)
+    if not ok and err then mm.warn(err) end
+    return true
+  end
+  if line == "mapper portallevel" then
+    mm.warn("Usage: mapper portallevel <index> <level> [quiet]")
+    return true
+  end
+
   if line == "mapper checkimport" then
     local nav = (mm and mm.nav) or (snd and snd.mapper) or nil
     if nav and nav.checkImport then
@@ -770,6 +781,7 @@ mm.alias_specs = {
   {"^mapper shops?(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("shops", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper train(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("train", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper quest(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("quest", m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper unmapped(?:%s+(.*))?$", function(m) local ok, err = mm.show_unmapped(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper next(?:%s+(%d+))?$", function(m) local ok, err = mm.next_result(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexits area%s+(.+)$", function(m) local ok, err = mm.list_cexits("area " .. m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexits(?:%s+(.+))?$", function(m) local ok, err = mm.list_cexits(m[2]); if not ok then mm.warn(err) end end},
@@ -801,6 +813,8 @@ mm.alias_specs = {
       local ok, err = mm.lock_exit(m[2], n)
       if not ok then mm.warn(err) end
     end},
+  {"^mapper noportal(.*)$", function(m) local ok, err = mm.set_room_flag("noportal", m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper norecall(.*)$", function(m) local ok, err = mm.set_room_flag("norecall", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper resume$", function() local ok, err = mm.resume(); if not ok then mm.warn(err) end end},
   {"^mapper stop$", function() send("stop") end},
   {"^mapper thisroom$", function() mm.print_room_details() end},
@@ -920,11 +934,9 @@ mm.alias_specs = {
 }
 
 mm.stubbed = {
-  "mapper findpath", "mapper unmapped", "mapper bookmarks", "mapper clearcache",
+  "mapper findpath", "mapper bookmarks", "mapper clearcache",
   "mapper fullportal",
-  "mapper portallevel",
   "mapper areas",
-  "mapper noportal", "mapper norecall",
   "mapper zoom in", "mapper zoom out",
 }
 

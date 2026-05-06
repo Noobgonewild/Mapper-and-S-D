@@ -461,33 +461,17 @@ function snd.cp.endCpInfo()
     
     snd.cp.parsing.infoActive = false
     local wasActive = snd.campaign.active
-    
-    -- Transfer targets to main list
-    snd.campaign.targets = snd.cp.parsing.tempTargets
-    snd.campaign.active = #snd.campaign.targets > 0
 
     local hasCompleteBy = snd.cp.normalizeCompleteBy(snd.cp.parsing.capturedCompleteBy) ~= ""
     if snd.db and ((snd.campaign.active and not wasActive) or hasCompleteBy) then
         snd.cp.openHistorySession(snd.char.level or 0, snd.cp.parsing.capturedCompleteBy)
-    end
-    
-    -- Determine if area or room based
-    if #snd.campaign.targets > 0 then
-        snd.campaign.targetType = snd.cp.determineTargetType(snd.campaign.targets)
-        snd.targets.type = snd.campaign.targetType
-        snd.targets.activity = "cp"
-    end
-
-    -- Build the main display list and refresh the window (same as GQ flow)
-    if #snd.campaign.targets > 0 then
-        snd.cp.buildMainTargetList()
     end
 
     if snd.gui and snd.gui.refresh then
         snd.gui.refresh()
     end
 
-    snd.utils.debugNote("CP info complete. " .. #snd.campaign.targets .. " targets")
+    snd.utils.debugNote("CP info complete. Target list unchanged (cp check is sole S&D target source).")
     if snd.campaign.active and snd.setActiveTab and snd.getPreferredActiveActivity then
         snd.setActiveTab(snd.getPreferredActiveActivity() or "cp", {save = true, refresh = false})
     end
@@ -536,6 +520,10 @@ function snd.cp.endCpCheck()
 
     if snd.campaign.active and not wasActive and snd.db then
         snd.cp.openHistorySession(snd.char.level or 0)
+    end
+
+    if snd.campaign.active and not wasActive and snd.config.autocheck then
+        snd.config.autocheck.cpKillCounter = 0
     end
     
     if snd.gui and snd.gui.refresh then
@@ -952,6 +940,17 @@ function snd.cp.buildMainTargetList()
     for _, entry in ipairs(lowEntries) do
         table.insert(cpEntries, entry)
     end
+    local areaGroupSeen = {}
+    local areaGroupCount = 0
+    for _, entry in ipairs(cpEntries) do
+        local arid = entry.arid or ""
+        if not areaGroupSeen[arid] then
+            areaGroupCount = areaGroupCount + 1
+            areaGroupSeen[arid] = areaGroupCount
+        end
+        entry._areaGroup = areaGroupSeen[arid]
+    end
+
     table.sort(cpEntries, function(a, b)
         if a.dead ~= b.dead then
             return not a.dead
@@ -961,11 +960,18 @@ function snd.cp.buildMainTargetList()
         if aLow ~= bLow then
             return not aLow
         end
+        if (a._areaGroup or 0) ~= (b._areaGroup or 0) then
+            return (a._areaGroup or 0) < (b._areaGroup or 0)
+        end
         if (a.campaignIndex or 0) ~= (b.campaignIndex or 0) then
             return (a.campaignIndex or 0) < (b.campaignIndex or 0)
         end
         return (a.dupIndex or 0) < (b.dupIndex or 0)
     end)
+
+    for _, entry in ipairs(cpEntries) do
+        entry._areaGroup = nil
+    end
 
     local cpDisplayIndex = 0
     local cpListIndex = 0
@@ -998,10 +1004,11 @@ function snd.cp.updateTargetStatus()
     local cpCampaignIndex = 0
     for _, campaignTarget in ipairs(snd.campaign.targets or {}) do
         cpCampaignIndex = cpCampaignIndex + 1
+        local wasDead = campaignTarget.dead == true
         campaignTarget.dead = true
         for _, check in ipairs(snd.campaign.checkList) do
             if campaignTarget.mob == check.mob and (campaignTarget.loc or "") == (check.loc or "") then
-                campaignTarget.dead = check.dead
+                campaignTarget.dead = check.dead or wasDead
                 break
             end
         end
@@ -1012,8 +1019,9 @@ function snd.cp.updateTargetStatus()
     local consumedChecks = {}
     for _, target in ipairs(snd.targets.list) do
         if target.activity == "cp" then
+            local wasDead = target.dead == true
             target.dead = false
-            
+
             local found = false
             for idx, check in ipairs(snd.campaign.checkList) do
                 if not consumedChecks[idx]
@@ -1021,7 +1029,7 @@ function snd.cp.updateTargetStatus()
                     and (target.loc or "") == (check.loc or "") then
                     found = true
                     consumedChecks[idx] = true
-                    target.dead = check.dead
+                    target.dead = check.dead or wasDead
                     break
                 end
             end
@@ -1030,12 +1038,12 @@ function snd.cp.updateTargetStatus()
                     if not consumedChecks[idx] and target.mob == check.mob then
                         found = true
                         consumedChecks[idx] = true
-                        target.dead = check.dead
+                        target.dead = check.dead or wasDead
                         break
                     end
                 end
             end
-            
+
             -- If not in check list, it's been killed
             if not found then
                 target.dead = true
@@ -1044,6 +1052,17 @@ function snd.cp.updateTargetStatus()
         else
             table.insert(nonCpList, target)
         end
+    end
+
+    local areaGroupSeen = {}
+    local areaGroupCount = 0
+    for _, entry in ipairs(cpList) do
+        local arid = entry.arid or ""
+        if not areaGroupSeen[arid] then
+            areaGroupCount = areaGroupCount + 1
+            areaGroupSeen[arid] = areaGroupCount
+        end
+        entry._areaGroup = areaGroupSeen[arid]
     end
 
     table.sort(cpList, function(a, b)
@@ -1055,11 +1074,18 @@ function snd.cp.updateTargetStatus()
         if aLow ~= bLow then
             return not aLow
         end
+        if (a._areaGroup or 0) ~= (b._areaGroup or 0) then
+            return (a._areaGroup or 0) < (b._areaGroup or 0)
+        end
         if (a.campaignIndex or 0) ~= (b.campaignIndex or 0) then
             return (a.campaignIndex or 0) < (b.campaignIndex or 0)
         end
         return (a.dupIndex or 0) < (b.dupIndex or 0)
     end)
+
+    for _, entry in ipairs(cpList) do
+        entry._areaGroup = nil
+    end
 
     local cpIndex = 0
     local cpListIndex = 0
@@ -1091,19 +1117,37 @@ end
 function snd.cp.onMobKilled()
     snd.utils.debugNote("Campaign mob killed!")
     local shouldSyncAfterKill = true
+    local confirmedKilledMob = ""
+    if snd.conwin and snd.conwin.getRecentKilledMobName then
+        confirmedKilledMob = snd.conwin.getRecentKilledMobName(3) or ""
+        if confirmedKilledMob ~= "" and snd.conwin.clearRecentKilledMobName then
+            snd.conwin.clearRecentKilledMobName()
+        end
+    end
     
+    -- Fallback: when text trigger fires before GMCP clears, ConWin still sees the live enemy
+    local activeCombatMob = ""
+    if confirmedKilledMob == "" and snd.conwin and snd.conwin.getCurrentCombatMobName then
+        activeCombatMob = snd.conwin.getCurrentCombatMobName() or ""
+    end
+
     -- Record the kill if we have a current target
     if snd.targets.current and snd.targets.current.activity == "cp" then
         local target = snd.targets.current
-        
+
         -- Mark as dead in target list
         local bestIndex, bestScore = nil, -1
         local currentArea = snd.room and snd.room.current and tostring(snd.room.current.arid or "") or ""
         local currentRoom = snd.room and snd.room.current and tostring(snd.room.current.name or "") or ""
         for i, t in ipairs(snd.targets.list) do
             if t.activity == "cp" and not t.dead then
-                if t.mob == target.name then
+                local nameMatchesCurrent = (t.mob == target.name)
+                local nameMatchesConfirmedKill = (confirmedKilledMob ~= "" and t.mob == confirmedKilledMob)
+                local nameMatchesActiveCombat = (activeCombatMob ~= "" and t.mob == activeCombatMob)
+                if nameMatchesCurrent or nameMatchesConfirmedKill or nameMatchesActiveCombat then
                     local score = 5
+                    if nameMatchesConfirmedKill then score = score + 8 end
+                    if nameMatchesActiveCombat then score = score + 4 end
                     if t.arid and currentArea ~= "" and tostring(t.arid) == currentArea then score = score + 3 end
                     if t.roomName and currentRoom ~= "" and tostring(t.roomName) == currentRoom then score = score + 2 end
                     if target.index and t.displayIndex and tonumber(target.index) == tonumber(t.displayIndex) then
@@ -1132,8 +1176,8 @@ function snd.cp.onMobKilled()
     -- Trigger cp check to update status (throttled to avoid duplicate sends).
     -- Do not re-check immediately after the last kill; completion parsing/DB close
     -- should proceed without a terminal "not on campaign" sync race.
-    if shouldSyncAfterKill then
-        snd.cp.requestCheck(0.5, "cp.onMobKilled")
+    if shouldSyncAfterKill and (not snd.shouldAutoCheckAfterKill or snd.shouldAutoCheckAfterKill("cp")) then
+        snd.cp.requestCheck(0.1, "cp.onMobKilled")
     end
     
     if snd.gui and snd.gui.refresh then

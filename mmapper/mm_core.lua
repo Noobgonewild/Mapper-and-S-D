@@ -324,6 +324,53 @@ function mm.set_portal_recall(index, explicit_state)
   return mm.save_portal_persistence()
 end
 
+
+function mm.set_portal_level(args)
+  local pnum, level, quiet = tostring(args or ""):match("^%s*(%d+)%s+(%d+)%s*(%S*)%s*$")
+  if not pnum or not level then
+    mm.warn("Usage: mapper portallevel <index> <level> [quiet]")
+    return false, "invalid arguments"
+  end
+
+  pnum = tonumber(pnum)
+  level = tonumber(level)
+  if not pnum or not level then
+    mm.warn("Usage: mapper portallevel <index> <level> [quiet]")
+    return false, "invalid arguments"
+  end
+
+  local quiet_mode = tostring(quiet or ""):lower() == "quiet"
+  local selected = get_portal_by_index(pnum)
+  if not selected then
+    mm.warn("PORTALLEVEL FAILED: Did not find index " .. tostring(pnum) .. ". Try 'mapper portals'.")
+    return false, "portal index not found"
+  end
+
+  local dir = tostring(selected.command or selected.dir or "")
+  local fromuid = tostring(selected.fromuid or "")
+  local touid = tostring(selected.touid or selected.target_uid or "")
+  if dir == "" or fromuid == "" or touid == "" then
+    return false, "selected portal row is missing required fields"
+  end
+
+  local ok, qerr = mm.exec_mapper_db(string.format(
+    "UPDATE exits SET level=%d WHERE dir=%s AND fromuid=%s AND touid=%s",
+    level,
+    mm.sql_escape(dir),
+    mm.sql_escape(fromuid),
+    mm.sql_escape(touid)
+  ))
+  if not ok then
+    return false, qerr
+  end
+
+  selected.level = level
+  if not quiet_mode then
+    mm.note("Portal '" .. dir .. "' to '" .. tostring(selected.room_name or "?") .. "' given minimum level lock of " .. tostring(level) .. ".")
+  end
+  return mm.save_portal_persistence()
+end
+
 function mm.set_portal_chaos(index, explicit_state)
   ensure_portal_settings()
   local ensured, ensure_err = mm.ensure_exits_chaos_column()
@@ -885,6 +932,61 @@ function mm.print_room_details(room)
       mm.note("Info: " .. tostring(rows[1].info))
     end
   end
+end
+
+function mm.set_room_flag(flag, arg)
+  local safe_flag
+  if flag == "noportal" or flag == "norecall" then
+    safe_flag = flag
+  else
+    return false, "invalid room flag"
+  end
+
+  local room = mm.current_room()
+  if not room then
+    return false, "current room unknown"
+  end
+
+  local mode = tostring(arg or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+  if mode == "" then
+    mode = "toggle"
+  end
+  if mode ~= "on" and mode ~= "off" and mode ~= "toggle" then
+    return false, string.format("Usage: mapper %s [on|off|toggle]", safe_flag)
+  end
+
+  local rows, read_err = mm.query_mapper_db(
+    string.format("SELECT name, %s FROM rooms WHERE uid = %d LIMIT 1", safe_flag, room),
+    "Aardwolf.db"
+  )
+  if not rows then
+    return false, read_err
+  end
+  if not rows[1] then
+    return false, string.format("room %s not found in mapper database", tostring(room))
+  end
+
+  local current = tonumber(rows[1][safe_flag]) == 1
+  local next_value
+  if mode == "on" then
+    next_value = true
+  elseif mode == "off" then
+    next_value = false
+  else
+    next_value = not current
+  end
+
+  local ok, write_err = mm.exec_mapper_db(
+    string.format("UPDATE rooms SET %s = %d WHERE uid = %d", safe_flag, next_value and 1 or 0, room),
+    "Aardwolf.db"
+  )
+  if not ok then
+    return false, write_err
+  end
+
+  local room_name = tostring(rows[1].name or "?")
+  mm.note(string.format("Room %s (id: %s) %s set to %s.", room_name, tostring(room), safe_flag, next_value and "on" or "off"))
+  return true
 end
 
 local NOTES_DB_NAME = "Aardwolf.db"
@@ -1668,6 +1770,83 @@ function mm.search_special(which, area_arg)
   end
 
   mm.print_search_results(results, "special search: " .. which)
+  return true
+end
+
+function mm.show_unmapped(raw_arg)
+  local arg = tostring(raw_arg or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if arg == "" then
+    local rows, err = mm.query_mapper_db([[
+      SELECT area, count(dir) as cnt
+      FROM rooms INNER JOIN exits ON rooms.uid = fromuid
+      WHERE touid NOT IN (SELECT uid FROM rooms) AND touid != -1
+      GROUP BY area
+      ORDER BY area
+    ]])
+    if not rows then return false, err end
+    if #rows == 0 then
+      mm.note("No unmapped exits found.")
+      return true
+    end
+
+    cecho("<cyan>Unmapped exits by area<reset>\n")
+    cecho("<gray>--------------------------------------------------------------------<reset>\n")
+    cecho(string.format("<white>| %-50s | %5s |<reset>\n", "area", "count"))
+    cecho("<gray>--------------------------------------------------------------------<reset>\n")
+    for _, row in ipairs(rows) do
+      cecho(string.format("| %-50s | %5d |\n", tostring(row.area or "?"), tonumber(row.cnt) or 0))
+    end
+    cecho("<gray>--------------------------------------------------------------------<reset>\n")
+    return true
+  end
+
+  local area = arg
+  local where_area_sql
+  if arg:lower() == "here" then
+    local info = mm.get_room_info and mm.get_room_info() or nil
+    if not info then
+      return false, "current room is unknown; try LOOK first"
+    end
+    local current_area = info and (info.zone or info.area) or nil
+    if not current_area or tostring(current_area):gsub("%s+", "") == "" then
+      return false, "current area is unknown; try LOOK first"
+    end
+    area = tostring(current_area)
+    where_area_sql = "lower(area) = " .. mm.sql_escape(area:lower())
+  else
+    where_area_sql = "lower(area) LIKE " .. mm.sql_escape("%" .. area:lower() .. "%")
+  end
+
+  local rows, err = mm.query_mapper_db(string.format([[
+    SELECT uid, name, area, dir, touid
+    FROM rooms INNER JOIN exits ON rooms.uid = fromuid
+    WHERE %s
+      AND touid NOT IN (SELECT uid FROM rooms)
+      AND touid != -1
+    ORDER BY area, uid
+  ]], where_area_sql))
+  if not rows then return false, err end
+  if #rows == 0 then
+    mm.note("No unmapped exits found for area filter: " .. tostring(area))
+    return true
+  end
+
+  cecho("<cyan>Rooms with unmapped exits<reset>\n")
+  cecho("<gray>-------------------------------------------------------------------------------------------------------------------<reset>\n")
+  cecho(string.format("<white>| %-24s | %-28s | %-8s | %-5s | %-8s |<reset>\n", "area", "room name", "rm uid", "dir", "to uid"))
+  cecho("<gray>-------------------------------------------------------------------------------------------------------------------<reset>\n")
+  for _, row in ipairs(rows) do
+    local uid = tonumber(row.uid)
+    cecho(string.format("| %-24s | ", tostring(row.area or "?")))
+    cechoLink(
+      string.format("%-28s", tostring(row.name or "?")),
+      uid and string.format("mm.goto_room(%d)", uid) or "",
+      "Go to room " .. tostring(row.uid or ""),
+      uid ~= nil
+    )
+    cecho(string.format(" | %-8s | %-5s | %-8s |\n", tostring(row.uid or "?"), tostring(row.dir or "?"), tostring(row.touid or "?")))
+  end
+  cecho("<gray>-------------------------------------------------------------------------------------------------------------------<reset>\n")
   return true
 end
 

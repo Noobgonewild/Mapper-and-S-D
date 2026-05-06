@@ -307,6 +307,7 @@ function snd.gq.buildMainTargetList()
             remaining = target.remaining or target.qty,
             dead = target.remaining == 0,
             index = i,
+            sourceIndex = i,
             activity = "gq",
             keyword = target.keyword or snd.gmcp.guessMobKeyword(target.mob, ""),
             hasMobData = hasMobData,
@@ -334,6 +335,34 @@ function snd.gq.buildMainTargetList()
         duplicateIndexSeen[dk] = (duplicateIndexSeen[dk] or 0) + 1
         entry.index = duplicateIndexSeen[dk]
         entry._dupkey = nil
+    end
+
+    local areaGroupSeen = {}
+    local areaGroupCount = 0
+    for _, entry in ipairs(gqEntries) do
+        local arid = entry.arid or ""
+        if not areaGroupSeen[arid] then
+            areaGroupCount = areaGroupCount + 1
+            areaGroupSeen[arid] = areaGroupCount
+        end
+        entry._areaGroup = areaGroupSeen[arid]
+    end
+
+    table.sort(gqEntries, function(a, b)
+        if a.dead ~= b.dead then
+            return not a.dead
+        end
+        if (a._areaGroup or 0) ~= (b._areaGroup or 0) then
+            return (a._areaGroup or 0) < (b._areaGroup or 0)
+        end
+        if (a.sourceIndex or 0) ~= (b.sourceIndex or 0) then
+            return (a.sourceIndex or 0) < (b.sourceIndex or 0)
+        end
+        return (a.index or 0) < (b.index or 0)
+    end)
+
+    for _, entry in ipairs(gqEntries) do
+        entry._areaGroup = nil
     end
 
     -- Insert GQ targets at the BEGINNING (highest priority) preserving gqEntries order.
@@ -382,6 +411,10 @@ function snd.gq.onJoined(gqId)
     snd.utils.reportLine("Joined Global Quest #" .. gqId, "gquest")
     snd.gquest.joined = gqId
 
+    if snd.config.autocheck then
+        snd.config.autocheck.gqKillCounter = 0
+    end
+
     if snd.char and not snd.char.noexp then
         sendGMCP("config noexp on")
         snd.utils.infoNote("Search and Destroy: Turning noexp ON (joined global quest)")
@@ -427,7 +460,20 @@ end
 --- Handle gquest mob killed
 function snd.gq.onMobKilled()
     snd.utils.debugNote("Global quest mob killed!")
-    
+    local confirmedKilledMob = ""
+    if snd.conwin and snd.conwin.getRecentKilledMobName then
+        confirmedKilledMob = snd.conwin.getRecentKilledMobName(3) or ""
+        if confirmedKilledMob ~= "" and snd.conwin.clearRecentKilledMobName then
+            snd.conwin.clearRecentKilledMobName()
+        end
+    end
+
+    -- Fallback: when text trigger fires before GMCP clears, ConWin still sees the live enemy
+    local activeCombatMob = ""
+    if confirmedKilledMob == "" and snd.conwin and snd.conwin.getCurrentCombatMobName then
+        activeCombatMob = snd.conwin.getCurrentCombatMobName() or ""
+    end
+
     -- Update remaining count for current target
     if snd.targets.current and snd.targets.current.activity == "gq" then
         local bestIndex, bestScore = nil, -1
@@ -435,8 +481,13 @@ function snd.gq.onMobKilled()
         local currentRoom = snd.room and snd.room.current and tostring(snd.room.current.name or "") or ""
         for i, t in ipairs(snd.targets.list) do
             if t.activity == "gq" and not t.dead then
-                if t.mob == snd.targets.current.name then
+                local nameMatchesCurrent = (t.mob == snd.targets.current.name)
+                local nameMatchesConfirmedKill = (confirmedKilledMob ~= "" and t.mob == confirmedKilledMob)
+                local nameMatchesActiveCombat = (activeCombatMob ~= "" and t.mob == activeCombatMob)
+                if nameMatchesCurrent or nameMatchesConfirmedKill or nameMatchesActiveCombat then
                     local score = 5
+                    if nameMatchesConfirmedKill then score = score + 8 end
+                    if nameMatchesActiveCombat then score = score + 4 end
                     if t.arid and currentArea ~= "" and tostring(t.arid) == currentArea then score = score + 3 end
                     if t.roomName and currentRoom ~= "" and tostring(t.roomName) == currentRoom then score = score + 2 end
                     if snd.targets.current.index and t.index and tonumber(snd.targets.current.index) == tonumber(t.index) then
@@ -458,10 +509,12 @@ function snd.gq.onMobKilled()
         end
     end
     
-    -- Trigger gq check to update status
-    tempTimer(0.5, function()
-        send("gq check", false)
-    end)
+    -- Trigger gq check to update status (subject to AutoCheck mode)
+    if not snd.shouldAutoCheckAfterKill or snd.shouldAutoCheckAfterKill("gq") then
+        tempTimer(0.5, function()
+            send("gq check", false)
+        end)
+    end
 
     if snd.gui and snd.gui.refresh then
         snd.gui.refresh()

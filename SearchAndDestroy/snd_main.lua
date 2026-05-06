@@ -65,6 +65,7 @@ snd.config = snd.config or {
     
     -- Sound notifications
     soundEnabled = false,
+    soundVolume = 100,
     
     -- Express mode (skip targets with enough kills)
     express = {
@@ -72,6 +73,17 @@ snd.config = snd.config or {
         minKillCount = 2,
     },
     
+    -- Auto check behavior after kills: on|smart|off
+    autocheck = {
+        mode = "on",
+        smartKills = 3,
+        cpKillCounter = 0,
+        gqKillCounter = 0,
+    },
+
+    -- Mobdetect behavior on room arrival after target confirmation: off|on|always
+    mobdetect = "off",
+
     -- Table display settings
     tableNotes = false,
     tableWidth = 80,
@@ -89,6 +101,9 @@ snd.config = snd.config or {
     
     -- Automatic update checks
     autoUpdateCheck = true,
+
+    -- Area color banding for target list location labels
+    areaColors = true,
 
     -- Reporting channel for S&D event/history output ("default" = local echo)
     reportChannel = "default",
@@ -219,6 +234,7 @@ snd.gquest = snd.gquest or {
 
 snd.quest = snd.quest or {
     active = false,
+    available = false,
     target = {
         mob = "",
         area = "",
@@ -227,6 +243,8 @@ snd.quest = snd.quest or {
         status = "0",
     },
     timer = 0,
+    timerEndTime = 0,
+    timerTickerId = nil,
     nextQuestTime = 0,
     nextQuestRemaining = 0,
     cooldownStart = 0,
@@ -998,6 +1016,49 @@ function snd.getPreferredActiveActivity()
     return nil
 end
 
+function snd.getAutocheckMode()
+    local cfg = snd.config and snd.config.autocheck or {}
+    local mode = tostring(cfg.mode or "on"):lower()
+    if mode ~= "on" and mode ~= "smart" and mode ~= "off" then
+        mode = "on"
+    end
+    return mode
+end
+
+function snd.shouldAutoCheckAfterKill(activity)
+    local cfg = snd.config and snd.config.autocheck
+    if not cfg then return true end
+
+    local mode = snd.getAutocheckMode()
+    if mode == "on" then
+        return true
+    end
+    if mode == "off" then
+        return false
+    end
+
+    local smartKills = tonumber(cfg.smartKills) or 1
+    if smartKills <= 1 then
+        snd.utils.infoNote("AutoCheck SMART with kills=1 is equivalent to ON; switching mode to ON.")
+        if snd.commands and snd.commands.setAutocheckMode then
+            snd.commands.setAutocheckMode("on")
+        else
+            cfg.mode = "on"
+            if snd.saveState then snd.saveState() end
+        end
+        if snd.gui and snd.gui.refresh then snd.gui.refresh() end
+        return true
+    end
+
+    local key = (activity == "gq") and "gqKillCounter" or "cpKillCounter"
+    cfg[key] = (tonumber(cfg[key]) or 0) + 1
+    if cfg[key] >= smartKills then
+        cfg[key] = 0
+        return true
+    end
+    return false
+end
+
 function snd.setActiveTab(activity, opts)
     local options = opts or {}
     local normalized = tostring(activity or "auto"):lower()
@@ -1031,17 +1092,26 @@ function snd.onRoomChange()
         snd.mapper.onConfirmedRoomVisit(snd.room.current and snd.room.current.rmid)
     end
 
+    local wasNavigating = (snd.nav.goingToRoom or snd.mapper.goingToRoom) ~= nil
+
     -- Check if we arrived at destination
     local destination = snd.nav.goingToRoom or snd.mapper.goingToRoom
     if destination and tostring(snd.room.current.rmid) == tostring(destination) then
+        if snd.mapper and snd.mapper.flushPendingPersists then
+            snd.mapper.flushPendingPersists()
+        end
         snd.onDestinationArrived()
         snd.nav.goingToRoom = nil
         snd.mapper.goingToRoom = nil
     end
-    
-    -- Refresh GUI
-    if snd.gui and snd.gui.refresh then
-        snd.gui.refresh()
+
+    -- Skip per-room GUI refresh while mid-route; the 2s periodic timer covers updates during travel.
+    -- Refresh on arrival (wasNavigating=true, now nil) or during manual movement.
+    local stillNavigating = (snd.nav.goingToRoom or snd.mapper.goingToRoom) ~= nil
+    if not (wasNavigating and stillNavigating) then
+        if snd.gui and snd.gui.refresh then
+            snd.gui.refresh()
+        end
     end
 end
 

@@ -225,8 +225,34 @@ function snd.mapper.normalizeDirection(dir)
 end
 
 function snd.mapper.isInCombat()
-    local state = snd.char and snd.char.status and tonumber(snd.char.status.state)
+    local state
+    if gmcp and gmcp.char and gmcp.char.status then
+        state = tonumber(gmcp.char.status.state)
+    end
+    if state == nil and snd.char and snd.char.status then
+        state = tonumber(snd.char.status.state)
+    end
     return state == 8
+end
+
+function snd.mapper.canSendCommands()
+    local state
+    if gmcp and gmcp.char and gmcp.char.status then
+        state = tonumber(gmcp.char.status.state)
+    end
+    if state == nil and snd.char and snd.char.status then
+        state = tonumber(snd.char.status.state)
+    end
+    if state == nil and snd.char then
+        state = tonumber(snd.char.state)
+    end
+    if state == nil then
+        return true
+    end
+    if state == 1 or state == 2 or state == 5 or state == 6 or state == 7 then
+        return false
+    end
+    return true
 end
 
 function snd.mapper.setExitLock(roomId, dir, level)
@@ -437,6 +463,27 @@ function snd.mapper.persistDiscoveredRoom(roomInfo)
     end
 
     return true
+end
+
+snd.mapper.pendingPersists = snd.mapper.pendingPersists or {}
+
+function snd.mapper.bufferRoomPersist(ri)
+    if not ri or not ri.num then return end
+    snd.mapper.pendingPersists[tostring(ri.num)] = ri
+end
+
+function snd.mapper.flushPendingPersists()
+    local pending = snd.mapper.pendingPersists
+    if not pending or next(pending) == nil then return end
+    if not snd.mapper.db.open() then return end
+
+    snd.mapper.db.conn:execute("BEGIN")
+    for _, ri in pairs(pending) do
+        snd.mapper.persistDiscoveredRoom(ri)
+    end
+    snd.mapper.db.conn:execute("COMMIT")
+
+    snd.mapper.pendingPersists = {}
 end
 
 local function tokenizeInfo(info)
@@ -1977,6 +2024,13 @@ function snd.mapper.executePath(path)
     if not path or #path == 0 then
         return
     end
+
+    snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
+    local executionSerial = snd.mapper.pathExecutionSerial
+
+    local function isExecutionCurrent()
+        return snd.mapper.pathExecutionSerial == executionSerial
+    end
     
     -- Cardinal directions that can use 'run'
     local cardinalDirs = {
@@ -2011,11 +2065,30 @@ function snd.mapper.executePath(path)
         return table.concat(compressed, "")
     end
     
+    local function getCurrentRoomId()
+        local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
+        if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info and gmcp.room.info.num then
+            currentRoom = tostring(gmcp.room.info.num)
+        end
+        return tostring(currentRoom or "-1")
+    end
+
+    local function enemyMatchesToken(token)
+        local t = tostring(token or ""):lower():match("^%s*(.-)%s*$")
+        if t == "" then return false end
+        local enemy = ""
+        if gmcp and gmcp.char and gmcp.char.status then
+            enemy = tostring(gmcp.char.status.enemy or gmcp.char.status.opponent or ""):lower()
+        end
+        return enemy ~= "" and enemy:find(t, 1, true) ~= nil
+    end
+
     -- Build command groups (separated by waits)
-    -- Each group is {commands = {{text="cmd1", travelType=nil}, ...}, delayAfter = 0}
+    -- Each group is {commands = {{text="cmd1", travelType=nil}, ...}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil}
     local groups = {}
-    local currentGroup = {commands = {}, delayAfter = 0}
+    local currentGroup = {commands = {}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil}
     local cardinalBuffer = {}
+    local simulatedRoom = getCurrentRoomId()
     
     local function flushCardinals()
         if #cardinalBuffer > 0 then
@@ -2047,31 +2120,70 @@ function snd.mapper.executePath(path)
 	for _, step in ipairs(path) do
 		local raw = tostring(step.dir or "")
 		local parts = raw:find(";", 1, true) and splitSemis(raw) or { raw }
+        local stepSourceRoom = simulatedRoom
+        local stepHasWait = false
+        local encounteredWait = false
+        for _, token in ipairs(parts) do
+            if tostring(token):match("^%s*wait%((%d+%.?%d*)%)%s*$") then
+                stepHasWait = true
+                break
+            end
+        end
+        if stepHasWait then
+            flushCardinals()
+            if #currentGroup.commands > 0 then
+                table.insert(groups, currentGroup)
+                currentGroup = {commands = {}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil}
+            end
+        end
 
 		for _, dir in ipairs(parts) do
 			local dirLower = dir:lower()
 
 			-- Check if this is a wait() command
 			local waitTime = dir:match("^wait%((%d+%.?%d*)%)$")
-			if waitTime then
-				flushCardinals()
-				currentGroup.delayAfter = tonumber(waitTime)
-				table.insert(groups, currentGroup)
-				currentGroup = {commands = {}, delayAfter = 0}
+				if waitTime then
+					flushCardinals()
+					currentGroup.delayAfter = tonumber(waitTime)
+                if not currentGroup.waitRoomId or currentGroup.waitRoomId == "-1" then
+                    currentGroup.waitRoomId = tostring(stepSourceRoom or "-1")
+                end
+					table.insert(groups, currentGroup)
+					currentGroup = {commands = {}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil}
+                    encounteredWait = true
 
 			elseif cardinalDirs[dirLower] then
 				-- cardinal movement token (n/s/e/w/u/d)
 				table.insert(cardinalBuffer, dirLower)
 
-			else
-				-- normal command token (e.g. "open d", "kill hidden", "o n", "enter")
-				flushCardinals()
+                else
+                    -- normal command token (e.g. "open d", "kill hidden", "o n", "enter")
+					flushCardinals()
+                    if stepHasWait and (not encounteredWait)
+                        and (not currentGroup.executeRoomId or currentGroup.executeRoomId == "-1") then
+                        currentGroup.executeRoomId = tostring(stepSourceRoom or "-1")
+                    end
+                    if stepHasWait and (not encounteredWait) then
+                        local verb, args = tostring(dir):match("^(%S+)%s+(.+)$")
+                        local v = tostring(verb or ""):lower()
+                        if (v == "k" or v == "ki" or v == "kil" or v == "kill")
+                            and (not currentGroup.killTargetToken or currentGroup.killTargetToken == "")
+                        then
+                            local token = tostring(args or ""):match("^%s*(%S+)")
+                            if token and token ~= "" then
+                                currentGroup.killTargetToken = token:lower()
+                            end
+                        end
+                    end
                 table.insert(currentGroup.commands, {
                     text = dir,
                     travelType = step.travelType,
                 })
 			end
 		end
+        if step.uid then
+            simulatedRoom = tostring(step.uid)
+        end
 	end
 
     
@@ -2121,64 +2233,137 @@ function snd.mapper.executePath(path)
         return true
     end
     
-    -- Check if any group has a delay
-    local hasDelays = false
-    for _, grp in ipairs(groups) do
-        if grp.delayAfter > 0 then
-            hasDelays = true
-            break
+    -- Execute path groups sequentially so wait() never races ahead of queued actions.
+    -- If a wait expires while in combat, hold execution until combat clears.
+    local function runFrom(startIndex)
+        if not isExecutionCurrent() then
+            return
         end
-    end
-    
-    if not hasDelays then
-        -- No waits - send all at once with ;; separators
-        local allCmds = {}
-        for _, grp in ipairs(groups) do
-            for _, entry in ipairs(grp.commands) do
-                table.insert(allCmds, entry)
+        local index = startIndex
+        while true do
+            if not isExecutionCurrent() then
+                return
             end
-        end
-        local cmdTexts = {}
-        for _, entry in ipairs(allCmds) do
-            table.insert(cmdTexts, entry.text)
-        end
-        local cmdString = table.concat(cmdTexts, ";;")
-        cecho("<dim_gray>[S&D Path] " .. cmdString .. "<reset>\n")
-        sendCommands(allCmds)
-    else
-        -- Has waits - use tempTimers
-        local cumulativeDelay = 0
-        for i, grp in ipairs(groups) do
+            local grp = groups[index]
+            if not grp then
+                return
+            end
+
+            if snd.mapper.canSendCommands and not snd.mapper.canSendCommands() then
+                tempTimer(0.25, function()
+                    if not isExecutionCurrent() then return end
+                    runFrom(index)
+                end)
+                return
+            end
+
+            local executeRoomId = tostring(grp.executeRoomId or "-1")
+            if executeRoomId ~= "" and executeRoomId ~= "-1" then
+                local currentRoomId = getCurrentRoomId()
+                if currentRoomId ~= executeRoomId then
+                    snd.utils.debugNote("Holding group until room " .. executeRoomId .. " (current " .. tostring(currentRoomId) .. ").")
+                    tempTimer(0.1, function()
+                        if not isExecutionCurrent() then return end
+                        runFrom(index)
+                    end)
+                    return
+                end
+            end
+
             if #grp.commands > 0 then
                 local cmdTexts = {}
                 for _, entry in ipairs(grp.commands) do
                     table.insert(cmdTexts, entry.text)
                 end
                 local cmdString = table.concat(cmdTexts, ";;")
-                if cumulativeDelay > 0 then
-                    -- Schedule this group after the accumulated delay
-                    local cmdsToSend = grp.commands
-                    local delayToUse = cumulativeDelay
-                    cecho(string.format("<dim_gray>[S&D Path] (after %.1fs) %s<reset>\n", delayToUse, cmdString))
-                    tempTimer(delayToUse, function()
-                        sendCommands(cmdsToSend)
-                    end)
-                else
-                    -- No delay yet, send immediately
-                    cecho("<dim_gray>[S&D Path] " .. cmdString .. "<reset>\n")
-                    local ok = sendCommands(grp.commands)
-                    if ok == false then
-                        break
-                    end
+                cecho("<dim_gray>[S&D Path] " .. cmdString .. "<reset>\n")
+                local ok = sendCommands(grp.commands)
+                if ok == false then
+                    return
                 end
             end
-            -- Add this group's delay to cumulative
+
             if grp.delayAfter > 0 then
                 cecho(string.format("<dim_gray>[S&D Path] Waiting %.1f seconds...<reset>\n", grp.delayAfter))
+                local function beginWaitTimer()
+                    if not isExecutionCurrent() then return end
+                    local nextIndex = index + 1
+                    local delaySeconds = tonumber(grp.delayAfter) or 0
+                    local observedTarget = false
+                    local killToken = tostring(grp.killTargetToken or "")
+                    local advanced = false
+                    local statusHandlerId = nil
+
+                    local function clearStatusHandler()
+                        if statusHandlerId then
+                            killAnonymousEventHandler(statusHandlerId)
+                            statusHandlerId = nil
+                        end
+                    end
+
+                    local function advance(reason)
+                        if advanced then return end
+                        advanced = true
+                        clearStatusHandler()
+                        if reason then snd.utils.debugNote(reason) end
+                        runFrom(nextIndex)
+                    end
+
+                    local function isInCombatNow()
+                        return snd.mapper.isInCombat and snd.mapper.isInCombat()
+                    end
+
+                    -- Early-exit listener: if this group followed a kill command
+                    -- and we observed the enemy enter and leave combat, advance
+                    -- the moment the gmcp.char.status event reports state != 8.
+                    -- The handler is a no-op for non-combat waits (no kill
+                    -- token), so those always run their full duration.
+                    if killToken ~= "" then
+                        local function onCharStatus()
+                            if advanced then return end
+                            if not isExecutionCurrent() then
+                                clearStatusHandler()
+                                return
+                            end
+                            if enemyMatchesToken(killToken) then
+                                observedTarget = true
+                            end
+                            if observedTarget and not isInCombatNow()
+                                and not enemyMatchesToken(killToken)
+                            then
+                                advance("wait() ended early: combat cleared before timeout.")
+                            end
+                        end
+                        statusHandlerId = registerAnonymousEventHandler("gmcp.char.status", onCharStatus)
+                        -- Catch a transition that already happened between sending
+                        -- the kill and registering the handler.
+                        onCharStatus()
+                    end
+
+                    -- Countdown timer: when the user's wait() expires, advance
+                    -- unconditionally. Combat state is irrelevant at this point.
+                    tempTimer(delaySeconds, function()
+                        if advanced then return end
+                        if not isExecutionCurrent() then
+                            clearStatusHandler()
+                            return
+                        end
+                        advance(nil)
+                    end)
+                end
+
+                -- User intent: once wait() is reached/sent, the countdown must
+                -- start immediately and release the next path group exactly when
+                -- it expires, regardless of room/combat state.
+                beginWaitTimer()
+                return
             end
-            cumulativeDelay = cumulativeDelay + grp.delayAfter
+
+            index = index + 1
         end
     end
+
+    runFrom(1)
 end
 
 --- Go to a room using portal-aware pathfinding

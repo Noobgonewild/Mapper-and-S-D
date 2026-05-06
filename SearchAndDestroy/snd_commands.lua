@@ -214,8 +214,8 @@ function snd.commands.snd(args)
         snd.commands.showStatus()
     elseif args == "targets" then
         snd.commands.showTargets()
-    elseif args == "stats" then
-        snd.commands.showStats()
+    elseif args:match("^stats") then
+        snd.commands.showStats(args:gsub("^stats", "", 1))
     elseif args == "save" then
         snd.saveState()
         snd.utils.infoNote("State saved.")
@@ -707,8 +707,20 @@ function snd.commands.nx()
         quickWhere.index = nextIndex
         persistQuickWhereScope(quickWhere.scope or (current and current.activity))
 
-        if wrappingCycle and snd.nav.nxState then
-            snd.nav.nxState.xcpActionFired = nil
+        -- For cp/gq wrap, honor configured xcp mode (ht|qw|off) without
+        -- forcing an extra move back to room #1 first.
+        if wrappingCycle and current and (current.activity == "cp" or current.activity == "gq") then
+            local wrapMode = (snd.config and snd.config.xcpActionMode) or "qw"
+            if wrapMode == "qw" and snd.commands and snd.commands.qw then
+                snd.utils.debugNote("NX: wrap detected, refreshing quick-where without extra move")
+                snd.commands.qw("")
+                return
+            elseif wrapMode == "ht" and snd.commands and snd.commands.ht then
+                snd.utils.debugNote("NX: wrap detected, running hunt trick without extra move")
+                snd.commands.ht("")
+                return
+            end
+            -- wrapMode == "off": fall through to normal room movement.
         end
 
         local nextRoomId = quickWhere.rooms[nextIndex]
@@ -793,6 +805,31 @@ end
 -- qw - Quick Where
 -------------------------------------------------------------------------------
 
+local function resolveSelectedTargetKeyword()
+    local function hasText(value)
+        return snd.utils.trim(tostring(value or "")) ~= ""
+    end
+
+    local scopedActivity = getScopedActivity()
+    if scopedActivity and (not snd.targets.current or snd.targets.current.activity ~= scopedActivity) then
+        activateTabTarget(scopedActivity)
+    end
+
+    local keyword = ""
+    local exactNameHint = ""
+    if snd.targets.current and hasText(snd.targets.current.keyword) then
+        keyword = snd.targets.current.keyword
+        if hasText(snd.targets.current.name) then
+            exactNameHint = snd.targets.current.name
+        end
+    elseif snd.quest and snd.quest.active and snd.quest.target and hasText(snd.quest.target.keyword) then
+        keyword = snd.quest.target.keyword
+        exactNameHint = snd.quest.target.mob or ""
+    end
+
+    return keyword, exactNameHint
+end
+
 local function runQuickWhere(args, exact)
     args = snd.utils.trim(args or "")
 
@@ -847,24 +884,17 @@ local function runQuickWhere(args, exact)
 
     -- If no args, use current target in active tab scope
     if keyword == "" then
-        if scopedActivity and (not snd.targets.current or snd.targets.current.activity ~= scopedActivity) then
-            activateTabTarget(scopedActivity)
-        end
-        if snd.targets.current and hasText(snd.targets.current.keyword) then
-            keyword = snd.targets.current.keyword
-            if hasText(snd.targets.current.name) then
-                exactNameHint = snd.targets.current.name
-            end
-        elseif snd.quest and snd.quest.active and snd.quest.target and snd.quest.target.keyword and snd.quest.target.keyword ~= "" then
-            keyword = snd.quest.target.keyword
-            exactNameHint = snd.quest.target.mob or exactNameHint
-        else
+        keyword, exactNameHint = resolveSelectedTargetKeyword()
+        if keyword == "" then
             snd.utils.infoNote("No target selected. Usage: qw <keyword>")
             return
         end
     end
 
     keyword = snd.utils.trim(keyword or "")
+    if keyword:lower() == "target" or keyword:lower() == "current" then
+        keyword = snd.utils.trim(resolveSelectedTargetKeyword() or "")
+    end
     if keyword == "" then
         snd.utils.infoNote("No target keyword available. Usage: qw <keyword>")
         return
@@ -1134,6 +1164,32 @@ function snd.commands.processQuickWhereResult()
     if firstRoomId and snd.targets and snd.targets.current then
         snd.targets.current.roomId = firstRoomId
         snd.targets.current.roomName = lastMatch.room
+
+        -- Sync the scoped activity target so a subsequent activateTabTarget()
+        -- (triggered when nextActivity flips to "qw") doesn't restore a stale
+        -- roomId from before this QW refresh and send nx back to the old room.
+        -- Only sync when we're confident the QW was hunting THIS scoped
+        -- target: skip ad-hoc qw, require stable identity, and require the
+        -- matched mob name to equal the scoped name. Keyword-only matches are
+        -- too ambiguous in non-exact where flows and can corrupt scoped room
+        -- data for a different mob.
+        if (not isAdhocQuickWhere) and hasStableIdentity then
+            local scopeForSync = quickWhereScope
+            if scopeForSync ~= "cp" and scopeForSync ~= "gq" and scopeForSync ~= "quest" then
+                scopeForSync = preservedActivity
+            end
+            local scoped = (scopeForSync == "cp" or scopeForSync == "gq" or scopeForSync == "quest")
+                and snd.targets.scoped and snd.targets.scoped[scopeForSync] or nil
+            if scoped then
+                local scopedName = snd.utils.trim(scoped.name or "")
+                local nameMatchesScoped = scopedName ~= "" and matchedName ~= ""
+                    and scopedName:lower() == matchedName:lower()
+                if nameMatchesScoped then
+                    scoped.roomId = firstRoomId
+                    scoped.roomName = lastMatch.room
+                end
+            end
+        end
     end
 
     if snd.nav.quickWhere then
@@ -1452,26 +1508,35 @@ function snd.commands.xkill()
         activateTabTarget(scopedActivity)
     end
 
-    -- Check if we have a current target
-    if not snd.targets.current then
-        snd.utils.infoNote("No target selected. Use xcp to select a target first.")
-        return
-    end
-    
-    local keyword = snd.targets.current.keyword or snd.targets.current.matchedMobName
-    if not keyword or keyword == "" then
-        keyword = snd.targets.current.name
-        if keyword then
-            -- Extract last word as keyword fallback
-            keyword = snd.utils.findKeyword(keyword)
+    local currentTarget = snd.targets.current
+    local keyword = ""
+
+    -- xkill should always prioritize the selected current target and only
+    -- consider quest fallback when no current target exists.
+    if currentTarget then
+        keyword = snd.utils.trim(tostring(currentTarget.keyword or ""))
+        if keyword == "" and currentTarget.matchedMobName then
+            keyword = snd.utils.trim(tostring(currentTarget.matchedMobName or ""))
+        end
+        if keyword == "" and currentTarget.name then
+            keyword = snd.utils.findKeyword(currentTarget.name)
+        end
+        if keyword == "" then
+            snd.utils.infoNote("No keyword for current target")
+            return
+        end
+    else
+        keyword = select(1, resolveSelectedTargetKeyword())
+        if not keyword or keyword == "" then
+            snd.utils.infoNote("No target selected. Use xcp to select a target first.")
+            return
         end
     end
-    
+
     if not keyword or keyword == "" then
-        snd.utils.infoNote("No keyword for current target")
         return
     end
-    
+
     -- Get the kill command (default: "kill")
     local killCmd = snd.config.killCommand or "kill"
     
@@ -1791,7 +1856,45 @@ function snd.commands.xset(args)
             snd.utils.infoNote("Usage: xset expressmin <number>")
             return
         end
+    elseif setting == "autocheck" then
+        local sub = normalized or ""
+        local smartKills = tonumber(parts[3])
+        if sub == "" then
+            local mode = snd.getAutocheckMode and snd.getAutocheckMode() or "on"
+            local n = snd.config.autocheck and snd.config.autocheck.smartKills or 3
+            snd.utils.infoNote(string.format("AutoCheck mode: %s (smart kills: %d)", string.upper(mode), tonumber(n) or 3))
+        elseif sub == "on" or sub == "off" or sub == "smart" then
+            if sub == "smart" and parts[3] ~= nil then
+                if not smartKills or smartKills < 1 then
+                    snd.utils.infoNote("Usage: xset autocheck smart <n> (n >= 1)")
+                    return
+                end
+            end
+            snd.commands.setAutocheckMode(sub)
+            if sub == "smart" and smartKills then
+                snd.commands.setAutocheckSmartKills(smartKills)
+            end
+        elseif sub == "kills" then
+            snd.commands.setAutocheckSmartKills(tonumber(parts[3]))
+        else
+            snd.utils.infoNote("Usage: xset autocheck <on|smart|off|kills <n>>")
+            return
+        end
         
+    elseif setting == "mobdetect" then
+        if not normalized or normalized == "" then
+            snd.utils.infoNote("Mobdetect mode: " .. tostring(snd.config.mobdetect or "off"):upper())
+        elseif normalized == "off" or normalized == "on" or normalized == "always" then
+            snd.config.mobdetect = normalized
+            snd.utils.infoNote("Mobdetect mode: " .. string.upper(normalized))
+            if normalized == "always" then
+                snd.utils.infoNote("WARNING: Mobdetect ALWAYS bypasses maze/PvP/player safety guards.")
+            end
+        else
+            snd.utils.infoNote("Usage: xset mobdetect <on|off|always>")
+            return
+        end
+
     elseif setting == "window" then
         snd.config.window.enabled = (value == "on" or value == "true" or value == "1")
         snd.utils.infoNote("Window: " .. (snd.config.window.enabled and "ON" or "OFF"))
@@ -1810,11 +1913,41 @@ function snd.commands.xset(args)
             snd.config.soundEnabled = true
         elseif value == "off" or value == "false" or value == "0" then
             snd.config.soundEnabled = false
+        elseif value == "volume" then
+            local raw = parts[3]
+            if not raw or raw == "" then
+                snd.utils.infoNote(string.format("Sound volume: %d%%", tonumber(snd.config.soundVolume) or 100))
+                return
+            end
+            local n = tonumber((raw:gsub("%%", "")))
+            if not n then
+                snd.utils.infoNote("Usage: xset sound volume <n%>")
+                return
+            end
+            n = math.max(0, math.min(100, math.floor(n + 0.5)))
+            snd.config.soundVolume = n
+            snd.utils.infoNote(string.format("Sound volume set to %d%%", n))
+            return
         else
-            snd.utils.infoNote("Usage: xset sound [on|off]")
+            snd.utils.infoNote("Usage: xset sound [on|off|volume <n%>]")
             return
         end
-        snd.utils.infoNote("Sound alerts: " .. (snd.config.soundEnabled and "ON" or "OFF"))
+        snd.utils.infoNote("Sound alerts: " .. (snd.config.soundEnabled and "ON" or "OFF") .. string.format(" (volume %d%%)", tonumber(snd.config.soundVolume) or 100))
+
+    elseif setting == "areacolors" then
+        if not normalized or normalized == "" then
+            snd.utils.infoNote("S&D area colors: " .. (snd.config.areaColors ~= false and "on" or "off"))
+            return
+        elseif normalized == "on" or normalized == "true" or normalized == "1" then
+            snd.config.areaColors = true
+        elseif normalized == "off" or normalized == "false" or normalized == "0" then
+            snd.config.areaColors = false
+        else
+            snd.utils.infoNote("Usage: xset areacolors <on|off>")
+            return
+        end
+        snd.utils.infoNote("S&D area colors: " .. (snd.config.areaColors ~= false and "on" or "off"))
+        if snd.gui and snd.gui.refresh then snd.gui.refresh() end
         
     elseif setting == "keyword" then
         -- Set custom keyword for current target
@@ -1859,7 +1992,9 @@ function snd.commands.xset(args)
             return true
         end
 
-        if sub == "nowhere" then
+        if sub == "help" then
+            snd.commands.showMobHelp()
+        elseif sub == "nowhere" then
             if not needMob() then return end
             local on = snd.db.toggleMobTag(mob, zone, "nowhere")
             snd.utils.infoNote("Mob '" .. mob .. "' nowhere flag: " .. ((on and "ON") or "OFF"))
@@ -1921,7 +2056,7 @@ function snd.commands.xset(args)
                 snd.utils.infoNote("Failed deleting mob tag #" .. tostring(idx))
             end
         else
-            snd.utils.infoNote("Usage: xset mob <nowhere|nohunt|priority|unpriority|tags|clearflags|delete>")
+            snd.utils.infoNote("Usage: xset mob <help|nowhere|nohunt|priority|unpriority|tags|clearflags|delete>")
             return
         end
     else
@@ -1931,6 +2066,45 @@ function snd.commands.xset(args)
     
     -- Save config after changes
     snd.saveState()
+end
+
+function snd.commands.setAutocheckMode(mode)
+    local m = tostring(mode or ""):lower()
+    if m ~= "on" and m ~= "smart" and m ~= "off" then
+        snd.utils.infoNote("AutoCheck mode must be on, smart, or off.")
+        return false
+    end
+    snd.config.autocheck = snd.config.autocheck or {}
+    snd.config.autocheck.mode = m
+    snd.config.autocheck.cpKillCounter = 0
+    snd.config.autocheck.gqKillCounter = 0
+    snd.utils.infoNote("AutoCheck mode: " .. string.upper(m))
+    if m == "off" then
+        snd.utils.infoNote("WARNING: AutoCheck OFF can desync CP/GQ targets until you manually refresh (ref / cp check / gq check).")
+    end
+    if snd.gui and snd.gui.updateAutocheck then snd.gui.updateAutocheck() end
+    if snd.saveState then snd.saveState() end
+    return true
+end
+
+function snd.commands.setAutocheckSmartKills(value)
+    local n = tonumber(value)
+    if not n or n < 1 then
+        snd.utils.infoNote("Usage: xset autocheck kills <n> (n >= 1)")
+        return false
+    end
+    snd.config.autocheck = snd.config.autocheck or {}
+    snd.config.autocheck.smartKills = math.floor(n)
+    snd.config.autocheck.cpKillCounter = 0
+    snd.config.autocheck.gqKillCounter = 0
+    snd.utils.infoNote("AutoCheck SMART kills: " .. tostring(snd.config.autocheck.smartKills))
+    if snd.config.autocheck.smartKills == 1 then
+        snd.utils.infoNote("AutoCheck SMART kills set to 1; switching mode to ON.")
+        snd.commands.setAutocheckMode("on")
+    end
+    if snd.gui and snd.gui.updateAutocheck then snd.gui.updateAutocheck() end
+    if snd.saveState then snd.saveState() end
+    return true
 end
 
 -------------------------------------------------------------------------------
@@ -2035,6 +2209,7 @@ function snd.commands.showHelp()
     cecho("  "); emitHelpCommandLink("snd db", "snd db", "Show database info/path"); cecho("        - Show database info/path\n")
     cecho("  "); emitHelpCommandLink("snd channel", "snd channel", "Show/set report channel"); cecho("   - Show/set report channel\n")
     cecho("  "); emitHelpCommandLink("snd history", "snd history", "Show history"); cecho("   - Show last 20 history rows\n")
+    cecho("  "); emitHelpCommandLink("snd stats cp/gq/quest", "snd stats help", "Show stats commands"); cecho(" - Stats by type (campaign/gq/quest)\n")
     cecho("\n<yellow>Help<reset>\n")
     cecho("  "); emitHelpCommandLink("xhelp", "xhelp", "Show this help"); cecho("         - Show this help\n")
     cecho("  "); emitHelpCommandLink("xhelp commands", "xhelp commands", "Detailed commands help"); cecho(" - Detailed command usage and examples\n")
@@ -2134,7 +2309,7 @@ function snd.commands.showCommandHelp()
     cecho("  <cyan>ht [keyword]<reset>     Hunt trick to mob\n")
     cecho("\n<yellow>Configuration:<reset>\n")
     cecho("  <cyan>xset<reset>             Show all settings\n")
-    cecho("  <cyan>xset sound [on|off]<reset> Toggle/query sound alerts\n")
+    cecho("  <cyan>xset sound [on|off|volume <n%>]<reset> Toggle/query sound alerts\n")
     cecho("  <cyan>xset keyword <kw><reset>  Set mob keyword\n")
     cecho("  <cyan>xset startroom<reset>   Set area start room\n")
     cecho("\n<yellow>History & Reporting:<reset>\n")
@@ -2175,10 +2350,46 @@ function snd.commands.showConfigHelp()
     cecho("                none      = do nothing on arrival\n")
     cecho("  <cyan>express<reset>      <on|off>  Prefer known fixed-room targets\n")
     cecho("  <cyan>expressmin<reset>   <number>  Min kills before express applies\n")
+    cecho("  <cyan>autocheck<reset>    <on|smart|off>  Post-kill CP/GQ recheck mode\n")
+    cecho("  <cyan>autocheck kills<reset> <number>  SMART mode: run check every N kills\n")
     cecho("  <cyan>xcp mode<reset>     <ht|qw|off>  Action after arriving for cp/gq targets\n")
-    cecho("  <cyan>mob tags<reset>     xset mob tags|delete|nowhere|nohunt|priority\n")
+    cecho("  <cyan>mob tags<reset>     xset mob help|tags|delete|nowhere|nohunt|priority\n")
     cecho("  <cyan>window<reset>       on/off - GUI window\n")
-    cecho("  <cyan>sound<reset>        on/off - Sound alerts (quest-ready, etc)\n")
+    cecho("  <cyan>sound<reset>        on/off/volume - Sound alerts and volume\n")
+    cecho("  <cyan>areacolors<reset>   on/off - Color-band area labels in target list\n")
+    cecho("<gray>----------------------------------------<reset>\n")
+end
+
+function snd.commands.showMobHelp()
+    cecho("\n<white>Search and Destroy - xset mob help<reset>\n")
+    cecho("<gray>----------------------------------------<reset>\n")
+    cecho("<yellow>Mob Tagging Commands:<reset>\n")
+    cecho("  <cyan>xset mob nowhere <mob><reset>\n")
+    cecho("    Toggle the <orange>nowhere<reset> flag for a mob in the current zone.\n")
+    cecho("    Flagged mobs are hidden from search results and target lists.\n")
+    cecho("    <dim_gray>Example: xset mob nowhere city guard<reset>\n")
+    cecho("  <cyan>xset mob nohunt <mob><reset>\n")
+    cecho("    Toggle the <orange>nohunt<reset> flag in the current zone.\n")
+    cecho("    Flagged mobs still show in results, but auto-hunt will skip them.\n")
+    cecho("    <dim_gray>Example: xset mob nohunt aggressive sentinel<reset>\n")
+    cecho("  <cyan>xset mob priority <mob><reset>\n")
+    cecho("    Set this room as the mob's priority room.\n")
+    cecho("    If multiple rooms match, this room is preferred first.\n")
+    cecho("    <dim_gray>Example: xset mob priority goblin scout<reset>\n")
+    cecho("  <cyan>xset mob unpriority <mob><reset>\n")
+    cecho("    Clear the mob's priority room assignment.\n")
+    cecho("    <dim_gray>Example: xset mob unpriority goblin scout<reset>\n")
+    cecho("  <cyan>xset mob tags [zone]<reset>\n")
+    cecho("    List tagged mobs (nowhere/nohunt/priority) for current or named zone.\n")
+    cecho("    This also caches row numbers for indexed deletion.\n")
+    cecho("    <dim_gray>Examples: xset mob tags | xset mob tags bloodlust<reset>\n")
+    cecho("  <cyan>xset mob clearflags <mob><reset>\n")
+    cecho("    Remove all mob flags (nowhere/nohunt/priority) for this zone.\n")
+    cecho("    <dim_gray>Example: xset mob clearflags city guard<reset>\n")
+    cecho("  <cyan>xset mob delete <index><reset>\n")
+    cecho("    Delete a specific tag row by index from your last 'xset mob tags' output.\n")
+    cecho("    Workflow: run tags, then delete by #.\n")
+    cecho("    <dim_gray>Example: xset mob tags, then xset mob delete 3<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
@@ -2256,8 +2467,13 @@ function snd.commands.showConfig()
     cecho(string.format("  <cyan>xcpmode<reset>     %s\n", snd.config.xcpActionMode or "qw"))
     cecho(string.format("  <cyan>express<reset>     %s\n", snd.config.express.enabled and "ON" or "OFF"))
     cecho(string.format("  <cyan>expressmin<reset>  %d\n", snd.config.express.minKillCount))
+    cecho(string.format("  <cyan>autocheck<reset>   %s (kills=%d)\n",
+        string.upper(snd.getAutocheckMode and snd.getAutocheckMode() or "on"),
+        tonumber(snd.config.autocheck and snd.config.autocheck.smartKills) or 3))
+    cecho(string.format("  <cyan>mobdetect<reset>   %s\n", string.upper(tostring(snd.config.mobdetect or "off"))))
     cecho(string.format("  <cyan>window<reset>      %s\n", snd.config.window.enabled and "ON" or "OFF"))
-    cecho(string.format("  <cyan>sound<reset>       %s\n", snd.config.soundEnabled and "ON" or "OFF"))
+    cecho(string.format("  <cyan>sound<reset>       %s (volume=%d%%)\n", snd.config.soundEnabled and "ON" or "OFF", tonumber(snd.config.soundVolume) or 100))
+    cecho(string.format("  <cyan>areacolors<reset>  %s\n", snd.config.areaColors ~= false and "ON" or "OFF"))
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
@@ -2330,10 +2546,10 @@ function snd.commands.showTargets()
         if now - (snd.targets.lastAutoRefresh or 0) > 10 then
             snd.targets.lastAutoRefresh = now
             send("quest check", false)
-            send("cp info", false)
+            send("cp check", false)
             send("gq info", false)
         end
-        cecho("  <dim_gray>No targets - refreshing quest check, cp info, and gq info...<reset>\n")
+        cecho("  <dim_gray>No targets - refreshing quest check, cp check, and gq info...<reset>\n")
         cecho("<dim_gray>----------------------------------------<reset>\n")
         return
     end
@@ -2643,7 +2859,187 @@ function snd.commands.gotoArea(areaKey)
     end
 end
 
-function snd.commands.showStats()
+local function statsTypeFromArg(arg)
+    local map = {
+        q = snd.db.HISTORY_TYPE_QUEST,
+        quest = snd.db.HISTORY_TYPE_QUEST,
+        gq = snd.db.HISTORY_TYPE_GQUEST,
+        gquest = snd.db.HISTORY_TYPE_GQUEST,
+        cp = snd.db.HISTORY_TYPE_CAMPAIGN,
+        campaign = snd.db.HISTORY_TYPE_CAMPAIGN,
+    }
+    return map[tostring(arg or ""):lower()]
+end
+
+local function statsTypeTitle(historyType)
+    if tonumber(historyType) == snd.db.HISTORY_TYPE_QUEST then return "Quest" end
+    if tonumber(historyType) == snd.db.HISTORY_TYPE_GQUEST then return "GQ" end
+    if tonumber(historyType) == snd.db.HISTORY_TYPE_CAMPAIGN then return "Campaign" end
+    return "Unknown"
+end
+
+local echoReportChannelPopup
+
+local function statsEmitReportRow(label, lineText, reportText, typeLabel)
+    cecho("  ")
+    if type(cechoPopup) == "function" then
+        echoReportChannelPopup(
+            "<cyan>[>>]<reset>",
+            snd.config and snd.config.reportChannel or "default",
+            function(channel)
+                snd.commands.reportStatsLine(reportText, typeLabel, channel)
+            end
+        )
+    else
+        cecho("[>>]")
+    end
+    cecho(string.format("  <yellow>%-12s<reset> %s\n", label, lineText))
+end
+
+local function statsShowType(historyType)
+    local title = statsTypeTitle(historyType)
+    local typeLabel = string.lower(title == "GQ" and "gquest" or title)
+    local statusRows = snd.db.query(string.format(
+        "SELECT status, COUNT(*) as cnt FROM history WHERE type = %d GROUP BY status",
+        historyType
+    )) or {}
+    local counts = {total = 0, complete = 0, failed = 0, timeout = 0, skipped = 0}
+    for _, row in ipairs(statusRows) do
+        local status = tonumber(row.status) or 0
+        local cnt = tonumber(row.cnt) or 0
+        counts.total = counts.total + cnt
+        if status == snd.db.HISTORY_STATUS_COMPLETE then counts.complete = cnt end
+        if status == snd.db.HISTORY_STATUS_FAILED then counts.failed = cnt end
+        if status == snd.db.HISTORY_STATUS_TIMEOUT then counts.timeout = cnt end
+        if status == snd.db.HISTORY_STATUS_SKIPPED then counts.skipped = cnt end
+    end
+
+    local durationRows = snd.db.query(string.format([[
+        SELECT AVG(end_time - start_time) as avg_dur, MIN(end_time - start_time) as best_dur, MAX(end_time - start_time) as worst_dur
+        FROM history WHERE type = %d AND status = %d AND end_time > 0 AND start_time > 0
+    ]], historyType, snd.db.HISTORY_STATUS_COMPLETE)) or {}
+    local d = durationRows[1] or {}
+    local bestDuration = tonumber(d.best_dur) or 0
+    local worstDuration = tonumber(d.worst_dur) or 0
+    local bestRows = snd.db.query(string.format([[
+        SELECT * FROM history
+        WHERE type = %d AND status = %d AND end_time > 0 AND start_time > 0 AND (end_time - start_time) = %d
+        ORDER BY end_time DESC LIMIT 1
+    ]], historyType, snd.db.HISTORY_STATUS_COMPLETE, bestDuration)) or {}
+    local worstRows = snd.db.query(string.format([[
+        SELECT * FROM history
+        WHERE type = %d AND status = %d AND end_time > 0 AND start_time > 0 AND (end_time - start_time) = %d
+        ORDER BY end_time DESC LIMIT 1
+    ]], historyType, snd.db.HISTORY_STATUS_COMPLETE, worstDuration)) or {}
+    local bestRow = bestRows[1]
+    local worstRow = worstRows[1]
+
+    local rewardRows = snd.db.query(string.format([[
+        SELECT SUM(qp_rewards) as total_qp, AVG(qp_rewards) as avg_qp, SUM(tp_rewards) as total_tp, AVG(tp_rewards) as avg_tp,
+               SUM(train_rewards) as total_tr, SUM(prac_rewards) as total_pr, SUM(gold_rewards) as total_gold, AVG(gold_rewards) as avg_gold
+        FROM history WHERE type = %d AND status = %d
+    ]], historyType, snd.db.HISTORY_STATUS_COMPLETE)) or {}
+    local r = rewardRows[1] or {}
+
+    local streakRows = snd.db.query(string.format(
+        "SELECT status FROM history WHERE type = %d AND end_time > 0 ORDER BY start_time DESC LIMIT 200",
+        historyType
+    )) or {}
+    local streak = 0
+    for _, row in ipairs(streakRows) do
+        if tonumber(row.status) == snd.db.HISTORY_STATUS_COMPLETE then streak = streak + 1 else break end
+    end
+
+    local avgDur = snd.utils.formatSeconds(tonumber(d.avg_dur) or 0)
+    local bestDur = snd.utils.formatSeconds(tonumber(d.best_dur) or 0)
+    local worstDur = snd.utils.formatSeconds(tonumber(d.worst_dur) or 0)
+    local totalLine = string.format("%d total  |  %d complete  |  %d failed  |  %d timeout  |  %d skipped", counts.total, counts.complete, counts.failed, counts.timeout, counts.skipped)
+    local timeLine = string.format("avg %s  |  best %s  |  worst %s", avgDur, bestDur, worstDur)
+    local streakLine = string.format("%d consecutive completions", streak)
+    local qpLine = string.format("%s total  |  %.1f avg", snd.utils.readableNumber(tonumber(r.total_qp) or 0), tonumber(r.avg_qp) or 0)
+    local tpLine = string.format("%s total  |  %.2f avg", snd.utils.readableNumber(tonumber(r.total_tp) or 0), tonumber(r.avg_tp) or 0)
+    local goldLine = string.format("%s total  |  %.0f avg", snd.utils.readableNumber(tonumber(r.total_gold) or 0), tonumber(r.avg_gold) or 0)
+    local trprLine = string.format("%s total  |  Pracs: %s total", snd.utils.readableNumber(tonumber(r.total_tr) or 0), snd.utils.readableNumber(tonumber(r.total_pr) or 0))
+
+    cecho(string.format("\n<white>──── %s Statistics ────<reset>\n", title))
+    statsEmitReportRow("Total", totalLine, string.format("%s Stats - Total: %s", title, totalLine), typeLabel)
+    cecho("  ")
+    if type(cechoPopup) == "function" then
+        echoReportChannelPopup("<cyan>[>>]<reset>", snd.config and snd.config.reportChannel or "default", function(channel)
+            snd.commands.reportStatsLine(string.format("%s Stats - Time: %s", title, timeLine), typeLabel, channel)
+        end)
+    else
+        cecho("[>>]")
+    end
+    cecho("  <yellow>Time        <reset> ")
+    cecho(string.format("avg %s  |  ", avgDur))
+    if type(cechoPopup) == "function" then
+        echoReportChannelPopup("<green>best<reset>", snd.config and snd.config.reportChannel or "default", function(channel)
+            if bestRow then
+                snd.commands.reportHistoryLikeRow(bestRow, channel)
+            else
+                snd.commands.reportStatsLine(string.format("%s Stats - Time: best %s", title, bestDur), typeLabel, channel)
+            end
+        end, "Left-click: report BEST run via ")
+    else
+        cecho("best")
+    end
+    cecho(string.format(" %s  |  ", bestDur))
+    if type(cechoPopup) == "function" then
+        echoReportChannelPopup("<red>worst<reset>", snd.config and snd.config.reportChannel or "default", function(channel)
+            if worstRow then
+                snd.commands.reportHistoryLikeRow(worstRow, channel)
+            else
+                snd.commands.reportStatsLine(string.format("%s Stats - Time: worst %s", title, worstDur), typeLabel, channel)
+            end
+        end, "Left-click: report WORST run via ")
+    else
+        cecho("worst")
+    end
+    cecho(string.format(" %s\n", worstDur))
+    statsEmitReportRow("Streak", streakLine, string.format("%s Stats - Streak: %s", title, streakLine), typeLabel)
+    statsEmitReportRow("QP earned", qpLine, string.format("%s Stats - QP earned: %s", title, qpLine), typeLabel)
+    statsEmitReportRow("TP earned", tpLine, string.format("%s Stats - TP earned: %s", title, tpLine), typeLabel)
+    statsEmitReportRow("Gold", goldLine, string.format("%s Stats - Gold: %s", title, goldLine), typeLabel)
+    statsEmitReportRow("Trains", trprLine, string.format("%s Stats - Trains: %s", title, trprLine), typeLabel)
+    cecho(string.format("<gray>Click [>>] to report that line to your configured channel (%s).<reset>\n", tostring(snd.config.reportChannel or "gt")))
+end
+
+function snd.commands.reportStatsLine(reportText, typeLabel, channelOverride)
+    local channel = channelOverride and snd.utils.trim(tostring(channelOverride)) or "default"
+    if channel:lower() == "group" then
+        channel = "gtell"
+    end
+    if snd.utils.isDefaultReportChannel(channel) then
+        snd.utils.reportLine(reportText, typeLabel)
+        return
+    end
+    local style = snd.utils.getReportTypeStyle(typeLabel)
+    local payload = string.format("%s[%s]@w %s", snd.utils.getReportAardColor(typeLabel), style.label, reportText)
+    if snd.utils and snd.utils.dispatchReportChannel then
+        snd.utils.dispatchReportChannel(channel, payload)
+    else
+        snd.commands.sendGameCommand(channel .. " " .. payload, false)
+    end
+end
+
+function snd.commands.showStats(args)
+    args = snd.utils.trim(args or "")
+    local sub = tostring(args):match("^(%S+)$")
+    if sub == "help" then
+        cecho("\n<white>snd stats usage:<reset>\n")
+        cecho("  snd stats\n  snd stats cp\n  snd stats quest\n  snd stats gq\n")
+        cecho("  aliases: campaign=cp, q=quest, gquest=gq\n")
+        return
+    end
+    local historyType = statsTypeFromArg(sub)
+    if historyType then
+        statsShowType(historyType)
+        return
+    elseif sub ~= nil and sub ~= "" then
+        cecho("<red>Unknown stats type. Try: snd stats help<reset>\n")
+        return
+    end
     cecho("\n<white>Search and Destroy - Statistics<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
     
@@ -2721,6 +3117,30 @@ local function historyTypeLabel(v)
     if tonumber(v) == snd.db.HISTORY_TYPE_GQUEST then return "gquest" end
     if tonumber(v) == snd.db.HISTORY_TYPE_CAMPAIGN then return "campaign" end
     return "unknown"
+end
+
+function snd.commands.reportHistoryLikeRow(row, channelOverride)
+    if not row then
+        snd.utils.infoNote("No history row available to report.")
+        return
+    end
+    local channel = channelOverride and snd.utils.trim(tostring(channelOverride)) or "default"
+    if channel == "default" and snd.config and snd.config.reportChannel then
+        channel = snd.utils.trim(snd.config.reportChannel)
+    end
+    if channel:lower() == "group" then
+        channel = "gtell"
+    end
+    if snd.utils.isDefaultReportChannel(channel) then
+        snd.utils.reportLine(snd.commands.buildHistoryRowText(row), historyTypeLabel(row.type))
+        return
+    end
+    local payload = snd.commands.buildHistoryRowChannelText(row)
+    if snd.utils and snd.utils.dispatchReportChannel then
+        snd.utils.dispatchReportChannel(channel, payload)
+    else
+        snd.commands.sendGameCommand(channel .. " " .. payload, false)
+    end
 end
 
 local function historyStatusLabel(v)
@@ -2882,32 +3302,32 @@ local function historyChannelLabel(channel)
     return channel:gsub("^%l", string.upper)
 end
 
-local function echoHistoryRowLink(index, configuredChannel)
+echoReportChannelPopup = function(triggerText, configuredChannel, reporter, tooltipPrefix)
     local channel = snd.utils.trim(tostring(configuredChannel or "default"))
     if channel == "" then
         channel = "default"
     end
-	
-	local rowNumber = tonumber(index) or 0
     local defaultLabel = historyChannelLabel(channel)
-    echoPopup(
-        --string.format("[%2d]", tonumber(index) or 0),
-		string.format("[%2d]", rowNumber),
+    local label = tostring(triggerText or "")
+    local plainLabel = label:gsub("<%a[^>]*>", "")
+    local tip = tostring(tooltipPrefix or "Left-click: report this via ")
+    cechoPopup(
+        label,
         {
-			"",
-			"",
-            function() snd.commands.reportHistoryRow(index, channel) end,
+            function() reporter(channel) end,
             "",
-            function() snd.commands.reportHistoryRow(index, "clan") end,
+            function() reporter(channel) end,
             "",
-            function() snd.commands.reportHistoryRow(index, "say") end,
+            function() reporter("clan") end,
             "",
-            function() snd.commands.reportHistoryRow(index, "gtell") end,
+            function() reporter("say") end,
+            "",
+            function() reporter("gtell") end,
         },
         {
-            "Left-click: report this row via " .. defaultLabel .. "\nRight-click for other channels",
-			string.format("[%2d]", rowNumber),
-			"",
+            tip .. defaultLabel .. "\nRight-click for other channels",
+            plainLabel,
+            "",
             defaultLabel,
             "",
             "Clan",
@@ -2917,6 +3337,16 @@ local function echoHistoryRowLink(index, configuredChannel)
             "Group",
         },
         true
+    )
+end
+
+local function echoHistoryRowLink(index, configuredChannel)
+    local rowNumber = tonumber(index) or 0
+    echoReportChannelPopup(
+        string.format("[%2d]", rowNumber),
+        configuredChannel,
+        function(channel) snd.commands.reportHistoryRow(index, channel) end,
+        "Left-click: report this row via "
     )
 end
 
@@ -2940,7 +3370,7 @@ function snd.commands.reportHistoryRow(index, channelOverride)
         channel = "gtell"
     end
 
-    if channel == "" or channel == "default" then
+    if snd.utils.isDefaultReportChannel(channel) then
         snd.utils.reportLine(snd.commands.buildHistoryRowText(row), historyTypeLabel(row.type))
         return
     end

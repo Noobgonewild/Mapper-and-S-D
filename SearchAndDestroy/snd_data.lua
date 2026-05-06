@@ -528,8 +528,8 @@ snd.data.mobKeywordFilters = {
     ["bonds"] = {{f = "^(.*[bgry]%a+) dragon$", g = "%1"}},
     ["citadel"] = {{f = "^([bgjlmsv]%a+) ([ap]r%a+[el]) .+$", g = "%1 %2"}},
     ["elemental"] = {
-        {f = "^(%a+)%'(%a+) (%a+)$", g = "%1%2 %3"},
-        {f = "^wandering (%a+)%'(%a+) (%a+)$", g = "%1%2 %3"}
+        {f = "^(%a+)%'(%a+) (%a+)$", g = "%1 %3"},
+        {f = "^wandering (%a+)%'(%a+) (%a+)$", g = "%1 %3"}
     },
     ["hatchling"] = {
         {f = "^(%a+) dragon (egg)$", g = "%1 %2"},

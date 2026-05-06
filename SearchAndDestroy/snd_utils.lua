@@ -406,8 +406,10 @@ function snd.utils.findKeyword(item)
     }
     
     for word in item:gmatch("%S+") do
-        word = word:gsub("[',]", "")
-        if not badwords[word:lower()] then
+        word = word:gsub("[,]", "")
+        local pre, post = word:match("^(.-)%'(.+)$")
+        if pre and post then word = #pre <= 1 and (pre .. post) or pre end
+        if word ~= "" and not badwords[word:lower()] then
             return word:lower()
         end
     end
