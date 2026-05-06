@@ -781,7 +781,7 @@ mm.alias_specs = {
   {"^mapper shops?(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("shops", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper train(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("train", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper quest(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("quest", m[2]); if not ok then mm.warn(err) end end},
-  {"^mapper unmapped(?:%s+(.*))?$", function(m) local ok, err = mm.show_unmapped(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper unmapped%s*(.*)$", function(m) local ok, err = mm.show_unmapped(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper next(?:%s+(%d+))?$", function(m) local ok, err = mm.next_result(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexits area%s+(.+)$", function(m) local ok, err = mm.list_cexits("area " .. m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexits(?:%s+(.+))?$", function(m) local ok, err = mm.list_cexits(m[2]); if not ok then mm.warn(err) end end},
@@ -863,9 +863,9 @@ mm.alias_specs = {
         mm.warn("Failed to update safe flag.")
       end
     end},
-  {"^mapper quicklist(?: (on|off))?$", function(m) mm.state.quick_mode = mm.bool_arg(m[2], not mm.state.quick_mode); mm.note("quicklist " .. (mm.state.quick_mode and "on" or "off")) end},
+  {"^mapper quicklist%s*(%S*)$", function(m) mm.state.quick_mode = mm.bool_arg(m[2], not mm.state.quick_mode); mm.note("quicklist " .. (mm.state.quick_mode and "on" or "off")) end},
   {"^mapper shownotes(?: (on|off))?$", function(m) if m[2] then mm.state.shownotes = mm.bool_arg(m[2], mm.state.shownotes) end; mm.note("shownotes " .. (mm.state.shownotes and "on" or "off")) end},
-  {"^mapper compact(?: (on|off))?$", function(m) mm.state.compact_mode = mm.bool_arg(m[2], not mm.state.compact_mode); mm.note("compact " .. (mm.state.compact_mode and "on" or "off")) end},
+  {"^mapper compact%s*(%S*)$", function(m) mm.state.compact_mode = mm.bool_arg(m[2], not mm.state.compact_mode); mm.note("compact " .. (mm.state.compact_mode and "on" or "off")) end},
   {"^mapper backup$", function() local ok, err = mm.create_backup(true); if not ok then mm.warn(err) end end},
   {"^mapper addnote$", function()
       if type(appendCmdLine) == "function" then
@@ -942,11 +942,13 @@ mm.stubbed = {
 
 function mm.handle_command(line)
   line = normalize_line(line)
+  mm.debug("handle_command received: " .. tostring(line))
   if handle_command_inline(line) then return true end
 
   for _, spec in ipairs(mm.alias_specs) do
-    local matches = {line:match(spec[1])}
-    if #matches > 0 then
+    local start_idx, end_idx = line:find(spec[1])
+    if start_idx == 1 and end_idx == #line then
+      local matches = {line:match(spec[1])}
       table.insert(matches, 1, line)
       spec[2](matches)
       return true
@@ -954,6 +956,7 @@ function mm.handle_command(line)
   end
 
   if line:find("^mapper ") then
+    mm.debug("no alias matched mapper command: " .. tostring(line))
     for _, prefix in ipairs(mm.stubbed) do
       if line:find("^" .. prefix) then
         mm.warn("Command recognized but not yet implemented in Mudlet port: " .. line)
