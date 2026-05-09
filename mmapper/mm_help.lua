@@ -41,7 +41,7 @@ mm.help_table = {
       { cmd = "mapper underlines [on/off]", desc = "Show status, or turn clickable link underlines on/off in mapper output" },
       { cmd = "mapper autolocate (on/off)", desc = "Automatically sync Mudlet mapper room from GMCP" },
       { cmd = "mapper centerlocate (on/off)", desc = "Center view each auto-locate update" },
-      { cmd = "mapper rebuild layout on/off", desc = "Toggle auto rebuild layout when bigmap sync fails" },
+      { cmd = "mapper rebuild layout on/off", desc = "Toggle auto rebuild layout on area entry" },
       { cmd = "mapper debug (on/off)", desc = "Toggle mapper debug diagnostics" },
       { cmd = "mapper locate", desc = "Send look to force fresh GMCP room info" },
       { cmd = "mapper database", desc = "Print the name of the map database file." },

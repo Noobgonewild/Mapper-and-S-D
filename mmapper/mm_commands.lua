@@ -694,7 +694,7 @@ local function handle_command_inline(line)
 
     if normalized == "on" or normalized == "off" then
       mm.state.rebuild_layout_on_sync_error = mm.bool_arg(normalized, mm.state.rebuild_layout_on_sync_error)
-      mm.note("auto rebuild layout on sync error " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off"))
+      mm.note("auto rebuild layout on area entry " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off"))
       return true
     end
 
@@ -706,7 +706,7 @@ local function handle_command_inline(line)
     end
 
     mm.warn("Usage: mapper rebuild layout [on|off|<room_id>]")
-    mm.note("auto rebuild layout on sync error " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off"))
+    mm.note("auto rebuild layout on area entry " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off"))
     return true
   end
 
@@ -886,7 +886,7 @@ mm.alias_specs = {
   {"^mapper underlines?(?: (on|off))?$", function(m) if m[2] then mm.state.underline_links = mm.bool_arg(m[2], mm.state.underline_links) end; mm.note("underlines " .. (mm.state.underline_links and "on" or "off")) end},
   {"^mapper autolocate(?: (on|off))?$", function(m) mm.state.auto_locate = mm.bool_arg(m[2], not mm.state.auto_locate); mm.note("autolocate " .. (mm.state.auto_locate and "on" or "off")) end},
   {"^mapper centerlocate(?: (on|off))?$", function(m) mm.state.center_on_locate = mm.bool_arg(m[2], not mm.state.center_on_locate); mm.note("centerlocate " .. (mm.state.center_on_locate and "on" or "off")) end},
-  {"^mapper rebuild layout (on|off)$", function(m) mm.state.rebuild_layout_on_sync_error = mm.bool_arg(m[2], not mm.state.rebuild_layout_on_sync_error); mm.note("auto rebuild layout on sync error " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off")) end},
+  {"^mapper rebuild layout (on|off)$", function(m) mm.state.rebuild_layout_on_sync_error = mm.bool_arg(m[2], not mm.state.rebuild_layout_on_sync_error); mm.note("auto rebuild layout on area entry " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off")) end},
   {"^mapper locate$", function() send("look") end},
   {"^mapper debug(?: (on|off))?$", function(m) if m[2] then mm.state.debug = (m[2] == "on"); mm.note("debug " .. m[2]); if m[2] == "on" then mm.debug("debugging enabled; watch for setPlayerRoom/map capture lines") end else mm.note("debug " .. ((mm.state and mm.state.debug) and "on" or "off")) end end},
   {"^mapper database$", function() mm.note("Current mapper database: " .. mm.state.map_db) end},

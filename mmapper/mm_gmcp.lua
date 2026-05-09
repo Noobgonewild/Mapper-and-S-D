@@ -267,20 +267,7 @@ local function sync_to_room_id(room_id, reason)
     end
 
     if mm.state and mm.state.rebuild_layout_on_sync_error then
-      local info = mm.get_room_info and mm.get_room_info() or nil
-      local start = (info and tonumber(info.num)) or 32418
-      local key = tostring(start)
-      mm.runtime.rebuild_layout_attempts = mm.runtime.rebuild_layout_attempts or {}
-      if not mm.runtime.rebuild_layout_attempts[key] then
-        mm.runtime.rebuild_layout_attempts[key] = true
-        mm.warn("Attempting mapper rebuild layout from " .. tostring(start) .. " due to bigmap sync error.")
-        local ok, err = mm.import.rebuild_layout_from(start)
-        if not ok then
-          mm.warn("Auto rebuild layout failed: " .. tostring(err))
-        end
-      else
-        mm.debug("Auto rebuild layout already attempted for start room " .. key)
-      end
+      mm.debug("Bigmap sync unavailable; auto layout rebuild now occurs on area entry.")
     end
 
     return false
@@ -386,6 +373,23 @@ function mm.on_room_info()
   mm.runtime.last_coords_y = tonumber(coord.y or info.y) or mm.runtime.last_coords_y
   mm.runtime.last_coords_z = tonumber(coord.z or info.z) or mm.runtime.last_coords_z
   mm.runtime.last_zone = tostring(info.zone or info.area or mm.runtime.last_zone or "")
+
+  local current_area = tostring(info.zone or info.area or "")
+  local previous_area = tostring(mm.runtime.last_auto_rebuild_attempt_area or "")
+  if mm.state and mm.state.rebuild_layout_on_sync_error and current_area ~= "" and current_area ~= previous_area then
+    local start = tonumber(info.num)
+    if start and start > 0 then
+      mm.runtime.last_auto_rebuild_attempt_area = current_area
+      local ok, err = mm.import.rebuild_layout_from(start, { silent = true })
+      if ok then
+        mm.runtime.last_auto_rebuild_area = current_area
+      else
+        mm.warn("Auto rebuild layout failed for area '" .. current_area .. "': " .. tostring(err))
+      end
+    else
+      mm.debug("Skipping auto rebuild layout for area '" .. current_area .. "' until a mappable room id is received.")
+    end
+  end
 
   sync_current_room(info)
 
@@ -611,6 +615,7 @@ function mm.on_room_info_event()
   local info = mm.get_room_info()
   local room_num = tostring(info and info.num or "")
   local room_name = tostring(info and info.name or "")
+  local room_area = tostring(info and (info.zone or info.area) or "")
 
   mm.runtime = mm.runtime or {}
   local now_ms = (type(getEpoch) == "function" and tonumber(getEpoch())) or math.floor((os.clock() or 0) * 1000)
@@ -624,6 +629,10 @@ function mm.on_room_info_event()
   mm.runtime.last_room_info_event_key = event_key
   mm.runtime.last_room_info_event_ms = now_ms
   mm.on_room_info()
+  if type(raiseEvent) == "function" then
+    -- Integration surface: external scripts can listen to "mm.room.changed"
+    raiseEvent("mm.room.changed", room_num, room_area)
+  end
 end
 
 function mm.on_room_exits_event()

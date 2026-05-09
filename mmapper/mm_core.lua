@@ -746,17 +746,37 @@ function mm.load_native_mapper_db(path)
 end
 
 function mm.current_room()
+  local function build_nomap_uid(name, zone)
+    local clean_name = mm.strip_ansi(name):gsub("^%s+", ""):gsub("%s+$", "")
+    local clean_zone = mm.strip_ansi(zone):gsub("^%s+", ""):gsub("%s+$", "")
+    if clean_name == "" then clean_name = "?" end
+    if clean_zone == "" then clean_zone = "?" end
+    return "nomap_" .. clean_name .. "_" .. clean_zone
+  end
+
   if mm and mm.get_room_info then
     local info = mm.get_room_info()
     if info and info.num then
-      return tonumber(info.num)
+      local n = tonumber(info.num)
+      if n == -1 then
+        return build_nomap_uid(info.name, info.zone or info.area)
+      end
+      return n
     end
   end
   if gmcp and gmcp.Room and gmcp.Room.Info and gmcp.Room.Info.num then
-    return tonumber(gmcp.Room.Info.num)
+    local n = tonumber(gmcp.Room.Info.num)
+    if n == -1 then
+      return build_nomap_uid(gmcp.Room.Info.name, gmcp.Room.Info.zone or gmcp.Room.Info.area)
+    end
+    if n then return n end
   end
   if gmcp and gmcp.room and gmcp.room.info and gmcp.room.info.num then
-    return tonumber(gmcp.room.info.num)
+    local n = tonumber(gmcp.room.info.num)
+    if n == -1 then
+      return build_nomap_uid(gmcp.room.info.name, gmcp.room.info.zone or gmcp.room.info.area)
+    end
+    return n
   end
   return nil
 end
@@ -914,6 +934,10 @@ function mm.print_room_details(room)
     mm.warn("No room information available yet.")
     return
   end
+  if type(room) ~= "number" then
+    mm.warn("Room details are not available in unmapped rooms.")
+    return
+  end
   mm.note("Room: " .. room)
   local info = mm.get_room_info and mm.get_room_info()
   if info then
@@ -945,6 +969,9 @@ function mm.set_room_flag(flag, arg)
   local room = mm.current_room()
   if not room then
     return false, "current room unknown"
+  end
+  if type(room) ~= "number" then
+    return false, "room flags are not available in unmapped rooms"
   end
 
   local mode = tostring(arg or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
@@ -996,6 +1023,9 @@ function mm.add_note(note_text)
   if not room then
     return false, "current room unknown"
   end
+  if type(room) ~= "number" then
+    return false, "notes are not available in unmapped rooms"
+  end
 
   local note = tostring(note_text or ""):gsub("^%s+", ""):gsub("%s+$", "")
   if note == "" then
@@ -1021,6 +1051,9 @@ function mm.delete_note()
   local room = mm.current_room()
   if not room then
     return false, "current room unknown"
+  end
+  if type(room) ~= "number" then
+    return false, "notes are not available in unmapped rooms"
   end
 
   local ok, err = mm.exec_mapper_db(string.format("DELETE FROM bookmarks WHERE uid=%d", room), NOTES_DB_NAME)
@@ -1775,6 +1808,7 @@ end
 
 function mm.show_unmapped(raw_arg)
   local arg = tostring(raw_arg or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  mm.debug("show_unmapped invoked with arg: '" .. arg .. "'")
   if arg == "" then
     local rows, err = mm.query_mapper_db([[
       SELECT area, count(dir) as cnt
@@ -1784,6 +1818,7 @@ function mm.show_unmapped(raw_arg)
       ORDER BY area
     ]])
     if not rows then return false, err end
+    mm.debug("show_unmapped summary rows: " .. tostring(#rows))
     if #rows == 0 then
       mm.note("No unmapped exits found.")
       return true
@@ -1826,6 +1861,7 @@ function mm.show_unmapped(raw_arg)
     ORDER BY area, uid
   ]], where_area_sql))
   if not rows then return false, err end
+  mm.debug("show_unmapped detail rows: " .. tostring(#rows) .. " (area filter: " .. tostring(area) .. ")")
   if #rows == 0 then
     mm.note("No unmapped exits found for area filter: " .. tostring(area))
     return true
@@ -1944,11 +1980,18 @@ function mm.add_full_cexit(command, src, dst, level, quiet, opts)
   else
     command = tostring(command or ""):gsub("^%s+", ""):gsub("%s+$", "")
   end
-  src = tonumber(src)
-  dst = tonumber(dst)
+  -- Preserve nomap_ virtual IDs as strings; convert numeric IDs normally.
+  local srcStr = mm.strip_ansi(src):gsub("^%s+", ""):gsub("%s+$", "")
+  local dstStr = mm.strip_ansi(dst):gsub("^%s+", ""):gsub("%s+$", "")
+  local srcIsNomap = srcStr:match("^nomap_")
+  local dstIsNomap = dstStr:match("^nomap_")
+  if srcIsNomap then src = srcStr else src = tonumber(src) end
+  if dstIsNomap then dst = dstStr else dst = tonumber(dst) end
   level = tonumber(level) or 0
   if command == "" then return false, "cexit command is required" end
-  if not src or not dst then return false, "source and destination room ids are required" end
+  if (not srcIsNomap and not src) or (not dstIsNomap and not dst) then
+    return false, "source and destination room ids are required"
+  end
   if src == dst then return false, "start room and destination room should be different" end
 
   local ok, err = mm.exec_mapper_db(string.format(
@@ -1957,14 +2000,17 @@ function mm.add_full_cexit(command, src, dst, level, quiet, opts)
   ))
   if not ok then return false, err end
 
-  if is_cardinal_dir(command) and type(setExit) == "function" then
-    pcall(setExit, src, dst, command)
-  elseif type(addSpecialExit) == "function" then
-    pcall(addSpecialExit, src, dst, command)
+  -- Mudlet bigmap APIs require numeric room IDs; skip them for nomap_ virtual rooms.
+  if not srcIsNomap and not dstIsNomap then
+    if is_cardinal_dir(command) and type(setExit) == "function" then
+      pcall(setExit, src, dst, command)
+    elseif type(addSpecialExit) == "function" then
+      pcall(addSpecialExit, src, dst, command)
+    end
   end
 
   if not quiet then
-    mm.note(string.format("Custom Exit CONFIRMED: %d (%s) -> %d [lock level %d]", src, command, dst, level))
+    mm.note(string.format("Custom Exit CONFIRMED: %s (%s) -> %s [lock level %d]", tostring(src), command, tostring(dst), level))
   end
   return true
 end
@@ -2098,7 +2144,8 @@ function mm.list_cexits(scope_arg)
   local where, intro, err = cexit_where_for_scope(scope_arg)
   if not where then return false, err end
 
-  local sql = "SELECT uid, name, area, dir, touid FROM rooms INNER JOIN exits ON rooms.uid = fromuid WHERE " .. where .. " ORDER BY area, uid, dir"
+  local sql = "SELECT COALESCE(rooms.uid, exits.fromuid) AS uid, COALESCE(rooms.name, exits.fromuid) AS name, COALESCE(rooms.area, '') AS area, exits.dir, exits.touid "
+    .. "FROM exits LEFT JOIN rooms ON rooms.uid = exits.fromuid WHERE " .. where .. " ORDER BY area, uid, dir"
   local rows, qerr = mm.query_mapper_db(sql)
   if not rows then return false, qerr end
 

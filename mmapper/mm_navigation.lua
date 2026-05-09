@@ -30,6 +30,16 @@ snd.room = snd.room or { current = { rmid = "-1" } }
 snd.char = snd.char or { level = 201, tier = 0 }
 snd.nav = snd.nav or {}
 
+local function build_nomap_uid(name, zone)
+    local clean_name = (mm and mm.strip_ansi) and mm.strip_ansi(name) or tostring(name or "")
+    local clean_zone = (mm and mm.strip_ansi) and mm.strip_ansi(zone) or tostring(zone or "")
+    clean_name = tostring(clean_name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    clean_zone = tostring(clean_zone or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if clean_name == "" then clean_name = "?" end
+    if clean_zone == "" then clean_zone = "?" end
+    return "nomap_" .. clean_name .. "_" .. clean_zone
+end
+
 if type(snd.utils.infoNote) ~= "function" then
     snd.utils.infoNote = function(msg)
         if mm and type(mm.note) == "function" then
@@ -2382,17 +2392,38 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     -- Get current room
     local currentRoom = snd.room.current.rmid
     if not currentRoom or currentRoom == "-1" then
-        -- Try to get from GMCP
+        -- Try to get from GMCP; uid=-1 means a clan/unmapped room.
         if gmcp and gmcp.room and gmcp.room.info then
-            currentRoom = tostring(gmcp.room.info.num)
+            local n = tonumber(gmcp.room.info.num)
+            if n == -1 then
+                currentRoom = build_nomap_uid(gmcp.room.info.name, gmcp.room.info.zone or gmcp.room.info.area)
+            else
+                currentRoom = tostring(gmcp.room.info.num)
+            end
         end
     end
-    
+
     if not currentRoom or currentRoom == "-1" then
         snd.utils.infoNote("Current room unknown. Try 'look' first.")
         return false
     end
-    
+
+    if currentRoom:match("^nomap_") then
+        -- Clan room: allow navigation only when cexit exits have been mapped from here.
+        local hasClanExits = false
+        if snd.mapper.db.open() then
+            local rows = snd.mapper.db.query(string.format(
+                "SELECT COUNT(*) AS cnt FROM exits WHERE fromuid = %s",
+                snd.mapper.db.escape(currentRoom)
+            )) or {}
+            hasClanExits = rows[1] and (tonumber(rows[1].cnt) or 0) > 0
+        end
+        if not hasClanExits then
+            snd.utils.infoNote("In a clan room with no mapped exits. Use 'mapper cexit <cmd>' to map one first.")
+            return false
+        end
+    end
+
     if currentRoom == roomId then
         snd.mapper.goingToRoom = nil
         snd.nav.goingToRoom = nil
@@ -2428,6 +2459,12 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     -- Try our pathfinding first
     local noPortals = not usePortals or not snd.mapper.config.usePortals
     local noRecalls = not snd.mapper.config.useRecall
+
+    -- Clan rooms (nomap_ prefix) cannot use portals or recalls; walk-only via mapped cexits.
+    if currentRoom and currentRoom:match("^nomap_") then
+        noPortals = true
+        noRecalls = true
+    end
 
     if usePortals then
         local outwardPath, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(currentRoom, roomId, ignoreLockedExits)

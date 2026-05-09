@@ -403,7 +403,8 @@ local function normalize_dir(dir)
   return dir_alias[dir] or dir
 end
 
-function mm.import.rebuild_layout_from(start_room)
+function mm.import.rebuild_layout_from(start_room, opts)
+  opts = opts or {}
   if type(getRoomExits) ~= "function" or type(setRoomCoordinates) ~= "function" then
     return false, "Mudlet room coordinate APIs unavailable"
   end
@@ -462,6 +463,8 @@ function mm.import.rebuild_layout_from(start_room)
     pcall(setPlayerRoom, start)
   end
 
-  mm.note(string.format("Rebuilt layout from room %d. Updated coordinates for %d rooms.", start, applied))
+  if not opts.silent then
+    mm.note(string.format("Rebuilt layout from room %d. Updated coordinates for %d rooms.", start, applied))
+  end
   return true, { start = start, applied = applied }
 end
