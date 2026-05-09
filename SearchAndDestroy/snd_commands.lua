@@ -690,7 +690,8 @@ function snd.commands.nx()
             return nil
         end
 
-        foundIndex = findRoomIndex(currentRoom) or findRoomIndex(targetRoom)
+        local currentRoomIndex = findRoomIndex(currentRoom)
+        foundIndex = currentRoomIndex or findRoomIndex(targetRoom)
 
         local nextIndex = nil
         local wrappingCycle = false
@@ -699,7 +700,10 @@ function snd.commands.nx()
                 nextIndex = foundIndex + 1
             else
                 nextIndex = 1
-                wrappingCycle = #quickWhere.rooms > 1
+                -- Wrap when cycling a multi-room list, OR when standing in the
+                -- only room of a single-room list (currentRoomIndex proves the
+                -- player is physically here, not just targeting it).
+                wrappingCycle = #quickWhere.rooms > 1 or currentRoomIndex ~= nil
             end
         else
             nextIndex = quickWhere.index or 1
@@ -1165,15 +1169,7 @@ function snd.commands.processQuickWhereResult()
         snd.targets.current.roomId = firstRoomId
         snd.targets.current.roomName = lastMatch.room
 
-        -- Sync the scoped activity target so a subsequent activateTabTarget()
-        -- (triggered when nextActivity flips to "qw") doesn't restore a stale
-        -- roomId from before this QW refresh and send nx back to the old room.
-        -- Only sync when we're confident the QW was hunting THIS scoped
-        -- target: skip ad-hoc qw, require stable identity, and require the
-        -- matched mob name to equal the scoped name. Keyword-only matches are
-        -- too ambiguous in non-exact where flows and can corrupt scoped room
-        -- data for a different mob.
-        if (not isAdhocQuickWhere) and hasStableIdentity then
+        if not isAdhocQuickWhere then
             local scopeForSync = quickWhereScope
             if scopeForSync ~= "cp" and scopeForSync ~= "gq" and scopeForSync ~= "quest" then
                 scopeForSync = preservedActivity
@@ -1204,6 +1200,13 @@ function snd.commands.processQuickWhereResult()
         snd.nav.quickWhere.processed = true
         snd.nav.quickWhere.pendingMatches = {}
         persistQuickWhereScope(snd.nav.quickWhere.scope)
+    end
+
+    if (not isAdhocQuickWhere) and snd.nav.nxState and snd.targets.current and #quickWhereRooms > 0 then
+        local newKey = snd.commands.buildTargetKeyFromCurrent(snd.targets.current)
+        if newKey ~= "" then
+            snd.nav.nxState.targetKey = newKey
+        end
     end
 
     snd.triggers.disableQuickWhereTriggers()
@@ -1537,14 +1540,26 @@ function snd.commands.xkill()
         return
     end
 
+    -- Reuse the shared GMCP keyword guesser when a stored keyword contains
+    -- punctuation (such as hyphenated forms) that may not be command-safe.
+    local normalizedKeyword = keyword
+    if currentTarget and currentTarget.name and normalizedKeyword:find("%-") and snd.gmcp and snd.gmcp.guessMobKeyword then
+        local arid = snd.room and snd.room.current and snd.room.current.arid
+        local guessed = snd.utils.trim(snd.gmcp.guessMobKeyword(currentTarget.name, arid) or "")
+        if guessed ~= "" then
+            normalizedKeyword = guessed
+        end
+    end
+    normalizedKeyword = snd.utils.trim((normalizedKeyword:gsub("%s+", " ")))
+
     -- Get the kill command (default: "kill")
     local killCmd = snd.config.killCommand or "kill"
     
     -- Send the kill command
-    local fullCmd = killCmd .. " " .. keyword
+    local fullCmd = killCmd .. " " .. normalizedKeyword
     snd.utils.debugNote("xkill: " .. fullCmd)
     if snd.conwin and snd.conwin.noteAttackByKeyword then
-        snd.conwin.noteAttackByKeyword(keyword, 1)
+        snd.conwin.noteAttackByKeyword(normalizedKeyword, 1)
     end
     send(fullCmd, false)
 end
@@ -2352,6 +2367,7 @@ function snd.commands.showConfigHelp()
     cecho("  <cyan>expressmin<reset>   <number>  Min kills before express applies\n")
     cecho("  <cyan>autocheck<reset>    <on|smart|off>  Post-kill CP/GQ recheck mode\n")
     cecho("  <cyan>autocheck kills<reset> <number>  SMART mode: run check every N kills\n")
+    cecho("  <cyan>mobdetect<reset>    <off|on|always>  Confirm mob presence on room-entry\n")
     cecho("  <cyan>xcp mode<reset>     <ht|qw|off>  Action after arriving for cp/gq targets\n")
     cecho("  <cyan>mob tags<reset>     xset mob help|tags|delete|nowhere|nohunt|priority\n")
     cecho("  <cyan>window<reset>       on/off - GUI window\n")
@@ -2717,18 +2733,26 @@ end
 --- Select a target by index and activity type (for clickable links)
 function snd.commands.selectTarget(index, activity)
     clearNxOverride()
+    local previousCurrent = snd.targets and snd.targets.current or nil
+    local didSelect = false
+
     if activity == "cp" then
-        snd.cp.selectTarget(index)
+        didSelect = snd.cp.selectTarget(index) == true
     elseif activity == "gq" then
-        snd.gq.selectTarget(index)
+        didSelect = snd.gq.selectTarget(index) == true
     elseif activity == "quest" then
-        snd.commands.selectQuestTarget()
+        didSelect = snd.commands.selectQuestTarget() == true
     end
+
     if snd.targets and snd.targets.current and snd.targets.current.activity then
         setScopedCurrent(snd.targets.current.activity, snd.targets.current)
         activateQuickWhereScope(snd.targets.current.activity)
         if snd.setActiveTab then
             snd.setActiveTab(snd.targets.current.activity, {save = true, refresh = false})
+        end
+        if didSelect and snd.targets.current ~= previousCurrent and type(raiseEvent) == "function" then
+            -- Integration surface: external scripts can listen to "snd.target.selected"
+            raiseEvent("snd.target.selected", snd.targets.current)
         end
     end
 end
@@ -2737,7 +2761,7 @@ end
 function snd.commands.selectQuestTarget()
     if not snd.quest.active or not snd.quest.target.mob or snd.quest.target.mob == "" then
         snd.utils.infoNote("No active quest")
-        return
+        return false
     end
     
     -- Find quest target in list
@@ -2818,9 +2842,10 @@ function snd.commands.selectQuestTarget()
                 snd.setActiveTab("quest", {save = true, refresh = false})
             end
             snd.utils.infoNote("Quest target selected: " .. target.mob)
-            return
+            return true
         end
     end
+    return false
 end
 
 --- Select quest target, navigate to it, and execute xkill

@@ -337,10 +337,24 @@ function snd.gq.buildMainTargetList()
         entry._dupkey = nil
     end
 
+    local currentArid = (snd.room and snd.room.current and tostring(snd.room.current.arid or "")) or ""
+    local currentAreaHasAlive = false
+    if currentArid ~= "" then
+        for _, entry in ipairs(gqEntries) do
+            if tostring(entry.arid or "") == currentArid and not entry.dead then
+                currentAreaHasAlive = true
+                break
+            end
+        end
+    end
+
     local areaGroupSeen = {}
     local areaGroupCount = 0
+    if currentAreaHasAlive then
+        areaGroupSeen[currentArid] = 0
+    end
     for _, entry in ipairs(gqEntries) do
-        local arid = entry.arid or ""
+        local arid = tostring(entry.arid or "")
         if not areaGroupSeen[arid] then
             areaGroupCount = areaGroupCount + 1
             areaGroupSeen[arid] = areaGroupCount
@@ -476,6 +490,12 @@ function snd.gq.onMobKilled()
 
     -- Update remaining count for current target
     if snd.targets.current and snd.targets.current.activity == "gq" then
+        local roomId = snd.room and snd.room.current and snd.room.current.id or nil
+        local killedMobName = confirmedKilledMob ~= "" and confirmedKilledMob or snd.targets.current.name or ""
+        if type(raiseEvent) == "function" then
+            -- Integration surface: external scripts can listen to "snd.kill.confirmed"
+            raiseEvent("snd.kill.confirmed", killedMobName, roomId)
+        end
         local bestIndex, bestScore = nil, -1
         local currentArea = snd.room and snd.room.current and tostring(snd.room.current.arid or "") or ""
         local currentRoom = snd.room and snd.room.current and tostring(snd.room.current.name or "") or ""

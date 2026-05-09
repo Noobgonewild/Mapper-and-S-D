@@ -21,6 +21,21 @@ local function clearQuestQuickWhereCache()
     end
 end
 
+local function sanitizeNomapPart(value)
+    local cleaned = tostring(value or "?")
+    cleaned = cleaned:gsub("\27%[[0-9;]*m", "")
+    cleaned = cleaned:gsub("[%z\1-\8\11\12\14-\31]", "")
+    cleaned = cleaned:gsub("^%s+", ""):gsub("%s+$", "")
+    if cleaned == "" then
+        cleaned = "?"
+    end
+    return cleaned
+end
+
+local function buildNomapRoomId(name, zone)
+    return "nomap_" .. sanitizeNomapPart(name) .. "_" .. sanitizeNomapPart(zone)
+end
+
 -- Store event handler IDs so we can unregister them
 snd.gmcp.handlers = snd.gmcp.handlers or {}
 
@@ -216,7 +231,9 @@ function snd.gmcp.onRoomInfo()
     
     -- Update current room
     snd.room.current = {
-        rmid = tostring(ri.num or "-1"),
+        rmid = (tonumber(ri.num) == -1)
+                    and buildNomapRoomId(ri.name, ri.zone or ri.area)
+                    or tostring(ri.num or "-1"),
         arid = ri.zone or "",
         exits = ri.exits or {},
         maze = isMaze,
