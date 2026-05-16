@@ -578,7 +578,20 @@
                     <integer>1</integer>
                 </regexCodePropertyList>
             </Trigger>
-            
+
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>gq_may_win_more</name>
+                <script>snd.triggers.gqMayWinMore()</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^You may win \d+ more gquests? at this level\.$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+
             <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
                 <name>gq_ended</name>
                 <script>snd.triggers.gqEnded(matches)</script>

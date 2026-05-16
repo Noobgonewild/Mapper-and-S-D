@@ -964,9 +964,37 @@ function snd.gui.updateTargetList()
 
     local targetCount = snd.targets and snd.targets.list and #snd.targets.list or 0
 
-    local maxHeight = (snd.config.window.height or DEFAULT_HEIGHT) - TARGET_START_Y - TAB_HEIGHT - 18
+    -- Measure the actual rendered line height and the MiniConsole's pixel height
+    -- so the displayed target count adapts to real geometry (window resizes,
+    -- font-size changes) instead of relying on hardcoded constants that left
+    -- visible empty space at the bottom of the window.
     local lineHeight = 13
-    local maxLines = math.floor(maxHeight / lineHeight)
+    if type(calcFontSize) == "function" then
+        local ok, fw, fh = pcall(calcFontSize, "sndTargetArea")
+        if ok and type(fh) == "number" and fh > 0 then
+            lineHeight = fh
+        end
+    end
+
+    local areaPixelHeight
+    local taElement = snd.gui.elements.targetArea
+    if taElement then
+        local heightGetter = taElement.get_height or taElement.getHeight
+        if type(heightGetter) == "function" then
+            local ok, h = pcall(heightGetter, taElement)
+            if ok and type(h) == "number" and h > 0 then
+                areaPixelHeight = h
+            end
+        end
+    end
+
+    local maxHeight
+    if areaPixelHeight then
+        maxHeight = areaPixelHeight
+    else
+        maxHeight = (snd.config.window.height or DEFAULT_HEIGHT) - TARGET_START_Y - TAB_HEIGHT - 18
+    end
+    local maxLines = math.max(1, math.floor(maxHeight / lineHeight))
     local lineCount = 0
     local activeTab = snd.getActiveTab and snd.getActiveTab() or nil
     local function normalizeMobName(name)
@@ -1153,6 +1181,8 @@ function snd.gui.updateTargetList()
                     color = TC.targeted
                 elseif v.unlikely then
                     color = TC.unlikely
+                elseif v.killed then
+                    color = TC.dead
                 elseif v.dead and (not v.arid or v.arid == "") then
                     color = TC.unknownDead
                 elseif v.dead then
@@ -1164,7 +1194,12 @@ function snd.gui.updateTargetList()
                 end
 
                 local mob = v.mob or "?"
-                local deathTag = v.dead and " [Dead]" or ""
+                local deathTag = ""
+                if v.killed then
+                    deathTag = " [Killed]"
+                elseif v.dead then
+                    deathTag = " [Dead]"
+                end
 
                 local location = ""
                 if snd.targets.type == "room" and v.roomName and v.roomName ~= "" then

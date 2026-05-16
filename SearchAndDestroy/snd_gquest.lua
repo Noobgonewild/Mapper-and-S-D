@@ -108,12 +108,21 @@ function snd.gq.endGqInfo()
         snd.utils.debugNote("GQ info was for a finished quest, ignoring")
         return
     end
-    
+
+    -- Only activate GQ state if the player actually joined this quest.
+    -- onJoined() sets snd.gquest.joined = gqId before sending gq info, so
+    -- the IDs match iff the player joined; a browse-only gq info won't match.
+    local currentId = tostring(snd.gq.parsing.currentGqId or "")
+    local joinedId = tostring(snd.gquest.joined or "")
+    if currentId == "" or currentId ~= joinedId then
+        snd.utils.debugNote("GQ info browsed without joining (parsed=" .. currentId .. ", joined=" .. joinedId .. "), skipping activation")
+        return
+    end
+
     -- Transfer targets to main list
     snd.gquest.targets = snd.gq.parsing.tempTargets
     snd.gquest.active = #snd.gquest.targets > 0
-    snd.gquest.joined = snd.gq.parsing.currentGqId or "-1"
-    snd.gquest.started = snd.gq.parsing.currentGqId or "-1"
+    -- joined/started already set correctly by onJoined()/onStarted(); do not overwrite
     snd.gquest.effectiveLevel = snd.gq.parsing.effectiveLevel
     
     if snd.gq.parsing.extended then
@@ -145,10 +154,6 @@ end
 -- @param value string|number reward value from regex capture
 -- @param bonusPerKill string|number|nil optional qp bonus awarded per target kill
 function snd.gq.captureInfoReward(rewardType, value, bonusPerKill)
-    if snd.gq.parsing and not snd.gq.parsing.infoActive and snd.gq.startGqInfo then
-        snd.gq.startGqInfo(snd.gquest.joined or snd.gquest.started or "0")
-    end
-
     local amount = tonumber((tostring(value or ""):gsub(",", ""))) or 0
     if rewardType == "qp" then
         snd.gquest.qpReward = amount
@@ -541,35 +546,47 @@ function snd.gq.onMobKilled()
     end
 end
 
+--- Record GQ win in history and clear state.
+-- @param gqId The global quest ID
+function snd.gq.onPersonallyCompleted(gqId)
+    snd.utils.reportLine("You won Global Quest #" .. (gqId or "?") .. "!", "gquest")
+    if snd.db then
+        snd.db.historyEnd(snd.db.HISTORY_TYPE_GQUEST, snd.db.HISTORY_STATUS_COMPLETE, {
+            qp     = (tonumber(snd.gquest.qpReward) or 0) + (tonumber(snd.gquest.qpKillBonusTotal) or 0),
+            tp     = tonumber(snd.gquest.tpReward) or 0,
+            trains = tonumber(snd.gquest.trainReward) or 0,
+            pracs  = tonumber(snd.gquest.pracReward) or 0,
+            gold   = tonumber(snd.gquest.goldReward) or 0,
+        })
+    end
+    snd.gq.clearGquest()
+end
+
 --- Handle gquest winner
 -- @param gqId The global quest ID
 -- @param winner Name of the winner
 function snd.gq.onWinner(gqId, winner)
     local myName = snd.char.name or ""
-    
     if winner == myName then
-        snd.utils.reportLine("You won Global Quest #" .. gqId .. "!", "gquest")
-        
-        -- Record as complete
-        if snd.db then
-            snd.db.historyEnd(
-                snd.db.HISTORY_TYPE_GQUEST,
-                snd.db.HISTORY_STATUS_COMPLETE,
-                {
-                    qp = (tonumber(snd.gquest.qpReward) or 0) + (tonumber(snd.gquest.qpKillBonusTotal) or 0),
-                    tp = tonumber(snd.gquest.tpReward) or 0,
-                    trains = tonumber(snd.gquest.trainReward) or 0,
-                    pracs = tonumber(snd.gquest.pracReward) or 0,
-                    gold = tonumber(snd.gquest.goldReward) or 0,
-                }
-            )
-        end
+        if not snd.gquest.active then return end
+        snd.gq.onPersonallyCompleted(gqId)
     else
         snd.utils.infoNote("Global Quest #" .. gqId .. " won by " .. winner)
-        if snd.db and (snd.gquest.joined == gqId or snd.gquest.started == gqId) then
-            snd.db.historyEnd(snd.db.HISTORY_TYPE_GQUEST, snd.db.HISTORY_STATUS_FAILED)
+        if snd.gquest.joined == gqId or snd.gquest.started == gqId then
+            if snd.db then snd.db.historyEnd(snd.db.HISTORY_TYPE_GQUEST, snd.db.HISTORY_STATUS_FAILED) end
+            snd.gq.clearGquest()
         end
     end
+end
+
+--- Fallback for when the GCHAN winner announcement is dropped.
+function snd.gq.onMayWinMore()
+    if not snd.gquest.active then return end
+    tempTimer(2, function()
+        if not snd.gquest.active then return end
+        local gqId = snd.gquest.joined ~= "-1" and snd.gquest.joined or snd.gquest.started
+        snd.gq.onPersonallyCompleted(gqId)
+    end)
 end
 
 --- Handle gquest ended
@@ -607,6 +624,14 @@ end
 
 --- Clear gquest state
 function snd.gq.clearGquest()
+    -- Kill any pending gq info end timer so a stale endGqInfo() cannot
+    -- re-establish the false joined/active state after clearGquest() runs.
+    if snd.gq.parsing and snd.gq.parsing.infoEndTimer then
+        pcall(function() killTimer(snd.gq.parsing.infoEndTimer) end)
+        snd.gq.parsing.infoEndTimer = nil
+    end
+    if snd.gq.parsing then snd.gq.parsing.infoActive = false end
+
     snd.gquest.active = false
     snd.gquest.joined = "-1"
     snd.gquest.started = "-1"
@@ -638,8 +663,9 @@ function snd.gq.clearGquest()
         snd.clearTarget()
     end
 
-    -- Update activity type
-    if snd.campaign.active then
+    if snd.quest and snd.quest.active then
+        snd.targets.activity = "quest"
+    elseif snd.campaign.active then
         snd.targets.activity = "cp"
     else
         snd.targets.activity = "none"
@@ -648,6 +674,10 @@ function snd.gq.clearGquest()
 
     if snd.nav and snd.nav.clearActivityQuickWhere then
         snd.nav.clearActivityQuickWhere("gq")
+    end
+
+    if snd.setActiveTab and snd.getPreferredActiveActivity then
+        snd.setActiveTab(snd.getPreferredActiveActivity() or "quest", {save = true, refresh = false})
     end
 
     if snd.gui and snd.gui.refresh then

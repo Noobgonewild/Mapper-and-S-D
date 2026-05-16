@@ -29,6 +29,7 @@ CW.lastKnownEnemyPct = CW.lastKnownEnemyPct or nil
 CW.lastTrackedMobId = CW.lastTrackedMobId or nil
 CW.lastKilledMobName = CW.lastKilledMobName or ""
 CW.lastKilledAt = CW.lastKilledAt or 0
+CW.lastRawEnemy = CW.lastRawEnemy or ""
 
 local consider_map = {
     {[[^(\(.+\) ?)?(.+) looks a little worried about the idea\.$]], "chartreuse", "-2 to -4"},
@@ -150,7 +151,9 @@ function CW.isCurrentRoomPk()
 end
 
 function CW.roomHasPlayers()
-    -- TODO:
+    -- TODO: Aardwolf GMCP does not currently provide a documented room-players list.
+    -- If a reliable source becomes available (GMCP payload or deterministic tagged output),
+    -- implement player-presence detection here and re-enable this safety guard.
     return false
 end
 
@@ -186,9 +189,7 @@ function CW.tryMobDetectConfirmedTarget()
         if CW.roomHasPlayers() then return false end
     end
 
-    CW.mobDetectDispatched = true
-    snd.utils.infoNote("Mobdetect: found cp/quest/gq target in room " .. roomId .. ".")
-   
+    
     return true
 end
 function CW.clear(_reason)
@@ -343,6 +344,14 @@ function CW.trackAttackCommand(command)
     if lowered == "xkill" then
         local t = snd.targets and snd.targets.current
         local keyword = t and (t.keyword or t.matchedMobName or snd.utils.findKeyword(t.name or "")) or ""
+        if t and t.name and keyword:find("%-") and snd.gmcp and snd.gmcp.guessMobKeyword then
+            local arid = snd.room and snd.room.current and snd.room.current.arid
+            local guessed = trim(snd.gmcp.guessMobKeyword(t.name, arid) or "")
+            if guessed ~= "" then
+                keyword = guessed
+            end
+        end
+        keyword = trim(keyword:gsub("%s+", " "))
         CW.noteAttackByKeyword(keyword, 1)
         return
     end
@@ -655,11 +664,14 @@ end
 
 function CW.onCharStatus()
     local prevEnemy = normalizeMobName(CW.lastEnemy or "")
-    local enemyNow = normalizeMobName(CW.getActiveEnemyName())
+    local prevRawEnemy = trim(CW.lastRawEnemy or "")
+    local rawEnemyNow = CW.getActiveEnemyName()
+    local enemyNow = normalizeMobName(rawEnemyNow)
     local hadEnemy = prevEnemy ~= ""
     local hasEnemy = enemyNow ~= ""
 
     if hadEnemy and not hasEnemy then
+        local prevKnownEnemyPct = CW.lastKnownEnemyPct
         local matched = false
         local killedMobName = ""
         local strictFocus = cfg().strictFocusIdOnly and true or false
@@ -687,7 +699,7 @@ function CW.onCharStatus()
         CW.currentEnemyMobId = nil
         CW.lastKnownEnemyPct = nil
         if matched then
-            CW.lastKilledMobName = trim(killedMobName)
+            CW.lastKilledMobName = normalizeMobName(killedMobName)
             CW.lastKilledAt = os.time()
             CW.killsSinceRefresh = (tonumber(CW.killsSinceRefresh) or 0) + 1
         end
@@ -705,6 +717,12 @@ function CW.onCharStatus()
                     snd.room.current.arid
                 )
             end
+        end
+
+        if not matched and #CW.mobs == 0 and prevRawEnemy ~= ""
+                and prevKnownEnemyPct == 0 then
+            CW.lastKilledMobName = prevRawEnemy
+            CW.lastKilledAt = os.time()
         end
 
         local threshold = math.max(0, math.floor(tonumber(cfg().repopulate) or 0))
@@ -764,6 +782,7 @@ function CW.onCharStatus()
         end
     end
     CW.lastEnemy = enemyNow
+    CW.lastRawEnemy = rawEnemyNow
     CW.lastTrackedMobId = CW.currentEnemyMobId
 end
 
@@ -784,20 +803,27 @@ function CW.clearRecentKilledMobName()
 end
 
 function CW.getCurrentCombatMobName()
+    -- Require live GMCP enemy name in all paths: currentEnemyMobId is only set when nil
+    -- (see onCharStatus), so it can be stale if the player switched targets without a kill.
+    -- Gating on activeEnemy ensures we never return a mob that disagrees with GMCP.
     local activeEnemy = normalizeMobName(CW.getActiveEnemyName())
     if activeEnemy == "" then return "" end
+    -- ID match is preferred for precision, but only when ID mob name agrees with GMCP
     if CW.currentEnemyMobId then
         for _, m in ipairs(CW.mobs) do
             if m.id == CW.currentEnemyMobId and not m.dead and normalizeMobName(m.name) == activeEnemy then
-                return m.name
+                return activeEnemy
             end
         end
     end
-    -- Name-only fallback
+    -- Name-only fallback (handles case where ID was stale or never set)
     for _, m in ipairs(CW.mobs) do
         if not m.dead and normalizeMobName(m.name) == activeEnemy then
-            return m.name
+            return activeEnemy
         end
+    end
+    if #CW.mobs == 0 then
+        return activeEnemy
     end
     return ""
 end

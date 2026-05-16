@@ -2367,7 +2367,7 @@ function snd.commands.showConfigHelp()
     cecho("  <cyan>expressmin<reset>   <number>  Min kills before express applies\n")
     cecho("  <cyan>autocheck<reset>    <on|smart|off>  Post-kill CP/GQ recheck mode\n")
     cecho("  <cyan>autocheck kills<reset> <number>  SMART mode: run check every N kills\n")
-    cecho("  <cyan>mobdetect<reset>    <off|on|always>  Confirm mob presence on room-entry\n")
+    
     cecho("  <cyan>xcp mode<reset>     <ht|qw|off>  Action after arriving for cp/gq targets\n")
     cecho("  <cyan>mob tags<reset>     xset mob help|tags|delete|nowhere|nohunt|priority\n")
     cecho("  <cyan>window<reset>       on/off - GUI window\n")

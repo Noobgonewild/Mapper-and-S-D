@@ -533,19 +533,73 @@ end
 
 --- Build target list from cp check results (when cp info wasn't run first)
 function snd.cp.buildTargetListFromCheck()
+    -- Preserve player-killed flag across rebuilds. cp check can report a
+    -- mob's location differently when alive vs dead (e.g. a room name while
+    -- alive, an area name while dead), so a strict (mob, loc) match would
+    -- drop killed=true after the rebuild. Use a two-tier match: exact
+    -- (mob, loc) first, mob-only as fallback, with consumption counts so
+    -- multiple campaign entries sharing a mob name don't all inherit the
+    -- same killed flag.
+    local killedExact = {}
+    local killedByMob = {}
+    for _, t in ipairs(snd.campaign.targets or {}) do
+        if t.killed then
+            local mob = t.mob or ""
+            local key = mob .. "|" .. (t.loc or "")
+            killedExact[key] = (killedExact[key] or 0) + 1
+            killedByMob[mob] = (killedByMob[mob] or 0) + 1
+        end
+    end
+
+    -- Identify mob names that have any alive entry in the new check. The
+    -- mob-only fallback below is unsafe for these: the prior kill might be
+    -- the now-alive (respawned) entry, and applying its leftover token to a
+    -- different dead same-name duplicate would misattribute ownership.
+    local aliveMobs = {}
+    for _, check in ipairs(snd.campaign.checkList) do
+        if not check.dead then
+            aliveMobs[check.mob or ""] = true
+        end
+    end
+
     snd.campaign.targets = {}
-    
+
     for i, check in ipairs(snd.campaign.checkList) do
         local areaKey = ""
         if check.loc and check.loc ~= "" then
             areaKey = snd.db.getAreaKeyFromName(check.loc) or ""
         end
-        
+
+        local mob = check.mob or ""
+        local key = mob .. "|" .. (check.loc or "")
+
+        -- Always consume an exact (mob, loc) token if one exists, regardless
+        -- of the new dead state. If the mob respawned (check.dead == false),
+        -- burning the token here keeps it from leaking into the fallback for
+        -- a different same-name duplicate.
+        local exactMatched = false
+        if (killedExact[key] or 0) > 0 then
+            killedExact[key] = killedExact[key] - 1
+            killedByMob[mob] = (killedByMob[mob] or 1) - 1
+            exactMatched = true
+        end
+
+        local killed = false
+        if check.dead then
+            if exactMatched then
+                killed = true
+            elseif (killedByMob[mob] or 0) > 0 and not aliveMobs[mob] then
+                killedByMob[mob] = killedByMob[mob] - 1
+                killed = true
+            end
+        end
+
         table.insert(snd.campaign.targets, {
             mob = check.mob,
             loc = check.loc,
             arid = areaKey,
             dead = check.dead or false,
+            killed = killed,
             keyword = snd.gmcp.guessMobKeyword(check.mob, areaKey),
         })
     end
@@ -904,6 +958,7 @@ function snd.cp.buildMainTargetList()
                 arid = arid,
                 roomName = roomName,
                 dead = target.dead == true,
+                killed = target.killed == true,
                 index = j,
                 campaignIndex = i,
                 activity = "cp",
@@ -940,10 +995,24 @@ function snd.cp.buildMainTargetList()
     for _, entry in ipairs(lowEntries) do
         table.insert(cpEntries, entry)
     end
+    local currentArid = (snd.room and snd.room.current and tostring(snd.room.current.arid or "")) or ""
+    local currentAreaHasAlive = false
+    if currentArid ~= "" then
+        for _, entry in ipairs(cpEntries) do
+            if tostring(entry.arid or "") == currentArid and not entry.dead then
+                currentAreaHasAlive = true
+                break
+            end
+        end
+    end
+
     local areaGroupSeen = {}
     local areaGroupCount = 0
+    if currentAreaHasAlive then
+        areaGroupSeen[currentArid] = 0
+    end
     for _, entry in ipairs(cpEntries) do
-        local arid = entry.arid or ""
+        local arid = tostring(entry.arid or "")
         if not areaGroupSeen[arid] then
             areaGroupCount = areaGroupCount + 1
             areaGroupSeen[arid] = areaGroupCount
@@ -1000,11 +1069,12 @@ end
 function snd.cp.updateTargetStatus()
     -- Mark all as potentially alive first
     -- Then mark as dead based on check list
-    
+
     local cpCampaignIndex = 0
     for _, campaignTarget in ipairs(snd.campaign.targets or {}) do
         cpCampaignIndex = cpCampaignIndex + 1
         local wasDead = campaignTarget.dead == true
+        local wasKilled = campaignTarget.killed == true
         campaignTarget.dead = true
         for _, check in ipairs(snd.campaign.checkList) do
             if campaignTarget.mob == check.mob and (campaignTarget.loc or "") == (check.loc or "") then
@@ -1012,6 +1082,9 @@ function snd.cp.updateTargetStatus()
                 break
             end
         end
+        -- Preserve player-killed flag only while the mob is still dead in our state.
+        -- If the mob is now alive (respawned or never died), clear the killed flag.
+        campaignTarget.killed = (campaignTarget.dead and wasKilled) and true or false
     end
 
     local cpList = {}
@@ -1020,7 +1093,9 @@ function snd.cp.updateTargetStatus()
     for _, target in ipairs(snd.targets.list) do
         if target.activity == "cp" then
             local wasDead = target.dead == true
+            local wasKilled = target.killed == true
             target.dead = false
+            target.killed = false
 
             local found = false
             for idx, check in ipairs(snd.campaign.checkList) do
@@ -1044,9 +1119,17 @@ function snd.cp.updateTargetStatus()
                 end
             end
 
-            -- If not in check list, it's been killed
+            -- If not in check list, mark the entry dead (matches the original
+            -- behavior). Don't infer killed=true here: this branch also fires
+            -- for duplicate zones whose sibling already consumed the matching
+            -- check-list row, and those are not player kills. Real kills mark
+            -- killed=true on the specific entry in onMobKilled, so preserving
+            -- wasKilled is sufficient.
             if not found then
                 target.dead = true
+                target.killed = wasKilled
+            else
+                target.killed = (target.dead and wasKilled) and true or false
             end
             table.insert(cpList, target)
         else
@@ -1054,10 +1137,24 @@ function snd.cp.updateTargetStatus()
         end
     end
 
+    local currentArid = (snd.room and snd.room.current and tostring(snd.room.current.arid or "")) or ""
+    local currentAreaHasAlive = false
+    if currentArid ~= "" then
+        for _, entry in ipairs(cpList) do
+            if tostring(entry.arid or "") == currentArid and not entry.dead then
+                currentAreaHasAlive = true
+                break
+            end
+        end
+    end
+
     local areaGroupSeen = {}
     local areaGroupCount = 0
+    if currentAreaHasAlive then
+        areaGroupSeen[currentArid] = 0
+    end
     for _, entry in ipairs(cpList) do
-        local arid = entry.arid or ""
+        local arid = tostring(entry.arid or "")
         if not areaGroupSeen[arid] then
             areaGroupCount = areaGroupCount + 1
             areaGroupSeen[arid] = areaGroupCount
@@ -1133,6 +1230,12 @@ function snd.cp.onMobKilled()
 
     -- Record the kill if we have a current target
     if snd.targets.current and snd.targets.current.activity == "cp" then
+        local roomId = snd.room and snd.room.current and snd.room.current.id or nil
+        local killedMobName = confirmedKilledMob ~= "" and confirmedKilledMob or snd.targets.current.name or ""
+        if type(raiseEvent) == "function" then
+            -- Integration surface: external scripts can listen to "snd.kill.confirmed"
+            raiseEvent("snd.kill.confirmed", killedMobName, roomId)
+        end
         local target = snd.targets.current
 
         -- Mark as dead in target list
@@ -1161,12 +1264,46 @@ function snd.cp.onMobKilled()
             end
         end
         if bestIndex and snd.targets.list[bestIndex] then
-            snd.targets.list[bestIndex].dead = true
+            local killedEntry = snd.targets.list[bestIndex]
+            killedEntry.dead = true
+            killedEntry.killed = true
+            -- Mirror the killed flag onto snd.campaign.targets so it survives
+            -- the next buildTargetListFromCheck rebuild. Match by campaignIndex
+            -- rather than (mob, loc): buildMainTargetList rewrites entry.loc to
+            -- zone.areaName, which won't equal the campaign target's original
+            -- check-list location for room-based campaigns.
+            local campaignIdx = tonumber(killedEntry.campaignIndex)
+            local ct = campaignIdx and snd.campaign.targets and snd.campaign.targets[campaignIdx]
+            if ct and ct.mob == killedEntry.mob then
+                ct.dead = true
+                ct.killed = true
+            else
+                for _, c in ipairs(snd.campaign.targets or {}) do
+                    if c.mob == killedEntry.mob and not c.killed then
+                        c.dead = true
+                        c.killed = true
+                        break
+                    end
+                end
+            end
         end
         snd.cp.updateTargetStatus()
         if snd.cp.getRemainingCount and snd.cp.getRemainingCount() == 0 then
-            shouldSyncAfterKill = false
-            snd.utils.debugNote("Skipping post-kill cp check because last campaign target was just killed")
+            -- The original skip exists to avoid racing the cp_complete trigger when
+            -- the player just killed the final alive target. Only honor it when this
+            -- kill is the only one pending refresh; otherwise prior killed-by-player
+            -- mobs would stay in the list as [Killed] forever because no future cp
+            -- check would ever fire to clear them.
+            local killedPendingCount = 0
+            for _, t in ipairs(snd.targets.list) do
+                if t.activity == "cp" and t.killed then
+                    killedPendingCount = killedPendingCount + 1
+                end
+            end
+            if killedPendingCount <= 1 then
+                shouldSyncAfterKill = false
+                snd.utils.debugNote("Skipping post-kill cp check because last campaign target was just killed")
+            end
         end
         
         -- Clear current target

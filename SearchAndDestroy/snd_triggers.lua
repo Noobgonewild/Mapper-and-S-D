@@ -421,6 +421,11 @@ function snd.triggers.gqWinner(matches)
     snd.gq.onWinner(matches[2], matches[3])
 end
 
+--- GQ may-win-more trigger
+function snd.triggers.gqMayWinMore()
+    snd.gq.onMayWinMore()
+end
+
 --- GQ ended trigger
 function snd.triggers.gqEnded(matches)
     if not matches or not matches[2] then return end
@@ -1074,6 +1079,7 @@ end
 --- Campaign info gold reward trigger
 function snd.triggers.cpInfoRewardGold(matches)
     if not matches or not matches[2] then return end
+    if snd.gq and snd.gq.parsing and snd.gq.parsing.infoActive then return end
     if snd.cp and snd.cp.parsing and not snd.cp.parsing.infoActive and snd.cp.startCpInfo then
         snd.cp.startCpInfo()
     end
@@ -1097,6 +1103,7 @@ end
 --- Campaign info training reward trigger
 function snd.triggers.cpInfoRewardTrain(matches)
     if not matches or not matches[2] then return end
+    if snd.gq and snd.gq.parsing and snd.gq.parsing.infoActive then return end
     if snd.cp and snd.cp.parsing and not snd.cp.parsing.infoActive and snd.cp.startCpInfo then
         snd.cp.startCpInfo()
     end
@@ -1108,6 +1115,7 @@ end
 --- Campaign info practice reward trigger
 function snd.triggers.cpInfoRewardPrac(matches)
     if not matches or not matches[2] then return end
+    if snd.gq and snd.gq.parsing and snd.gq.parsing.infoActive then return end
     if snd.cp and snd.cp.parsing and not snd.cp.parsing.infoActive and snd.cp.startCpInfo then
         snd.cp.startCpInfo()
     end
