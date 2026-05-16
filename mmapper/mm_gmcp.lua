@@ -374,23 +374,6 @@ function mm.on_room_info()
   mm.runtime.last_coords_z = tonumber(coord.z or info.z) or mm.runtime.last_coords_z
   mm.runtime.last_zone = tostring(info.zone or info.area or mm.runtime.last_zone or "")
 
-  local current_area = tostring(info.zone or info.area or "")
-  local previous_area = tostring(mm.runtime.last_auto_rebuild_attempt_area or "")
-  if mm.state and mm.state.rebuild_layout_on_sync_error and current_area ~= "" and current_area ~= previous_area then
-    local start = tonumber(info.num)
-    if start and start > 0 then
-      mm.runtime.last_auto_rebuild_attempt_area = current_area
-      local ok, err = mm.import.rebuild_layout_from(start, { silent = true })
-      if ok then
-        mm.runtime.last_auto_rebuild_area = current_area
-      else
-        mm.warn("Auto rebuild layout failed for area '" .. current_area .. "': " .. tostring(err))
-      end
-    else
-      mm.debug("Skipping auto rebuild layout for area '" .. current_area .. "' until a mappable room id is received.")
-    end
-  end
-
   sync_current_room(info)
 
   -- Keep the big map centered after every movement update.
@@ -619,7 +602,7 @@ function mm.on_room_info_event()
 
   mm.runtime = mm.runtime or {}
   local now_ms = (type(getEpoch) == "function" and tonumber(getEpoch())) or math.floor((os.clock() or 0) * 1000)
-  local event_key = room_num .. "::" .. room_name
+  local event_key = room_num .. "::" .. room_name .. "::" .. room_area
   local last_key = tostring(mm.runtime.last_room_info_event_key or "")
   local last_ms = tonumber(mm.runtime.last_room_info_event_ms or -1000) or -1000
   if event_key == last_key and (now_ms - last_ms) <= 150 then
@@ -656,6 +639,22 @@ function mm.register_events()
     registerAnonymousEventHandler("gmcp.Room", "mm.on_room_packet"),
     registerAnonymousEventHandler("gmcp.room.sectors", "mm.refresh_terrain_ids"),
     registerAnonymousEventHandler("gmcp.Room.Sectors", "mm.refresh_terrain_ids"),
+    registerAnonymousEventHandler("mm.room.changed", function(_, room_num, room_area)
+      if not (mm.state and mm.state.rebuild_layout_on_sync_error) then return end
+      if room_area == "" then return end
+      mm.runtime = mm.runtime or {}
+      local prev = tostring(mm.runtime.last_auto_rebuild_attempt_area or "")
+      if room_area == prev then return end
+      local roomId = tonumber(room_num)
+      if not (roomId and roomId > 0) then return end
+      mm.runtime.last_auto_rebuild_attempt_area = room_area
+      local ok, err = mm.import.rebuild_layout_from(roomId, { silent = true })
+      if ok then
+        mm.runtime.last_auto_rebuild_area = room_area
+      else
+        mm.warn("Auto rebuild layout failed for area '" .. room_area .. "': " .. tostring(err))
+      end
+    end),
   }
 
   -- Capture every line while the map block is active; Aardwolf map lines contain

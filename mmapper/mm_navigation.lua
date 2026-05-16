@@ -2388,7 +2388,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     roomId = tostring(roomId)
     usePortals = (usePortals ~= false)  -- Default true
     iterativeMode = (iterativeMode == true)
-    
+
     -- Get current room
     local currentRoom = snd.room.current.rmid
     if not currentRoom or currentRoom == "-1" then
