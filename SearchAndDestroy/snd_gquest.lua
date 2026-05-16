@@ -584,6 +584,7 @@ function snd.gq.onMayWinMore()
     if not snd.gquest.active then return end
     tempTimer(2, function()
         if not snd.gquest.active then return end
+        if snd.gq.getTotalRemainingKills() > 0 then return end
         local gqId = snd.gquest.joined ~= "-1" and snd.gquest.joined or snd.gquest.started
         snd.gq.onPersonallyCompleted(gqId)
     end)
