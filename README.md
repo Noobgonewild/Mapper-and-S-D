@@ -1,3 +1,6 @@
+FOR MAPPER TO WORK, IMPORTANT:
+Click on Scripts (in the Mudlet top button bar) -> create a new script-> name it whatever -> paste this into the script body: dofile(getMudletHomeDir() .. "/mmapper/mm_init.lua") -> reload mudlet
+
 **This was made for my personal use! I am sharing in case someone else finds it useful; I know 99% of people are die hard Mush veterans!**
 
 **Mapper + Search and Destroy Database Guide (Mudlet)**
