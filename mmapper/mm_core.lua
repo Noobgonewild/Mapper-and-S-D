@@ -1718,14 +1718,23 @@ function mm.print_search_results(results, title)
     local notes = trim_to(entry.reason or entry.info or "", 24)
     local rowColor = (i % 2 == 0) and "light_grey" or "dark_slate_grey"
 
-    cecho(string.format("<%s>%3d<reset> ", rowColor, i))
+    local idx_display = string.format("%3d", i)
+    local note_summary = notes
+
+    if rid > 0 then
+      echoLink(idx_display, string.format([[mm.show_note_for_room(%d)]], rid), "Show full room note", true)
+      echo(" ")
+    else
+      cecho(string.format("<%s>%3d<reset> ", rowColor, i))
+    end
 
     if rid > 0 then
       local ridtxt = string.format("(%d)", rid)
       echoLink(string.format("%-8s", ridtxt), [[mm.goto_room(]] .. rid .. [[)]], "Go to room " .. rid, true)
       echo(" ")
       echoLink(name, [[mm.goto_room(]] .. rid .. [[)]], "Go to room " .. rid, true)
-      cecho("  <" .. rowColor .. ">" .. area .. "  " .. notes .. "<reset>")
+      cecho("  <" .. rowColor .. ">" .. area .. "  <reset>")
+      echoLink(note_summary, string.format([[mm.show_note_for_room(%d)]], rid), "Show full room note", true)
       echo("  ")
       echoLink("{sw}", [[mm.goto_room(]] .. rid .. [[)]], "Speedwalk to room " .. rid, true)
       echo("\n")
@@ -1741,6 +1750,25 @@ function mm.print_search_results(results, title)
 
   cecho("<gray>----------------------------------------------------------------------------------------------------<reset>\n")
   mm.note("Use: mapper next [index] to travel through this list.")
+  return true
+end
+
+function mm.show_note_for_room(room_id)
+  local rid = tonumber(room_id)
+  if not rid then return false, "invalid room id" end
+  if type(mm.get_room_note) ~= "function" then
+    return false, "note lookup is unavailable"
+  end
+  local note, err = mm.get_room_note(rid)
+  if note == nil and err then
+    return false, err
+  end
+  note = tostring(note or "")
+  if note == "" then
+    mm.note(string.format("Room %d has no saved note.", rid))
+    return true
+  end
+  mm.note(string.format("Room %d note: %s", rid, note))
   return true
 end
 
@@ -1903,6 +1931,52 @@ function mm.search_notes(area_arg)
   local rows, err = mm.query_mapper_db(sql, NOTES_DB_NAME)
   if not rows then return false, err end
   mm.print_search_results(rows, "notes search")
+  return true
+end
+
+function mm.search_notes_text(raw_text)
+  local text = tostring(raw_text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if text == "" then return false, "Usage: mapper searchnotes <text>" end
+
+  local sql = string.format(
+    "SELECT bookmarks.uid as uid, rooms.name as name, rooms.area as area, bookmarks.notes as reason FROM bookmarks JOIN rooms ON bookmarks.uid = rooms.uid WHERE lower(bookmarks.notes) LIKE %s ORDER BY rooms.area, rooms.name",
+    mm.sql_escape("%" .. text:lower() .. "%")
+  )
+
+  local rows, err = mm.query_mapper_db(sql, NOTES_DB_NAME)
+  if not rows then return false, err end
+  set_search_results(rows)
+
+  mm.note(string.format("notes text search: '%s' (%d found)", text, #rows))
+  if #rows == 0 then
+    mm.note("No matching rooms found.")
+    return true
+  end
+
+  for i, entry in ipairs(rows) do
+    local rid = tonumber(entry.uid) or -1
+    local name = mm.strip_ansi(entry.name or "?")
+    local area = mm.strip_ansi(entry.area or "?")
+    local note = mm.strip_ansi(entry.reason or "")
+    cecho(string.format("<light_grey>%3d)<reset> ", i))
+    if rid > 0 then
+      echoLink(string.format("(%d)", rid), [[mm.goto_room(]] .. rid .. [[)]], "Go to room " .. rid, true)
+      echo(" ")
+    else
+      echo("(?) ")
+    end
+    cecho(string.format("<cyan>%s<reset> [<dark_orange>%s<reset>]\n", name, area))
+    if rid > 0 then
+      echoLink(note, string.format([[mm.show_note_for_room(%d)]], rid), "Show full room note", true)
+      echo("\n")
+    else
+      cecho(note .. "\n")
+    end
+    if i >= 100 then
+      mm.warn("More than 100 results found; showing first 100.")
+      break
+    end
+  end
   return true
 end
 

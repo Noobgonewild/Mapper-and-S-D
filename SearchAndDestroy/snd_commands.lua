@@ -117,6 +117,115 @@ local function activateTabTarget(activity)
     return false
 end
 
+local function normalizeXcpActionMode(mode)
+    local normalized = tostring(mode or "qw"):lower()
+    if normalized == "off" then
+        return "db"
+    end
+    if normalized ~= "db" and normalized ~= "qw" and normalized ~= "ht" then
+        return "qw"
+    end
+    return normalized
+end
+
+local function getCharacterState()
+    local state = snd.char and snd.char.state
+    if (state == nil or tostring(state) == "") and gmcp and gmcp.char and gmcp.char.status then
+        state = gmcp.char.status.state
+    end
+    return tostring(state or "0")
+end
+
+local function quickWhereBlockedReason()
+    local state = getCharacterState()
+    if state == "8" then
+        return "combat"
+    elseif state == "9" then
+        return "sleeping"
+    end
+    return nil
+end
+
+local function canStartQuickWhere()
+    local reason = quickWhereBlockedReason()
+    if reason then
+        snd.utils.infoNote("Quick where skipped while " .. reason .. ".")
+        snd.utils.qwDebugNote("QW DEBUG: blocked by char.status.state=" .. getCharacterState())
+        return false
+    end
+    return true
+end
+
+local xcpModeDescriptions = {
+    db = "db - use stored DB/mapped rooms only",
+    qw = "qw - live where, exact-match selected target",
+    ht = "ht - live hunt, then exact live where",
+}
+
+local function collectKnownMobNames(activity, options)
+    local opts = options or {}
+    local names = {}
+
+    if snd.targets and snd.targets.list then
+        for _, target in ipairs(snd.targets.list) do
+            if (not activity or target.activity == activity) and not target.dead then
+                local name = snd.utils.trim(target.mob or target.name or "")
+                if name ~= "" then
+                    table.insert(names, name)
+                end
+            end
+        end
+    end
+
+    if opts.includeConwin and snd.conwin and snd.conwin.mobs then
+        for _, mob in ipairs(snd.conwin.mobs) do
+            if not mob.dead then
+                local name = snd.utils.trim(mob.name or "")
+                if name ~= "" then
+                    table.insert(names, name)
+                end
+            end
+        end
+    end
+
+    return names
+end
+
+local function commandSelectorForTarget(target, mode, options)
+    if not target then return "", "none" end
+    local name = snd.utils.trim(target.name or target.mob or "")
+    local areaKey = snd.utils.trim(target.area or target.arid or "")
+    if name == "" then
+        local keyword = snd.utils.trim(target.keyword or "")
+        return keyword, keyword ~= "" and "stored-keyword" or "empty"
+    end
+
+    local knownNames = collectKnownMobNames(target.activity, {
+        includeConwin = mode == "kill",
+    })
+    local selector, reason = snd.utils.buildMobCommandSelector(name, knownNames, {
+        mode = mode,
+        areaKey = areaKey,
+    })
+
+    if selector == "" then
+        selector = snd.utils.trim(target.keyword or target.matchedMobName or snd.utils.findKeyword(name))
+        reason = "fallback-keyword"
+    end
+
+    if options and options.debugContext then
+        snd.utils.debugNote(string.format(
+            "%s selector for '%s': '%s' (%s)",
+            options.debugContext,
+            name,
+            selector,
+            tostring(reason)
+        ))
+    end
+
+    return selector, reason
+end
+
 -------------------------------------------------------------------------------
 -- Module Loading Helpers
 -------------------------------------------------------------------------------
@@ -360,23 +469,30 @@ end
 function snd.commands.xcp(args)
     args = snd.utils.trim(args or "")
 
-    local modeArg = args:match("^mode%s*(.*)$")
+    local modeArg = nil
+    if args == "mode" then
+        modeArg = ""
+    else
+        modeArg = args:match("^mode%s+(.+)$")
+    end
     if modeArg ~= nil then
         local normalized = snd.utils.trim(modeArg or ""):lower()
-        local options = {
-            ht = "ht - do hunt trick",
-            qw = "qw - do quick where",
-            off = "off - no additional action",
-        }
+        if normalized == "off" then
+            normalized = "db"
+        end
         if normalized == "" then
-            snd.utils.infoNote("Current 'xcp' mode: " .. (options[snd.config.xcpActionMode or "qw"] or options.qw) .. ".")
-            snd.utils.infoNote("Syntax: xcp mode <ht|qw|off>")
-        elseif options[normalized] then
+            local currentMode = normalizeXcpActionMode(snd.config.xcpActionMode or "qw")
+            snd.utils.infoNote("Current 'xcp' mode: " .. (xcpModeDescriptions[currentMode] or xcpModeDescriptions.qw) .. ".")
+            snd.utils.infoNote("Syntax: xcp mode <db|qw|ht>")
+            snd.utils.infoNote("  db: use stored DB/mapped rooms; no live where/hunt after arrival.")
+            snd.utils.infoNote("  qw: live where selected target, accepting only exact returned mob names.")
+            snd.utils.infoNote("  ht: live hunt selected target, then exact live where.")
+        elseif xcpModeDescriptions[normalized] then
             snd.config.xcpActionMode = normalized
-            snd.utils.infoNote("Set 'xcp' mode to: " .. options[normalized] .. ".")
+            snd.utils.infoNote("Set 'xcp' mode to: " .. xcpModeDescriptions[normalized] .. ".")
             snd.saveState()
         else
-            snd.utils.infoNote("Invalid xcp mode. Syntax: xcp mode <ht|qw|off>")
+            snd.utils.infoNote("Invalid xcp mode. Syntax: xcp mode <db|qw|ht>")
         end
         return
     end
@@ -550,13 +666,10 @@ local function selectTargetEntry(target)
         if target.activity == "cp" or target.activity == "gq" then
             local results = snd.mapper.searchMobLocations(target.mob, target.arid)
             if not results or #results == 0 then
-                local keyword = target.keyword or snd.utils.findKeyword(target.mob)
-                if keyword and keyword ~= "" then
-                    snd.commands.qw(keyword)
-                end
+                snd.commands.qw("")
             end
         elseif target.keyword then
-            snd.commands.qw(target.keyword)
+            snd.commands.qw("")
         end
     end
     return true
@@ -566,6 +679,16 @@ function snd.commands.nx()
     local current = snd.targets.current
     local nxOverride = snd.nav and snd.nav.nxOverride or nil
     local useAdhocQuickWhere = nxOverride and nxOverride.mode == "adhoc_qw"
+    local initialQuickWhere = snd.nav and snd.nav.quickWhere or nil
+    if not useAdhocQuickWhere
+        and initialQuickWhere
+        and initialQuickWhere.isAdhoc == true
+        and initialQuickWhere.active
+        and initialQuickWhere.rooms
+        and #initialQuickWhere.rooms > 0
+    then
+        useAdhocQuickWhere = true
+    end
 
     local scopedActivity = getScopedActivity()
     if not useAdhocQuickWhere
@@ -582,20 +705,33 @@ function snd.commands.nx()
         return
     end
 
+    local function currentQuickWhereList()
+        local quickWhere = snd.nav and snd.nav.quickWhere or nil
+        if not quickWhere or not quickWhere.active or not quickWhere.rooms or #quickWhere.rooms == 0 then
+            return nil
+        end
+
+        if useAdhocQuickWhere or quickWhere.isAdhoc == true then
+            return quickWhere
+        end
+
+        local quickWhereKey = tostring(quickWhere.targetKey or "")
+        local currentQuickWhereKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
+        if quickWhereKey == "" or currentQuickWhereKey == "" or quickWhereKey == currentQuickWhereKey then
+            return quickWhere
+        end
+
+        return nil
+    end
+
     local currentKey = snd.commands.buildTargetKeyFromCurrent(current)
     if not snd.nav.nxState or snd.nav.nxState.targetKey ~= currentKey then
         snd.nav.nxState = {
             targetKey = currentKey,
             arrived = false,
         }
-        if useAdhocQuickWhere then
-            local qwRooms = snd.nav and snd.nav.quickWhere and snd.nav.quickWhere.rooms or nil
-            if qwRooms and #qwRooms > 0 then
-                snd.nav.nxState.arrived = true
-            else
-                snd.commands.gotoTarget()
-                return
-            end
+        if currentQuickWhereList() then
+            snd.nav.nxState.arrived = true
         else
             snd.commands.gotoTarget()
             return
@@ -605,25 +741,20 @@ function snd.commands.nx()
     if not snd.nav.nxState.arrived then
         local targetRoom = current.roomId
         local currentRoom = snd.room and snd.room.current and snd.room.current.rmid or nil
-        if useAdhocQuickWhere and (not targetRoom or tostring(targetRoom) == "") then
-            local qwRooms = snd.nav and snd.nav.quickWhere and snd.nav.quickWhere.rooms or nil
-            if qwRooms and #qwRooms > 0 then
-                snd.nav.nxState.arrived = true
-            end
-        end
-        if snd.nav.nxState.arrived then
-            -- ad-hoc quick-where overrides do not require a concrete target room;
-            -- once a room cycle exists we can proceed directly to cycling logic.
-        elseif targetRoom and currentRoom and tostring(targetRoom) == tostring(currentRoom) then
+        if currentQuickWhereList() then
             snd.nav.nxState.arrived = true
-        else
+        end
+        if targetRoom and currentRoom and tostring(targetRoom) == tostring(currentRoom) then
+            snd.nav.nxState.arrived = true
+        end
+        if not snd.nav.nxState.arrived then
             snd.commands.gotoTarget()
             return
         end
     end
 
-    local quickWhere = snd.nav.quickWhere
-    if quickWhere and quickWhere.active and quickWhere.rooms and #quickWhere.rooms > 0 then
+    local quickWhere = currentQuickWhereList()
+    if quickWhere then
         if not useAdhocQuickWhere then
             local quickWhereKey = quickWhere.targetKey or ""
             local currentQuickWhereKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
@@ -691,7 +822,10 @@ function snd.commands.nx()
         end
 
         local currentRoomIndex = findRoomIndex(currentRoom)
-        foundIndex = currentRoomIndex or findRoomIndex(targetRoom)
+        foundIndex = currentRoomIndex
+        if not foundIndex and (not currentRoom or tostring(currentRoom) == "") then
+            foundIndex = findRoomIndex(targetRoom)
+        end
 
         local nextIndex = nil
         local wrappingCycle = false
@@ -711,10 +845,10 @@ function snd.commands.nx()
         quickWhere.index = nextIndex
         persistQuickWhereScope(quickWhere.scope or (current and current.activity))
 
-        -- For cp/gq wrap, honor configured xcp mode (ht|qw|off) without
+        -- For cp/gq wrap, honor configured xcp mode (db|qw|ht) without
         -- forcing an extra move back to room #1 first.
         if wrappingCycle and current and (current.activity == "cp" or current.activity == "gq") then
-            local wrapMode = (snd.config and snd.config.xcpActionMode) or "qw"
+            local wrapMode = normalizeXcpActionMode((snd.config and snd.config.xcpActionMode) or "qw")
             if wrapMode == "qw" and snd.commands and snd.commands.qw then
                 snd.utils.debugNote("NX: wrap detected, refreshing quick-where without extra move")
                 snd.commands.qw("")
@@ -724,7 +858,7 @@ function snd.commands.nx()
                 snd.commands.ht("")
                 return
             end
-            -- wrapMode == "off": fall through to normal room movement.
+            -- wrapMode == "db": fall through to normal room movement.
         end
 
         local nextRoomId = quickWhere.rooms[nextIndex]
@@ -809,7 +943,7 @@ end
 -- qw - Quick Where
 -------------------------------------------------------------------------------
 
-local function resolveSelectedTargetKeyword()
+local function resolveSelectedTargetKeyword(mode)
     local function hasText(value)
         return snd.utils.trim(tostring(value or "")) ~= ""
     end
@@ -821,21 +955,38 @@ local function resolveSelectedTargetKeyword()
 
     local keyword = ""
     local exactNameHint = ""
-    if snd.targets.current and hasText(snd.targets.current.keyword) then
-        keyword = snd.targets.current.keyword
+    if snd.targets.current and (hasText(snd.targets.current.name) or hasText(snd.targets.current.keyword)) then
+        keyword = commandSelectorForTarget(snd.targets.current, mode or "where", {
+            debugContext = "QW",
+        })
         if hasText(snd.targets.current.name) then
             exactNameHint = snd.targets.current.name
         end
-    elseif snd.quest and snd.quest.active and snd.quest.target and hasText(snd.quest.target.keyword) then
-        keyword = snd.quest.target.keyword
-        exactNameHint = snd.quest.target.mob or ""
+    elseif snd.quest and snd.quest.active and snd.quest.target
+        and (hasText(snd.quest.target.keyword) or hasText(snd.quest.target.mob))
+    then
+        local questTarget = {
+            name = snd.quest.target.mob or "",
+            keyword = snd.quest.target.keyword or "",
+            activity = "quest",
+            area = snd.quest.target.arid or snd.quest.target.area or "",
+        }
+        keyword = commandSelectorForTarget(questTarget, mode or "where", {
+            debugContext = "QW quest",
+        })
+        exactNameHint = questTarget.name
     end
 
     return keyword, exactNameHint
 end
 
-local function runQuickWhere(args, exact)
+local function runQuickWhere(args, exact, options)
     args = snd.utils.trim(args or "")
+    local opts = options or {}
+
+    if not canStartQuickWhere() then
+        return
+    end
 
     local function hasText(value)
         return snd.utils.trim(tostring(value or "")) ~= ""
@@ -845,6 +996,7 @@ local function runQuickWhere(args, exact)
     local rawKeyword = keyword
     local exactNameHint = ""
     local startIndex = 1
+    local selectedTargetLookup = opts.forceTargetExact == true
 
     local prefixedIndex, prefixedKeyword = keyword:match("^(%d+)%.(.+)$")
     if prefixedIndex and prefixedKeyword then
@@ -857,29 +1009,46 @@ local function runQuickWhere(args, exact)
     local lowered = keyword:lower()
     if lowered == "target" or lowered == "current" then
         keyword = ""
+        selectedTargetLookup = true
     elseif lowered == "cp_target" then
         for _, target in ipairs(snd.targets.list or {}) do
-            if target.activity == "cp" and not target.dead and target.keyword and target.keyword ~= "" then
-                keyword = target.keyword
+            if target.activity == "cp" and not target.dead then
+                keyword = commandSelectorForTarget(target, "where", {
+                    debugContext = "QW cp_target",
+                })
                 exactNameHint = target.mob or ""
+                selectedTargetLookup = true
                 break
             end
         end
     elseif lowered == "gq_target" then
         for _, target in ipairs(snd.targets.list or {}) do
-            if target.activity == "gq" and not target.dead and target.keyword and target.keyword ~= "" then
-                keyword = target.keyword
+            if target.activity == "gq" and not target.dead then
+                keyword = commandSelectorForTarget(target, "where", {
+                    debugContext = "QW gq_target",
+                })
                 exactNameHint = target.mob or ""
+                selectedTargetLookup = true
                 break
             end
         end
     elseif lowered == "quest_target" and snd.quest and snd.quest.target then
-        keyword = snd.quest.target.keyword or ""
-        exactNameHint = snd.quest.target.mob or ""
+        local questTarget = {
+            name = snd.quest.target.mob or "",
+            keyword = snd.quest.target.keyword or "",
+            activity = "quest",
+            area = snd.quest.target.arid or snd.quest.target.area or "",
+        }
+        keyword = commandSelectorForTarget(questTarget, "where", {
+            debugContext = "QW quest_target",
+        })
+        exactNameHint = questTarget.name
+        selectedTargetLookup = true
     end
 
     local scopedActivity = getScopedActivity()
     local isAdhocQw = rawKeyword ~= ""
+        and not selectedTargetLookup
         and lowered ~= "target"
         and lowered ~= "current"
         and lowered ~= "cp_target"
@@ -888,7 +1057,8 @@ local function runQuickWhere(args, exact)
 
     -- If no args, use current target in active tab scope
     if keyword == "" then
-        keyword, exactNameHint = resolveSelectedTargetKeyword()
+        keyword, exactNameHint = resolveSelectedTargetKeyword("where")
+        selectedTargetLookup = true
         if keyword == "" then
             snd.utils.infoNote("No target selected. Usage: qw <keyword>")
             return
@@ -897,12 +1067,20 @@ local function runQuickWhere(args, exact)
 
     keyword = snd.utils.trim(keyword or "")
     if keyword:lower() == "target" or keyword:lower() == "current" then
-        keyword = snd.utils.trim(resolveSelectedTargetKeyword() or "")
+        keyword, exactNameHint = resolveSelectedTargetKeyword("where")
+        selectedTargetLookup = true
     end
     if keyword == "" then
         snd.utils.infoNote("No target keyword available. Usage: qw <keyword>")
         return
     end
+
+    if hasText(opts.exactMatchText) then
+        exactNameHint = opts.exactMatchText
+        selectedTargetLookup = true
+    end
+
+    local requireExactTarget = exact == true or hasText(exactNameHint) or opts.forceTargetExact == true
 
     snd.triggers.enableQuickWhereTriggers()
     snd.nav = snd.nav or {}
@@ -922,22 +1100,35 @@ local function runQuickWhere(args, exact)
         snd.nav.quickWhere.requestedKeyword = keyword
         snd.nav.quickWhere.lookupKeyword = keyword
         snd.nav.quickWhere.index = startIndex
-        snd.nav.quickWhere.exact = exact == true
-        if exact then
+        snd.nav.quickWhere.exact = requireExactTarget
+        snd.nav.quickWhere.completed = false
+        snd.nav.quickWhere.accepted = false
+        snd.nav.quickWhere.awaitingCommandEcho = true
+        snd.nav.quickWhere.probePending = false
+        snd.nav.quickWhere.exactTargetName = (selectedTargetLookup and hasText(exactNameHint)) and exactNameHint or nil
+        if requireExactTarget then
             local exactText = ""
-            if isAdhocQw then
-                exactText = keyword
-            elseif exactNameHint ~= "" then
+            if exactNameHint ~= "" then
                 exactText = exactNameHint
+            elseif isAdhocQw then
+                exactText = keyword
             elseif snd.targets and snd.targets.current and snd.targets.current.name and snd.targets.current.name ~= "" then
                 exactText = snd.targets.current.name
             else
                 exactText = keyword
             end
             snd.nav.quickWhere.exactMatchText = exactText
+            snd.utils.qwDebugNote(string.format(
+                "QW DEBUG: exact live match required target='%s', selector='%s', start=%d",
+                tostring(exactText),
+                tostring(keyword),
+                tonumber(startIndex) or 1
+            ))
         else
             snd.nav.quickWhere.exactMatchText = nil
+            snd.nav.quickWhere.exactTargetName = nil
         end
+        snd.nav.quickWhere.source = opts.source or (selectedTargetLookup and "target" or "adhoc")
         snd.nav.quickWhere.scope = scopedActivity or (snd.targets.current and snd.targets.current.activity) or "unknown"
         if snd.nav.quickWhere.processTimer then
             killTimer(snd.nav.quickWhere.processTimer)
@@ -1004,6 +1195,9 @@ function snd.commands.processQuickWhereResult()
     if #matchesToProcess == 0 then
         snd.utils.qwDebugNote("QW DEBUG: process result received no captured matches")
         quickWhere.processed = true
+        quickWhere.completed = true
+        quickWhere.awaitingCommandEcho = false
+        quickWhere.probePending = false
         snd.triggers.disableQuickWhereTriggers()
         return
     end
@@ -1015,18 +1209,41 @@ function snd.commands.processQuickWhereResult()
     local preservedActivity = snd.targets.current.activity
     local quickWhereScope = quickWhere.scope
     local isAdhocQuickWhere = quickWhere.isAdhoc == true
+    local preservesSelectedIdentity = snd.utils.trim(quickWhere.exactTargetName or "") ~= ""
     local originalName = snd.utils.trim(snd.targets.current.name or "")
     local matchedName = snd.utils.trim(lastMatch.mob or "")
+    -- whole-word token match: "tree" finds "red tree" and "a large tree", but not "pirate" for "rat"
+    local qwKeyword = snd.utils.trim(
+        quickWhere.requestedKeyword or quickWhere.lookupKeyword or ""
+    ):lower()
+    local function keywordTokensInName(lcKeyword, lcName)
+        local nameWords = {}
+        for w in lcName:gmatch("%a+") do nameWords[w] = true end
+        for token in lcKeyword:gmatch("%a+") do
+            if not nameWords[token] then return false end
+        end
+        return lcKeyword:find("%a") ~= nil
+    end
+    local lcOriginal = originalName:lower()
+    local lcMatched  = matchedName:lower()
     local hasStableIdentity = (originalName == "" or matchedName == "")
-        or (originalName:lower() == matchedName:lower())
+        or snd.utils.mobIdentityMatches(lcOriginal, lcMatched, 30)
+        or (qwKeyword ~= ""
+            and keywordTokensInName(qwKeyword, lcOriginal)
+            and keywordTokensInName(qwKeyword, lcMatched))
     local nextActivity = "qw"
     if hasStableIdentity and (not isAdhocQuickWhere) and (quickWhereScope == "cp" or quickWhereScope == "gq" or quickWhereScope == "quest") then
         nextActivity = quickWhereScope
     elseif hasStableIdentity and (not isAdhocQuickWhere) and (preservedActivity == "cp" or preservedActivity == "gq" or preservedActivity == "quest") then
         nextActivity = preservedActivity
     end
-    snd.targets.current.name = lastMatch.mob or snd.targets.current.name
-    snd.targets.current.keyword = snd.utils.findKeyword(lastMatch.mob or snd.targets.current.name or "")
+
+    if preservesSelectedIdentity then
+        snd.utils.qwDebugNote("QW DEBUG: preserving selected target name/keyword after exact live match")
+    else
+        snd.targets.current.name = lastMatch.mob or snd.targets.current.name
+        snd.targets.current.keyword = snd.utils.findKeyword(lastMatch.mob or snd.targets.current.name or "")
+    end
     snd.targets.current.matchedMobName = lastMatch.mob or snd.targets.current.matchedMobName
     snd.targets.current.activity = nextActivity
     snd.targets.current.roomName = lastMatch.room or snd.targets.current.roomName
@@ -1074,7 +1291,10 @@ function snd.commands.processQuickWhereResult()
     end
     results = dedupedResults
 
-    local chanceMob = (lastMatch and lastMatch.mob) or (snd.targets.current and snd.targets.current.name) or nil
+    local chanceMob = snd.utils.trim(quickWhere.exactTargetName or "")
+    if chanceMob == "" then
+        chanceMob = (lastMatch and lastMatch.mob) or (snd.targets.current and snd.targets.current.name) or nil
+    end
     local roomidList = {}
     for _, entry in ipairs(results) do
         local roomId = tonumber(entry.rmid)
@@ -1179,7 +1399,7 @@ function snd.commands.processQuickWhereResult()
             if scoped then
                 local scopedName = snd.utils.trim(scoped.name or "")
                 local nameMatchesScoped = scopedName ~= "" and matchedName ~= ""
-                    and scopedName:lower() == matchedName:lower()
+                    and snd.utils.mobIdentityMatches(scopedName, matchedName, 30)
                 if nameMatchesScoped then
                     scoped.roomId = firstRoomId
                     scoped.roomName = lastMatch.room
@@ -1198,6 +1418,9 @@ function snd.commands.processQuickWhereResult()
             snd.nav.quickWhere.targetKey = nil
         end
         snd.nav.quickWhere.processed = true
+        snd.nav.quickWhere.completed = true
+        snd.nav.quickWhere.awaitingCommandEcho = false
+        snd.nav.quickWhere.probePending = false
         snd.nav.quickWhere.pendingMatches = {}
         persistQuickWhereScope(snd.nav.quickWhere.scope)
     end
@@ -1228,6 +1451,7 @@ function snd.commands.ht(args)
 
     local startIndex = 1
     local keyword = args
+    local exactMatchText = ""
     local prefixedIndex, prefixedKeyword = keyword:match("^(%d+)%.(.+)$")
     if prefixedIndex and prefixedKeyword then
         startIndex = tonumber(prefixedIndex) or 1
@@ -1236,12 +1460,17 @@ function snd.commands.ht(args)
 
     -- If no args, use current target
     if keyword == "" then
-        if snd.targets.current and snd.targets.current.keyword then
-            keyword = snd.targets.current.keyword
+        if snd.targets.current and (snd.targets.current.name or snd.targets.current.keyword) then
+            keyword, exactMatchText = resolveSelectedTargetKeyword("where")
         else
             snd.utils.infoNote("No target selected. Usage: ht <keyword>")
             return
         end
+    end
+    keyword = snd.utils.trim(keyword or "")
+    if keyword == "" then
+        snd.utils.infoNote("No target keyword available. Usage: ht <keyword>")
+        return
     end
 
     -- Enable hunt triggers
@@ -1253,6 +1482,7 @@ function snd.commands.ht(args)
         index = startIndex,
         firstTarget = true,
         active = true,
+        exactMatchText = exactMatchText,
     }
 
     if startIndex > 1 then
@@ -1289,14 +1519,22 @@ function snd.commands.huntTrickComplete()
     local ht = snd.nav.huntTrick
     local ix = tonumber(ht.index) or 1
     local keyword = ht.keyword
+    local exactMatchText = ht.exactMatchText
 
     snd.commands.stopHunt(true)
 
     if keyword and keyword ~= "" then
+        local qwOptions = {
+            source = "ht",
+        }
+        if exactMatchText and exactMatchText ~= "" then
+            qwOptions.forceTargetExact = true
+            qwOptions.exactMatchText = exactMatchText
+        end
         if ix > 1 then
-            snd.commands.qw(string.format("%d.%s", ix, keyword))
+            runQuickWhere(string.format("%d.%s", ix, keyword), false, qwOptions)
         else
-            snd.commands.qw(keyword)
+            runQuickWhere(keyword, false, qwOptions)
         end
     else
         snd.utils.debugNote("You no longer have a target. Stopping hunt trick.")
@@ -1325,6 +1563,7 @@ function snd.commands.stopHunt(silent)
         snd.nav.huntTrick.active = false
         snd.nav.huntTrick.index = 1
         snd.nav.huntTrick.firstTarget = true
+        snd.nav.huntTrick.exactMatchText = nil
     end
     snd.triggers.disableGroup("Hunt")
     if not silent then
@@ -1517,7 +1756,9 @@ function snd.commands.xkill()
     -- xkill should always prioritize the selected current target and only
     -- consider quest fallback when no current target exists.
     if currentTarget then
-        keyword = snd.utils.trim(tostring(currentTarget.keyword or ""))
+        keyword = snd.utils.trim(commandSelectorForTarget(currentTarget, "kill", {
+            debugContext = "xkill",
+        }) or "")
         if keyword == "" and currentTarget.matchedMobName then
             keyword = snd.utils.trim(tostring(currentTarget.matchedMobName or ""))
         end
@@ -1529,7 +1770,7 @@ function snd.commands.xkill()
             return
         end
     else
-        keyword = select(1, resolveSelectedTargetKeyword())
+        keyword = select(1, resolveSelectedTargetKeyword("kill"))
         if not keyword or keyword == "" then
             snd.utils.infoNote("No target selected. Use xcp to select a target first.")
             return
@@ -2206,11 +2447,11 @@ function snd.commands.showHelp()
     cecho("<yellow>Targeting & Combat<reset>\n")
     cecho("  "); emitHelpCommandLink("xcp <n>", "xcp 1", "Select target by number"); cecho("       - Select target by number\n")
     cecho("  "); emitHelpCommandLink("xcp", "xcp", "Show clickable target list"); cecho("           - Show clickable target list\n")
-    cecho("  "); emitHelpCommandLink("xcp mode <ht|qw|off>", "xcp mode", "Set post-xcp action mode"); cecho(" - Set post-xcp action\n")
+    cecho("  "); emitHelpCommandLink("xcp mode <db|qw|ht>", "xcp mode", "Set post-xcp action mode"); cecho(" - Set post-xcp action\n")
     cecho("  "); emitHelpCommandLink("nx", "nx", "Go to next/current target"); cecho("            - Go to next/current target\n")
-    cecho("  "); emitHelpCommandLink("xkill", "xkill", "Kill current target"); cecho("         - Kill current target\n")
+    cecho("  "); emitHelpCommandLink("xkill", "xkill", "Kill current target"); cecho("         - Kill current target with precise temporary selector\n")
     cecho("\n<yellow>Navigation & Search<reset>\n")
-    cecho("  "); emitHelpCommandLink("qw [mob]", "qw", "Quick where"); cecho("      - Quick where (find mob)\n")
+    cecho("  "); emitHelpCommandLink("qw [mob]", "qw", "Quick where"); cecho("      - Live where + mapper room list\n")
     cecho("  "); emitHelpCommandLink("qwx [mob]", "qwx", "Quick where exact"); cecho("    - Quick where exact match\n")
     cecho("  "); emitHelpCommandLink("ht [mob]", "ht", "Hunt trick"); cecho("      - Hunt trick (track mob)\n")
     cecho("  "); emitHelpCommandLink("ah [mob]", "ah", "Auto hunt"); cecho("       - Auto-hunt loop\n")
@@ -2254,7 +2495,7 @@ function snd.commands.showConwinHelp()
     cecho("  "); emitHelpCommandLink("snd conwin focusid <strict | fallback>", "snd conwin focusid", "Show current focus mode"); cecho(" - Show focus mode (set strict to require selected duplicate)\n")
     cecho("  "); emitHelpCommandLink("snd conwin aligntags <on|off>", "snd conwin aligntags", "Show alignment tag setting"); cecho(" - Show alignment tags state (G/E markers)\n")
     cecho("\n<dim_gray>Clicking a mob line sends kill command.\n")
-    cecho("<dim_gray>For duplicate names, ConWin uses numbered form (e.g. kill 2.name).<reset>\n")
+    cecho("<dim_gray>ConWin chooses distinctive kill selectors; duplicate exact names use numbered form (e.g. kill 2.name).<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
@@ -2305,7 +2546,7 @@ function snd.commands.showConwinHelp()
     cechoLink("<cyan>snd conwin aligntags <on|off><reset>", [[snd.commands.snd("conwin aligntags")]], "Show alignment tag display setting", true)
     cecho(" - Show alignment tags setting ((G)/(E) prefixes)\n")
     cecho("\n<dim_gray>Clicking a mob line sends kill command.\n")
-    cecho("<dim_gray>For duplicate names, ConWin uses numbered form (e.g. kill 2.name).<reset>\n")
+    cecho("<dim_gray>ConWin chooses distinctive kill selectors; duplicate exact names use numbered form (e.g. kill 2.name).<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
@@ -2315,13 +2556,14 @@ function snd.commands.showCommandHelp()
     cecho("<yellow>Target Selection:<reset>\n")
     cecho("  <cyan>xcp<reset>              Show all targets\n")
     cecho("  <cyan>xcp <n><reset>          Select target #n\n")
+    cecho("  <cyan>xcp mode <db|qw|ht><reset>  Post-arrival target mode (db=stored list, qw=exact live where, ht=hunt then exact where)\n")
     cecho("\n<yellow>Navigation:<reset>\n")
     cecho("  <cyan>nx<reset>               Go to current target\n")
     cecho("  <cyan>xrt <area|roomid><reset>  Go to area or room (portal-aware)\n")
     cecho("  <cyan>xrtforce <area|roomid><reset>  Go to area/room (ignores exits.level locks)\n")
     cecho("  <cyan>walkto <area|roomid><reset>  Walk to area or room (no portals)\n")
-    cecho("  <cyan>qw [keyword]<reset>     Where is the mob?\n")
-    cecho("  <cyan>ht [keyword]<reset>     Hunt trick to mob\n")
+    cecho("  <cyan>qw [keyword]<reset>     Live where + mapper room list; selected target uses exact returned-name matching\n")
+    cecho("  <cyan>ht [keyword]<reset>     Hunt trick to mob; selected target follows with exact live where\n")
     cecho("\n<yellow>Configuration:<reset>\n")
     cecho("  <cyan>xset<reset>             Show all settings\n")
     cecho("  <cyan>xset sound [on|off|volume <n%>]<reset> Toggle/query sound alerts\n")
@@ -2367,8 +2609,11 @@ function snd.commands.showConfigHelp()
     cecho("  <cyan>expressmin<reset>   <number>  Min kills before express applies\n")
     cecho("  <cyan>autocheck<reset>    <on|smart|off>  Post-kill CP/GQ recheck mode\n")
     cecho("  <cyan>autocheck kills<reset> <number>  SMART mode: run check every N kills\n")
-    
-    cecho("  <cyan>xcp mode<reset>     <ht|qw|off>  Action after arriving for cp/gq targets\n")
+   
+    cecho("  <cyan>xcp mode<reset>     <db|qw|ht>  Post-arrival CP/GQ target mode\n")
+    cecho("                db = use stored DB/mapped rooms only\n")
+    cecho("                qw = live where and accept only exact selected-target mob names\n")
+    cecho("                ht = live hunt, then exact live where\n")
     cecho("  <cyan>mob tags<reset>     xset mob help|tags|delete|nowhere|nohunt|priority\n")
     cecho("  <cyan>window<reset>       on/off - GUI window\n")
     cecho("  <cyan>sound<reset>        on/off/volume - Sound alerts and volume\n")
@@ -2480,7 +2725,7 @@ function snd.commands.showConfig()
     cecho(string.format("  <cyan>silent<reset>      %s\n", snd.config.silentMode and "ON" or "OFF"))
     cecho(string.format("  <cyan>speed<reset>       %s\n", snd.config.speed))
     cecho(string.format("  <cyan>nxaction<reset>    %s\n", snd.config.nxAction))
-    cecho(string.format("  <cyan>xcpmode<reset>     %s\n", snd.config.xcpActionMode or "qw"))
+    cecho(string.format("  <cyan>xcpmode<reset>     %s\n", normalizeXcpActionMode(snd.config.xcpActionMode or "qw")))
     cecho(string.format("  <cyan>express<reset>     %s\n", snd.config.express.enabled and "ON" or "OFF"))
     cecho(string.format("  <cyan>expressmin<reset>  %d\n", snd.config.express.minKillCount))
     cecho(string.format("  <cyan>autocheck<reset>   %s (kills=%d)\n",
@@ -2633,8 +2878,8 @@ function snd.commands.showTargets()
                             cecho("<red>")
                             setUnderline(true)
                             echoLink(target.mob,
-                                [[snd.commands.qw(]] .. string.format("%q", target.mob) .. [[)]],
-                                "Quick where: " .. target.mob, true)
+                                [[snd.commands.selectAndQuickWhere(]] .. selectIndex .. [[, "]] .. target.activity .. [[")]],
+                                "Select and exact quick where: " .. target.mob, true)
                             setUnderline(false)
                             cecho("<reset>")
                         else
@@ -2865,6 +3110,16 @@ function snd.commands.selectAndGo(index, activity)
     tempTimer(0.1, function()
         snd.commands.gotoTarget()
     end)
+end
+
+--- Select a target and run exact quick where if selection did not already do it
+function snd.commands.selectAndQuickWhere(index, activity)
+    snd.commands.selectTarget(index, activity)
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    if quickWhere and quickWhere.processed == false then
+        return
+    end
+    snd.commands.qw("")
 end
 
 --- Go to an area by key (for clickable links)

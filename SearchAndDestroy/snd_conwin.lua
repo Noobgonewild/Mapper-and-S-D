@@ -189,6 +189,7 @@ function CW.tryMobDetectConfirmedTarget()
         if CW.roomHasPlayers() then return false end
     end
 
+    CW.mobDetectDispatched = true
     
     return true
 end
@@ -265,7 +266,16 @@ function CW.killCommandFor(index)
     if m.dead then return nil end
     local base = trim(cfg().killCommand)
     if base == "" then base = "kill" end
-    local kw = snd.utils.findKeyword(m.name)
+    local aliveNames = {}
+    for _, other in ipairs(CW.mobs) do
+        if not other.dead and other.name and other.name ~= "" then
+            table.insert(aliveNames, other.name)
+        end
+    end
+    local kw = snd.utils.buildMobCommandSelector(m.name, aliveNames, {mode = "kill"})
+    if not kw or kw == "" then
+        kw = snd.utils.findKeyword(m.name)
+    end
     local aliveDupCount = 0
     local aliveDupIndex = 1
     local targetName = normalizeMobName(m.name)
@@ -318,7 +328,9 @@ function CW.selectMobForKeyword(keyword, dupIndex)
         if not m.dead then
             local mobKeyword = trim(snd.utils.findKeyword(m.name)):lower()
             local mobName = normalizeMobName(m.name)
-            if mobKeyword == kw or mobName:find(kw, 1, true) then
+            if mobKeyword == kw or mobName:find(kw, 1, true)
+                or (snd.utils.mobSelectorMatchesName and snd.utils.mobSelectorMatchesName(kw, m.name))
+            then
                 matches[#matches + 1] = m
             end
         end
@@ -343,7 +355,19 @@ function CW.trackAttackCommand(command)
 
     if lowered == "xkill" then
         local t = snd.targets and snd.targets.current
-        local keyword = t and (t.keyword or t.matchedMobName or snd.utils.findKeyword(t.name or "")) or ""
+        local keyword = ""
+        if t then
+            local names = {}
+            for _, m in ipairs(CW.mobs or {}) do
+                if not m.dead and m.name and m.name ~= "" then
+                    table.insert(names, m.name)
+                end
+            end
+            keyword = snd.utils.buildMobCommandSelector(t.name or t.mob or "", names, {mode = "kill"})
+            if keyword == "" then
+                keyword = t.keyword or t.matchedMobName or snd.utils.findKeyword(t.name or "")
+            end
+        end
         if t and t.name and keyword:find("%-") and snd.gmcp and snd.gmcp.guessMobKeyword then
             local arid = snd.room and snd.room.current and snd.room.current.arid
             local guessed = trim(snd.gmcp.guessMobKeyword(t.name, arid) or "")
@@ -362,14 +386,13 @@ function CW.trackAttackCommand(command)
     local rest = trim(raw:sub(#base + 1))
     if rest == "" then return end
 
-    local token = rest:match("^(%S+)")
-    if not token or token == "" then return end
-
-    local dupIndex, keyword = token:match("^(%d+)%.(.+)$")
+    local dupIndex, keyword = rest:match("^(%d+)%.(.+)$")
     if not keyword or keyword == "" then
-        keyword = token
+        keyword = rest
         dupIndex = 1
     end
+    keyword = trim(keyword)
+    if keyword == "" then return end
     CW.noteAttackByKeyword(keyword, dupIndex)
 end
 

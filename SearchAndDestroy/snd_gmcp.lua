@@ -612,24 +612,30 @@ function snd.gmcp.emitQuestReward()
     local reward = snd.quest.pendingReward
     local totalQp = (reward.qp or 0) + (snd.quest.blessingBonus or 0) + (snd.quest.extraBonus or 0)
     local gold = reward.gold or 0
+    local tp = reward.tp or 0
+    local trains = reward.trains or 0
+    local pracs = reward.pracs or 0
     local durationSeconds = nil
 
     if snd.db then
         local endedHistory = snd.db.historyEnd(snd.db.HISTORY_TYPE_QUEST, snd.db.HISTORY_STATUS_COMPLETE, {
             qp = totalQp,
             gold = gold,
-            tp = reward.tp or 0,
-            trains = reward.trains or 0,
-            pracs = reward.pracs or 0,
+            tp = tp,
+            trains = trains,
+            pracs = pracs,
         })
         if endedHistory then
             totalQp = tonumber(endedHistory.qp_rewards) or totalQp
             gold = tonumber(endedHistory.gold_rewards) or gold
+            tp = tonumber(endedHistory.tp_rewards) or tp
+            trains = tonumber(endedHistory.train_rewards) or trains
+            pracs = tonumber(endedHistory.prac_rewards) or pracs
             durationSeconds = tonumber(endedHistory.duration_seconds) or durationSeconds
         end
     end
 
-    snd.utils.reportQuestCompletion(totalQp, gold, durationSeconds)
+    snd.utils.reportQuestCompletion(totalQp, gold, durationSeconds, tp, trains, pracs)
 
     snd.quest.pendingReward = nil
     snd.quest.rewardTimer = nil
@@ -896,6 +902,7 @@ function snd.gmcp.onConfig()
     -- Check noexp setting
     if config.noexp then
         snd.char.noexp = (config.noexp == "YES")
+        snd.char.noexpPending = nil
         snd.utils.debugNote("config.noexp: " .. tostring(snd.char.noexp))
     end
 
@@ -908,6 +915,34 @@ end
 -- Auto Noexp Check
 -------------------------------------------------------------------------------
 
+function snd.gmcp.setNoexp(enabled, message, managed)
+    if not snd.char then
+        return false
+    end
+
+    local desired = enabled and "on" or "off"
+    if snd.char.noexpPending or snd.char.noexp == enabled then
+        return false
+    end
+
+    if managed ~= nil then
+        snd.char.autoNoexpManaged = managed == true
+    end
+    snd.char.noexpPending = desired
+    snd.char.noexpCommandEcho = desired
+    snd.char.noexpCommandAt = os.clock()
+    snd.char.noexp = enabled
+    sendGMCP("config noexp " .. desired)
+
+    if message and message ~= "" then
+        snd.utils.infoNote(message)
+    end
+    if snd.gui and snd.gui.updateNoexp then
+        snd.gui.updateNoexp()
+    end
+    return true
+end
+
 function snd.gmcp.checkAutoNoexp()
     if not snd.config.anex.automatic then
         return
@@ -918,22 +953,20 @@ function snd.gmcp.checkAutoNoexp()
     local tnl = tonumber(snd.char.tnl) or 0
     local campaignStatus = tostring(snd.char.autoNoexpCampaignStatus or "unknown")
     local checkedLevel = tonumber(snd.char.autoNoexpCampaignLevel) or 0
+    if campaignStatus == "active" then
+        snd.char.autoNoexpCampaignStatus = "unknown"
+        campaignStatus = "unknown"
+    end
 
     -- Levels 200+ should always have noexp off (mirrors original behavior).
     if level >= 200 then
-        if snd.char.noexp then
-            sendGMCP("config noexp off")
-            snd.utils.infoNote("Search and Destroy: Turning noexp OFF (you have reached level " .. level .. ")")
-        end
+        snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (you have reached level " .. level .. ")", false)
         return
     end
 
     -- Cutoff 0 means automatic noexp is disabled.
     if cutoff <= 0 then
-        if snd.char.noexp then
-            sendGMCP("config noexp off")
-            snd.utils.infoNote("Search and Destroy: Turning noexp OFF (auto noexp is disabled)")
-        end
+        snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (auto noexp is disabled)", false)
         return
     end
 
@@ -952,23 +985,42 @@ function snd.gmcp.checkAutoNoexp()
     end
 
     if campaignStatus ~= "eligible" then
-        if snd.char.noexp then
-            sendGMCP("config noexp off")
-            snd.utils.infoNote("Search and Destroy: Turning noexp OFF (you cannot take a campaign at this level yet)")
-        end
+        snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (you cannot take a campaign at this level yet)", false)
         return
     end
 
     if tnl < cutoff then
-        if not snd.char.noexp then
-            sendGMCP("config noexp on")
-            snd.utils.infoNote("Search and Destroy: Turning noexp ON (your TNL is less than " .. cutoff .. ")")
-        end
+        snd.gmcp.setNoexp(true, "Search and Destroy: Turning noexp ON (your TNL is less than " .. cutoff .. ")", true)
     else
-        if snd.char.noexp then
-            sendGMCP("config noexp off")
-            snd.utils.infoNote("Search and Destroy: Turning noexp OFF (your TNL is greater than " .. cutoff .. ")")
-        end
+        snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (your TNL is greater than " .. cutoff .. ")", false)
+    end
+end
+
+--- Release noexp after a campaign is accepted and re-check eligibility next time.
+function snd.gmcp.setCampaignActiveForAutoNoexp()
+    if not snd.char then
+        return
+    end
+
+    snd.char.autoNoexpCampaignLevel = tonumber(snd.char.level) or 0
+    snd.char.autoNoexpCampaignStatus = "unknown"
+
+    if not snd.config.anex.automatic and not snd.char.autoNoexpManaged then
+        return
+    end
+
+    snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (campaign accepted)", false)
+end
+
+--- Clear legacy active campaign eligibility state.
+function snd.gmcp.clearCampaignActiveForAutoNoexp()
+    if not snd.char then
+        return
+    end
+
+    if tostring(snd.char.autoNoexpCampaignStatus or "") == "active" then
+        snd.char.autoNoexpCampaignStatus = "unknown"
+        snd.char.autoNoexpCampaignLevel = tonumber(snd.char.level) or 0
     end
 end
 
@@ -986,9 +1038,8 @@ function snd.gmcp.setCampaignEligibility(canTakeCampaign)
     snd.char.autoNoexpCampaignLevel = level
     snd.char.autoNoexpCampaignStatus = canTakeCampaign and "eligible" or "blocked"
 
-    if not canTakeCampaign and snd.char.noexp then
-        sendGMCP("config noexp off")
-        snd.utils.infoNote("Search and Destroy: Turning noexp OFF (you cannot take a campaign at this level yet)")
+    if not canTakeCampaign then
+        snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (you cannot take a campaign at this level yet)", false)
     end
 
     if snd.gmcp and snd.gmcp.checkAutoNoexp then

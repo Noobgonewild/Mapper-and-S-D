@@ -57,7 +57,7 @@ snd.config = snd.config or {
     -- Next action after arriving at target (smartscan, con, scan, qs, none)
     nxAction = "qs",
     
-    -- xcp action mode compatibility: ht|qw|off
+    -- xcp post-arrival action mode: db|qw|ht (legacy "off" loads as db)
     xcpActionMode = "qw",
     
     -- Overwrite con data
@@ -174,6 +174,10 @@ snd.char = snd.char or {
     noexp = false,
     autoNoexpCampaignStatus = "unknown", -- unknown/pending/blocked/eligible
     autoNoexpCampaignLevel = 0,
+    autoNoexpManaged = false,
+    noexpPending = nil,
+    noexpCommandEcho = nil,
+    noexpCommandAt = 0,
 }
 
 -------------------------------------------------------------------------------
@@ -1176,7 +1180,12 @@ function snd.onDestinationArrived()
     end
 
     local current = snd.targets and snd.targets.current
-    local mode = snd.config and snd.config.xcpActionMode or "qw"
+    local mode = tostring((snd.config and snd.config.xcpActionMode) or "qw"):lower()
+    if mode == "off" then
+        mode = "db"
+    elseif mode ~= "db" and mode ~= "qw" and mode ~= "ht" then
+        mode = "qw"
+    end
     local nxState = snd.nav and snd.nav.nxState or nil
     local shouldRunXcpModeAction = false
     if current and nxState and nxState.arrived and not nxState.xcpActionFired then
@@ -1188,13 +1197,18 @@ function snd.onDestinationArrived()
         end
     end
 
-    if shouldRunXcpModeAction and (current.activity == "cp" or current.activity == "gq") and mode ~= "off" then
+    if shouldRunXcpModeAction and (current.activity == "cp" or current.activity == "gq") then
         if mode == "ht" and snd.commands and snd.commands.ht then
+            snd.utils.debugNote("xcp mode ht: running live hunt after arrival")
             nxState.xcpActionFired = true
             snd.commands.ht("")
         elseif mode == "qw" and snd.commands and snd.commands.qw then
+            snd.utils.debugNote("xcp mode qw: running exact live where after arrival")
             nxState.xcpActionFired = true
             snd.commands.qw("")
+        elseif mode == "db" then
+            snd.utils.debugNote("xcp mode db: using existing DB/mapped room list after arrival")
+            nxState.xcpActionFired = true
         end
     end
 

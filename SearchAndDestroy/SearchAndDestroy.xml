@@ -96,6 +96,19 @@
             </Trigger>
             
             <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>cp_accepted</name>
+                <script>snd.triggers.cpAccepted()</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^.+ tells you 'Good luck in your campaign!'$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+            
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
                 <name>cp_not_on</name>
                 <script>snd.triggers.cpNotOn()</script>
                 <mCommand></mCommand>

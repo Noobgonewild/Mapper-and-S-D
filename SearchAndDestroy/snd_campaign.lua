@@ -1455,6 +1455,15 @@ function snd.cp.onNotOnCampaign()
     snd.cp.clearCampaign()
 end
 
+--- Handle the first positive signal that a campaign has been accepted.
+function snd.cp.onCampaignAccepted()
+    snd.campaign.canGetNew = false
+
+    if snd.gmcp and snd.gmcp.setCampaignActiveForAutoNoexp then
+        snd.gmcp.setCampaignActiveForAutoNoexp()
+    end
+end
+
 --- Clear campaign state
 function snd.cp.clearCampaign()
     snd.campaign.active = false
@@ -1484,6 +1493,10 @@ function snd.cp.clearCampaign()
 
     if snd.nav and snd.nav.clearActivityQuickWhere then
         snd.nav.clearActivityQuickWhere("cp")
+    end
+
+    if snd.gmcp and snd.gmcp.clearCampaignActiveForAutoNoexp then
+        snd.gmcp.clearCampaignActiveForAutoNoexp()
     end
 
     if snd.gui and snd.gui.refresh then
@@ -1606,10 +1619,7 @@ function snd.cp.selectTarget(index)
     else
         local results = snd.mapper.searchMobLocations(target.mob, target.arid)
         if not results or #results == 0 then
-            local keyword = target.keyword or snd.utils.findKeyword(target.mob)
-            if keyword and keyword ~= "" then
-                snd.commands.qw(keyword)
-            end
+            snd.commands.qw("")
         end
     end
     

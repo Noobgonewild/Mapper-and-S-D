@@ -434,8 +434,11 @@ function snd.gq.onJoined(gqId)
         snd.config.autocheck.gqKillCounter = 0
     end
 
-    if snd.char and not snd.char.noexp then
+    if snd.gmcp and snd.gmcp.setNoexp then
+        snd.gmcp.setNoexp(true, "Search and Destroy: Turning noexp ON (joined global quest)", true)
+    elseif snd.char and not snd.char.noexp then
         sendGMCP("config noexp on")
+        snd.char.noexp = true
         snd.utils.infoNote("Search and Destroy: Turning noexp ON (joined global quest)")
     end
 
@@ -584,7 +587,7 @@ function snd.gq.onMayWinMore()
     if not snd.gquest.active then return end
     tempTimer(2, function()
         if not snd.gquest.active then return end
-        if snd.gq.getTotalRemainingKills() > 0 then return end
+		if snd.gq.getTotalRemainingKills() > 0 then return end
         local gqId = snd.gquest.joined ~= "-1" and snd.gquest.joined or snd.gquest.started
         snd.gq.onPersonallyCompleted(gqId)
     end)
@@ -739,10 +742,7 @@ function snd.gq.selectTarget(index)
     else
         local results = snd.mapper.searchMobLocations(target.mob, target.arid)
         if not results or #results == 0 then
-            local keyword = target.keyword or snd.utils.findKeyword(target.mob)
-            if keyword and keyword ~= "" then
-                snd.commands.qw(keyword)
-            end
+            snd.commands.qw("")
         end
     end
     

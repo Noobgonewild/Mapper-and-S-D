@@ -492,6 +492,8 @@ local function handle_command_inline(line)
 
   local notes_arg = line:match("^mapper notes%s+(.+)$")
   if line == "mapper notes" or notes_arg then local ok, err = mm.search_notes(notes_arg); if not ok then mm.warn(err) end; return true end
+  local searchnotes_arg = line:match("^mapper searchnotes%s+(.+)$")
+  if searchnotes_arg then local ok, err = mm.search_notes_text(searchnotes_arg); if not ok then mm.warn(err) end; return true end
 
   local special_arg = line:match("^mapper shops?%s+(.+)$")
   if line == "mapper shop" or line == "mapper shops" or special_arg then local ok, err = mm.search_special("shops", special_arg); if not ok then mm.warn(err) end; return true end
@@ -778,6 +780,7 @@ mm.alias_specs = {
   {"^mapper find%s+(.+)$", function(m) local ok, err = mm.search_text("find", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper list%s+(.+)$", function(m) local ok, err = mm.search_text("list", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper notes(?:%s+(.+))?$", function(m) local ok, err = mm.search_notes(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper searchnotes%s+(.+)$", function(m) local ok, err = mm.search_notes_text(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper shops?(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("shops", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper train(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("train", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper quest(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("quest", m[2]); if not ok then mm.warn(err) end end},

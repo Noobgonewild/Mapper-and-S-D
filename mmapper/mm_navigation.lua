@@ -234,6 +234,43 @@ function snd.mapper.normalizeDirection(dir)
     return mapperDirectionAliases[key]
 end
 
+local mapperCardinalDirectionsSql = "'n','north','s','south','e','east','w','west','u','up','d','down'"
+
+function snd.mapper.isCardinalExitDir(dir)
+    return snd.mapper.normalizeDirection(dir) ~= nil
+end
+
+function snd.mapper.shouldPreferExitDir(candidateDir, currentDir)
+    if currentDir == nil then
+        return true
+    end
+
+    local candidateIsCardinal = snd.mapper.isCardinalExitDir(candidateDir)
+    local currentIsCardinal = snd.mapper.isCardinalExitDir(currentDir)
+    if candidateIsCardinal ~= currentIsCardinal then
+        return not candidateIsCardinal
+    end
+
+    local candidateText = tostring(candidateDir or "")
+    local currentText = tostring(currentDir or "")
+    if #candidateText ~= #currentText then
+        return #candidateText > #currentText
+    end
+
+    return candidateText:lower() < currentText:lower()
+end
+
+function snd.mapper.exitPreferenceOrderSql(dirColumn)
+    dirColumn = dirColumn or "dir"
+    return string.format(
+        "CASE WHEN lower(trim(%s)) IN (%s) THEN 1 ELSE 0 END ASC, length(%s) DESC, lower(%s) ASC",
+        dirColumn,
+        mapperCardinalDirectionsSql,
+        dirColumn,
+        dirColumn
+    )
+end
+
 function snd.mapper.isInCombat()
     local state
     if gmcp and gmcp.char and gmcp.char.status then
@@ -1193,8 +1230,8 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
             AND fromuid NOT IN (%s) 
             AND %s
             AND %s
-            ORDER BY length(dir) ASC
-        ]], table.concat(roomsList, ","), visited, levelWhere, chaosWhere)
+            ORDER BY %s
+        ]], table.concat(roomsList, ","), visited, levelWhere, chaosWhere, snd.mapper.exitPreferenceOrderSql("dir"))
         
         local results = snd.mapper.db.query(sql) or {}
         roomSets[depth] = {}
@@ -1212,12 +1249,15 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
         }
 
         for idx, row in ipairs(results) do
-            -- Prefer custom exits (longer dir names)
-            roomSets[depth][row.fromuid] = {
-                fromuid = row.fromuid,
-                touid = row.touid,
-                dir = row.dir
-            }
+            -- Prefer custom cexit commands over bare cardinal exits from the same room.
+            local existingStep = roomSets[depth][row.fromuid]
+            if snd.mapper.shouldPreferExitDir(row.dir, existingStep and existingStep.dir) then
+                roomSets[depth][row.fromuid] = {
+                    fromuid = row.fromuid,
+                    touid = row.touid,
+                    dir = row.dir
+                }
+            end
 
             -- Track whether this depth can connect from source/portal/recall
             if row.fromuid == src then
@@ -1623,8 +1663,8 @@ function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits)
     local sql = string.format([[
         SELECT dir FROM exits 
         WHERE fromuid = %s AND touid = %s%s
-        ORDER BY length(dir) DESC LIMIT 1
-    ]], snd.mapper.db.escape(src), snd.mapper.db.escape(dst), where)
+        ORDER BY %s LIMIT 1
+    ]], snd.mapper.db.escape(src), snd.mapper.db.escape(dst), where, snd.mapper.exitPreferenceOrderSql("dir"))
     
     local results = snd.mapper.db.query(sql)
     if results and #results > 0 then
@@ -1727,8 +1767,8 @@ function snd.mapper.findNearestJumpRoom(src, dst, targetType, ignoreLockedExits)
             WHERE exits.fromuid IN (%s) 
             AND exits.touid NOT IN (%s) 
             AND %s
-            ORDER BY length(exits.dir) ASC
-        ]], table.concat(roomsList, ","), visited, levelWhere)
+            ORDER BY %s
+        ]], table.concat(roomsList, ","), visited, levelWhere, snd.mapper.exitPreferenceOrderSql("exits.dir"))
         
         local results = snd.mapper.db.query(sql) or {}
         roomsList = {}
@@ -1803,8 +1843,8 @@ function snd.mapper.findNearestRoomWithoutFlag(src, restrictionFlag, ignoreLocke
                   AND fromuid NOT IN ('*', '**')
                   AND touid NOT IN ('*', '**')
                   AND %s
-                ORDER BY length(dir) ASC
-            ]], snd.mapper.db.escape(node.room), levelWhere)
+                ORDER BY %s
+            ]], snd.mapper.db.escape(node.room), levelWhere, snd.mapper.exitPreferenceOrderSql("dir"))
             local exits = snd.mapper.db.query(sql) or {}
             for _, ex in ipairs(exits) do
                 local nextRoom = tostring(ex.touid or "")
@@ -1880,8 +1920,8 @@ function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
                   AND fromuid NOT IN ('*', '**')
                   AND touid NOT IN ('*', '**')
                   AND %s
-                ORDER BY length(dir) ASC
-            ]], snd.mapper.db.escape(node.room), levelWhere)
+                ORDER BY %s
+            ]], snd.mapper.db.escape(node.room), levelWhere, snd.mapper.exitPreferenceOrderSql("dir"))
             local exits = snd.mapper.db.query(sql) or {}
             for _, ex in ipairs(exits) do
                 local nextRoom = tostring(ex.touid or "")
@@ -2006,8 +2046,8 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
                   AND fromuid NOT IN ('*', '**')
                   AND touid NOT IN ('*', '**')
                   AND %s
-                ORDER BY length(dir) ASC
-            ]], snd.mapper.db.escape(node.room), levelWhere)
+                ORDER BY %s
+            ]], snd.mapper.db.escape(node.room), levelWhere, snd.mapper.exitPreferenceOrderSql("dir"))
             local exits = snd.mapper.db.query(sql) or {}
             for _, ex in ipairs(exits) do
                 local nextRoom = tostring(ex.touid or "")
@@ -2046,7 +2086,6 @@ function snd.mapper.executePath(path)
     local cardinalDirs = {
         n = true, s = true, e = true, w = true,
         u = true, d = true,
-        ne = true, nw = true, se = true, sw = true,
     }
     
     -- Helper: compress consecutive cardinal directions (s,s,e,e,e → 2s3e)
@@ -3529,8 +3568,6 @@ function snd.mapper.importFromDb()
     local dirMap = {
         n = "north", s = "south", e = "east", w = "west",
         u = "up", d = "down",
-        ne = "northeast", nw = "northwest",
-        se = "southeast", sw = "southwest"
     }
     
     while true do
@@ -3648,20 +3685,12 @@ snd.mapper.dirOffsets = {
     w  = { x = -1, y = 0,  z = 0 },
     u  = { x = 0,  y = 0,  z = 1 },
     d  = { x = 0,  y = 0,  z = -1 },
-    ne = { x = 1,  y = 1,  z = 0 },
-    nw = { x = -1, y = 1,  z = 0 },
-    se = { x = 1,  y = -1, z = 0 },
-    sw = { x = -1, y = -1, z = 0 },
     north = { x = 0,  y = 1,  z = 0 },
     south = { x = 0,  y = -1, z = 0 },
     east  = { x = 1,  y = 0,  z = 0 },
     west  = { x = -1, y = 0,  z = 0 },
     up    = { x = 0,  y = 0,  z = 1 },
     down  = { x = 0,  y = 0,  z = -1 },
-    northeast = { x = 1,  y = 1,  z = 0 },
-    northwest = { x = -1, y = 1,  z = 0 },
-    southeast = { x = 1,  y = -1, z = 0 },
-    southwest = { x = -1, y = -1, z = 0 },
 }
 
 --- Calculate coordinates for all rooms using BFS from exits
@@ -3689,9 +3718,8 @@ function snd.mapper.calculateCoordinates(startRoom)
         SELECT fromuid, touid, dir FROM exits 
         WHERE fromuid NOT IN ('*', '**') 
         AND touid NOT IN ('*', '**')
-        AND dir IN ('n','s','e','w','u','d','ne','nw','se','sw',
-                    'north','south','east','west','up','down',
-                    'northeast','northwest','southeast','southwest')
+        AND dir IN ('n','s','e','w','u','d',
+                    'north','south','east','west','up','down')
     ]])
     
     if not exitQuery or #exitQuery == 0 then

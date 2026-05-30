@@ -422,27 +422,27 @@ function mm.show_room_note(room_id, info, source)
   end
   if room_note == "" then return false end
 
-  mm.runtime = mm.runtime or {}
-  local ts = now_millis()
-  -- Mudlet may emit duplicate gmcp.room.info events for the same room payload.
-  -- Keep a tiny de-dupe window for those duplicate events only, but always show
-  -- notes triggered by explicit "look" parsing hooks such as coords_line.
   local note_source = tostring(source or "unknown")
-  if note_source ~= "coords_line" then
-    local dedupe_key = tostring(room_id or "") .. "::" .. tostring(room_note or "") .. "::" .. note_source
-    local last_key = tostring(mm.runtime.last_note_key or "")
-    local last_ts = tonumber(mm.runtime.last_note_ts or -100000) or -100000
-    if dedupe_key == last_key and (ts - last_ts) <= 150 then
-      mm.debug("suppressed duplicate room note (" .. note_source .. ")")
-      return false
-    end
-    mm.runtime.last_note_key = dedupe_key
-    mm.runtime.last_note_ts = ts
+
+  if mm.state and mm.state.debug then
+    mm.debug(string.format(
+      "room-note candidate source=%s room=%s",
+      note_source,
+      tostring(room_id)
+    ))
   end
 
   -- Defer one tick so the room title line is already printed, avoiding the
   -- note being concatenated onto the same row as the room name.
   local emit_note = function()
+    local player_state = nil
+    if gmcp and gmcp.char and gmcp.char.status and gmcp.char.status.state ~= nil then
+      player_state = tonumber(gmcp.char.status.state) or tostring(gmcp.char.status.state)
+    elseif snd and snd.char and snd.char.status and snd.char.status.state ~= nil then
+      player_state = tonumber(snd.char.status.state) or tostring(snd.char.status.state)
+    end
+    mm.debug("player state before room note emit=" .. tostring(player_state))
+    mm.debug("emitting room note (source=" .. note_source .. ", room=" .. tostring(room_id) .. ")")
     if mm.room_note then
       mm.room_note("Room note: " .. room_note)
     else
@@ -456,7 +456,6 @@ function mm.show_room_note(room_id, info, source)
   end
   return true
 end
-
 function mm.on_room_exits()
   -- Minimap updates are intentionally limited to copied ASCII map lines between
   -- <MAPSTART>/<MAPEND>; this hook remains for debug/event parity only.
@@ -567,23 +566,7 @@ function mm.on_room_vnum_line()
 end
 
 function mm.on_coords_line()
-  if not matches then return end
-  mm.runtime = mm.runtime or {}
-  local payload = tostring(matches[2] or "")
-  local cx, cy, cz = payload:match("^%s*(-?%d+),(-?%d+),(-?%d+)%s*$")
-  if cx and cy and cz then
-    mm.runtime.last_coords_x = tonumber(cx)
-    mm.runtime.last_coords_y = tonumber(cy)
-    mm.runtime.last_coords_z = tonumber(cz)
-  end
   if type(deleteLine) == "function" then deleteLine() end
-
-  -- Aardwolf "look" may not emit a fresh gmcp.room.info event for current room.
-  -- Re-show room notes when coordinates are printed, with de-dupe to avoid spam.
-  local room_id = tonumber(mm.runtime.last_room_num) or tonumber((mm.get_room_info() or {}).num)
-  if room_id then
-    mm.show_room_note(room_id, nil, "coords_line")
-  end
 end
 
 function mm.on_tag_line()
@@ -597,20 +580,8 @@ end
 function mm.on_room_info_event()
   local info = mm.get_room_info()
   local room_num = tostring(info and info.num or "")
-  local room_name = tostring(info and info.name or "")
   local room_area = tostring(info and (info.zone or info.area) or "")
 
-  mm.runtime = mm.runtime or {}
-  local now_ms = (type(getEpoch) == "function" and tonumber(getEpoch())) or math.floor((os.clock() or 0) * 1000)
-  local event_key = room_num .. "::" .. room_name .. "::" .. room_area
-  local last_key = tostring(mm.runtime.last_room_info_event_key or "")
-  local last_ms = tonumber(mm.runtime.last_room_info_event_ms or -1000) or -1000
-  if event_key == last_key and (now_ms - last_ms) <= 150 then
-    return
-  end
-
-  mm.runtime.last_room_info_event_key = event_key
-  mm.runtime.last_room_info_event_ms = now_ms
   mm.on_room_info()
   if type(raiseEvent) == "function" then
     -- Integration surface: external scripts can listen to "mm.room.changed"

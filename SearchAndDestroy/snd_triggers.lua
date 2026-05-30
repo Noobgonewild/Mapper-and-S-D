@@ -197,6 +197,12 @@ function snd.triggers.cpCanGetNew()
     end
 end
 
+function snd.triggers.cpAccepted()
+    if snd.cp and snd.cp.onCampaignAccepted then
+        snd.cp.onCampaignAccepted()
+    end
+end
+
 --- Not on campaign trigger
 function snd.triggers.cpNotOn()
     snd.cp.onNotOnCampaign()
@@ -215,6 +221,19 @@ end
 
 --- Auto-noexp manual OFF trigger
 function snd.triggers.noexpManualOff()
+    local recentAutoEcho = snd.char
+        and snd.char.noexpCommandEcho == "on"
+        and ((os.clock() - (tonumber(snd.char.noexpCommandAt) or 0)) < 5)
+    if snd.char and (snd.char.noexpPending == "on" or recentAutoEcho) then
+        snd.char.noexp = true
+        snd.char.noexpPending = nil
+        snd.char.noexpCommandEcho = nil
+        if snd.gui and snd.gui.updateNoexp then
+            snd.gui.updateNoexp()
+        end
+        return
+    end
+
     snd.config.anex.automatic = false
     snd.char.noexp = true
     snd.utils.infoNote("Search and Destroy: noexp is manually OFF. Type 'noexp' again to re-enable automatic mode.")
@@ -225,6 +244,19 @@ end
 
 --- Auto-noexp manual ON trigger
 function snd.triggers.noexpManualOn()
+    local recentAutoEcho = snd.char
+        and snd.char.noexpCommandEcho == "off"
+        and ((os.clock() - (tonumber(snd.char.noexpCommandAt) or 0)) < 5)
+    if snd.char and (snd.char.noexpPending == "off" or recentAutoEcho) then
+        snd.char.noexp = false
+        snd.char.noexpPending = nil
+        snd.char.noexpCommandEcho = nil
+        if snd.gui and snd.gui.updateNoexp then
+            snd.gui.updateNoexp()
+        end
+        return
+    end
+
     snd.config.anex.automatic = true
     snd.char.noexp = false
     if snd.gmcp and snd.gmcp.checkAutoNoexp then
@@ -251,8 +283,12 @@ function snd.triggers.noexpMustLevelBeforeCampaign()
     if snd.gmcp and snd.gmcp.setCampaignEligibility then
         snd.gmcp.setCampaignEligibility(false)
     elseif snd.char and snd.char.noexp then
-        sendGMCP("config noexp off")
-        snd.utils.infoNote("Search and Destroy: Turning noexp OFF (you cannot take a campaign at this level yet)")
+        if snd.gmcp and snd.gmcp.setNoexp then
+            snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (you cannot take a campaign at this level yet)", false)
+        else
+            sendGMCP("config noexp off")
+            snd.utils.infoNote("Search and Destroy: Turning noexp OFF (you cannot take a campaign at this level yet)")
+        end
     end
     if snd.gui and snd.gui.updateNoexp then
         snd.gui.updateNoexp()
@@ -720,24 +756,36 @@ function snd.triggers.onWhereCommandIssued()
         return
     end
 
-    snd.utils.qwDebugNote("QW DEBUG: where command observed, enabling QuickWhere capture")
-    snd.nav.quickWhere.lastMatch = nil
-    snd.nav.quickWhere.pendingMatches = {}
-    snd.nav.quickWhere.processed = false
+    local quickWhere = snd.nav.quickWhere
+    if quickWhere.completed == true and quickWhere.awaitingCommandEcho ~= true then
+        snd.utils.qwDebugNote("QW DEBUG: ignoring where echo for completed quick-where lookup")
+        return
+    end
 
-    if snd.nav.quickWhere.processTimer then
-        killTimer(snd.nav.quickWhere.processTimer)
-        snd.nav.quickWhere.processTimer = nil
+    if quickWhere.processed ~= false and quickWhere.awaitingCommandEcho ~= true then
+        return
+    end
+
+    snd.utils.qwDebugNote("QW DEBUG: where command observed, enabling QuickWhere capture")
+    quickWhere.lastMatch = nil
+    quickWhere.pendingMatches = {}
+    quickWhere.processed = false
+    quickWhere.awaitingCommandEcho = false
+    quickWhere.probePending = false
+
+    if quickWhere.processTimer then
+        killTimer(quickWhere.processTimer)
+        quickWhere.processTimer = nil
     end
 
     snd.triggers.enableQuickWhereTriggers()
 
-    if snd.nav.quickWhere.disableTimer then
-        killTimer(snd.nav.quickWhere.disableTimer)
-        snd.nav.quickWhere.disableTimer = nil
+    if quickWhere.disableTimer then
+        killTimer(quickWhere.disableTimer)
+        quickWhere.disableTimer = nil
     end
 
-    snd.nav.quickWhere.disableTimer = tempTimer(5, function()
+    quickWhere.disableTimer = tempTimer(5, function()
         if snd.nav and snd.nav.quickWhere then
             snd.nav.quickWhere.disableTimer = nil
             if snd.nav.quickWhere.processed == false then
@@ -865,21 +913,37 @@ function snd.triggers.qwMatch(matches)
     local roomName = snd.utils.trim(roomPart)
     local quickWhere = snd.nav.quickWhere
 
+    local function quickWhereBlockedReason()
+        local state = snd.char and snd.char.state
+        if (state == nil or tostring(state) == "") and gmcp and gmcp.char and gmcp.char.status then
+            state = gmcp.char.status.state
+        end
+        state = tostring(state or "0")
+        if state == "8" then
+            return "combat", state
+        elseif state == "9" then
+            return "sleeping", state
+        end
+        return nil, state
+    end
+
     snd.utils.debugNote("QW match: " .. mobName .. " in " .. roomName)
     snd.utils.qwDebugNote("QW DEBUG: trigger matched line mob='" .. mobName .. "' room='" .. roomName .. "'")
 
     local function lineMatchesTarget()
-        local mobLine = mobName:lower()
-
         if quickWhere.exact then
             local exactSource = snd.utils.trim(quickWhere.exactMatchText or "")
             if exactSource == "" and snd.targets.current and snd.targets.current.name then
                 exactSource = snd.utils.trim(snd.targets.current.name or "")
             end
-            local exactTarget = snd.utils.trim(exactSource:sub(1, 30)):lower()
-            if exactTarget ~= "" and mobLine == exactTarget then
+            if snd.utils.mobIdentityMatches(mobName, exactSource, 30) then
                 return true
             end
+            snd.utils.qwDebugNote(string.format(
+                "QW DEBUG: rejected live row mob='%s'; expected='%s'",
+                tostring(mobName),
+                tostring(exactSource)
+            ))
             return false
         end
 
@@ -889,12 +953,40 @@ function snd.triggers.qwMatch(matches)
     end
 
     if not lineMatchesTarget() then
+        if quickWhere.probePending == true then
+            snd.utils.qwDebugNote("QW DEBUG: numbered where probe already pending; ignoring duplicate rejected row")
+            return
+        end
+        local blockReason, blockState = quickWhereBlockedReason()
+        if blockReason then
+            snd.utils.infoNote("Quick where stopped while " .. blockReason .. ".")
+            snd.utils.qwDebugNote("QW DEBUG: numbered probe blocked by char.status.state=" .. tostring(blockState))
+            quickWhere.processed = true
+            quickWhere.completed = true
+            quickWhere.awaitingCommandEcho = false
+            quickWhere.probePending = false
+            snd.triggers.disableQuickWhereTriggers()
+            return
+        end
         quickWhere.index = (tonumber(quickWhere.index) or 1) + 1
         if quickWhere.index < 101 then
             local lookupKeyword = snd.utils.trim(quickWhere.lookupKeyword or quickWhere.requestedKeyword or "")
             if lookupKeyword ~= "" then
                 local cmd = string.format("where %d.%s", quickWhere.index, lookupKeyword)
                 snd.utils.qwDebugNote("QW DEBUG: line not accepted, probing next index with '" .. cmd .. "'")
+                quickWhere.probePending = true
+                quickWhere.awaitingCommandEcho = true
+                if type(tempTimer) == "function" then
+                    local activeQuickWhere = quickWhere
+                    tempTimer(0.05, function()
+                        if snd.nav and snd.nav.quickWhere == activeQuickWhere
+                            and activeQuickWhere.processed == false
+                            and activeQuickWhere.probePending == true
+                        then
+                            activeQuickWhere.probePending = false
+                        end
+                    end)
+                end
                 if snd.commands and snd.commands.sendGameCommand then
                     snd.commands.sendGameCommand(cmd, false)
                 else
@@ -902,11 +994,17 @@ function snd.triggers.qwMatch(matches)
                 end
             else
                 quickWhere.processed = true
+                quickWhere.completed = true
+                quickWhere.awaitingCommandEcho = false
+                quickWhere.probePending = false
                 snd.triggers.disableQuickWhereTriggers()
             end
         else
             snd.utils.infoNote("qw: too many fails")
             quickWhere.processed = true
+            quickWhere.completed = true
+            quickWhere.awaitingCommandEcho = false
+            quickWhere.probePending = false
             snd.triggers.disableQuickWhereTriggers()
         end
         return
@@ -924,11 +1022,18 @@ function snd.triggers.qwMatch(matches)
     }
     quickWhere.pendingMatches = {quickWhere.lastMatch}
     quickWhere.processed = true
+    quickWhere.completed = true
+    quickWhere.accepted = true
+    quickWhere.awaitingCommandEcho = false
+    quickWhere.probePending = false
 
     local ok, err = pcall(snd.commands.processQuickWhereResult)
     if not ok then
         snd.utils.errorNote("QW DEBUG: processing where result failed: " .. tostring(err))
         quickWhere.processed = true
+        quickWhere.completed = true
+        quickWhere.awaitingCommandEcho = false
+        quickWhere.probePending = false
         snd.triggers.disableQuickWhereTriggers()
     end
 end
@@ -939,12 +1044,18 @@ function snd.triggers.qwNoMatch()
     snd.utils.qwDebugNote("QW DEBUG: server returned 'There is no ... around here.'")
     
     if snd.nav.quickWhere and snd.nav.quickWhere.processed == false then
+        if snd.utils.trim(snd.nav.quickWhere.exactTargetName or "") ~= "" then
+            snd.utils.qwDebugNote("QW DEBUG: exact selected-target lookup stopped without broad fallback")
+        end
         if snd.nav.quickWhere.processTimer then
             killTimer(snd.nav.quickWhere.processTimer)
             snd.nav.quickWhere.processTimer = nil
         end
         snd.nav.quickWhere.lastMatch = nil
         snd.nav.quickWhere.processed = true
+        snd.nav.quickWhere.completed = true
+        snd.nav.quickWhere.awaitingCommandEcho = false
+        snd.nav.quickWhere.probePending = false
         snd.triggers.disableQuickWhereTriggers()
     end
 end

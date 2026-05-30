@@ -417,6 +417,196 @@ function snd.utils.findKeyword(item)
     return item:lower()
 end
 
+--- Normalize a mob name for identity comparison only.
+-- This intentionally keeps articles and punctuation; it just removes colors,
+-- collapses whitespace, and ignores case.
+-- @param name Mob name
+-- @param maxLen Optional maximum length, used for fixed-width where output
+-- @return Normalized identity string
+function snd.utils.normalizeMobIdentity(name, maxLen)
+    local text = snd.utils.stripColors(tostring(name or ""))
+    if maxLen then
+        text = text:sub(1, maxLen)
+    end
+    text = text:lower()
+    text = text:gsub("%s+", " ")
+    return snd.utils.trim(text)
+end
+
+--- Compare two mob names as identities.
+-- @param a First mob name
+-- @param b Second mob name
+-- @param maxLen Optional maximum length
+-- @return True if both normalize to the same non-empty identity
+function snd.utils.mobIdentityMatches(a, b, maxLen)
+    local left = snd.utils.normalizeMobIdentity(a, maxLen)
+    local right = snd.utils.normalizeMobIdentity(b, maxLen)
+    return left ~= "" and right ~= "" and left == right
+end
+
+local commandSelectorOmitWords = {
+    ["a"] = true,
+    ["an"] = true,
+    ["and"] = true,
+    ["at"] = true,
+    ["by"] = true,
+    ["for"] = true,
+    ["from"] = true,
+    ["in"] = true,
+    ["of"] = true,
+    ["on"] = true,
+    ["or"] = true,
+    ["some"] = true,
+    ["the"] = true,
+    ["to"] = true,
+    ["with"] = true,
+}
+
+--- Split a mob name into command-selector words.
+-- This is only for temporary MUD commands, never for storage or DB lookup.
+-- @param name Mob name
+-- @return List of lowercase selector words
+function snd.utils.mobCommandWords(name)
+    local text = snd.utils.stripColors(tostring(name or "")):lower()
+    text = text:gsub("'s", "")
+    text = text:gsub("[^%w']+", " ")
+
+    local words = {}
+    for word in text:gmatch("%S+") do
+        word = word:gsub("^'+", ""):gsub("'+$", "")
+        if word ~= "" and not commandSelectorOmitWords[word] then
+            table.insert(words, word)
+        end
+    end
+    return words
+end
+
+local function appendUnique(list, seen, value)
+    local text = snd.utils.trim(tostring(value or ""):gsub("%s+", " "))
+    if text == "" then return end
+    local key = text:lower()
+    if seen[key] then return end
+    seen[key] = true
+    table.insert(list, text)
+end
+
+--- Check whether a command selector could name a mob.
+-- @param selector Temporary command selector
+-- @param name Full mob name
+-- @return True if all selector words appear in the mob name
+function snd.utils.mobSelectorMatchesName(selector, name)
+    local selectorWords = snd.utils.mobCommandWords(selector)
+    if #selectorWords == 0 then return false end
+
+    local nameWords = {}
+    for _, word in ipairs(snd.utils.mobCommandWords(name)) do
+        nameWords[word] = true
+    end
+
+    for _, word in ipairs(selectorWords) do
+        if not nameWords[word] then
+            return false
+        end
+    end
+    return true
+end
+
+local function selectorUniquelyNamesTarget(selector, targetName, knownNames)
+    if not knownNames or #knownNames == 0 then
+        return true
+    end
+
+    local matches = 0
+    local targetMatched = false
+    for _, name in ipairs(knownNames) do
+        if snd.utils.mobSelectorMatchesName(selector, name) then
+            matches = matches + 1
+            if snd.utils.mobIdentityMatches(name, targetName) then
+                targetMatched = true
+            end
+        end
+    end
+
+    return matches == 1 and targetMatched
+end
+
+--- Build a temporary selector for MUD commands.
+-- The returned value is not suitable for storage or DB lookup.
+-- @param targetName Full target name
+-- @param knownNames Optional list of visible/active full mob names
+-- @param options Optional table: mode = "where" or "kill"
+-- @return selector, reason
+function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
+    local fullName = snd.utils.trim(targetName or "")
+    if fullName == "" then
+        return "", "empty"
+    end
+
+    local opts = options or {}
+    local mode = tostring(opts.mode or "kill"):lower()
+    local words = snd.utils.mobCommandWords(fullName)
+    local candidates = {}
+    local seen = {}
+    local guessedKeyword = nil
+
+    if snd.gmcp and snd.gmcp.guessMobKeyword then
+        local ok, guessed = pcall(snd.gmcp.guessMobKeyword, fullName, opts.areaKey)
+        if ok then
+            guessedKeyword = guessed
+        end
+    end
+
+    if fullName:find(",", 1, true) then
+        appendUnique(candidates, seen, guessedKeyword)
+        local commaLead = snd.utils.trim(fullName:match("^%s*([^,]+)") or "")
+        local leadWords = snd.utils.mobCommandWords(commaLead)
+        if #leadWords > 0 then
+            appendUnique(candidates, seen, table.concat(leadWords, " "))
+            appendUnique(candidates, seen, leadWords[1])
+        end
+    end
+
+    if #words > 0 then
+        if mode == "where" then
+            appendUnique(candidates, seen, words[#words])
+            for len = 2, #words do
+                local start = #words - len + 1
+                local chunk = {}
+                for i = start, #words do
+                    table.insert(chunk, words[i])
+                end
+                appendUnique(candidates, seen, table.concat(chunk, " "))
+            end
+        else
+            for len = 1, #words do
+                local start = #words - len + 1
+                local chunk = {}
+                for i = start, #words do
+                    table.insert(chunk, words[i])
+                end
+                appendUnique(candidates, seen, table.concat(chunk, " "))
+            end
+            for i = #words - 1, 1, -1 do
+                appendUnique(candidates, seen, words[i])
+            end
+        end
+    end
+
+    appendUnique(candidates, seen, guessedKeyword)
+    appendUnique(candidates, seen, snd.utils.findKeyword(fullName))
+    appendUnique(candidates, seen, fullName:lower())
+
+    if mode == "kill" and knownNames and #knownNames > 0 then
+        for _, candidate in ipairs(candidates) do
+            if selectorUniquelyNamesTarget(candidate, fullName, knownNames) then
+                return candidate, "unique"
+            end
+        end
+    end
+
+    return candidates[1] or "", "fallback"
+end
+
 -------------------------------------------------------------------------------
 -- Conditional Helper
 -------------------------------------------------------------------------------
@@ -642,14 +832,13 @@ end
 -- @param gold number Gold reward
 -- @param durationSeconds number|nil Optional completion duration in seconds
 -- @return true if delivered, false otherwise
-function snd.utils.reportQuestCompletion(qp, gold, durationSeconds)
+function snd.utils.reportQuestCompletion(qp, gold, durationSeconds, tp, trains, pracs)
     qp = tonumber(qp) or 0
     gold = tonumber(gold) or 0
+    tp = tonumber(tp) or 0
+    trains = tonumber(trains) or 0
+    pracs = tonumber(pracs) or 0
     local durationText = snd.utils.formatQuestCompletionDuration(durationSeconds)
-    local durationSuffix = ""
-    if durationText ~= "" then
-        durationSuffix = string.format(", <cyan>Duration: %s<reset>", durationText)
-    end
 
     local channel = "default"
     if snd.config and snd.config.reportChannel then
@@ -657,20 +846,30 @@ function snd.utils.reportQuestCompletion(qp, gold, durationSeconds)
     end
 
     if snd.utils.isDefaultReportChannel(channel) then
+        local parts = {
+            string.format("<red>QP: %d<reset>", qp),
+            string.format("<yellow>Gold: %d<reset>", gold),
+        }
+        if tp > 0 then table.insert(parts, string.format("<white>TP: %d<reset>", tp)) end
+        if trains > 0 then table.insert(parts, string.format("<cyan>Trains: %d<reset>", trains)) end
+        if pracs > 0 then table.insert(parts, string.format("<green>Pracs: %d<reset>", pracs)) end
+        if durationText ~= "" then table.insert(parts, string.format("<cyan>Duration: %s<reset>", durationText)) end
         cecho(string.format(
-            "<orange>[S&D]<reset> <magenta>Quest complete!<reset> <red>QP: %d<reset>, <yellow>Gold: %d<reset>%s\n",
-            qp,
-            gold,
-            durationSuffix
+            "<orange>[S&D]<reset> <magenta>Quest complete!<reset> %s\n",
+            table.concat(parts, ", ")
         ))
         return true
     end
 
-    local channelDurationSuffix = ""
-    if durationText ~= "" then
-        channelDurationSuffix = string.format(", @cDuration: %s@w", durationText)
-    end
-    local payload = string.format("@MQuest complete!@w @rQP: %d@w, @yGold: %d@w%s", qp, gold, channelDurationSuffix)
+    local channelParts = {
+        string.format("@rQP: %d@w", qp),
+        string.format("@yGold: %d@w", gold),
+    }
+    if tp > 0 then table.insert(channelParts, string.format("@wTP: %d@w", tp)) end
+    if trains > 0 then table.insert(channelParts, string.format("@cTrains: %d@w", trains)) end
+    if pracs > 0 then table.insert(channelParts, string.format("@gPracs: %d@w", pracs)) end
+    if durationText ~= "" then table.insert(channelParts, string.format("@cDuration: %s@w", durationText)) end
+    local payload = string.format("@MQuest complete!@w %s", table.concat(channelParts, ", "))
     return snd.utils.dispatchReportChannel(channel, payload)
 end
 

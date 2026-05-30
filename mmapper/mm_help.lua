@@ -139,6 +139,7 @@ mm.help_table = {
       { cmd = "mapper list <text>", desc = "Find rooms without the known-path limits of \"area\" and \"find\"" },
       { cmd = "mapper notes", desc = "Show nearby rooms that you marked with notes" },
       { cmd = "mapper notes <here/area>", desc = "Ditto" },
+      { cmd = "mapper searchnotes <text>", desc = "Search note text and print full matching notes" },
       { cmd = "mapper shops", desc = "Show all shops/banks" },
       { cmd = "mapper shops <here/area>", desc = "Ditto" },
       { cmd = "mapper train", desc = "Show all trainers" },
