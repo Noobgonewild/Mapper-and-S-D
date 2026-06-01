@@ -233,6 +233,58 @@ function CW.activityMarkersForMob(name)
     return table.concat(markers, "")
 end
 
+function CW.visibleNameForActivityTarget(targetName, activity)
+    local needle = trim(targetName)
+    if needle == "" then return "" end
+
+    local activityMarkers = {
+        quest = "[Q]",
+        cp = "[CP]",
+        gq = "[GQ]",
+    }
+    local marker = activityMarkers[tostring(activity or ""):lower()]
+
+    for _, m in ipairs(CW.mobs or {}) do
+        local mobName = trim(m.name or "")
+        if not m.dead and snd.utils.mobIdentityMatches(mobName, needle)
+            and (not marker or CW.activityMarkersForMob(mobName):find(marker, 1, true))
+        then
+            return mobName
+        end
+    end
+
+    if not marker then return "" end
+
+    local matches = {}
+    for _, m in ipairs(CW.mobs or {}) do
+        local mobName = trim(m.name or "")
+        if not m.dead and mobName ~= "" and CW.activityMarkersForMob(mobName):find(marker, 1, true) then
+            local selectorMatches = snd.utils.mobSelectorMatchesName(needle, mobName)
+            if not selectorMatches then
+                local mobNorm = normalizeMobName(mobName)
+                local needleNorm = normalizeMobName(needle)
+                selectorMatches = needleNorm ~= ""
+                    and (mobNorm:find(needleNorm, 1, true) or needleNorm:find(mobNorm, 1, true))
+            end
+            if selectorMatches then
+                matches[#matches + 1] = mobName
+            end
+        end
+    end
+
+    if #matches == 1 then
+        return matches[1]
+    end
+
+    for _, m in ipairs(CW.mobs or {}) do
+        local mobName = trim(m.name or "")
+        if not m.dead and snd.utils.mobIdentityMatches(mobName, needle) then
+            return mobName
+        end
+    end
+    return ""
+end
+
 local function markerToColorToken(marker)
     if marker == "[Q]" then return "<red>" end
     if marker == "[CP]" then return "<green>" end
@@ -363,9 +415,18 @@ function CW.trackAttackCommand(command)
                     table.insert(names, m.name)
                 end
             end
-            keyword = snd.utils.buildMobCommandSelector(t.name or t.mob or "", names, {mode = "kill"})
+            local selectorName = t.name or t.mob or ""
+            local visibleName = CW.visibleNameForActivityTarget(selectorName, t.activity)
+            if visibleName ~= "" then
+                selectorName = visibleName
+            end
+            keyword = snd.utils.buildMobCommandSelector(selectorName, names, {mode = "kill"})
             if keyword == "" then
-                keyword = t.keyword or t.matchedMobName or snd.utils.findKeyword(t.name or "")
+                if visibleName ~= "" then
+                    keyword = snd.utils.findKeyword(visibleName)
+                else
+                    keyword = t.keyword or t.matchedMobName or snd.utils.findKeyword(t.name or "")
+                end
             end
         end
         if t and t.name and keyword:find("%-") and snd.gmcp and snd.gmcp.guessMobKeyword then

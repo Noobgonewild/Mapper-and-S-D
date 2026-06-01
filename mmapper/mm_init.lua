@@ -92,7 +92,12 @@ function mm.initialize()
 
   local loaded, err = mm.load_native_mapper_db()
   if not loaded then
-    mm.warn("Native mapper DB was not auto-loaded: " .. tostring(err))
+    local native_path = mm.resolve_native_mapper_db(mm.state.native_mapper_db)
+    if native_path and mm.path_exists(native_path) and mm.looks_like_sqlite(native_path) then
+      mm.debug("Native mapper DB autoload skipped: configured path is SQLite live mapper DB.")
+    else
+      mm.warn("Native mapper DB was not auto-loaded: " .. tostring(err))
+    end
   end
 
   safe_step("ensure_exits_chaos_column", function()

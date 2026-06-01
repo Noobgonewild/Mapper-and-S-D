@@ -67,17 +67,44 @@ local function serialize_value(v)
   return "nil"
 end
 
-local function portal_persist_path()
-  return getMudletHomeDir() .. "/mmapper_portals.lua"
+local function persistence_dir()
+  return getMudletHomeDir() .. "/persistence"
 end
 
-local function deleted_cexits_persist_path()
-  return getMudletHomeDir() .. "/mmapper_deleted_cexits.lua"
+function mm.persistence_path(filename)
+  return persistence_dir() .. "/" .. tostring(filename or "")
 end
 
-local function deleted_portals_persist_path()
-  return getMudletHomeDir() .. "/mmapper_deleted_portals.lua"
+function mm.legacy_persistence_path(filename)
+  return getMudletHomeDir() .. "/" .. tostring(filename or "")
 end
+
+function mm.load_persistence_chunk(filename)
+  local primary = mm.persistence_path(filename)
+  local chunk = loadfile(primary)
+  if chunk then
+    return chunk, primary
+  end
+
+  local legacy = mm.legacy_persistence_path(filename)
+  chunk = loadfile(legacy)
+  if chunk then
+    return chunk, legacy
+  end
+
+  return nil, primary
+end
+
+function mm.open_persistence_file(filename, mode)
+  if type(mm.ensure_dir) == "function" then
+    mm.ensure_dir(persistence_dir())
+  end
+  return io.open(mm.persistence_path(filename), mode or "wb")
+end
+
+local PORTAL_PERSIST_FILE = "mmapper_portals.lua"
+local DELETED_CEXITS_PERSIST_FILE = "mmapper_deleted_cexits.lua"
+local DELETED_PORTALS_PERSIST_FILE = "mmapper_deleted_portals.lua"
 
 local function sanitize_deleted_cexit_entry(entry)
   if type(entry) ~= "table" then return nil end
@@ -96,7 +123,7 @@ local function sanitize_deleted_cexit_entry(entry)
 end
 
 function mm.load_deleted_cexits_persistence()
-  local chunk = loadfile(deleted_cexits_persist_path())
+  local chunk, source_path = mm.load_persistence_chunk(DELETED_CEXITS_PERSIST_FILE)
   if not chunk then return false end
   local ok, data = pcall(chunk)
   if not ok or type(data) ~= "table" then return false end
@@ -113,6 +140,9 @@ function mm.load_deleted_cexits_persistence()
     table.remove(restored, 1)
   end
   mm.state.deleted_cexits = restored
+  if source_path == mm.legacy_persistence_path(DELETED_CEXITS_PERSIST_FILE) then
+    mm.save_deleted_cexits_persistence()
+  end
   return #restored > 0
 end
 
@@ -120,7 +150,7 @@ function mm.save_deleted_cexits_persistence()
   local payload = {
     deleted = mm.state.deleted_cexits or {},
   }
-  local f = io.open(deleted_cexits_persist_path(), "wb")
+  local f = mm.open_persistence_file(DELETED_CEXITS_PERSIST_FILE, "wb")
   if not f then
     return false, "unable to open deleted cexit persistence file for writing"
   end
@@ -150,7 +180,7 @@ local function sanitize_deleted_portal_entry(entry)
 end
 
 function mm.load_deleted_portals_persistence()
-  local chunk = loadfile(deleted_portals_persist_path())
+  local chunk, source_path = mm.load_persistence_chunk(DELETED_PORTALS_PERSIST_FILE)
   if not chunk then return false end
   local ok, data = pcall(chunk)
   if not ok or type(data) ~= "table" then return false end
@@ -162,6 +192,9 @@ function mm.load_deleted_portals_persistence()
   end
   while #restored > 20 do table.remove(restored, 1) end
   mm.state.deleted_portals = restored
+  if source_path == mm.legacy_persistence_path(DELETED_PORTALS_PERSIST_FILE) then
+    mm.save_deleted_portals_persistence()
+  end
   return #restored > 0
 end
 
@@ -169,7 +202,7 @@ function mm.save_deleted_portals_persistence()
   local payload = {
     deleted = mm.state.deleted_portals or {},
   }
-  local f = io.open(deleted_portals_persist_path(), "wb")
+  local f = mm.open_persistence_file(DELETED_PORTALS_PERSIST_FILE, "wb")
   if not f then
     return false, "unable to open deleted portal persistence file for writing"
   end
@@ -202,7 +235,7 @@ local function sanitize_rebuilt_portal_entry(entry)
 end
 
 function mm.load_portal_persistence()
-  local chunk = loadfile(portal_persist_path())
+  local chunk, source_path = mm.load_persistence_chunk(PORTAL_PERSIST_FILE)
   if not chunk then return false end
   local ok, data = pcall(chunk)
   if not ok or type(data) ~= "table" then return false end
@@ -240,6 +273,9 @@ function mm.load_portal_persistence()
   end
   mm.portals.settings.bounce_portal_id = persisted_settings.bounce_portal_id and tostring(persisted_settings.bounce_portal_id) or nil
   mm.portals.settings.bounce_recall_id = persisted_settings.bounce_recall_id and tostring(persisted_settings.bounce_recall_id) or nil
+  if source_path == mm.legacy_persistence_path(PORTAL_PERSIST_FILE) then
+    mm.save_portal_persistence()
+  end
   return true
 end
 
@@ -262,7 +298,7 @@ function mm.save_portal_persistence()
       bounce_recall_id = mm.portals.settings.bounce_recall_id and tostring(mm.portals.settings.bounce_recall_id) or nil,
     },
   }
-  local f = io.open(portal_persist_path(), "wb")
+  local f = mm.open_persistence_file(PORTAL_PERSIST_FILE, "wb")
   if not f then
     return false, "unable to open portal persistence file for writing"
   end
@@ -724,7 +760,7 @@ function mm.load_native_mapper_db(path)
   end
 
   if mm.looks_like_sqlite(resolved) then
-    return false, "file looks like SQLite (likely Mushclient/Aard mapper DB), not Mudlet map export; run: mapper native convert " .. tostring(mm.state.map_db)
+    return false, "configured path is SQLite live mapper DB, not a Mudlet native map export"
   end
 
   if type(loadMap) ~= "function" then

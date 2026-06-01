@@ -1158,6 +1158,9 @@ snd.commands.xcmd(matches[2])
 if _G.snd_loader_in_progress then
     return
 end
+if _G.snd and _G.snd.initialized then
+    return
+end
 _G.snd_loader_in_progress = true
 
 local function findPackagePath()

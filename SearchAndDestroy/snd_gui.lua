@@ -1653,6 +1653,10 @@ function snd.gui.showContextMenu()
 
     cechoLink("<cyan> [Toggle Debug]", function()
         snd.config.debugMode = not snd.config.debugMode
+        if snd.debug and snd.debug.setEnabled then
+            snd.debug.setEnabled(snd.config.debugMode)
+        end
+        if snd.saveState then snd.saveState() end
         cecho(string.format("\n<green>Debug mode: %s\n", snd.config.debugMode and "ON" or "OFF"))
     end, "Toggle debug mode", true)
     cecho("  ")

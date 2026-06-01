@@ -117,26 +117,15 @@ function snd.gmcp.onCharStatus()
     snd.char.level = tonumber(status.level) or 0
     snd.char.tnl = tonumber(status.tnl) or snd.char.tnl or 0
 
-    -- Only reset post-login reconcile guard when returning to login flow states:
-    -- 1 = login screen, 2 = MOTD/login sequence. Do NOT reset for normal in-game
-    -- states (AFK, note, combat, sleeping, resting, running, etc.).
-    local loginFlowStates = {
-        ["1"] = true,
-        ["2"] = true,
-    }
-    if oldState == "3" and loginFlowStates[snd.char.state] then
-        snd.postLoginReconcileDone = false
-    end
-
     if oldLevel ~= nil and tonumber(oldLevel) ~= tonumber(snd.char.level) then
         snd.char.autoNoexpCampaignStatus = "unknown"
     end
     
-    -- Check if player just became active (state 3)
-    if snd.char.state == "3" and oldState ~= "3" then
-        -- Player is now active/logged in
-        if snd.db and snd.db.clearSeenCache then
-            snd.db.clearSeenCache()
+    if snd.char.state == "3" then
+        if oldState ~= "3" then
+            if snd.db and snd.db.clearSeenCache then
+                snd.db.clearSeenCache()
+            end
         end
         if snd.onPlayerActive then
             snd.onPlayerActive()

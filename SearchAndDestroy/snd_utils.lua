@@ -462,11 +462,25 @@ local commandSelectorOmitWords = {
     ["with"] = true,
 }
 
---- Split a mob name into command-selector words.
--- This is only for temporary MUD commands, never for storage or DB lookup.
--- @param name Mob name
--- @return List of lowercase selector words
-function snd.utils.mobCommandWords(name)
+local commandSelectorRelationWords = {
+    ["around"] = true,
+    ["at"] = true,
+    ["beside"] = true,
+    ["by"] = true,
+    ["for"] = true,
+    ["from"] = true,
+    ["in"] = true,
+    ["inside"] = true,
+    ["near"] = true,
+    ["of"] = true,
+    ["on"] = true,
+    ["outside"] = true,
+    ["to"] = true,
+    ["under"] = true,
+    ["with"] = true,
+}
+
+local function rawMobCommandWords(name)
     local text = snd.utils.stripColors(tostring(name or "")):lower()
     text = text:gsub("'s", "")
     text = text:gsub("[^%w']+", " ")
@@ -474,11 +488,45 @@ function snd.utils.mobCommandWords(name)
     local words = {}
     for word in text:gmatch("%S+") do
         word = word:gsub("^'+", ""):gsub("'+$", "")
+        if word ~= "" then
+            table.insert(words, word)
+        end
+    end
+    return words
+end
+
+--- Split a mob name into command-selector words.
+-- This is only for temporary MUD commands, never for storage or DB lookup.
+-- @param name Mob name
+-- @return List of lowercase selector words
+function snd.utils.mobCommandWords(name)
+    local words = {}
+    for _, word in ipairs(rawMobCommandWords(name)) do
         if word ~= "" and not commandSelectorOmitWords[word] then
             table.insert(words, word)
         end
     end
     return words
+end
+
+local function mobCommandHeadWords(name)
+    local head = {}
+    local brokeOnRelation = false
+
+    for _, word in ipairs(rawMobCommandWords(name)) do
+        if commandSelectorRelationWords[word] and #head > 0 then
+            brokeOnRelation = true
+            break
+        end
+        if word ~= "" and not commandSelectorOmitWords[word] then
+            table.insert(head, word)
+        end
+    end
+
+    if not brokeOnRelation then
+        return {}
+    end
+    return head
 end
 
 local function appendUnique(list, seen, value)
@@ -488,6 +536,22 @@ local function appendUnique(list, seen, value)
     if seen[key] then return end
     seen[key] = true
     table.insert(list, text)
+end
+
+local function appendKillWordCandidates(candidates, seen, words)
+    if not words or #words == 0 then return end
+    appendUnique(candidates, seen, words[#words])
+    for i = #words - 1, 1, -1 do
+        appendUnique(candidates, seen, words[i])
+    end
+    for len = 2, #words do
+        local start = #words - len + 1
+        local chunk = {}
+        for i = start, #words do
+            table.insert(chunk, words[i])
+        end
+        appendUnique(candidates, seen, table.concat(chunk, " "))
+    end
 end
 
 --- Check whether a command selector could name a mob.
@@ -518,10 +582,16 @@ local function selectorUniquelyNamesTarget(selector, targetName, knownNames)
 
     local matches = 0
     local targetMatched = false
+    local seenIdentities = {}
+    local targetIdentity = snd.utils.normalizeMobIdentity(targetName)
     for _, name in ipairs(knownNames) do
         if snd.utils.mobSelectorMatchesName(selector, name) then
-            matches = matches + 1
-            if snd.utils.mobIdentityMatches(name, targetName) then
+            local identity = snd.utils.normalizeMobIdentity(name)
+            if identity ~= "" and not seenIdentities[identity] then
+                seenIdentities[identity] = true
+                matches = matches + 1
+            end
+            if identity ~= "" and identity == targetIdentity then
                 targetMatched = true
             end
         end
@@ -578,17 +648,8 @@ function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
                 appendUnique(candidates, seen, table.concat(chunk, " "))
             end
         else
-            for len = 1, #words do
-                local start = #words - len + 1
-                local chunk = {}
-                for i = start, #words do
-                    table.insert(chunk, words[i])
-                end
-                appendUnique(candidates, seen, table.concat(chunk, " "))
-            end
-            for i = #words - 1, 1, -1 do
-                appendUnique(candidates, seen, words[i])
-            end
+            appendKillWordCandidates(candidates, seen, mobCommandHeadWords(fullName))
+            appendKillWordCandidates(candidates, seen, words)
         end
     end
 
@@ -697,6 +758,7 @@ end
 -- @return Aard color code like @R
 function snd.utils.getReportAardColor(eventType)
     local t = tostring(eventType or "general"):lower()
+    -- Use bright Aard @ codes because reports are stored with color codes; Mudlet tags may not survive.
     local map = {
         quest = "@R",
         campaign = "@G",
@@ -802,7 +864,7 @@ function snd.utils.reportLine(text, eventType)
         return true
     end
 
-    local payload = string.format("%s[%s]@w %s", snd.utils.getReportAardColor(eventType), style.label, text)
+    local payload = string.format("%s[%s]@W %s", snd.utils.getReportAardColor(eventType), style.label, text)
     return snd.utils.dispatchReportChannel(channel, payload)
 end
 
@@ -862,14 +924,14 @@ function snd.utils.reportQuestCompletion(qp, gold, durationSeconds, tp, trains, 
     end
 
     local channelParts = {
-        string.format("@rQP: %d@w", qp),
-        string.format("@yGold: %d@w", gold),
+        string.format("@RQP: %d@W", qp),
+        string.format("@YGold: %d@W", gold),
     }
-    if tp > 0 then table.insert(channelParts, string.format("@wTP: %d@w", tp)) end
-    if trains > 0 then table.insert(channelParts, string.format("@cTrains: %d@w", trains)) end
-    if pracs > 0 then table.insert(channelParts, string.format("@gPracs: %d@w", pracs)) end
-    if durationText ~= "" then table.insert(channelParts, string.format("@cDuration: %s@w", durationText)) end
-    local payload = string.format("@MQuest complete!@w %s", table.concat(channelParts, ", "))
+    if tp > 0 then table.insert(channelParts, string.format("@WTP: %d@W", tp)) end
+    if trains > 0 then table.insert(channelParts, string.format("@CTrains: %d@W", trains)) end
+    if pracs > 0 then table.insert(channelParts, string.format("@GPracs: %d@W", pracs)) end
+    if durationText ~= "" then table.insert(channelParts, string.format("@CDuration: %s@W", durationText)) end
+    local payload = string.format("@MQuest complete!@W %s", table.concat(channelParts, ", "))
     return snd.utils.dispatchReportChannel(channel, payload)
 end
 
@@ -917,14 +979,14 @@ function snd.utils.reportCampaignCompletion(rewards, durationSeconds)
     end
 
     local channelParts = {
-        string.format("@rQP: %d@w", qp),
-        string.format("@yGold: %d@w", gold),
+        string.format("@RQP: %d@W", qp),
+        string.format("@YGold: %d@W", gold),
     }
-    if tp > 0 then table.insert(channelParts, string.format("@wTP: %d@w", tp)) end
-    if trains > 0 then table.insert(channelParts, string.format("@cTrains: %d@w", trains)) end
-    if pracs > 0 then table.insert(channelParts, string.format("@gPracs: %d@w", pracs)) end
-    if durationText ~= "" then table.insert(channelParts, string.format("@cDuration: %s@w", durationText)) end
-    local payload = string.format("@GCampaign complete!@w %s", table.concat(channelParts, ", "))
+    if tp > 0 then table.insert(channelParts, string.format("@WTP: %d@W", tp)) end
+    if trains > 0 then table.insert(channelParts, string.format("@CTrains: %d@W", trains)) end
+    if pracs > 0 then table.insert(channelParts, string.format("@GPracs: %d@W", pracs)) end
+    if durationText ~= "" then table.insert(channelParts, string.format("@CDuration: %s@W", durationText)) end
+    local payload = string.format("@GCampaign complete!@W %s", table.concat(channelParts, ", "))
     if type(tempTimer) == "function" then
         tempTimer(0.2, function()
             snd.utils.dispatchReportChannel(channel, payload)

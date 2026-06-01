@@ -626,21 +626,24 @@ local function appendTargetTag(tag, color)
         return
     end
 
-    -- Preserve inline colors by copying/pasting the rendered row (same approach used by mapper minimap).
-    if type(selectCurrentLine) == "function" and type(copy) == "function" and type(appendBuffer) == "function" then
-        selectCurrentLine()
-        copy()
-        if type(deleteLine) == "function" then
-            deleteLine()
-        end
-        echo("\n")
-        appendBuffer("main")
-        cecho(" " .. color .. tag .. "<white>")
+    local tagText = " " .. color .. tag .. "<white>"
+
+    -- Suffix the matched line in place so room-char colors stay intact.
+    if type(suffix) == "function" and type(cecho) == "function" then
+        suffix(tagText, cecho)
         return
     end
 
-    -- Fallback if copy/paste APIs are unavailable.
-    replaceLine(line .. " " .. color .. tag .. "<white>")
+    -- Fallback for older Mudlet builds without suffix().
+    if type(cecho) == "function" then
+        cecho(tagText)
+        return
+    end
+
+    -- Fallback if colored echo is unavailable.
+    if type(replaceLine) == "function" then
+        replaceLine(line .. " " .. tag)
+    end
 end
 
 function snd.triggers.tagCpTargetLine()

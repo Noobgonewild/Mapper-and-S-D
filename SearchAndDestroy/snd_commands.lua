@@ -203,13 +203,25 @@ local function commandSelectorForTarget(target, mode, options)
     local knownNames = collectKnownMobNames(target.activity, {
         includeConwin = mode == "kill",
     })
-    local selector, reason = snd.utils.buildMobCommandSelector(name, knownNames, {
+    local selectorName = name
+    if mode == "kill" and snd.conwin and snd.conwin.visibleNameForActivityTarget then
+        local visibleName = snd.utils.trim(snd.conwin.visibleNameForActivityTarget(name, target.activity) or "")
+        if visibleName ~= "" then
+            selectorName = visibleName
+        end
+    end
+
+    local selector, reason = snd.utils.buildMobCommandSelector(selectorName, knownNames, {
         mode = mode,
         areaKey = areaKey,
     })
 
     if selector == "" then
-        selector = snd.utils.trim(target.keyword or target.matchedMobName or snd.utils.findKeyword(name))
+        if selectorName ~= name then
+            selector = snd.utils.trim(snd.utils.findKeyword(selectorName))
+        else
+            selector = snd.utils.trim(target.keyword or target.matchedMobName or snd.utils.findKeyword(name))
+        end
         reason = "fallback-keyword"
     end
 
@@ -217,7 +229,7 @@ local function commandSelectorForTarget(target, mode, options)
         snd.utils.debugNote(string.format(
             "%s selector for '%s': '%s' (%s)",
             options.debugContext,
-            name,
+            selectorName,
             selector,
             tostring(reason)
         ))
@@ -331,13 +343,39 @@ function snd.commands.snd(args)
     elseif args == "reload" then
         snd.loadState()
         snd.utils.infoNote("State reloaded.")
-    elseif args == "debug" then
-        if snd.debug and snd.debug.toggle then
-            snd.debug.toggle()
+    elseif args == "debug" or args:match("^debug%s+") then
+        local mode = snd.utils.trim(args:match("^debug%s+(.+)$") or ""):lower()
+        local nextValue
+        if mode == "" then
+            if snd.debug and snd.debug.toggle then
+                nextValue = snd.debug.toggle()
+            else
+                snd.config.debugMode = not snd.config.debugMode
+                nextValue = snd.config.debugMode
+                snd.utils.infoNote("Debug mode: " .. (nextValue and "ON" or "OFF"))
+            end
+        elseif mode == "on" or mode == "true" or mode == "1" then
+            nextValue = true
+            if snd.debug and snd.debug.setEnabled then
+                snd.debug.setEnabled(true)
+            else
+                snd.config.debugMode = true
+            end
+            snd.utils.infoNote("Debug mode: ON")
+        elseif mode == "off" or mode == "false" or mode == "0" then
+            nextValue = false
+            if snd.debug and snd.debug.setEnabled then
+                snd.debug.setEnabled(false)
+            else
+                snd.config.debugMode = false
+            end
+            snd.utils.infoNote("Debug mode: OFF")
         else
-            snd.config.debugMode = not snd.config.debugMode
-            snd.utils.infoNote("Debug mode: " .. (snd.config.debugMode and "ON" or "OFF"))
+            snd.utils.infoNote("Usage: snd debug [on|off]")
+            return
         end
+        snd.config.debugMode = nextValue
+        snd.saveState()
     elseif args:match("^window%s+font%s+%d+$") then
         local size = tonumber(args:match("^window%s+font%s+(%d+)$"))
         if size and size >= 6 then
@@ -2609,7 +2647,7 @@ function snd.commands.showConfigHelp()
     cecho("  <cyan>expressmin<reset>   <number>  Min kills before express applies\n")
     cecho("  <cyan>autocheck<reset>    <on|smart|off>  Post-kill CP/GQ recheck mode\n")
     cecho("  <cyan>autocheck kills<reset> <number>  SMART mode: run check every N kills\n")
-   
+    
     cecho("  <cyan>xcp mode<reset>     <db|qw|ht>  Post-arrival CP/GQ target mode\n")
     cecho("                db = use stored DB/mapped rooms only\n")
     cecho("                qw = live where and accept only exact selected-target mob names\n")
@@ -3295,7 +3333,7 @@ function snd.commands.reportStatsLine(reportText, typeLabel, channelOverride)
         return
     end
     local style = snd.utils.getReportTypeStyle(typeLabel)
-    local payload = string.format("%s[%s]@w %s", snd.utils.getReportAardColor(typeLabel), style.label, reportText)
+    local payload = string.format("%s[%s]@W %s", snd.utils.getReportAardColor(typeLabel), style.label, reportText)
     if snd.utils and snd.utils.dispatchReportChannel then
         snd.utils.dispatchReportChannel(channel, payload)
     else
@@ -3446,10 +3484,10 @@ local function historyTypeColor(v)
 end
 
 local function historyTypeAardColor(v)
-    if tonumber(v) == snd.db.HISTORY_TYPE_QUEST then return "@r" end
-    if tonumber(v) == snd.db.HISTORY_TYPE_GQUEST then return "@c" end
-    if tonumber(v) == snd.db.HISTORY_TYPE_CAMPAIGN then return "@g" end
-    return "@w"
+    if tonumber(v) == snd.db.HISTORY_TYPE_QUEST then return "@R" end
+    if tonumber(v) == snd.db.HISTORY_TYPE_GQUEST then return "@C" end
+    if tonumber(v) == snd.db.HISTORY_TYPE_CAMPAIGN then return "@G" end
+    return "@W"
 end
 
 local function formatLocalDateTime(ts)
@@ -3551,15 +3589,15 @@ function snd.commands.buildHistoryRowChannelText(row)
     local pr = tonumber(row.prac_rewards) or 0
     local gold = tonumber(row.gold_rewards) or 0
     local rewardParts = {}
-    if qp > 0 then table.insert(rewardParts, string.format("@r%dqp@w", qp)) end
-    if tp > 0 then table.insert(rewardParts, string.format("@c%dtp@w", tp)) end
-    if tr > 0 then table.insert(rewardParts, string.format("@g%dtr@w", tr)) end
-    if pr > 0 then table.insert(rewardParts, string.format("@m%dpr@w", pr)) end
-    if gold > 0 then table.insert(rewardParts, string.format("@y%dg@w", gold)) end
-    local rewardsText = #rewardParts > 0 and table.concat(rewardParts, " ") or "@D-@w"
+    if qp > 0 then table.insert(rewardParts, string.format("@R%dqp@W", qp)) end
+    if tp > 0 then table.insert(rewardParts, string.format("@C%dtp@W", tp)) end
+    if tr > 0 then table.insert(rewardParts, string.format("@G%dtr@W", tr)) end
+    if pr > 0 then table.insert(rewardParts, string.format("@M%dpr@W", pr)) end
+    if gold > 0 then table.insert(rewardParts, string.format("@Y%dg@W", gold)) end
+    local rewardsText = #rewardParts > 0 and table.concat(rewardParts, " ") or "@D-@W"
 
     return string.format(
-        "%s%s@w | @wlv %s@w | @D%s@w -> @D%s@w | @c%s@w | @m%s@w | rewards: %s",
+        "%s%s@W | @Wlv %s@W | @D%s@W -> @D%s@W | @C%s@W | @M%s@W | rewards: %s",
         typeColor,
         typeLabel,
         level,

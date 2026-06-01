@@ -22,13 +22,62 @@ snd.version = "7.0.0"
 snd.schemaVersion = 6
 snd.fullVersion = "Search & Destroy v" .. snd.version
 
+local function sndFileExists(path)
+    if type(io.exists) == "function" then
+        return io.exists(path)
+    end
+    local f = io.open(path, "r")
+    if not f then return false end
+    f:close()
+    return true
+end
+
+local function sndSaveFilePath()
+    return getMudletHomeDir() .. "/persistence/snd_state.lua"
+end
+
+local function mergeTables(target, source)
+    if type(target) ~= "table" or type(source) ~= "table" then
+        return target
+    end
+    for k, v in pairs(source) do
+        if type(v) == "table" and type(target[k]) == "table" then
+            mergeTables(target[k], v)
+        else
+            target[k] = v
+        end
+    end
+    return target
+end
+
+local function loadPersistedStateEarly()
+    local path = sndSaveFilePath()
+    if not sndFileExists(path) or type(table.load) ~= "function" then
+        return nil
+    end
+
+    local success, state = pcall(function()
+        local t = {}
+        table.load(path, t)
+        return t
+    end)
+    if success and type(state) == "table" then
+        return state
+    end
+    return nil
+end
+
+local persistedStateEarly = loadPersistedStateEarly()
+local existingConfig = type(snd.config) == "table" and snd.config or nil
+local wasInitialized = snd.initialized == true
+
 -------------------------------------------------------------------------------
 -- Configuration
 -------------------------------------------------------------------------------
 
-snd.config = snd.config or {
+local defaultConfig = {
     -- Debug mode
-    debugMode = true,
+    debugMode = false,
     
     -- Silent mode - suppress some messages
     silentMode = false,
@@ -124,6 +173,14 @@ snd.config = snd.config or {
         chips = true,
     },
 }
+
+snd.config = defaultConfig
+if wasInitialized and existingConfig then
+    mergeTables(snd.config, existingConfig)
+end
+if persistedStateEarly and type(persistedStateEarly.config) == "table" then
+    mergeTables(snd.config, persistedStateEarly.config)
+end
 
 -------------------------------------------------------------------------------
 -- Room State
@@ -555,7 +612,7 @@ snd.colors = snd.colors or {
 -- Save File Path
 -------------------------------------------------------------------------------
 
-snd.saveFile = getMudletHomeDir() .. "/persistence/snd_state.lua"
+snd.saveFile = sndSaveFilePath()
 -- snd.dbFile = getMudletHomeDir() .. "/snd_database.db"
 
 -------------------------------------------------------------------------------
@@ -565,7 +622,7 @@ snd.saveFile = getMudletHomeDir() .. "/persistence/snd_state.lua"
 -- Flag to track if we've initialized
 snd.initialized = false
 snd.windowAutoOpenPending = false
-snd.postLoginReconcileDone = snd.postLoginReconcileDone or false
+snd.postLoginCpCheckDone = snd.postLoginCpCheckDone or false
 
 function snd.initialize(silent)
     if snd.initialized then return end
@@ -684,19 +741,15 @@ function snd.onPlayerActive()
         snd.utils.infoNote(snd.fullVersion .. " ready. Type 'xhelp' for commands.")
     end
 
-    -- Campaign state has no GMCP payload; reconcile any open campaign history session
-    -- once per active-login transition.
-    if not snd.postLoginReconcileDone then
-        snd.postLoginReconcileDone = true
-        if snd.cp and snd.cp.hasOpenHistorySession and snd.cp.hasOpenHistorySession() then
-            if snd.cp.requestCheck then
-                snd.cp.requestCheck(0.8, "main.postLoginHistoryReconcile")
-            else
-                tempTimer(0.8, function()
-                    snd.utils.debugNote("Sending 'cp check' (reason: main.postLoginHistoryReconcile:fallback)")
-                    send("cp check", false)
-                end)
-            end
+    if not snd.postLoginCpCheckDone then
+        snd.postLoginCpCheckDone = true
+        if snd.cp and snd.cp.requestCheck then
+            snd.cp.requestCheck(0.8, "main.postLoginCpSync")
+        else
+            tempTimer(0.8, function()
+                snd.utils.debugNote("Sending 'cp check' (reason: main.postLoginCpSync:fallback)")
+                send("cp check", false)
+            end)
         end
     end
 end
@@ -787,7 +840,7 @@ end
 --- Load state from file
 function snd.loadState()
     snd.utils.debugNote("Loading state from " .. snd.saveFile)
-    if not io.exists(snd.saveFile) then
+    if not sndFileExists(snd.saveFile) then
         snd.utils.debugNote("No saved state found, using defaults")
         return
     end
@@ -805,15 +858,7 @@ function snd.loadState()
     
     -- Merge loaded state with defaults
     if state.config then
-        for k, v in pairs(state.config) do
-            if type(v) == "table" and type(snd.config[k]) == "table" then
-                for k2, v2 in pairs(v) do
-                    snd.config[k][k2] = v2
-                end
-            else
-                snd.config[k] = v
-            end
-        end
+        mergeTables(snd.config, state.config)
     end
     
     if state.colors then

@@ -53,8 +53,36 @@ local function style_title()
   }, " ")
 end
 
+local WINDOW_PERSIST_FILE = "mmapper_windows.lua"
+
 local function persist_path()
-  return getMudletHomeDir() .. "/mmapper_windows.lua"
+  if mm.persistence_path then
+    return mm.persistence_path(WINDOW_PERSIST_FILE)
+  end
+  return getMudletHomeDir() .. "/persistence/" .. WINDOW_PERSIST_FILE
+end
+
+local function legacy_persist_path()
+  return getMudletHomeDir() .. "/" .. WINDOW_PERSIST_FILE
+end
+
+local function load_window_chunk()
+  if mm.load_persistence_chunk then
+    return mm.load_persistence_chunk(WINDOW_PERSIST_FILE)
+  end
+
+  local chunk = loadfile(persist_path())
+  if chunk then return chunk, persist_path() end
+  chunk = loadfile(legacy_persist_path())
+  if chunk then return chunk, legacy_persist_path() end
+  return nil, persist_path()
+end
+
+local function open_window_persist_file()
+  if mm.open_persistence_file then
+    return mm.open_persistence_file(WINDOW_PERSIST_FILE, "wb")
+  end
+  return io.open(persist_path(), "wb")
 end
 
 local function serialize_value(v)
@@ -80,13 +108,14 @@ local function serialize_value(v)
   return "nil"
 end
 
+local save_window_persistence
+
 local function load_window_persistence()
   mm.runtime = mm.runtime or {}
   if mm.runtime._windows_loaded then return end
   mm.runtime._windows_loaded = true
 
-  local path = persist_path()
-  local chunk = loadfile(path)
+  local chunk, source_path = load_window_chunk()
   if not chunk then return end
   local ok, data = pcall(chunk)
   if not ok or type(data) ~= "table" then return end
@@ -101,13 +130,16 @@ local function load_window_persistence()
       end
     end
   end
+  if source_path == legacy_persist_path() then
+    save_window_persistence()
+  end
 end
 
-local function save_window_persistence()
+function save_window_persistence()
   mm.state = mm.state or {}
   mm.state.windows = mm.state.windows or {}
   local out = "return " .. serialize_value({ windows = mm.state.windows })
-  local f = io.open(persist_path(), "wb")
+  local f = open_window_persist_file()
   if not f then return end
   f:write(out)
   f:close()

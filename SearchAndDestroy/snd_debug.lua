@@ -7,7 +7,7 @@
 
 snd = snd or {}
 snd.debug = snd.debug or {
-    enabled = true,
+    enabled = false,
     lastSearch = nil,
 }
 
