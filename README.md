@@ -1,5 +1,4 @@
-FOR MAPPER TO WORK, IMPORTANT:
-Click on Scripts (in the Mudlet top button bar) -> create a new script-> name it whatever -> paste this into the script body: dofile(getMudletHomeDir() .. "/mmapper/mm_init.lua") -> reload mudlet
+NOTE: Mapper had a loading step that i didn't include in the install notes. I fixed it so it is no longer required, it should load fine now!
 
 **This was made for my personal use! I am sharing in case someone else finds it useful; I know 99% of people are die hard Mush veterans!**
 
