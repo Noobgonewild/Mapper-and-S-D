@@ -8,6 +8,7 @@ mm.help_index_rows = {
   { cmd = "mapper help config", desc = "Commands for configuring the mapper" },
   { cmd = "mapper help exits", desc = "Commands for managing exits" },
   { cmd = "mapper help portals", desc = "Commands for managing portals" },
+  { cmd = "mapper help boundaries", desc = "Commands for boundary discovery and manual redirects" },
   { cmd = "mapper help searching", desc = "Commands for finding rooms" },
   { cmd = "mapper help exploring", desc = "Commands to aid exploring" },
   { cmd = "mapper help moving", desc = "Commands for moving between rooms" },
@@ -131,6 +132,20 @@ mm.help_table = {
       { cmd = "mapper restoreportal <number|last>", desc = "Restore one deleted portal by row number, or restoreportal last" },
     }
   },
+  ['boundaries'] = {
+    header = "Boundaries and Redirects",
+    rows = {
+      { cmd = "mapper boundaries here", desc = "Show reachable boundary rooms in the current area without moving" },
+      { cmd = "mapper boundaries <area>", desc = "Show reachable boundary rooms in an area name or key" },
+      { cmd = "mapper boundaries <room UID>", desc = "Use the room's area and show its reachable boundary rooms" },
+      { cmd = "xrtnear <room UID>", desc = "Run its stored redirect when present; otherwise show reachable boundary rooms in the target area" },
+      { cmd = "mapper redirect add <target UID> <destination UID>", desc = "Set or replace the single xrtnear redirect after verifying the destination is currently reachable" },
+      { cmd = "mapper redirects [target UID]", desc = "List saved suggestions with clickable destinations, optionally limited to one target" },
+      { cmd = "mapper redirect delete <index>", desc = "Delete an entry by index from the last mapper redirects list" },
+      { cmd = "mapper redirect deleted", desc = "List deleted redirects" },
+      { cmd = "mapper redirect restore <index|last>", desc = "Restore an entry from the last deleted redirect list" },
+    }
+  },
   ['searching'] = {
     header = "Searching",
     rows = {
@@ -166,7 +181,8 @@ mm.help_table = {
     header = "Moving",
     rows = {
       { cmd = "mapper goto <room id>", desc = "Run to a room by its room number" },
-      { cmd = "xrtforce <area|room id>", desc = "Run like xrt but ignore exits.level checks (forced route)" },
+      { cmd = "xset areaguard <on|off>", desc = "Persistently guard xrt routes from areas more than 30 levels above you; default off" },
+      { cmd = "xrtforce <area|room id>", desc = "Run like xrt but ignore area guard and exits.level checks (forced route)" },
       { cmd = "mapper walkto <room id>", desc = "Run to a room by its room number without using any mapper portals" },
       { cmd = "mapper resume", desc = "Initiate a new run to the previous target" },
     }
@@ -232,7 +248,7 @@ function mm.show_help(topic)
       print_help_row(row, command_width, details_width)
     end
   elseif topic == "all" then
-    for _, key in ipairs({"config", "exits", "portals", "searching", "exploring", "moving", "utils"}) do
+    for _, key in ipairs({"config", "exits", "portals", "boundaries", "searching", "exploring", "moving", "utils"}) do
       print_section(mm.help_table[key])
     end
   elseif mm.help_table[topic] then

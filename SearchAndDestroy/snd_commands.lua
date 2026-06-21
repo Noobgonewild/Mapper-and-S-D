@@ -1562,6 +1562,12 @@ function snd.commands.huntTrickComplete()
     snd.commands.stopHunt(true)
 
     if keyword and keyword ~= "" then
+        if ix > 1 then
+            snd.utils.infoNote(string.format("Hunt trick: %d.%s cannot be hunted; running quick where.", ix, keyword))
+        else
+            snd.utils.infoNote("Hunt trick: " .. keyword .. " cannot be hunted; running quick where.")
+        end
+
         local qwOptions = {
             source = "ht",
         }
@@ -1588,10 +1594,9 @@ function snd.commands.huntTrickFail()
     snd.commands.stopHunt(true)
 
     if firstTarget then
-        snd.utils.infoNote("Hunt trick failed. Attempting quick where.")
-        snd.commands.qw("")
+        snd.utils.infoNote("Hunt trick: no matching hunt target found; no quick-where fallback needed.")
     else
-        snd.utils.infoNote("Hunt trick failed.")
+        snd.utils.infoNote("Hunt trick: all matching targets are huntable; no quick-where fallback needed.")
     end
 end
 
@@ -2112,6 +2117,26 @@ function snd.commands.xset(args)
             snd.utils.infoNote("Usage: xset speed <run|walk>")
             return
         end
+
+    elseif setting == "areaguard" then
+        snd.config.areaGuard = snd.config.areaGuard or {enabled = false, allowance = 30}
+        local allowance = tonumber(snd.config.areaGuard.allowance) or 30
+        if not normalized or normalized == "" then
+            snd.utils.infoNote(string.format(
+                "Area guard: %s (allows areas up to %d levels above you; area locks remain absolute)",
+                snd.config.areaGuard.enabled and "ON" or "OFF",
+                allowance
+            ))
+        elseif normalized == "on" or normalized == "true" or normalized == "1" then
+            snd.config.areaGuard.enabled = true
+            snd.utils.infoNote(string.format("Area guard: ON (%d-level allowance)", allowance))
+        elseif normalized == "off" or normalized == "false" or normalized == "0" then
+            snd.config.areaGuard.enabled = false
+            snd.utils.infoNote("Area guard: OFF")
+        else
+            snd.utils.infoNote("Usage: xset areaguard <on|off>")
+            return
+        end
         
     elseif setting == "nxaction" then
         local valid = {smartscan = true, con = true, scan = true, scanhere = true, qs = true, none = true}
@@ -2519,32 +2544,6 @@ function snd.commands.showConwinHelp()
     cecho("\n<white>Search and Destroy - ConWin Commands<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
     cecho(string.format("  <dim_gray>Status:<reset> enabled=<cyan>%s<reset>, mode=<cyan>%s<reset>, repopulate=<cyan>%s<reset>, focusid=<cyan>%s<reset>\n", enabled, mode, tostring(repopulate), focusMode))
-    cecho("  "); emitHelpCommandLink("snd conwin help", "snd conwin help", "Show conwin help"); cecho("         - Show this help\n")
-    cecho("  "); emitHelpCommandLink("snd conwin on", "snd conwin on", "Enable ConWin"); cecho("            - Enable ConWin window\n")
-    cecho("  "); emitHelpCommandLink("snd conwin off", "snd conwin off", "Disable ConWin"); cecho("           - Disable ConWin window\n")
-    cecho("  "); emitHelpCommandLink("snd conwin toggle", "snd conwin toggle", "Toggle ConWin"); cecho("        - Toggle ConWin window\n")
-    cecho("  "); emitHelpCommandLink("snd conwin refresh", "snd conwin refresh", "Run consider all now"); cecho("       - Run consider all and refresh list\n")
-    cecho("  "); emitHelpCommandLink("snd conwin clear", "snd conwin clear", "Clear current ConWin list"); cecho("         - Clear current ConWin mob list\n")
-    cecho("  "); emitHelpCommandLink("snd conwin consider", "snd conwin consider", "Set room-action mode consider"); cecho("      - Action on room change: consider\n")
-    cecho("  "); emitHelpCommandLink("snd conwin scan", "snd conwin scan", "Set room-action mode scan"); cecho("          - Action on room change: scan\n")
-    cecho("  "); emitHelpCommandLink("snd conwin mode off", "snd conwin mode off", "Disable room-action mode"); cecho("      - Action on room change: off\n")
-    cecho("  "); emitHelpCommandLink("snd conwin fontsize 10", "snd conwin fontsize 10", "Set ConWin font size"); cecho("  - Set ConWin font size (6-24)\n")
-    cecho("  "); emitHelpCommandLink("snd conwin killcommand <command>", "snd conwin killcommand", "Show current kill command"); cecho(" - Show current kill command (append <command> to set)\n")
-    cecho("  "); emitHelpCommandLink("snd conwin focusid <strict | fallback>", "snd conwin focusid", "Show current focus mode"); cecho(" - Show focus mode (set strict to require selected duplicate)\n")
-    cecho("  "); emitHelpCommandLink("snd conwin aligntags <on|off>", "snd conwin aligntags", "Show alignment tag setting"); cecho(" - Show alignment tags state (G/E markers)\n")
-    cecho("\n<dim_gray>Clicking a mob line sends kill command.\n")
-    cecho("<dim_gray>ConWin chooses distinctive kill selectors; duplicate exact names use numbered form (e.g. kill 2.name).<reset>\n")
-    cecho("<gray>----------------------------------------<reset>\n")
-end
-
-function snd.commands.showConwinHelp()
-    local mode = (snd.config and snd.config.conwin and snd.config.conwin.mode) or "consider"
-    local enabled = (snd.config and snd.config.conwin and snd.config.conwin.enabled) and "on" or "off"
-    local repopulate = (snd.config and snd.config.conwin and snd.config.conwin.repopulate) or 3
-    local focusMode = ((snd.config and snd.config.conwin and snd.config.conwin.strictFocusIdOnly) and "strict" or "fallback")
-    cecho("\n<white>Search and Destroy - ConWin Commands<reset>\n")
-    cecho("<gray>----------------------------------------<reset>\n")
-    cecho(string.format("  <dim_gray>Status:<reset> enabled=<cyan>%s<reset>, mode=<cyan>%s<reset>, repopulate=<cyan>%s<reset>, focusid=<cyan>%s<reset>\n", enabled, mode, tostring(repopulate), focusMode))
     cecho("  ")
     cechoLink("<cyan>snd conwin help<reset>", [[snd.commands.snd("conwin help")]], "Show conwin help", true)
     cecho("         - Show this help\n")
@@ -2598,12 +2597,13 @@ function snd.commands.showCommandHelp()
     cecho("\n<yellow>Navigation:<reset>\n")
     cecho("  <cyan>nx<reset>               Go to current target\n")
     cecho("  <cyan>xrt <area|roomid><reset>  Go to area or room (portal-aware)\n")
-    cecho("  <cyan>xrtforce <area|roomid><reset>  Go to area/room (ignores exits.level locks)\n")
+    cecho("  <cyan>xrtforce <area|roomid><reset>  Go to area/room (ignores area and exit-level guards)\n")
     cecho("  <cyan>walkto <area|roomid><reset>  Walk to area or room (no portals)\n")
     cecho("  <cyan>qw [keyword]<reset>     Live where + mapper room list; selected target uses exact returned-name matching\n")
     cecho("  <cyan>ht [keyword]<reset>     Hunt trick to mob; selected target follows with exact live where\n")
     cecho("\n<yellow>Configuration:<reset>\n")
     cecho("  <cyan>xset<reset>             Show all settings\n")
+    cecho("  <cyan>xset areaguard <on|off><reset>  Toggle persisted navigation area guard\n")
     cecho("  <cyan>xset sound [on|off|volume <n%>]<reset> Toggle/query sound alerts\n")
     cecho("  <cyan>xset keyword <kw><reset>  Set mob keyword\n")
     cecho("  <cyan>xset startroom<reset>   Set area start room\n")
@@ -2635,6 +2635,8 @@ function snd.commands.showConfigHelp()
     cecho("                Error notes still show.\n")
     cecho("  <cyan>speed<reset>        <run|walk>  Default travel mode for nx/go\n")
     cecho("                run=xrt (portal-aware), walk=walkto (no portals)\n")
+    cecho("  <cyan>areaguard<reset>    <on|off>  Avoid areas more than 30 levels above you\n")
+    cecho("                Area entry locks remain absolute. Default: off.\n")
     cecho("  <cyan>nxaction<reset>     <smartscan|con|scan|scanhere|qs|none>\n")
     cecho("                default   = qs\n")
     cecho("                smartscan = local smart scan routine (scan for activity targets; fallback to quick scan when none)\n")
@@ -2647,7 +2649,7 @@ function snd.commands.showConfigHelp()
     cecho("  <cyan>expressmin<reset>   <number>  Min kills before express applies\n")
     cecho("  <cyan>autocheck<reset>    <on|smart|off>  Post-kill CP/GQ recheck mode\n")
     cecho("  <cyan>autocheck kills<reset> <number>  SMART mode: run check every N kills\n")
-    
+   
     cecho("  <cyan>xcp mode<reset>     <db|qw|ht>  Post-arrival CP/GQ target mode\n")
     cecho("                db = use stored DB/mapped rooms only\n")
     cecho("                qw = live where and accept only exact selected-target mob names\n")
@@ -2762,6 +2764,9 @@ function snd.commands.showConfig()
     cecho(string.format("  <cyan>debug<reset>       %s\n", snd.config.debugMode and "ON" or "OFF"))
     cecho(string.format("  <cyan>silent<reset>      %s\n", snd.config.silentMode and "ON" or "OFF"))
     cecho(string.format("  <cyan>speed<reset>       %s\n", snd.config.speed))
+    cecho(string.format("  <cyan>areaguard<reset>   %s (allowance=%d)\n",
+        snd.config.areaGuard and snd.config.areaGuard.enabled and "ON" or "OFF",
+        tonumber(snd.config.areaGuard and snd.config.areaGuard.allowance) or 30))
     cecho(string.format("  <cyan>nxaction<reset>    %s\n", snd.config.nxAction))
     cecho(string.format("  <cyan>xcpmode<reset>     %s\n", normalizeXcpActionMode(snd.config.xcpActionMode or "qw")))
     cecho(string.format("  <cyan>express<reset>     %s\n", snd.config.express.enabled and "ON" or "OFF"))
@@ -3294,7 +3299,7 @@ local function statsShowType(historyType)
     if type(cechoPopup) == "function" then
         echoReportChannelPopup("<green>best<reset>", snd.config and snd.config.reportChannel or "default", function(channel)
             if bestRow then
-                snd.commands.reportHistoryLikeRow(bestRow, channel)
+                snd.commands.reportHistoryLikeRow(bestRow, channel, "BEST")
             else
                 snd.commands.reportStatsLine(string.format("%s Stats - Time: best %s", title, bestDur), typeLabel, channel)
             end
@@ -3306,7 +3311,7 @@ local function statsShowType(historyType)
     if type(cechoPopup) == "function" then
         echoReportChannelPopup("<red>worst<reset>", snd.config and snd.config.reportChannel or "default", function(channel)
             if worstRow then
-                snd.commands.reportHistoryLikeRow(worstRow, channel)
+                snd.commands.reportHistoryLikeRow(worstRow, channel, "WORST")
             else
                 snd.commands.reportStatsLine(string.format("%s Stats - Time: worst %s", title, worstDur), typeLabel, channel)
             end
@@ -3329,7 +3334,7 @@ function snd.commands.reportStatsLine(reportText, typeLabel, channelOverride)
         channel = "gtell"
     end
     if snd.utils.isDefaultReportChannel(channel) then
-        snd.utils.reportLine(reportText, typeLabel)
+        snd.utils.reportLine(reportText, typeLabel, channel)
         return
     end
     local style = snd.utils.getReportTypeStyle(typeLabel)
@@ -3437,7 +3442,7 @@ local function historyTypeLabel(v)
     return "unknown"
 end
 
-function snd.commands.reportHistoryLikeRow(row, channelOverride)
+function snd.commands.reportHistoryLikeRow(row, channelOverride, statsLabel)
     if not row then
         snd.utils.infoNote("No history row available to report.")
         return
@@ -3450,10 +3455,15 @@ function snd.commands.reportHistoryLikeRow(row, channelOverride)
         channel = "gtell"
     end
     if snd.utils.isDefaultReportChannel(channel) then
-        snd.utils.reportLine(snd.commands.buildHistoryRowText(row), historyTypeLabel(row.type))
+        local text = statsLabel
+            and snd.commands.buildStatsHistoryRowText(row, statsLabel)
+            or snd.commands.buildHistoryRowText(row)
+        snd.utils.reportLine(text, historyTypeLabel(row.type), channel)
         return
     end
-    local payload = snd.commands.buildHistoryRowChannelText(row)
+    local payload = statsLabel
+        and snd.commands.buildStatsHistoryRowChannelText(row, statsLabel)
+        or snd.commands.buildHistoryRowChannelText(row)
     if snd.utils and snd.utils.dispatchReportChannel then
         snd.utils.dispatchReportChannel(channel, payload)
     else
@@ -3496,6 +3506,19 @@ local function formatLocalDateTime(ts)
         return "n/a"
     end
     return os.date("%Y-%m-%d %H:%M", ts)
+end
+
+local function formatHistoryDate(row)
+    if not row then
+        return "n/a"
+    end
+    local endTs = tonumber(row.end_time) or 0
+    local startTs = tonumber(row.start_time) or 0
+    local ts = endTs > 0 and endTs or startTs
+    if ts <= 0 then
+        return "n/a"
+    end
+    return os.date("%Y-%m-%d", ts)
 end
 
 local function formatDuration(startTs, endTs, status)
@@ -3570,16 +3593,31 @@ function snd.commands.buildHistoryRowText(row)
     )
 end
 
+function snd.commands.buildStatsHistoryRowText(row, statsLabel)
+    if not row then
+        return ""
+    end
+    return string.format(
+        "%s Stats - %s | %s | lvl %s | %s -> %s | rewards: %s",
+        statsTypeTitle(row.type),
+        string.upper(tostring(statsLabel or "run")),
+        formatDuration(row.start_time, row.end_time, row.status),
+        tostring(row.level_taken or 0),
+        formatLocalDateTime(row.start_time),
+        formatLocalDateTime(row.end_time),
+        formatRewardSummary(row)
+    )
+end
+
 function snd.commands.buildHistoryRowChannelText(row)
     if not row then
         return ""
     end
 
     local typeColor = historyTypeAardColor(row.type)
-    local typeLabel = historyTypeLabel(row.type)
+    local typeLabel = string.upper(historyTypeLabel(row.type))
     local level = tostring(row.level_taken or 0)
-    local startText = formatLocalDateTime(row.start_time)
-    local endText = formatLocalDateTime(row.end_time)
+    local dateText = formatHistoryDate(row)
     local durationText = formatDuration(row.start_time, row.end_time, row.status)
     local statusText = historyStatusLabel(row.status)
 
@@ -3597,14 +3635,52 @@ function snd.commands.buildHistoryRowChannelText(row)
     local rewardsText = #rewardParts > 0 and table.concat(rewardParts, " ") or "@D-@W"
 
     return string.format(
-        "%s%s@W | @Wlv %s@W | @D%s@W -> @D%s@W | @C%s@W | @M%s@W | rewards: %s",
+        "%s[%s]@W @M%s@W | @C%s@W | @Wlvl %s@W | @D%s@W | rewards: %s",
         typeColor,
         typeLabel,
-        level,
-        startText,
-        endText,
-        durationText,
         statusText,
+        durationText,
+        level,
+        dateText,
+        rewardsText
+    )
+end
+
+function snd.commands.buildStatsHistoryRowChannelText(row, statsLabel)
+    if not row then
+        return ""
+    end
+
+    local typeColor = historyTypeAardColor(row.type)
+    local typeLabel = string.upper(historyTypeLabel(row.type))
+    local label = string.upper(tostring(statsLabel or "RUN"))
+    local labelColor = label == "BEST" and "@G" or (label == "WORST" and "@R" or "@W")
+    local durationText = formatDuration(row.start_time, row.end_time, row.status)
+    local level = tostring(row.level_taken or 0)
+    local dateText = formatHistoryDate(row)
+
+    local qp = tonumber(row.qp_rewards) or 0
+    local tp = tonumber(row.tp_rewards) or 0
+    local tr = tonumber(row.train_rewards) or 0
+    local pr = tonumber(row.prac_rewards) or 0
+    local gold = tonumber(row.gold_rewards) or 0
+    local rewardParts = {}
+    if qp > 0 then table.insert(rewardParts, string.format("@R%dqp@W", qp)) end
+    if tp > 0 then table.insert(rewardParts, string.format("@C%dtp@W", tp)) end
+    if tr > 0 then table.insert(rewardParts, string.format("@G%dtr@W", tr)) end
+    if pr > 0 then table.insert(rewardParts, string.format("@M%dpr@W", pr)) end
+    if gold > 0 then table.insert(rewardParts, string.format("@Y%dg@W", gold)) end
+    local rewardsText = #rewardParts > 0 and table.concat(rewardParts, " ") or "@D-@W"
+
+    return string.format(
+        "%s[%s]@W %s%s@W | @C%s@W | @Wlvl %s@W | @D%s@W | rewards: %s",
+        typeColor,
+        typeLabel,
+        labelColor,
+        label,
+        durationText,
+        level,
+        dateText,
         rewardsText
     )
 end
@@ -3689,7 +3765,7 @@ function snd.commands.reportHistoryRow(index, channelOverride)
     end
 
     if snd.utils.isDefaultReportChannel(channel) then
-        snd.utils.reportLine(snd.commands.buildHistoryRowText(row), historyTypeLabel(row.type))
+        snd.utils.reportLine(snd.commands.buildHistoryRowText(row), historyTypeLabel(row.type), channel)
         return
     end
 

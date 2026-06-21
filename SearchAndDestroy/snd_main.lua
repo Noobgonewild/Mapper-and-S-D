@@ -84,6 +84,12 @@ local defaultConfig = {
     
     -- Speed for navigation (run or walk)
     speed = "run",
+
+    -- Optional xrt/navigation guard for areas above the character's level.
+    areaGuard = {
+        enabled = false,
+        allowance = 30,
+    },
     
     -- Kill command for xkill (default: "kill", can be set with xcmd)
     killCommand = "kill",

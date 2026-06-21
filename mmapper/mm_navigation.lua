@@ -76,6 +76,44 @@ if type(snd.utils.trim) ~= "function" then
     end
 end
 
+local function ensureAreaReferencesLoaded()
+    if mm.area_references and type(mm.area_references.get) == "function" then
+        return true
+    end
+
+    local candidates = {}
+    if mm.base_dir and mm.base_dir ~= "" and mm.base_dir ~= "mm_package.xml" then
+        table.insert(candidates, tostring(mm.base_dir) .. "/mm_area_references.lua")
+    end
+
+    local source = debug.getinfo(1, "S").source or ""
+    if source:sub(1, 1) == "@" then
+        local path = source:sub(2):gsub("\\", "/")
+        local dir = path:match("^(.*)/")
+        if dir and dir ~= "" then
+            table.insert(candidates, dir .. "/mm_area_references.lua")
+        end
+    end
+
+    for _, path in ipairs(candidates) do
+        local f = io.open(path, "rb")
+        if f then
+            f:close()
+            local ok, err = pcall(dofile, path)
+            if ok and mm.area_references then
+                snd.utils.debugNote("Area references loaded from " .. tostring(path))
+                return true
+            end
+            snd.utils.debugNote("Failed loading area references from " .. tostring(path) .. ": " .. tostring(err))
+        end
+    end
+
+    snd.utils.debugNote("Area references unavailable; area guard will fail open.")
+    return false
+end
+
+ensureAreaReferencesLoaded()
+
 -- Load LuaSQL for Aardwolf.db access
 local luasql = require "luasql.sqlite3"
 
@@ -449,6 +487,210 @@ function snd.mapper.getRoomInfo(roomId)
         return results[1]
     end
     return nil
+end
+
+-------------------------------------------------------------------------------
+-- Area Level Guard
+-------------------------------------------------------------------------------
+
+local AREA_GUARD_DEFAULT_ALLOWANCE = 30
+
+local function normalizeAreaKey(value)
+    return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+function snd.mapper.areaGuardConfig()
+    local cfg = snd.config and snd.config.areaGuard or nil
+    if type(cfg) ~= "table" then
+        return {enabled = false, allowance = AREA_GUARD_DEFAULT_ALLOWANCE}
+    end
+    return cfg
+end
+
+function snd.mapper.areaGuardEnabled()
+    return snd.mapper.areaGuardConfig().enabled == true
+end
+
+function snd.mapper.areaGuardAllowance()
+    return math.max(0, tonumber(snd.mapper.areaGuardConfig().allowance) or AREA_GUARD_DEFAULT_ALLOWANCE)
+end
+
+function snd.mapper.areaGuardPlayerLevel()
+    return tonumber(snd.char and snd.char.level) or 0
+end
+
+function snd.mapper.areaGuardBypassed(ignoreLockedExits, ignoreAreaGuard)
+    return ignoreLockedExits == true or ignoreAreaGuard == true or not snd.mapper.areaGuardEnabled()
+end
+
+function snd.mapper.evaluateAreaGuard(areaKey)
+    local normalized = normalizeAreaKey(areaKey)
+    if normalized == "" then
+        return {known = false, allowed = true, area = tostring(areaKey or "")}
+    end
+
+    local refs = mm.area_references
+    local ref = refs and type(refs.get) == "function" and refs.get(normalized) or nil
+    if not ref then
+        return {known = false, allowed = true, area = tostring(areaKey or "")}
+    end
+
+    local level = snd.mapper.areaGuardPlayerLevel()
+    local allowance = snd.mapper.areaGuardAllowance()
+    local required = refs.required_level(ref, allowance) or 0
+    return {
+        known = true,
+        allowed = level >= required,
+        area = ref.name or tostring(areaKey),
+        keyword = ref.keyword or normalized,
+        min = tonumber(ref.min) or 0,
+        lock = tonumber(ref.lock) or 0,
+        required = required,
+        level = level,
+        allowance = allowance,
+    }
+end
+
+function snd.mapper.evaluateRoomAreaGuard(roomId)
+    local room = snd.mapper.getRoomInfo(roomId)
+    if not room then
+        snd.utils.debugNote("Area guard: room " .. tostring(roomId) .. " is unknown; allowing destination.")
+        return {known = false, allowed = true, roomId = tostring(roomId or "")}
+    end
+
+    local result = snd.mapper.evaluateAreaGuard(room.area)
+    result.roomId = tostring(roomId or "")
+    result.roomName = room.name
+    result.mapperArea = room.area
+    return result
+end
+
+function snd.mapper.echoAreaGuardOverride(destination)
+    local dest = snd.utils.trim(tostring(destination or ""))
+    if dest == "" then return end
+
+    cecho("<yellow>[MMAPPER]<reset> Override: ")
+    local label = "[xrtforce " .. dest .. "]"
+    local command = string.format([[expandAlias(%q, false)]], "xrtforce " .. dest)
+    if type(echoLink) == "function" then
+        echoLink(label, command, "Navigate without area or exit-level guards", true)
+    else
+        echo(label)
+    end
+    echo("\n")
+end
+
+function snd.mapper.reportAreaGuardDestinationBlocked(result, destination)
+    local lockText = ""
+    if (tonumber(result.lock) or 0) > 0 then
+        lockText = string.format("; entry lock %d", tonumber(result.lock))
+    end
+    cecho(string.format(
+        "<orange_red>[MMAPPER]<reset> Navigation blocked: %s is rated level %d%s; your level is %d.\n",
+        tostring(result.area or result.mapperArea or "That area"),
+        tonumber(result.min) or 0,
+        lockText,
+        tonumber(result.level) or 0
+    ))
+    cecho(string.format(
+        "<yellow>[MMAPPER]<reset> Area guard requires level %d with the %d-level allowance.\n",
+        tonumber(result.required) or 0,
+        tonumber(result.allowance) or AREA_GUARD_DEFAULT_ALLOWANCE
+    ))
+    snd.mapper.echoAreaGuardOverride(destination)
+end
+
+function snd.mapper.reportAreaGuardRouteBlocked(destination)
+    cecho("<orange_red>[MMAPPER]<reset> No guarded route found; every known route crosses an area above your guarded level.\n")
+    snd.mapper.echoAreaGuardOverride(destination)
+end
+
+function snd.mapper.checkAreaGuardDestination(currentRoom, destinationRoom, overrideDestination, ignoreLockedExits, ignoreAreaGuard)
+    if snd.mapper.areaGuardBypassed(ignoreLockedExits, ignoreAreaGuard) then
+        snd.utils.debugNote(string.format(
+            "Area guard destination check bypassed: room=%s force=%s",
+            tostring(destinationRoom),
+            tostring(ignoreLockedExits == true or ignoreAreaGuard == true)
+        ))
+        return true
+    end
+
+    local result = snd.mapper.evaluateRoomAreaGuard(destinationRoom)
+    if not result.known then
+        snd.utils.debugNote(string.format(
+            "Area guard destination allowed: room=%s area='%s' has no reference metadata.",
+            tostring(destinationRoom),
+            tostring(result.mapperArea or "?")
+        ))
+        return true
+    end
+
+    snd.utils.debugNote(string.format(
+        "Area guard destination: room=%s area=%s level=%d min=%d lock=%d allowance=%d required=%d allowed=%s",
+        tostring(destinationRoom),
+        tostring(result.keyword or result.mapperArea or "?"),
+        tonumber(result.level) or 0,
+        tonumber(result.min) or 0,
+        tonumber(result.lock) or 0,
+        tonumber(result.allowance) or 0,
+        tonumber(result.required) or 0,
+        tostring(result.allowed)
+    ))
+
+    if result.allowed then
+        return true
+    end
+
+    snd.mapper.reportAreaGuardDestinationBlocked(result, overrideDestination or destinationRoom)
+    return false
+end
+
+function snd.mapper.areaGuardRoomSql(roomExpression, sourceRoom, ignoreLockedExits, ignoreAreaGuard)
+    if snd.mapper.areaGuardBypassed(ignoreLockedExits, ignoreAreaGuard) then
+        return "1=1", 0
+    end
+
+    local refs = mm.area_references
+    if not refs or type(refs.areas) ~= "table" or type(refs.required_level) ~= "function" then
+        snd.utils.debugNote("Area guard SQL filter unavailable because area references are not loaded; allowing route.")
+        return "1=1", 0
+    end
+
+    local sourceInfo = snd.mapper.getRoomInfo(sourceRoom)
+    local sourceArea = normalizeAreaKey(sourceInfo and sourceInfo.area or "")
+    local level = snd.mapper.areaGuardPlayerLevel()
+    local allowance = snd.mapper.areaGuardAllowance()
+    local blocked = {}
+    local seen = {}
+    local blockedCount = 0
+
+    for _, ref in ipairs(refs.areas) do
+        local required = refs.required_level(ref, allowance) or 0
+        local keyword = normalizeAreaKey(ref.keyword)
+        local name = normalizeAreaKey(ref.name)
+        local isSourceArea = sourceArea ~= "" and (sourceArea == keyword or sourceArea == name)
+        if level < required and not isSourceArea then
+            blockedCount = blockedCount + 1
+            for _, alias in ipairs({keyword, name}) do
+                if alias ~= "" and not seen[alias] then
+                    seen[alias] = true
+                    table.insert(blocked, snd.mapper.db.escape(alias))
+                end
+            end
+        end
+    end
+
+    if #blocked == 0 then
+        return "1=1", 0
+    end
+
+    local sql = string.format(
+        "NOT EXISTS (SELECT 1 FROM rooms AS area_guard_room " ..
+        "WHERE area_guard_room.uid = %s AND LOWER(area_guard_room.area) IN (%s))",
+        roomExpression,
+        table.concat(blocked, ",")
+    )
+    return sql, blockedCount
 end
 
 --- Persist a discovered room + exits from GMCP room.info into Aardwolf.db
@@ -1144,8 +1386,10 @@ end
 -- @param dst Destination room uid
 -- @param noPortals If true, don't use portals
 -- @param noRecalls If true, don't use recall
+-- @param ignoreLockedExits If true, ignore exit-level locks
+-- @param ignoreAreaGuard If true, ignore only the area guard
 -- @return Path table, depth, or nil if no path
-function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
+function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, ignoreAreaGuard)
     if not snd.mapper.db.open() then
         return nil
     end
@@ -1153,12 +1397,13 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
     src = tostring(src)
     dst = tostring(dst)
     snd.utils.debugNote(string.format(
-        "findPath start src=%s dst=%s noPortals=%s noRecalls=%s ignoreLocked=%s",
+        "findPath start src=%s dst=%s noPortals=%s noRecalls=%s ignoreLocked=%s ignoreAreaGuard=%s",
         src,
         dst,
         tostring(noPortals == true),
         tostring(noRecalls == true),
-        tostring(ignoreLockedExits == true)
+        tostring(ignoreLockedExits == true),
+        tostring(ignoreAreaGuard == true)
     ))
     
     if src == dst then
@@ -1177,9 +1422,30 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
         myLevel + (myTier * 10)
     )
     local chaosWhere = gqActive and "(fromuid <> '*' OR ifnull(chaos, 'no') <> 'yes')" or "1=1"
+    local areaFromWhere, blockedAreaCount = snd.mapper.areaGuardRoomSql(
+        "exits.fromuid",
+        src,
+        ignoreLockedExits,
+        ignoreAreaGuard
+    )
+    local areaToWhere = snd.mapper.areaGuardRoomSql(
+        "exits.touid",
+        src,
+        ignoreLockedExits,
+        ignoreAreaGuard
+    )
+    if blockedAreaCount > 0 then
+        snd.utils.debugNote(string.format(
+            "Area guard route filter active: level=%d allowance=%d blockedAreas=%d source=%s",
+            myLevel,
+            snd.mapper.areaGuardAllowance(),
+            blockedAreaCount,
+            tostring(src)
+        ))
+    end
     
     -- Check for direct one-room path first
-    local directPath = snd.mapper.checkDirectPath(src, dst, myLevel, ignoreLockedExits)
+    local directPath = snd.mapper.checkDirectPath(src, dst, myLevel, ignoreLockedExits, ignoreAreaGuard)
     if directPath then
         snd.utils.debugNote("findPath direct one-room path found.")
         return directPath, 1
@@ -1230,8 +1496,18 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
             AND fromuid NOT IN (%s) 
             AND %s
             AND %s
+            AND %s
+            AND %s
             ORDER BY %s
-        ]], table.concat(roomsList, ","), visited, levelWhere, chaosWhere, snd.mapper.exitPreferenceOrderSql("dir"))
+        ]],
+            table.concat(roomsList, ","),
+            visited,
+            levelWhere,
+            chaosWhere,
+            areaFromWhere,
+            areaToWhere,
+            snd.mapper.exitPreferenceOrderSql("dir")
+        )
         
         local results = snd.mapper.db.query(sql) or {}
         roomSets[depth] = {}
@@ -1362,12 +1638,12 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
                     local jumpRoom = snd.mapper.findNearestJumpRoom(src, dst, foundFrom, ignoreLockedExits)
                     if jumpRoom then
                         snd.utils.debugNote("findPath restricted source: nearest jump room candidate " .. tostring(jumpRoom))
-                        local walkPath = snd.mapper.findPath(src, jumpRoom, true, true, ignoreLockedExits)
+                        local walkPath = snd.mapper.findPath(src, jumpRoom, true, true, ignoreLockedExits, ignoreAreaGuard)
                         if walkPath then
                             for _, step in ipairs(walkPath) do
                                 table.insert(path, step)
                             end
-                            local portalPath = snd.mapper.findPath(jumpRoom, dst, nil, nil, ignoreLockedExits)
+                            local portalPath = snd.mapper.findPath(jumpRoom, dst, nil, nil, ignoreLockedExits, ignoreAreaGuard)
                             if portalPath then
                                 for _, step in ipairs(portalPath) do
                                     table.insert(path, step)
@@ -1465,12 +1741,137 @@ function snd.mapper.markRoomRestriction(roomId, flag)
     return true, true
 end
 
+function snd.mapper.pathStartsWithJump(path, expectedType)
+    local travelType = path and path[1] and path[1].travelType
+    if expectedType then
+        return travelType == expectedType
+    end
+    return travelType == "portal" or travelType == "recall"
+end
+
+function snd.mapper.roomsShareArea(firstRoom, secondRoom)
+    local firstInfo = snd.mapper.getRoomInfo(firstRoom)
+    local secondInfo = snd.mapper.getRoomInfo(secondRoom)
+    local firstArea = firstInfo and snd.utils.trim(firstInfo.area or ""):lower() or ""
+    local secondArea = secondInfo and snd.utils.trim(secondInfo.area or ""):lower() or ""
+    return firstArea ~= "" and firstArea == secondArea
+end
+
+function snd.mapper.resolveCurrentAreaStartRoom(sourceRoom)
+    local candidates = {}
+    local seen = {}
+
+    local function addCandidate(value)
+        local candidate = snd.utils.trim(value or "")
+        local key = candidate:lower()
+        if candidate ~= "" and candidate ~= "-1" and candidate ~= "-2" and not seen[key] then
+            seen[key] = true
+            table.insert(candidates, candidate)
+        end
+    end
+
+    addCandidate(snd.room and snd.room.current and snd.room.current.arid)
+    local sourceInfo = snd.mapper.getRoomInfo(sourceRoom)
+    addCandidate(sourceInfo and sourceInfo.area)
+
+    local function lookupStart(areaKey)
+        local normalizedKey = snd.utils.trim(areaKey or ""):lower()
+        if normalizedKey == "" then return nil end
+
+        if snd.db and type(snd.db.getAreaStartRoom) == "function" then
+            local ok, startRoom = pcall(snd.db.getAreaStartRoom, normalizedKey)
+            startRoom = ok and tonumber(startRoom) or -1
+            if startRoom and startRoom > 0 then
+                return normalizedKey, tostring(startRoom)
+            end
+        end
+
+        if snd.data and snd.data.areaDefaultStartRooms then
+            local defaults = snd.data.areaDefaultStartRooms[normalizedKey]
+            local startRoom = defaults and tonumber(defaults.start) or -1
+            if startRoom and startRoom > 0 then
+                return normalizedKey, tostring(startRoom)
+            end
+        end
+
+        return nil
+    end
+
+    for _, candidate in ipairs(candidates) do
+        local areaKey, startRoom = lookupStart(candidate)
+        if areaKey then
+            return areaKey, startRoom
+        end
+
+        if snd.db and type(snd.db.getAreaKeyFromName) == "function" then
+            local ok, resolvedKey = pcall(snd.db.getAreaKeyFromName, candidate)
+            if ok and resolvedKey and tostring(resolvedKey) ~= "" then
+                areaKey, startRoom = lookupStart(resolvedKey)
+                if areaKey then
+                    return areaKey, startRoom
+                end
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blockedType, ignoreLockedExits)
+    sourceRoom = tostring(sourceRoom or "")
+    destination = tostring(destination or "")
+    local areaKey, startRoom = snd.mapper.resolveCurrentAreaStartRoom(sourceRoom)
+    if not areaKey or not startRoom or startRoom == destination then
+        return nil
+    end
+
+    local walkPath = {}
+    if sourceRoom ~= startRoom then
+        walkPath = snd.mapper.findPath(sourceRoom, startRoom, true, true, ignoreLockedExits)
+        if not walkPath then
+            snd.utils.debugNote("area-start fallback: no walk-only route to " .. tostring(areaKey) .. " start room " .. tostring(startRoom) .. ".")
+            return nil
+        end
+    end
+
+    local jumpOrder
+    if blockedType == "recall" then
+        jumpOrder = {"portal", "recall"}
+    else
+        jumpOrder = {"recall", "portal"}
+    end
+
+    local jumpLeg = nil
+    local jumpType = nil
+    for _, candidateType in ipairs(jumpOrder) do
+        local noPortals = candidateType == "recall"
+        local noRecalls = candidateType == "portal"
+        local candidate = snd.mapper.findPath(startRoom, destination, noPortals, noRecalls, ignoreLockedExits)
+        if candidate and candidate[1] and candidate[1].travelType == candidateType then
+            jumpLeg = candidate
+            jumpType = candidateType
+            break
+        end
+    end
+
+    if not jumpLeg then
+        snd.utils.debugNote("area-start fallback: start room " .. tostring(startRoom) .. " has no direct recall/portal route to " .. destination .. ".")
+        return nil
+    end
+
+    local combined = {}
+    for _, step in ipairs(walkPath) do table.insert(combined, step) end
+    for _, step in ipairs(jumpLeg) do table.insert(combined, step) end
+    return combined, areaKey, startRoom, jumpType
+end
+
 function snd.mapper.onPortalBlocked()
     if snd.mapper.isInCombat and snd.mapper.isInCombat() then
         snd.mapper.consumeRestrictionMark("portal")
         snd.utils.debugNote("Ignoring portal blocked trigger while in combat.")
         return
     end
+    snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
     local destination = snd.mapper.goingToRoom or (snd.nav and snd.nav.goingToRoom)
     local pending = snd.mapper.consumeRestrictionMark("portal")
     local wasUpdated = false
@@ -1508,6 +1909,7 @@ function snd.mapper.onRecallBlocked()
         snd.utils.debugNote("Ignoring recall blocked trigger while in combat.")
         return
     end
+    snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
     local destination = snd.mapper.goingToRoom or (snd.nav and snd.nav.goingToRoom)
     local pending = snd.mapper.consumeRestrictionMark("recall")
     local wasUpdated = false
@@ -1571,19 +1973,16 @@ function snd.mapper.handleBlockedTravel(blockedType)
         tostring(currentNoRecall)
     ))
 
-    -- If both flags are set, find nearest room that does NOT have both flags
-    -- at the same time, then continue to destination in this same xrt.
+    -- If both flags are set, first try the closest room with a usable jump.
     if currentNoPortal and currentNoRecall then
         snd.utils.debugNote("current room is both norecall/noportal; trying outward jump-room expansion first.")
         local combined, chosenType, closestRoom = snd.mapper.buildOutwardJumpRoute(currentRoom, destination, nil)
-        if not combined or #combined == 0 then
-            snd.utils.infoNote("You couldn't find a nearby room that allows recall or portal from " .. currentRoom .. ".")
-            snd.utils.debugNote("outward jump-room expansion failed from room " .. currentRoom .. ".")
-            return false
+        if combined and #combined > 0 then
+            snd.utils.infoNote("Rerouting via closest viable room " .. tostring(closestRoom) .. " using " .. tostring(chosenType) .. ".")
+            snd.mapper.executePath(combined)
+            return true
         end
-        snd.utils.infoNote("Rerouting via closest viable room " .. tostring(closestRoom) .. " using " .. tostring(chosenType) .. ".")
-        snd.mapper.executePath(combined)
-        return true
+        snd.utils.debugNote("outward jump-room expansion failed from room " .. currentRoom .. "; trying broader fallbacks.")
     end
 
     local bounceStep = nil
@@ -1628,23 +2027,44 @@ function snd.mapper.handleBlockedTravel(blockedType)
     if not reroutePath then
         local forceNoPortals = (blockedType == "portal")
         local forceNoRecalls = (blockedType == "recall")
-        reroutePath = snd.mapper.findPath(currentRoom, destination, forceNoPortals, forceNoRecalls, nil)
-    end
-
-    if not reroutePath then
-        local reroute, viaRoom, mode = snd.mapper.findNearestAlternateRoute(currentRoom, destination, blockedType, nil)
-        if reroute and #reroute > 0 then
-            reroutePath = reroute
-            if mode == "preferred" then
-                snd.utils.infoNote("Rerouting via nearby room " .. tostring(viaRoom) .. " to use " .. ((blockedType == "recall") and "portal" or "recall") .. ".")
-            else
-                snd.utils.infoNote("Rerouting via nearby room " .. tostring(viaRoom) .. " (alternate jump unavailable there, using best available route).")
-            end
+        local expectedType = (blockedType == "portal") and "recall" or "portal"
+        local candidate = snd.mapper.findPath(currentRoom, destination, forceNoPortals, forceNoRecalls, nil)
+        if candidate and (snd.mapper.pathStartsWithJump(candidate, expectedType) or snd.mapper.roomsShareArea(currentRoom, destination)) then
+            reroutePath = candidate
+        elseif candidate then
+            snd.utils.debugNote("blocked travel deferred a cross-area walk-only route until area-start fallback is tried.")
         end
     end
 
     if not reroutePath then
-        reroutePath = snd.mapper.findPath(currentRoom, destination, nil, nil)
+        local reroute, viaRoom = snd.mapper.findNearestAlternateRoute(currentRoom, destination, blockedType, nil, false)
+        if reroute and #reroute > 0 then
+            reroutePath = reroute
+            snd.utils.infoNote("Rerouting via nearby room " .. tostring(viaRoom) .. " to use " .. ((blockedType == "recall") and "portal" or "recall") .. ".")
+        end
+    end
+
+    if not reroutePath then
+        local areaRoute, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(currentRoom, destination, blockedType, nil)
+        if areaRoute and #areaRoute > 0 then
+            reroutePath = areaRoute
+            snd.utils.infoNote(string.format(
+                "Nearby jump options exhausted. Rerouting through %s start room %s, then trying %s.",
+                tostring(areaKey),
+                tostring(startRoom),
+                tostring(jumpType)
+            ))
+        end
+    end
+
+    if not reroutePath then
+        local candidate = snd.mapper.findPath(currentRoom, destination, nil, nil)
+        if candidate and (snd.mapper.pathStartsWithJump(candidate) or snd.mapper.roomsShareArea(currentRoom, destination)) then
+            reroutePath = candidate
+        elseif candidate then
+            snd.utils.infoNote("Blocked " .. blockedType .. "; refusing a walk-only route across areas from room " .. currentRoom .. ".")
+            snd.utils.debugNote("cross-area walk-only fallback rejected after nearby and area-start jump options were exhausted.")
+        end
     end
 
     if reroutePath and #reroutePath > 0 then
@@ -1658,13 +2078,24 @@ function snd.mapper.handleBlockedTravel(blockedType)
 end
 
 --- Check for direct one-room path
-function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits)
+function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits, ignoreAreaGuard)
     local where = ignoreLockedExits and "" or string.format(" AND level <= %d", level)
+    local areaFromWhere = snd.mapper.areaGuardRoomSql("exits.fromuid", src, ignoreLockedExits, ignoreAreaGuard)
+    local areaToWhere = snd.mapper.areaGuardRoomSql("exits.touid", src, ignoreLockedExits, ignoreAreaGuard)
     local sql = string.format([[
         SELECT dir FROM exits 
         WHERE fromuid = %s AND touid = %s%s
+          AND %s
+          AND %s
         ORDER BY %s LIMIT 1
-    ]], snd.mapper.db.escape(src), snd.mapper.db.escape(dst), where, snd.mapper.exitPreferenceOrderSql("dir"))
+    ]],
+        snd.mapper.db.escape(src),
+        snd.mapper.db.escape(dst),
+        where,
+        areaFromWhere,
+        areaToWhere,
+        snd.mapper.exitPreferenceOrderSql("dir")
+    )
     
     local results = snd.mapper.db.query(sql)
     if results and #results > 0 then
@@ -1709,9 +2140,15 @@ function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedE
     local portalLeg = nil
     if not closestNoRecall then
         recallLeg = snd.mapper.findPath(tostring(closestRoom), destination, true, nil, ignoreLockedExits) -- recall only
+        if not snd.mapper.pathStartsWithJump(recallLeg, "recall") then
+            recallLeg = nil
+        end
     end
     if not closestNoPortal then
         portalLeg = snd.mapper.findPath(tostring(closestRoom), destination, nil, true, ignoreLockedExits) -- portal only
+        if not snd.mapper.pathStartsWithJump(portalLeg, "portal") then
+            portalLeg = nil
+        end
     end
 
     local chosenLeg = nil
@@ -1727,8 +2164,8 @@ function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedE
     elseif portalLeg and #portalLeg > 0 then
         chosenLeg, chosenType = portalLeg, "portal"
     else
-        chosenLeg = snd.mapper.findPath(tostring(closestRoom), destination, nil, nil, ignoreLockedExits)
-        chosenType = "fallback"
+        snd.utils.debugNote("outward jump-route: candidate room has no recall or portal continuation.")
+        return nil
     end
 
     if not chosenLeg or #chosenLeg == 0 then
@@ -1756,6 +2193,7 @@ function snd.mapper.findNearestJumpRoom(src, dst, targetType, ignoreLockedExits)
     local visited = table.concat(roomsList, ",")
     local myLevel = snd.char.level or 201
     local levelWhere = ignoreLockedExits and "1=1" or string.format("exits.level <= %d", myLevel)
+    local areaWhere = snd.mapper.areaGuardRoomSql("exits.touid", src, ignoreLockedExits)
     
     while depth < maxDepth do
         depth = depth + 1
@@ -1767,8 +2205,15 @@ function snd.mapper.findNearestJumpRoom(src, dst, targetType, ignoreLockedExits)
             WHERE exits.fromuid IN (%s) 
             AND exits.touid NOT IN (%s) 
             AND %s
+            AND %s
             ORDER BY %s
-        ]], table.concat(roomsList, ","), visited, levelWhere, snd.mapper.exitPreferenceOrderSql("exits.dir"))
+        ]],
+            table.concat(roomsList, ","),
+            visited,
+            levelWhere,
+            areaWhere,
+            snd.mapper.exitPreferenceOrderSql("exits.dir")
+        )
         
         local results = snd.mapper.db.query(sql) or {}
         roomsList = {}
@@ -1830,6 +2275,7 @@ function snd.mapper.findNearestRoomWithoutFlag(src, restrictionFlag, ignoreLocke
     local head = 1
     local visited = {[source] = true}
     local parents = {}
+    local areaWhere = snd.mapper.areaGuardRoomSql("exits.touid", source, ignoreLockedExits)
 
     while head <= #queue do
         local node = queue[head]
@@ -1843,8 +2289,14 @@ function snd.mapper.findNearestRoomWithoutFlag(src, restrictionFlag, ignoreLocke
                   AND fromuid NOT IN ('*', '**')
                   AND touid NOT IN ('*', '**')
                   AND %s
+                  AND %s
                 ORDER BY %s
-            ]], snd.mapper.db.escape(node.room), levelWhere, snd.mapper.exitPreferenceOrderSql("dir"))
+            ]],
+                snd.mapper.db.escape(node.room),
+                levelWhere,
+                areaWhere,
+                snd.mapper.exitPreferenceOrderSql("dir")
+            )
             local exits = snd.mapper.db.query(sql) or {}
             for _, ex in ipairs(exits) do
                 local nextRoom = tostring(ex.touid or "")
@@ -1907,6 +2359,7 @@ function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
     local head = 1
     local visited = {[source] = true}
     local parents = {}
+    local areaWhere = snd.mapper.areaGuardRoomSql("exits.touid", source, ignoreLockedExits)
 
     while head <= #queue do
         local node = queue[head]
@@ -1920,8 +2373,14 @@ function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
                   AND fromuid NOT IN ('*', '**')
                   AND touid NOT IN ('*', '**')
                   AND %s
+                  AND %s
                 ORDER BY %s
-            ]], snd.mapper.db.escape(node.room), levelWhere, snd.mapper.exitPreferenceOrderSql("dir"))
+            ]],
+                snd.mapper.db.escape(node.room),
+                levelWhere,
+                areaWhere,
+                snd.mapper.exitPreferenceOrderSql("dir")
+            )
             local exits = snd.mapper.db.query(sql) or {}
             for _, ex in ipairs(exits) do
                 local nextRoom = tostring(ex.touid or "")
@@ -1961,7 +2420,7 @@ function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
     return nil, nil
 end
 
-function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLockedExits)
+function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLockedExits, allowGeneralFallback)
     local source = tostring(src or "")
     local destination = tostring(dst or "")
     if source == "" or destination == "" then
@@ -1971,6 +2430,7 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
     local requiredFlag = (blockedType == "recall") and "noportal" or "norecall"
     local forceNoPortals = (blockedType == "portal")
     local forceNoRecalls = (blockedType == "recall")
+    local expectedType = (blockedType == "portal") and "recall" or "portal"
     local myLevel = snd.char.level or 201
     local maxDepth = snd.mapper.config.maxSearchDepth
     local maxCandidates = 40
@@ -1980,6 +2440,7 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
     local head = 1
     local visited = {[source] = true}
     local parents = {}
+    local areaWhere = snd.mapper.areaGuardRoomSql("exits.touid", source, ignoreLockedExits)
 
     while head <= #queue do
         local node = queue[head]
@@ -1990,7 +2451,7 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
         if canUseAlternate then
             testedCandidates = testedCandidates + 1
             local leg = snd.mapper.findPath(node.room, destination, forceNoPortals, forceNoRecalls, ignoreLockedExits)
-            if leg and #leg > 0 then
+            if leg and #leg > 0 and snd.mapper.pathStartsWithJump(leg, expectedType) then
                 local walkPath = {}
                 local cursor = node.room
                 while cursor ~= source do
@@ -2010,9 +2471,10 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
                 return combined, node.room, "preferred"
             end
 
-            -- If preferred jump type is not available from this room,
-            -- still allow a general route so we can move out of the blocked room.
-            local fallbackLeg = snd.mapper.findPath(node.room, destination, nil, nil, ignoreLockedExits)
+            -- Some callers may still opt into the legacy general-route fallback.
+            local fallbackLeg = allowGeneralFallback
+                and snd.mapper.findPath(node.room, destination, nil, nil, ignoreLockedExits)
+                or nil
             if fallbackLeg and #fallbackLeg > 0 then
                 local walkPath = {}
                 local cursor = node.room
@@ -2046,8 +2508,14 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
                   AND fromuid NOT IN ('*', '**')
                   AND touid NOT IN ('*', '**')
                   AND %s
+                  AND %s
                 ORDER BY %s
-            ]], snd.mapper.db.escape(node.room), levelWhere, snd.mapper.exitPreferenceOrderSql("dir"))
+            ]],
+                snd.mapper.db.escape(node.room),
+                levelWhere,
+                areaWhere,
+                snd.mapper.exitPreferenceOrderSql("dir")
+            )
             local exits = snd.mapper.db.query(sql) or {}
             for _, ex in ipairs(exits) do
                 local nextRoom = tostring(ex.touid or "")
@@ -2170,8 +2638,26 @@ function snd.mapper.executePath(path)
 		local raw = tostring(step.dir or "")
 		local parts = raw:find(";", 1, true) and splitSemis(raw) or { raw }
         local stepSourceRoom = simulatedRoom
+        local isTravelStep = step.travelType == "portal" or step.travelType == "recall"
         local stepHasWait = false
         local encounteredWait = false
+
+        -- Do not send a jump in the same batch as the walk leading to its
+        -- source room. Waiting for GMCP here also makes restriction markers
+        -- identify the room where recall/portal was actually attempted.
+        if isTravelStep then
+            flushCardinals()
+            if #currentGroup.commands > 0 then
+                table.insert(groups, currentGroup)
+            end
+            currentGroup = {
+                commands = {},
+                delayAfter = 0,
+                waitRoomId = nil,
+                executeRoomId = tostring(stepSourceRoom or "-1"),
+            }
+        end
+
         for _, token in ipairs(parts) do
             if tostring(token):match("^%s*wait%((%d+%.?%d*)%)%s*$") then
                 stepHasWait = true
@@ -2229,9 +2715,24 @@ function snd.mapper.executePath(path)
                     travelType = step.travelType,
                 })
 			end
-		end
+        end
         if step.uid then
             simulatedRoom = tostring(step.uid)
+        end
+
+        -- Commands after a jump must likewise wait until its destination is
+        -- confirmed instead of racing into the server command queue.
+        if isTravelStep then
+            flushCardinals()
+            if #currentGroup.commands > 0 then
+                table.insert(groups, currentGroup)
+            end
+            currentGroup = {
+                commands = {},
+                delayAfter = 0,
+                waitRoomId = nil,
+                executeRoomId = tostring(simulatedRoom or "-1"),
+            }
         end
 	end
 
@@ -2418,7 +2919,8 @@ end
 --- Go to a room using portal-aware pathfinding
 -- @param roomId Destination room uid
 -- @param usePortals Whether to use portals (default: true)
-function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMode)
+-- @param guardDestination Original xrt destination for area-guard override links
+function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMode, guardDestination)
     if not roomId then
         snd.utils.infoNote("No room specified")
         return false
@@ -2475,6 +2977,18 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
             snd.onDestinationArrived()
         end
         return true
+    end
+
+    if not snd.mapper.checkAreaGuardDestination(
+        currentRoom,
+        roomId,
+        guardDestination or roomId,
+        ignoreLockedExits,
+        false
+    ) then
+        snd.mapper.goingToRoom = nil
+        snd.nav.goingToRoom = nil
+        return false
     end
 
     local pendingBlocked = snd.mapper.pendingBlockedTravel
@@ -2560,7 +3074,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
                         end
                         nowRoom = tostring(nowRoom or "")
                         if nowRoom ~= "" and nowRoom ~= "-1" and nowRoom ~= expectedRoom then
-                            snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, true)
+                            snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, true, guardDestination)
                             return
                         end
                         if attempt < 2 then
@@ -2581,7 +3095,30 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
         snd.mapper.executePath(path)
         return true
     else
+        if snd.mapper.areaGuardEnabled() and not ignoreLockedExits then
+            local unguardedPath = snd.mapper.findPath(
+                currentRoom,
+                roomId,
+                noPortals,
+                noRecalls,
+                ignoreLockedExits,
+                true
+            )
+            if unguardedPath and #unguardedPath > 0 then
+                snd.utils.debugNote(string.format(
+                    "Area guard rejected all routes to room %s; unguarded route has %d steps.",
+                    tostring(roomId),
+                    #unguardedPath
+                ))
+                snd.mapper.reportAreaGuardRouteBlocked(guardDestination or roomId)
+                snd.mapper.goingToRoom = nil
+                snd.nav.goingToRoom = nil
+                return false
+            end
+            snd.utils.debugNote("Area guard route retry found no unguarded route either.")
+        end
         snd.utils.infoNote("You couldn't find a path to " .. roomId .. " from here.")
+        snd.utils.infoNote("Try 'xrtnear " .. roomId .. "' to list reachable boundary rooms. The lookup may take a moment.")
         snd.mapper.goingToRoom = nil
         snd.nav.goingToRoom = nil
         return false
@@ -2627,18 +3164,6 @@ function snd.mapper.gotoTarget()
     
     snd.utils.infoNote("Target has no room or area information")
     return false
-end
-
--------------------------------------------------------------------------------
--- Command Integration
--------------------------------------------------------------------------------
-
---- Override snd.commands.gotoTarget to use portal navigation
-local originalGotoTarget = snd.commands and snd.commands.gotoTarget
-
-function snd.commands.gotoTarget()
-    -- Use portal-aware navigation
-    return snd.mapper.gotoTarget()
 end
 
 -------------------------------------------------------------------------------
@@ -3120,7 +3645,7 @@ function snd.mapper.xrt(dest)
     if roomNum then
         cecho("<yellow>[MMAPPER]<reset> Going to room " .. roomNum .. "\n")
         snd.mapper.debugXrtDecision(dest, roomNum, "numeric destination")
-        return snd.mapper.gotoRoom(roomNum)
+        return snd.mapper.gotoRoom(roomNum, nil, nil, nil, dest)
     end
     
     -- Try exact match on area key first (prefer snd.db startRoom data)
@@ -3129,7 +3654,7 @@ function snd.mapper.xrt(dest)
         if startRoom > 0 then
             cecho("<yellow>[MMAPPER]<reset> Going to " .. dest .. " (room " .. startRoom .. ")\n")
             snd.mapper.debugXrtDecision(dest, startRoom, "area start room from snd.db.getAreaStartRoom")
-            return snd.mapper.gotoRoom(startRoom)
+            return snd.mapper.gotoRoom(startRoom, nil, nil, nil, dest)
         end
 
         if snd.db.query then
@@ -3145,7 +3670,7 @@ function snd.mapper.xrt(dest)
                 if roomId > 0 then
                     cecho("<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. roomId .. ")\n")
                     snd.mapper.debugXrtDecision(dest, roomId, "area match from snd.db area query")
-                    return snd.mapper.gotoRoom(roomId)
+                    return snd.mapper.gotoRoom(roomId, nil, nil, nil, dest)
                 end
             end
         end
@@ -3157,7 +3682,7 @@ function snd.mapper.xrt(dest)
         if areaData and areaData.start then
             cecho("<yellow>[MMAPPER]<reset> Going to " .. dest .. " (room " .. areaData.start .. ")\n")
             snd.mapper.debugXrtDecision(dest, areaData.start, "bundled default area start")
-            return snd.mapper.gotoRoom(areaData.start)
+            return snd.mapper.gotoRoom(areaData.start, nil, nil, nil, dest)
         end
         
         -- Try partial match on area names
@@ -3165,7 +3690,7 @@ function snd.mapper.xrt(dest)
             if areaKey:lower():find(dest, 1, true) and data.start then
                 cecho("<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. data.start .. ")\n")
                 snd.mapper.debugXrtDecision(dest, data.start, "bundled partial area match")
-                return snd.mapper.gotoRoom(data.start)
+                return snd.mapper.gotoRoom(data.start, nil, nil, nil, dest)
             end
         end
     end
@@ -3181,7 +3706,7 @@ function snd.mapper.xrt(dest)
             local roomId = results[1].uid
             cecho("<yellow>[MMAPPER]<reset> Going to area matching '" .. dest .. "' (room " .. roomId .. ")\n")
             snd.mapper.debugXrtDecision(dest, roomId, "mapper db area LIKE fallback")
-            return snd.mapper.gotoRoom(roomId)
+            return snd.mapper.gotoRoom(roomId, nil, nil, nil, dest)
         end
     end
     
@@ -3200,15 +3725,15 @@ function snd.mapper.xrtforce(dest)
 
     local roomNum = tonumber(dest)
     if roomNum then
-        cecho("<yellow>[MMAPPER]<reset> Force-going to room " .. roomNum .. " (ignoring exits.level locks)\n")
-        return snd.mapper.gotoRoom(roomNum, true, true)
+        cecho("<yellow>[MMAPPER]<reset> Force-going to room " .. roomNum .. " (ignoring area and exit-level guards)\n")
+        return snd.mapper.gotoRoom(roomNum, true, true, nil, dest)
     end
 
     if snd.db and snd.db.getAreaStartRoom then
         local startRoom = tonumber(snd.db.getAreaStartRoom(dest)) or -1
         if startRoom > 0 then
-            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. startRoom .. ", ignoring exits.level locks)\n")
-            return snd.mapper.gotoRoom(startRoom, true, true)
+            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. startRoom .. ", ignoring area and exit-level guards)\n")
+            return snd.mapper.gotoRoom(startRoom, true, true, nil, dest)
         end
 
         if snd.db.query then
@@ -3222,8 +3747,8 @@ function snd.mapper.xrtforce(dest)
                 local areaKey = areaRows[1].key
                 local roomId = tonumber(areaRows[1].startRoom) or -1
                 if roomId > 0 then
-                    cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. roomId .. ", ignoring exits.level locks)\n")
-                    return snd.mapper.gotoRoom(roomId, true, true)
+                    cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. roomId .. ", ignoring area and exit-level guards)\n")
+                    return snd.mapper.gotoRoom(roomId, true, true, nil, dest)
                 end
             end
         end
@@ -3232,14 +3757,14 @@ function snd.mapper.xrtforce(dest)
     if snd.data and snd.data.areaDefaultStartRooms then
         local areaData = snd.data.areaDefaultStartRooms[dest]
         if areaData and areaData.start then
-            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. areaData.start .. ", ignoring exits.level locks)\n")
-            return snd.mapper.gotoRoom(areaData.start, true, true)
+            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. areaData.start .. ", ignoring area and exit-level guards)\n")
+            return snd.mapper.gotoRoom(areaData.start, true, true, nil, dest)
         end
 
         for areaKey, data in pairs(snd.data.areaDefaultStartRooms) do
             if areaKey:lower():find(dest, 1, true) and data.start then
-                cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. data.start .. ", ignoring exits.level locks)\n")
-                return snd.mapper.gotoRoom(data.start, true, true)
+                cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. data.start .. ", ignoring area and exit-level guards)\n")
+                return snd.mapper.gotoRoom(data.start, true, true, nil, dest)
             end
         end
     end
@@ -3252,8 +3777,8 @@ function snd.mapper.xrtforce(dest)
         local results = snd.mapper.db.query(sql)
         if results and #results > 0 then
             local roomId = results[1].uid
-            cecho("<yellow>[MMAPPER]<reset> Force-going to area matching '" .. dest .. "' (room " .. roomId .. ", ignoring exits.level locks)\n")
-            return snd.mapper.gotoRoom(roomId, true, true)
+            cecho("<yellow>[MMAPPER]<reset> Force-going to area matching '" .. dest .. "' (room " .. roomId .. ", ignoring area and exit-level guards)\n")
+            return snd.mapper.gotoRoom(roomId, true, true, nil, dest)
         end
     end
 
@@ -3352,6 +3877,10 @@ function snd.mapper.walkTo(dest)
         cecho("<yellow>[MMAPPER]<reset> Already at " .. displayName .. "\n")
         return true
     end
+
+    if not snd.mapper.checkAreaGuardDestination(currentRoom, targetRoom, dest, false, false) then
+        return false
+    end
     
     -- Use snd.mapper.findPath with portals DISABLED
     cecho("<yellow>[MMAPPER]<reset> Walking to " .. displayName .. " (no portals)...\n")
@@ -3365,6 +3894,18 @@ function snd.mapper.walkTo(dest)
         snd.mapper.executePath(path)
         return true
     else
+        if snd.mapper.areaGuardEnabled() then
+            local unguardedPath = snd.mapper.findPath(currentRoom, targetRoom, true, true, false, true)
+            if unguardedPath and #unguardedPath > 0 then
+                snd.utils.debugNote(string.format(
+                    "Area guard rejected walking route to room %s; unguarded route has %d steps.",
+                    tostring(targetRoom),
+                    #unguardedPath
+                ))
+                snd.mapper.reportAreaGuardRouteBlocked(dest)
+                return false
+            end
+        end
         cecho("<red>[MMAPPER]<reset> No walking path found to " .. displayName .. "\n")
         cecho("<dim_gray>The destination may not be reachable by walking alone.<reset>\n")
         return false

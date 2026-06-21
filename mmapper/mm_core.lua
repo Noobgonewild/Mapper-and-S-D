@@ -67,6 +67,19 @@ local function serialize_value(v)
   return "nil"
 end
 
+local function now_millis()
+  if type(getEpoch) == "function" then
+    local v = tonumber(getEpoch())
+    if v then
+      if v < 10000000000 then
+        return v * 1000
+      end
+      return v
+    end
+  end
+  return (os.clock() or 0) * 1000
+end
+
 local function persistence_dir()
   return getMudletHomeDir() .. "/persistence"
 end
@@ -96,10 +109,16 @@ function mm.load_persistence_chunk(filename)
 end
 
 function mm.open_persistence_file(filename, mode)
+  local path = mm.persistence_path(filename)
+  local f = io.open(path, mode or "wb")
+  if f then
+    return f
+  end
+
   if type(mm.ensure_dir) == "function" then
     mm.ensure_dir(persistence_dir())
   end
-  return io.open(mm.persistence_path(filename), mode or "wb")
+  return io.open(path, mode or "wb")
 end
 
 local PORTAL_PERSIST_FILE = "mmapper_portals.lua"
@@ -147,15 +166,36 @@ function mm.load_deleted_cexits_persistence()
 end
 
 function mm.save_deleted_cexits_persistence()
+  local timing_enabled = mm.state and mm.state.debug
+  local timing_start = timing_enabled and now_millis() or nil
   local payload = {
     deleted = mm.state.deleted_cexits or {},
   }
+  local serialized = "return " .. serialize_value(payload)
+  local serialize_done = timing_enabled and now_millis() or nil
+
   local f = mm.open_persistence_file(DELETED_CEXITS_PERSIST_FILE, "wb")
+  local open_done = timing_enabled and now_millis() or nil
   if not f then
     return false, "unable to open deleted cexit persistence file for writing"
   end
-  f:write("return " .. serialize_value(payload))
+
+  f:write(serialized)
+  local write_done = timing_enabled and now_millis() or nil
   f:close()
+  local close_done = timing_enabled and now_millis() or nil
+
+  if timing_enabled then
+    mm.debug(string.format(
+      "deleted cexit history save timing: serialize=%.1fms open=%.1fms write=%.1fms close=%.1fms total=%.1fms",
+      (serialize_done or timing_start) - timing_start,
+      (open_done or serialize_done) - (serialize_done or timing_start),
+      (write_done or open_done) - (open_done or timing_start),
+      (close_done or write_done) - (write_done or timing_start),
+      (close_done or timing_start) - timing_start
+    ))
+  end
+
   return true
 end
 
@@ -583,6 +623,11 @@ function mm.path_exists(path)
 end
 
 function mm.dir_exists(path)
+  local ok, lfs = pcall(require, "lfs")
+  if ok and lfs and type(lfs.attributes) == "function" then
+    return lfs.attributes(path, "mode") == "directory"
+  end
+
   local sep = package.config:sub(1, 1)
   local probe = path
   if probe:sub(-1) ~= sep then
@@ -767,7 +812,13 @@ function mm.load_native_mapper_db(path)
     return false, "Mudlet API loadMap() is unavailable"
   end
 
+  local load_started = now_millis()
   local ok, result = pcall(loadMap, resolved)
+  mm.debug(string.format(
+    "native Mudlet map load timing: %.1fms (%s)",
+    now_millis() - load_started,
+    tostring(resolved)
+  ))
   if not ok then
     return false, "loadMap() errored: " .. tostring(result)
   end
@@ -2322,18 +2373,43 @@ function mm.delete_cexit(index)
     return false, "DELETE CEXIT ERROR: selected cexit row is missing required fields"
   end
 
+  local timing_enabled = mm.state and mm.state.debug
+  local timing_start = timing_enabled and now_millis() or nil
+  local db_start = timing_start
+
   -- never delete active cexits
   local ok, err = mm.exec_mapper_db(string.format(
     "DELETE FROM exits WHERE fromuid=%s AND dir=%s AND touid=%s",
     mm.sql_escape(entry.fromuid), mm.sql_escape(entry.dir), mm.sql_escape(entry.touid)
   ))
+  local db_done = timing_enabled and now_millis() or nil
   if not ok then return false, err end
 
+  local remove_done = db_done
   if type(removeSpecialExit) == "function" then
     pcall(removeSpecialExit, tonumber(entry.fromuid) or entry.fromuid, entry.dir)
+    if timing_enabled then remove_done = now_millis() end
   end
 
   remember_deleted_cexit(entry)
+  local history_done = timing_enabled and now_millis() or nil
+
+  if timing_enabled then
+    mm.debug(string.format(
+      "deletecexit timing: from=%s dir=%s to=%s db=%.1fms removeSpecialExit=%.1fms history=%.1fms total=%.1fms",
+      entry.fromuid,
+      entry.dir,
+      entry.touid,
+      (db_done or timing_start) - (db_start or timing_start),
+      (remove_done or db_done) - (db_done or timing_start),
+      (history_done or remove_done) - (remove_done or timing_start),
+      (history_done or timing_start) - timing_start
+    ))
+  end
+
+  table.remove(rows, n)
+  mm.runtime.cexit_last_rows = rows
+
   mm.note(string.format(
     "Deleted cexit: from (%s) area '%s' room '%s' dir '%s' to (%s).",
     entry.fromuid, entry.area, entry.name, entry.dir, entry.touid

@@ -157,6 +157,18 @@ function CW.roomHasPlayers()
     return false
 end
 
+local function activeActivityLabel(target)
+    local activity = tostring(target and target.activity or ""):lower()
+    if activity == "cp" and snd and snd.campaign and snd.campaign.active then
+        return "CP"
+    elseif activity == "gq" and snd and snd.gquest and snd.gquest.active then
+        return "GQ"
+    elseif activity == "quest" and snd and snd.quest and snd.quest.active then
+        return "quest"
+    end
+    return nil
+end
+
 function CW.tryMobDetectConfirmedTarget()
     if CW.mobDetectDispatched then return false end
     local mode = tostring(snd and snd.config and snd.config.mobdetect or "off"):lower()
@@ -168,6 +180,8 @@ function CW.tryMobDetectConfirmedTarget()
     local current = snd and snd.targets and snd.targets.current or nil
     if not current then return false end
     if current.dead or tostring(current.status or ""):lower() == "dead" then return false end
+    local activityLabel = activeActivityLabel(current)
+    if not activityLabel then return false end
 
     local targetName = normalizeMobName(current.name or "")
     local present = false
@@ -189,7 +203,6 @@ function CW.tryMobDetectConfirmedTarget()
         if CW.roomHasPlayers() then return false end
     end
 
-    CW.mobDetectDispatched = true
     
     return true
 end

@@ -579,8 +579,13 @@ local function playQuestReadyWarning()
     playConfiguredSound("SearchAndDestroy/quest_ready.wav", "sounds/quest_ready.wav")
 end
 
-function snd.triggers.gqAboutToStart()
+function snd.triggers.gqAboutToStart(matches)
     playConfiguredSound("SearchAndDestroy/GQ about to start.wav")
+
+    -- Browse the announced quest's details without joining it.
+    if matches and matches[2] then
+        send("gq i " .. tostring(matches[2]), false)
+    end
 end
 
 function snd.triggers.targetKilledSound()

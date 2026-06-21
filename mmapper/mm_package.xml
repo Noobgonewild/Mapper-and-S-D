@@ -117,6 +117,19 @@ local function serialize_value(v)
   return "nil"
 end
 
+local function now_millis()
+  if type(getEpoch) == "function" then
+    local v = tonumber(getEpoch())
+    if v then
+      if v < 10000000000 then
+        return v * 1000
+      end
+      return v
+    end
+  end
+  return (os.clock() or 0) * 1000
+end
+
 local function persistence_dir()
   return getMudletHomeDir() .. "/persistence"
 end
@@ -146,10 +159,16 @@ function mm.load_persistence_chunk(filename)
 end
 
 function mm.open_persistence_file(filename, mode)
+  local path = mm.persistence_path(filename)
+  local f = io.open(path, mode or "wb")
+  if f then
+    return f
+  end
+
   if type(mm.ensure_dir) == "function" then
     mm.ensure_dir(persistence_dir())
   end
-  return io.open(mm.persistence_path(filename), mode or "wb")
+  return io.open(path, mode or "wb")
 end
 
 local PORTAL_PERSIST_FILE = "mmapper_portals.lua"
@@ -197,15 +216,36 @@ function mm.load_deleted_cexits_persistence()
 end
 
 function mm.save_deleted_cexits_persistence()
+  local timing_enabled = mm.state and mm.state.debug
+  local timing_start = timing_enabled and now_millis() or nil
   local payload = {
     deleted = mm.state.deleted_cexits or {},
   }
+  local serialized = "return " .. serialize_value(payload)
+  local serialize_done = timing_enabled and now_millis() or nil
+
   local f = mm.open_persistence_file(DELETED_CEXITS_PERSIST_FILE, "wb")
+  local open_done = timing_enabled and now_millis() or nil
   if not f then
     return false, "unable to open deleted cexit persistence file for writing"
   end
-  f:write("return " .. serialize_value(payload))
+
+  f:write(serialized)
+  local write_done = timing_enabled and now_millis() or nil
   f:close()
+  local close_done = timing_enabled and now_millis() or nil
+
+  if timing_enabled then
+    mm.debug(string.format(
+      "deleted cexit history save timing: serialize=%.1fms open=%.1fms write=%.1fms close=%.1fms total=%.1fms",
+      (serialize_done or timing_start) - timing_start,
+      (open_done or serialize_done) - (serialize_done or timing_start),
+      (write_done or open_done) - (open_done or timing_start),
+      (close_done or write_done) - (write_done or timing_start),
+      (close_done or timing_start) - timing_start
+    ))
+  end
+
   return true
 end
 
@@ -633,6 +673,11 @@ function mm.path_exists(path)
 end
 
 function mm.dir_exists(path)
+  local ok, lfs = pcall(require, "lfs")
+  if ok and lfs and type(lfs.attributes) == "function" then
+    return lfs.attributes(path, "mode") == "directory"
+  end
+
   local sep = package.config:sub(1, 1)
   local probe = path
   if probe:sub(-1) ~= sep then
@@ -817,7 +862,13 @@ function mm.load_native_mapper_db(path)
     return false, "Mudlet API loadMap() is unavailable"
   end
 
+  local load_started = now_millis()
   local ok, result = pcall(loadMap, resolved)
+  mm.debug(string.format(
+    "native Mudlet map load timing: %.1fms (%s)",
+    now_millis() - load_started,
+    tostring(resolved)
+  ))
   if not ok then
     return false, "loadMap() errored: " .. tostring(result)
   end
@@ -2372,18 +2423,43 @@ function mm.delete_cexit(index)
     return false, "DELETE CEXIT ERROR: selected cexit row is missing required fields"
   end
 
+  local timing_enabled = mm.state and mm.state.debug
+  local timing_start = timing_enabled and now_millis() or nil
+  local db_start = timing_start
+
   -- never delete active cexits
   local ok, err = mm.exec_mapper_db(string.format(
     "DELETE FROM exits WHERE fromuid=%s AND dir=%s AND touid=%s",
     mm.sql_escape(entry.fromuid), mm.sql_escape(entry.dir), mm.sql_escape(entry.touid)
   ))
+  local db_done = timing_enabled and now_millis() or nil
   if not ok then return false, err end
 
+  local remove_done = db_done
   if type(removeSpecialExit) == "function" then
     pcall(removeSpecialExit, tonumber(entry.fromuid) or entry.fromuid, entry.dir)
+    if timing_enabled then remove_done = now_millis() end
   end
 
   remember_deleted_cexit(entry)
+  local history_done = timing_enabled and now_millis() or nil
+
+  if timing_enabled then
+    mm.debug(string.format(
+      "deletecexit timing: from=%s dir=%s to=%s db=%.1fms removeSpecialExit=%.1fms history=%.1fms total=%.1fms",
+      entry.fromuid,
+      entry.dir,
+      entry.touid,
+      (db_done or timing_start) - (db_start or timing_start),
+      (remove_done or db_done) - (db_done or timing_start),
+      (history_done or remove_done) - (remove_done or timing_start),
+      (history_done or timing_start) - timing_start
+    ))
+  end
+
+  table.remove(rows, n)
+  mm.runtime.cexit_last_rows = rows
+
   mm.note(string.format(
     "Deleted cexit: from (%s) area '%s' room '%s' dir '%s' to (%s).",
     entry.fromuid, entry.area, entry.name, entry.dir, entry.touid
@@ -2574,6 +2650,313 @@ function mm.restore_portal(which)
 end
 ]==========])
 
+  load_package_module("mm_area_references.lua", [==========[
+-- Static snapshot of Aardwolf's official area level metadata.
+-- Keep this module data-only; navigation policy lives in mm_navigation.lua.
+
+mm = mm or {}
+
+local areaTable = {
+    {name = "Bloodlust Dungeon", keyword = 'dungeon', start = 0, vidblain = false, noquest = false, min = 200, max = 201, lock = 201},
+    {name = "The Desert Prison", keyword = 'desert', start = 20186, vidblain = false, noquest = false, min = 130, max = 201, lock = 110},
+    {name = "The Dungeon of Doom", keyword = 'dundoom', start = 25661, vidblain = false, noquest = false, min = 200, max = 201, lock = 180},
+    {name = "The Earth Lords", keyword = 'earthlords', start = 42000, vidblain = false, noquest = false, min = 200, max = 201, lock = 175},
+    {name = "The Empire of Aiighialla", keyword = 'empire', start = 32203, vidblain = false, noquest = false, min = 140, max = 180, lock = 100},
+    {name = "The Fabled City of Stone", keyword = 'stone', start = 11386, vidblain = false, noquest = false, min = 70, max = 130, lock = 40},
+    {name = "The Flying Citadel", keyword = 'citadel', start = 14963, vidblain = false, noquest = false, min = 50, max = 70, lock = 20},
+    {name = "The Gauntlet", keyword = 'gauntlet', start = 31652, vidblain = false, noquest = false, min = 5, max = 30, lock = 0},
+    {name = "The Gladiator's Arena", keyword = 'arena', start = 25768, vidblain = false, noquest = false, min = 80, max = 100, lock = 0},
+    {name = "The Glamdursil", keyword = 'glamdursil', start = 35055, vidblain = false, noquest = false, min = 170, max = 201, lock = 140},
+    {name = "The Grand City of Aylor", keyword = 'aylor', start = 32418, vidblain = false, noquest = false, min = 1, max = 201, lock = 0},
+    {name = "The Great Salt Flats", keyword = 'salt', start = 4538, vidblain = false, noquest = false, min = 40, max = 50, lock = 15},
+    {name = "The Keep of Kearvek", keyword = 'kearvek', start = 29722, vidblain = false, noquest = false, min = 175, max = 201, lock = 140},
+    {name = "The Killing Fields", keyword = 'fields', start = 29232, vidblain = false, noquest = false, min = 60, max = 80, lock = 40},
+    {name = "The Labyrinth", keyword = 'labyrinth', start = 31405, vidblain = false, noquest = false, min = 30, max = 60, lock = 15},
+    {name = "The Land of the Beer Goblins", keyword = 'beer', start = 20062, vidblain = false, noquest = false, min = 1, max = 20, lock = 0},
+    {name = "The Lower Planes", keyword = 'lplanes', start = 29364, vidblain = false, noquest = false, min = 70, max = 100, lock = 50},
+    {name = "The Marshlands of Agroth", keyword = 'agroth', start = 11027, vidblain = false, noquest = false, min = 105, max = 125, lock = 60},
+    {name = "The Misty Shores of Yarr", keyword = 'yarr', start = 30281, vidblain = false, noquest = false, min = 115, max = 135, lock = 80},
+    {name = "The Monastery", keyword = 'monastery', start = 15756, vidblain = false, noquest = false, min = 90, max = 120, lock = 50},
+    {name = "The Nine Hells", keyword = 'ninehells', start = 4613, vidblain = false, noquest = false, min = 180, max = 201, lock = 170},
+    {name = "The Old Cathedral", keyword = 'cathedral', start = 27497, vidblain = false, noquest = false, min = 50, max = 80, lock = 25},
+    {name = "The Path of the Believer", keyword = 'believer', start = 25940, vidblain = false, noquest = false, min = 1, max = 10, lock = 0},
+    {name = "The Realm of Infamy", keyword = 'infamy', start = 26641, vidblain = false, noquest = false, min = 200, max = 201, lock = 190},
+    {name = "The Reman Conspiracy", keyword = 'remcon', start = 25837, vidblain = false, noquest = false, min = 130, max = 170, lock = 95},
+    {name = "The Shadows of Minos", keyword = 'minos', start = 20472, vidblain = false, noquest = false, min = 5, max = 35, lock = 0},
+    {name = "The Silver Volcano", keyword = 'volcano', start = 6091, vidblain = false, noquest = false, min = 30, max = 100, lock = 0},
+    {name = "The Slaughter House", keyword = 'slaughter', start = 1601, vidblain = false, noquest = false, min = 120, max = 145, lock = 95},
+    {name = "The Stuff of Shadows", keyword = 'stuff', start = 40400, vidblain = false, noquest = false, min = 110, max = 130, lock = 30},
+    {name = "The Town of Solan", keyword = 'solan', start = 23713, vidblain = false, noquest = false, min = 5, max = 35, lock = 0},
+    {name = "The Uprising", keyword = 'uprising', start = 15382, vidblain = false, noquest = false, min = 120, max = 160, lock = 100},
+    {name = "The Wobbly Woes of Woobleville", keyword = 'wooble', start = 11335, vidblain = false, noquest = false, min = 40, max = 60, lock = 0},
+    {name = "Tir na nOg", keyword = 'tirna', start = 20136, vidblain = false, noquest = false, min = 130, max = 150, lock = 100},
+    {name = "Tournament Camps", keyword = 'camps', start = 4714, vidblain = false, noquest = false, min = 1, max = 10, lock = 0},
+    {name = "Unearthly Bonds", keyword = 'bonds', start = 23411, vidblain = false, noquest = false, min = 140, max = 170, lock = 0},
+    {name = "A Genie's Last Wish", keyword = 'geniewish', start = 38464, vidblain = false, noquest = true, min = 200, max = 201, lock = 200},
+    {name = "Weather Observatory", keyword = 'weather', start = 40499, vidblain = false, noquest = false, min = 20, max = 40, lock = 0},
+    {name = "A Peaceful Giant Village", keyword = 'village', start = 30850, vidblain = false, noquest = false, min = 130, max = 160, lock = 100},
+    {name = "Aardington Estate", keyword = 'aardington', start = 47509, vidblain = false, noquest = false, min = 70, max = 90, lock = 0},
+    {name = "Aardwolf Zoological Park", keyword = 'zoo', start = 5920, vidblain = false, noquest = false, min = 5, max = 35, lock = 0},
+    {name = "Adventures in Sendhia", keyword = 'sendhian', start = 20288, vidblain = true, noquest = false, min = 5, max = 50, lock = 0},
+    {name = "Xyl's Mosaic", keyword = 'xylmos', start = 472, vidblain = false, noquest = false, min = 100, max = 120, lock = 80},
+    {name = "Afterglow", keyword = 'afterglow', start = 38134, vidblain = false, noquest = false, min = 200, max = 201, lock = 0},
+    {name = "Alagh, the Blood Lands", keyword = 'alagh', start = 3224, ct = 4, vidblain = false, noquest = false, min = 1, max = 210, lock = 0},
+    {name = "All in a Fayke Day", keyword = 'fayke', start = 30418, vidblain = false, noquest = false, min = 10, max = 30, lock = 0},
+    {name = "An Auspicious Star's Zenith", keyword = 'zenith', start = 23681, vidblain = false, noquest = false, min = 200, max = 201, lock = 150},
+    {name = "Ancient Greece", keyword = 'greece', start = 2089, vidblain = false, noquest = false, min = 20, max = 50, lock = 0},
+    {name = "Andolor's Ocean Adventure Park", keyword = 'oceanpark', start = 39600, vidblain = false, noquest = false, min = 200, max = 201, lock = 175},
+    {name = "Annwn", keyword = 'annwn', start = 28963, vidblain = false, noquest = false, min = 160, max = 180, lock = 140},
+    {name = "Snuckles Village", keyword = 'snuckles', start = 182, vidblain = false, noquest = false, min = 80, max = 100, lock = 65},
+    {name = "Storm Mountain", keyword = 'storm', start = 6304, vidblain = false, noquest = false, min = 10, max = 35, lock = 0},
+    {name = "Arisian Realm", keyword = 'arisian', start = 28144, vidblain = false, noquest = false, min = 150, max = 170, lock = 130},
+    {name = "Sundered Vale", keyword = 'vale', start = 1036, vidblain = false, noquest = false, min = 5, max = 20, lock = 0},
+    {name = "Swordbreaker's Hoard", keyword = 'hoard', start = 1675, vidblain = false, noquest = false, min = 5, max = 50, lock = 0},
+    {name = "Tairayden Peninsula", keyword = 'peninsula', start = 35701, vidblain = false, noquest = false, min = 110, max = 130, lock = 80},
+    {name = "Atlantis", keyword = 'atlantis', start = 10573, vidblain = false, noquest = false, min = 20, max = 40, lock = 0},
+    {name = "Takeda's Warcamp", keyword = 'takeda', start = 15952, vidblain = false, noquest = false, min = 140, max = 201, lock = 115},
+    {name = "Tanra'vea", keyword = 'tanra', start = 46913, vidblain = false, noquest = false, min = 180, max = 201, lock = 170},
+    {name = "Black Lagoon", keyword = 'lagoon', start = 30549, vidblain = false, noquest = false, min = 155, max = 195, lock = 120},
+    {name = "The Abyssal Caverns of Sahuagin", keyword = 'sahuagin', start = 34592, vidblain = false, noquest = false, min = 140, max = 160, lock = 100},
+    {name = "Brightsea and Glimmerdim", keyword = 'glimmerdim', start = 26252, vidblain = false, noquest = false, min = 5, max = 35, lock = 0},
+    {name = "Canyon Memorial Hospital", keyword = 'canyon', start = 25551, vidblain = false, noquest = false, min = 5, max = 30, lock = 0},
+    {name = "Castle Vlad-Shamir", keyword = 'vlad', start = 15970, vidblain = false, noquest = false, min = 50, max = 80, lock = 30},
+    {name = "Chakra Spire", keyword = 'chakra', start = 0, vidblain = false, noquest = false, min = 180, max = 201, lock = 0},
+    {name = "Chaprenula's Laboratory", keyword = 'lab', start = 28684, vidblain = false, noquest = false, min = 5, max = 15, lock = 0},
+    {name = "The Blighted Tundra of Andarin", keyword = 'andarin', start = 2399, vidblain = false, noquest = false, min = 35, max = 60, lock = 0},
+    {name = "Christmas Vacation", keyword = 'xmas', start = 6212, vidblain = false, noquest = false, min = 110, max = 150, lock = 100},
+    {name = "The Blood Sanctum", keyword = 'sanctum', start = 15307, vidblain = false, noquest = false, min = 180, max = 201, lock = 180},
+    {name = "The Broken Halls of Horath", keyword = 'horath', start = 91, vidblain = false, noquest = false, min = 120, max = 170, lock = 90},
+    {name = "Crossroads of Fortune", keyword = 'fortune', start = 38561, vidblain = false, noquest = false, min = 201, max = 201, lock = 201},
+    {name = "Crynn's Church", keyword = 'crynn', start = 43800, vidblain = false, noquest = false, min = 195, max = 201, lock = 185},
+    {name = "Dark Elf Stronghold", keyword = 'stronghold', start = 20572, vidblain = false, noquest = false, min = 90, max = 125, lock = 40},
+    {name = "Death's Manor", keyword = 'manor', start = 10621, vidblain = false, noquest = false, min = 20, max = 40, lock = 0},
+    {name = "Deathtrap Dungeon", keyword = 'deathtrap', start = 1767, vidblain = false, noquest = false, min = 80, max = 130, lock = 60},
+    {name = "Den of Thieves", keyword = 'thieves', start = 7, vidblain = false, noquest = false, min = 5, max = 20, lock = 0},
+    {name = "Descent to Hell", keyword = 'hell', start = 30984, vidblain = false, noquest = false, min = 35, max = 55, lock = 0},
+    {name = "Desert Doom", keyword = 'ddoom', start = 4193, vidblain = false, noquest = false, min = 135, max = 150, lock = 115},
+    {name = "Dhal'Gora Outlands", keyword = 'dhalgora', start = 16755, vidblain = false, noquest = false, min = 10, max = 50, lock = 0},
+    {name = "Diamond Soul Revelation", keyword = 'dsr', start = 30030, vidblain = false, noquest = false, min = 35, max = 85, lock = 25},
+    {name = "Dortmund", keyword = 'dortmund', start = 16577, vidblain = false, noquest = false, min = 5, max = 25, lock = 0},
+    {name = "Dread Tower", keyword = 'dread', start = 26075, vidblain = false, noquest = false, min = 160, max = 180, lock = 140},
+    {name = "Dunes in Gold", keyword = 'dunes', start = 42170, vidblain = false, noquest = false, min = 180, max = 201, lock = 160},
+    {name = "Dusk Valley", keyword = 'duskvalley', start = 37301, vidblain = false, noquest = false, min = 100, max = 120, lock = 100},
+    {name = "Earth Plane 4", keyword = 'earthplane', start = 1354, vidblain = false, noquest = false, min = 50, max = 80, lock = 30},
+    {name = "Elemental Chaos", keyword = 'elemental', start = 41624, vidblain = false, noquest = false, min = 90, max = 150, lock = 0},
+    {name = "Empyrean, Streets of Downfall", keyword = 'empyrean', start = 14042, vidblain = false, noquest = false, min = 170, max = 200, lock = 140},
+    {name = "Entrance to Hades", keyword = 'hades', start = 29161, vidblain = false, noquest = false, min = 190, max = 201, lock = 160},
+    {name = "Eternal Autumn", keyword = 'autumn', start = 13839, vidblain = false, noquest = false, min = 170, max = 201, lock = 0},
+    {name = "Faerie Tales II", keyword = 'ftii', start = 26673, vidblain = false, noquest = false, min = 120, max = 150, lock = 100},
+    {name = "Faerie Tales", keyword = 'ft1', start = 1205, vidblain = false, noquest = false, min = 100, max = 120, lock = 90},
+    {name = "Fantasy Fields", keyword = 'fantasy', start = 15205, vidblain = false, noquest = false, min = 5, max = 30, lock = 0},
+    {name = "Fellchantry", keyword = 'chantry', start = 0, vidblain = false, noquest = false, min = 150, max = 170, lock = 130},
+    {name = "Foolish Promises", keyword = 'promises', start = 25819, vidblain = false, noquest = false, min = 130, max = 140, lock = 115},
+    {name = "Fort Terramire", keyword = 'terramire', start = 4493, vidblain = false, noquest = false, min = 10, max = 35, lock = 0},
+    {name = "Gallows Hill", keyword = 'gallows', start = 4344, vidblain = false, noquest = false, min = 1, max = 30, lock = 0},
+    {name = "Gelidus", keyword = 'gelidus', start = 18780, ct = 2, vidblain = false, noquest = false, min = 1, max = 210, lock = 0},
+    {name = "Giant's Pet Store", keyword = 'petstore', start = 995, vidblain = false, noquest = false, min = 5, max = 20, lock = 0},
+    {name = "Gilda And The Dragon", keyword = 'gilda', start = 4243, vidblain = false, noquest = false, min = 120, max = 140, lock = 80},
+    {name = "Gnoll's Quarry", keyword = 'quarry', start = 23510, vidblain = false, noquest = false, min = 105, max = 125, lock = 0},
+    {name = "Gold Rush", keyword = 'goldrush', start = 15014, vidblain = false, noquest = false, min = 30, max = 70, lock = 15},
+    {name = "Guardian's Spyre of Knowledge", keyword = 'spyreknow', start = 34800, vidblain = false, noquest = false, min = 10, max = 30, lock = 0},
+    {name = "Wayfarer's Caravan", keyword = 'caravan', start = 16071, vidblain = false, noquest = false, min = 200, max = 201, lock = 0},
+    {name = "Halls of the Damned", keyword = 'damned', start = 10469, vidblain = false, noquest = false, min = 95, max = 115, lock = 70},
+    {name = "Hatchling Aerie", keyword = 'hatchling', start = 34670, vidblain = false, noquest = false, min = 5, max = 45, lock = 0},
+    {name = "Hedgehogs' Paradise", keyword = 'hedge', start = 15146, vidblain = false, noquest = false, min = 60, max = 80, lock = 0},
+    {name = "Helegear Sea", keyword = 'helegear', start = 30699, vidblain = false, noquest = false, min = 160, max = 180, lock = 130},
+    {name = "Hotel Orlando", keyword = 'orlando', start = 30331, vidblain = false, noquest = false, min = 1, max = 20, lock = 0},
+    {name = "House of Cards", keyword = 'cards', start = 6255, vidblain = false, noquest = false, min = 120, max = 150, lock = 90},
+    {name = "Icefall", keyword = 'icefall', start = 38701, vidblain = false, noquest = true, min = 200, max = 201, lock = 200},
+    {name = "Imagi's Nation", keyword = 'imagi', start = 36800, vidblain = false, noquest = false, min = 140, max = 160, lock = 0},
+    {name = "Imperial Nation", keyword = 'imperial', start = 16966, vidblain = true, noquest = false, min = 65, max = 201, lock = 20},
+    {name = "Into the Long Night", keyword = 'longnight', start = 26367, vidblain = false, noquest = false, min = 100, max = 200, lock = 60},
+    {name = "Insanitaria", keyword = 'insan', start = 6850, vidblain = false, noquest = false, min = 95, max = 115, lock = 0},
+    {name = "Intrigues of Times Past", keyword = 'times', start = 28463, vidblain = false, noquest = false, min = 175, max = 201, lock = 150},
+    {name = "Jotunheim", keyword = 'jotun', start = 31508, vidblain = false, noquest = false, min = 1, max = 40, lock = 0},
+    {name = "Jungles of Verume", keyword = 'verume', start = 30607, vidblain = false, noquest = false, min = 10, max = 40, lock = 0},
+    {name = "Keep of the Kobaloi", keyword = 'kobaloi', start = 10691, vidblain = false, noquest = false, min = 10, max = 201, lock = 0},
+    {name = "Kerofk", keyword = 'kerofk', start = 16405, vidblain = false, noquest = false, min = 5, max = 30, lock = 0},
+    {name = "Ketu Uplands", keyword = 'ketu', start = 35114, vidblain = false, noquest = false, min = 200, max = 201, lock = 0},
+    {name = "Kiksaadi Cove", keyword = 'cove', start = 49941, vidblain = false, noquest = false, min = 190, max = 200, lock = 150},
+    {name = "Kimr's Farm", keyword = 'farm', start = 10676, vidblain = false, noquest = false, min = 1, max = 5, lock = 0},
+    {name = "Kingdom of Ahner", keyword = 'ahner', start = 30129, vidblain = false, noquest = false, min = 20, max = 50, lock = 0},
+    {name = "Raganatittu", keyword = 'raga', start = 19861, vidblain = false, noquest = false, min = 40, max = 60, lock = 0},
+    {name = "Realm of Deneria", keyword = 'deneria', start = 35006, vidblain = false, noquest = false, min = 60, max = 85, lock = 0},
+    {name = "Realm of the Firebird", keyword = 'firebird', start = 32885, vidblain = false, noquest = false, min = 80, max = 110, lock = 50},
+    {name = "Land of Legend", keyword = 'legend', start = 16224, vidblain = false, noquest = false, min = 1, max = 20, lock = 0},
+    {name = "Sho'aram, Castle in the Sand", keyword = 'sandcastle', start = 37701, vidblain = false, noquest = false, min = 10, max = 30, lock = 0},
+    {name = "Siren's Oasis Resort", keyword = 'sirens', start = 16298, vidblain = false, noquest = false, min = 5, max = 15, lock = 0},
+    {name = "Mount duNoir", keyword = 'dunoir', start = 14222, vidblain = false, noquest = false, min = 175, max = 201, lock = 160},
+    {name = "Mudwog's Swamp", keyword = 'mudwog', start = 2347, vidblain = false, noquest = false, min = 30, max = 40, lock = 0},
+    {name = "Nanjiki Ruins", keyword = 'nanjiki', start = 11203, vidblain = false, noquest = false, min = 140, max = 160, lock = 110},
+    {name = "Nebulous Horizon", keyword = 'horizon', start = 31959, vidblain = false, noquest = false, min = 200, max = 201, lock = 185},
+    {name = "The Amusement Park", keyword = 'amusement', start = 29282, vidblain = false, noquest = false, min = 5, max = 20, lock = 0},
+    {name = "Nenukon and the Far Country", keyword = 'nenukon', start = 31784, vidblain = false, noquest = false, min = 70, max = 100, lock = 50},
+    {name = "The Astral Travels", keyword = 'astral', start = 27882, vidblain = false, noquest = false, min = 180, max = 201, lock = 150},
+    {name = "Northstar", keyword = 'northstar', start = 11127, vidblain = false, noquest = false, min = 70, max = 140, lock = 50},
+    {name = "Nottingham", keyword = 'nottingham', start = 11077, vidblain = false, noquest = false, min = 190, max = 201, lock = 180},
+    {name = "The Call of Heroes", keyword = 'callhero', start = 33031, vidblain = false, noquest = false, min = 1, max = 15, lock = 0},
+    {name = "Onyx Bazaar", keyword = 'bazaar', start = 34454, vidblain = false, noquest = false, min = 35, max = 55, lock = 0},
+    {name = "Ookushka Garrison", keyword = 'ooku', start = 39000, vidblain = false, noquest = false, min = 200, max = 201, lock = 160},
+    {name = "The Coral Kingdom", keyword = 'coral', start = 4565, vidblain = false, noquest = false, min = 30, max = 50, lock = 0},
+    {name = "Plains of Nulan'Boar", keyword = 'nulan', start = 37900, vidblain = false, noquest = false, min = 60, max = 80, lock = 0},
+    {name = "Pompeii", keyword = 'pompeii', start = 57, vidblain = false, noquest = false, min = 90, max = 110, lock = 70},
+    {name = "Prosper's Island", keyword = 'prosper', start = 28268, vidblain = false, noquest = false, min = 100, max = 125, lock = 70},
+    {name = "Qong", keyword = 'qong', start = 16115, vidblain = false, noquest = false, min = 200, max = 220, lock = 0},
+    {name = "The Dark Temple of Zyian", keyword = 'zyian', start = 729, vidblain = false, noquest = false, min = 130, max = 150, lock = 100},
+    {name = "The Darkside of the Fractured Lands", keyword = 'darkside', start = 15060, vidblain = false, noquest = false, min = 40, max = 60, lock = 0},
+    {name = "The Drageran Empire", keyword = 'drageran', start = 25894, vidblain = false, noquest = false, min = 130, max = 150, lock = 100},
+    {name = "The Eighteenth Dynasty", keyword = 'dynasty', start = 30799, vidblain = false, noquest = false, min = 120, max = 140, lock = 90},
+    {name = "Realm of the Sacred Flame", keyword = 'firenation', start = 41879, vidblain = false, noquest = false, min = 200, max = 201, lock = 180},
+    {name = "Realm of the Zodiac", keyword = 'zodiac', start = 15857, vidblain = false, noquest = false, min = 20, max = 30, lock = 0},
+    {name = "Rebellion of the Nix", keyword = 'rebellion', start = 10305, vidblain = false, noquest = false, min = 150, max = 190, lock = 120},
+    {name = "The Forest of Li'Dnesh", keyword = 'lidnesh', start = 27995, vidblain = false, noquest = false, min = 1, max = 10, lock = 0},
+    {name = "Sagewood Grove", keyword = 'sagewood', start = 28754, vidblain = false, noquest = false, min = 150, max = 180, lock = 130},
+    {name = "Sanctity of Eternal Damnation", keyword = 'sanctity', start = 10518, vidblain = false, noquest = false, min = 100, max = 201, lock = 75},
+    {name = "Sen'narre Lake", keyword = 'sennarre', start = 15491, vidblain = false, noquest = false, min = 1, max = 20, lock = 0},
+    {name = "Seven Wonders", keyword = 'wonders', start = 32981, vidblain = false, noquest = false, min = 100, max = 120, lock = 70},
+    {name = "Shadow's End", keyword = 'shadowsend', start = 40096, vidblain = false, noquest = false, min = 200, max = 201, lock = 190},
+    {name = "Sheila's Cat Sanctuary", keyword = 'cats', start = 40900, vidblain = false, noquest = false, min = 25, max = 35, lock = 0},
+    {name = "The Imperial City of Reme", keyword = 'reme', start = 32703, vidblain = false, noquest = false, min = 30, max = 100, lock = 15},
+    {name = "The Infestation", keyword = 'infest', start = 16165, vidblain = false, noquest = false, min = 5, max = 35, lock = 0},
+    {name = "The Land of Oz", keyword = 'landofoz', start = 510, vidblain = false, noquest = false, min = 40, max = 70, lock = 20},
+    {name = "The Maelstrom", keyword = 'maelstrom', start = 38058, vidblain = false, noquest = false, min = 20, max = 45, lock = 0},
+    {name = "The Mountains of Desolation", keyword = 'desolation', start = 19532, vidblain = false, noquest = false, min = 130, max = 175, lock = 100},
+    {name = "The Nyne Woods", keyword = 'nynewoods', start = 23562, vidblain = false, noquest = false, min = 200, max = 201, lock = 175},
+    {name = "The Palace of Song", keyword = 'songpalace', start = 47013, vidblain = false, noquest = false, min = 60, max = 80, lock = 30},
+    {name = "The Partroxis", keyword = 'partroxis', start = 5814, vidblain = false, noquest = false, min = 180, max = 201, lock = 150},
+    {name = "The Realm of the Hawklords", keyword = 'hawklord', start = 40550, vidblain = false, noquest = false, min = 80, max = 100, lock = 0},
+    {name = "The Relinquished Tombs", keyword = 'tombs', start = 15385, vidblain = false, noquest = false, min = 70, max = 100, lock = 50},
+    {name = "The Ruins of Diamond Reach", keyword = 'ruins', start = 16805, vidblain = false, noquest = false, min = 60, max = 120, lock = 35},
+    {name = "The Ruins of Stormhaven", keyword = 'stormhaven', start = 20649, vidblain = false, noquest = false, min = 150, max = 201, lock = 130},
+    {name = "The Sanguine Tavern", keyword = 'sanguine', start = 15436, vidblain = false, noquest = false, min = 120, max = 140, lock = 70},
+    {name = "The Scarred Lands", keyword = 'scarred', start = 34036, vidblain = false, noquest = false, min = 90, max = 110, lock = 60},
+    {name = "The School of Horror", keyword = 'soh', start = 25611, vidblain = false, noquest = false, min = 125, max = 201, lock = 110},
+    {name = "The Southern Ocean", keyword = 'southern', start = 5192, ct = 1, vidblain = false, noquest = false, min = 1, max = 210, lock = 0},
+    {name = "The Temple of Shal'indrael", keyword = 'temple', start = 31597, vidblain = false, noquest = false, min = 180, max = 201, lock = 160},
+    {name = "The Temple of Shouggoth", keyword = 'shouggoth', start = 34087, vidblain = false, noquest = false, min = 10, max = 50, lock = 0},
+    {name = "The Three Pillars of Diatz", keyword = 'diatz', start = 1254, vidblain = false, noquest = false, min = 60, max = 80, lock = 25},
+    {name = "The Titans' Keep", keyword = 'titan', start = 38234, vidblain = false, noquest = false, min = 200, max = 201, lock = 200},
+    {name = "The Tournament of Illoria", keyword = 'illoria', start = 10420, vidblain = false, noquest = false, min = 70, max = 90, lock = 40},
+    {name = "The Tree of Life", keyword = 'tol', start = 16325, vidblain = false, noquest = false, min = 170, max = 201, lock = 150},
+    {name = "The Trouble with Gwillimberry", keyword = 'gwillim', start = 25974, vidblain = false, noquest = false, min = 190, max = 201, lock = 185},
+    {name = "The Uncharted Oceans", keyword = 'uncharted', start = 7701, ct = 5, vidblain = false, noquest = false, min = 1, max = 210, lock = 0},
+    {name = "The UnderDark", keyword = 'underdark', start = 27341, vidblain = false, noquest = false, min = 15, max = 50, lock = 0},
+    {name = "The Upper Planes", keyword = 'uplanes', start = 29364, vidblain = false, noquest = false, min = 60, max = 100, lock = 50},
+    {name = "The Were Wood", keyword = 'werewood', start = 30956, vidblain = false, noquest = false, min = 200, max = 201, lock = 180},
+    {name = "The Witches of Omen Tor", keyword = 'omentor', start = 15579, vidblain = true, noquest = false, min = 160, max = 201, lock = 130},
+    {name = "The Wood Elves of Nalondir", keyword = 'woodelves', start = 32199, vidblain = false, noquest = false, min = 5, max = 30, lock = 0},
+    {name = "The Yurgach Domain", keyword = 'yurgach', start = 29450, vidblain = false, noquest = false, min = 50, max = 100, lock = 24},
+    {name = "Tilule Rehabilitation Clinic", keyword = 'tilule', start = 39771, vidblain = false, noquest = false, min = 50, max = 80, lock = 0},
+    {name = "Transcendece", keyword = 'transcend', start = 0, vidblain = false, noquest = true, min = 200, max = 201, lock = 180},
+    {name = "Tribal Origins", keyword = 'origins', start = 35900, vidblain = false, noquest = false, min = 165, max = 190, lock = 150},
+    {name = "Tumari's Diner", keyword = 'diner', start = 36700, vidblain = false, noquest = false, min = 125, max = 145, lock = 100},
+    {name = "Umari's Castle", keyword = 'umari', start = 36601, vidblain = false, noquest = false, min = 195, max = 201, lock = 175},
+    {name = "Verdure Estate", keyword = 'verdure', start = 24090, vidblain = false, noquest = false, min = 120, max = 140, lock = 80},
+    {name = "Vidblain, the Ever Dark", keyword = 'vidblain', start = 33570, ct = 6, vidblain = true, noquest = false, min = 1, max = 210, lock = 0},
+    {name = "War of the Wizards", keyword = 'wizards', start = 31316, vidblain = false, noquest = false, min = 5, max = 35, lock = 0},
+    {name = "Warrior's Training Camp", keyword = 'wtc', start = 37895, vidblain = false, noquest = false, min = 10, max = 20, lock = 0},
+    {name = "Wayward Alehouse", keyword = 'alehouse', start = 885, vidblain = false, noquest = false, min = 70, max = 90, lock = 0},
+    {name = "Wedded Bliss", keyword = 'bliss', start = 29988, vidblain = false, noquest = false, min = 80, max = 100, lock = 50},
+    {name = "Wildwood", keyword = 'wildwood', start = 322, vidblain = false, noquest = false, min = 10, max = 40, lock = 0},
+    {name = "Winds of Fate", keyword = 'winds', start = 39900, vidblain = false, noquest = true, min = 200, max = 201, lock = 0},
+    {name = "Winterlands", keyword = 'winter', start = 1306, vidblain = false, noquest = false, min = 150, max = 170, lock = 110},
+    {name = "Zangar's Demonic Grotto", keyword = 'zangar', start = 6164, vidblain = false, noquest = false, min = 40, max = 60, lock = 30},
+    {name = "The Keep of the Asherodan", keyword = 'asherodan', start = 37400, vidblain = true, noquest = false, min = 80, max = 90, lock = 70},
+    {name = "Svrogan's Logging Camp", keyword = 'logging', start = 31254, vidblain = false, noquest = false, min = 80, max = 110, lock = 0},
+    {name = "Yggdrasil: The World Tree", keyword = 'ygg', start = 24186, vidblain = false, noquest = false, min = 180, max = 201, lock = 150},
+    {name = "Cradlebrook", keyword = 'cradle', start = 11267, vidblain = false, noquest = false, min = 30, max = 50, lock = 0},
+    {name = "Cloud City of Gnomalin", keyword = 'gnomalin', start = 34397, vidblain = false, noquest = false, min = 5, max = 35, lock = 0},
+    {name = "Child's Play", keyword = 'childsplay', start = 678, vidblain = false, noquest = false, min = 5, max = 25, lock = 0},
+    {name = "Black Rose", keyword = 'blackrose', start = 1817, vidblain = false, noquest = false, min = 175, max = 201, lock = 140},
+    {name = "Battlefields of Adaldar", keyword = 'adaldar', start = 34400, vidblain = false, noquest = false, min = 150, max = 180, lock = 120},
+    {name = "Avian Kingdom", keyword = 'avian', start = 4334, vidblain = false, noquest = false, min = 170, max = 190, lock = 140},
+    {name = "Ascension Bluff Nursing Home", keyword = 'nursing', start = 31977, vidblain = false, noquest = false, min = 100, max = 120, lock = 90},
+    {name = "Artificer's Mayhem", keyword = 'mayhem', start = 1866, vidblain = false, noquest = false, min = 180, max = 201, lock = 140},
+    {name = "Art of Melody", keyword = 'melody', start = 14172, vidblain = false, noquest = false, min = 1, max = 15, lock = 0},
+    {name = "Arboretum", keyword = 'arboretum', start = 39100, vidblain = false, noquest = false, min = 110, max = 130, lock = 80},
+    {name = "Anthrox", keyword = 'anthrox', start = 3993, vidblain = false, noquest = false, min = 80, max = 110, lock = 50},
+    {name = "Aerial City of Cineko", keyword = 'cineko', start = 1507, vidblain = false, noquest = false, min = 15, max = 30, lock = 0},
+    {name = "A Magical Hodgepodge", keyword = 'hodgepodge', start = 30469, vidblain = false, noquest = false, min = 5, max = 35, lock = 0},
+    {name = "Island of Lost Time", keyword = 'losttime', start = 28584, vidblain = false, noquest = false, min = 80, max = 110, lock = 50},
+    {name = "Jenny's Tavern", keyword = 'jenny', start = 29637, vidblain = false, noquest = false, min = 50, max = 100, lock = 24},
+    {name = "Paradise Lost", keyword = 'paradise', start = 29624, vidblain = false, noquest = false, min = 50, max = 70, lock = 20},
+    {name = "Radiance Woods", keyword = 'radiance', start = 19805, vidblain = false, noquest = false, min = 200, max = 201, lock = 0},
+    {name = "Olde Worlde Carnivale", keyword = 'carnivale', start = 28635, vidblain = false, noquest = false, min = 5, max = 35, lock = 0},
+    {name = "New Thalos", keyword = 'newthalos', start = 23853, vidblain = false, noquest = false, min = 10, max = 35, lock = 0},
+    {name = "Necromancers' Guild", keyword = 'necro', start = 29922, vidblain = false, noquest = false, min = 15, max = 30, lock = 0},
+    {name = "Kul Tiras", keyword = 'kultiras', start = 31161, vidblain = false, noquest = false, min = 15, max = 30, lock = 10},
+    {name = "Masquerade Island", keyword = 'masq', start = 29840, vidblain = false, noquest = false, min = 100, max = 130, lock = 80},
+    {name = "Living Mines of Dak'Tai", keyword = 'livingmine', start = 37008, vidblain = false, noquest = false, min = 110, max = 140, lock = 70},
+    {name = "Storm Ships of Lem-Dagor", keyword = 'lemdagor', start = 1966, vidblain = false, noquest = false, min = 50, max = 100, lock = 30},
+    {name = "Tai'rha Laym", keyword = 'laym', start = 6005, vidblain = false, noquest = false, min = 70, max = 110, lock = 40},
+    {name = "Thandeld's Conflict", keyword = 'conflict', start = 27711, vidblain = false, noquest = false, min = 20, max = 50, lock = 0},
+    {name = "The Amazon Nation", keyword = 'amazon', start = 1409, vidblain = false, noquest = false, min = 120, max = 201, lock = 100},
+    {name = "The Archipelago of Entropy", keyword = 'entropy', start = 29773, vidblain = false, noquest = false, min = 120, max = 150, lock = 90},
+    {name = "The Aylorian Academy", keyword = 'academy', start = 35233, vidblain = false, noquest = false, min = 1, max = 201, lock = 0},
+    {name = "The Blood Opal of Rauko'ra", keyword = 'raukora', start = 6040, vidblain = false, noquest = false, min = 125, max = 201, lock = 100},
+    {name = "The Continent of Mesolar", keyword = 'mesolar', start = 12664, ct = 0, vidblain = false, noquest = false, min = 1, max = 210, lock = 0},
+    {name = "The Cougarian Queendom", keyword = 'cougarian', start = 14311, vidblain = false, noquest = false, min = 140, max = 160, lock = 100},
+    {name = "The Council of the Wyrm", keyword = 'wyrm', start = 28847, vidblain = false, noquest = false, min = 190, max = 201, lock = 175},
+    {name = "The Covenant of Mistridge", keyword = 'mistridge', start = 4491, vidblain = false, noquest = false, min = 160, max = 201, lock = 120},
+    {name = "The Cracks of Terra", keyword = 'terra', start = 19679, vidblain = false, noquest = false, min = 200, max = 201, lock = 200},
+    {name = "The Curse of the Midnight Fens", keyword = 'fens', start = 16528, vidblain = false, noquest = false, min = 200, max = 201, lock = 160},
+    {name = "The Dark Continent, Abend", keyword = 'abend', start = 24909, ct = 3, vidblain = false, noquest = false, min = 1, max = 210, lock = 0},
+    {name = "The DarkLight", keyword = 'darklight', start = 19642, vidblain = true, noquest = false, min = 60, max = 120, lock = 30},
+    {name = "The Deadlights", keyword = 'deadlights', start = 16856, vidblain = false, noquest = false, min = 175, max = 201, lock = 135},
+    {name = "The Empire of Talsa", keyword = 'talsa', start = 26917, vidblain = false, noquest = false, min = 70, max = 130, lock = 40},
+    {name = "The Fire Swamp", keyword = 'fireswamp', start = 34755, vidblain = false, noquest = false, min = 5, max = 15, lock = 0},
+    {name = "The First Ascent", keyword = 'ascent', start = 43150, vidblain = false, noquest = false, min = 5, max = 15, lock = 0},
+    {name = "The Fractured Lands", keyword = 'fractured', start = 17033, vidblain = false, noquest = false, min = 20, max = 40, lock = 0},
+    {name = "The Gathering Horde", keyword = 'gathering', start = 36451, vidblain = false, noquest = false, min = 140, max = 170, lock = 110},
+    {name = "The Goblin Fortress", keyword = 'fortress', start = 31835, vidblain = false, noquest = false, min = 60, max = 80, lock = 30},
+    {name = "The Graveyard", keyword = 'graveyard', start = 28918, vidblain = false, noquest = false, min = 5, max = 15, lock = 0},
+    {name = "The Great City of Knossos", keyword = 'knossos', start = 28193, vidblain = false, noquest = false, min = 60, max = 80, lock = 30},
+    {name = "The Icy Caldera of Mauldoon", keyword = 'caldera', start = 26341, vidblain = false, noquest = false, min = 190, max = 201, lock = 150},
+    {name = "The Chessboard", keyword = 'chessboard', start = 25513, vidblain = false, noquest = false, min = 5, max = 20, lock = 0},
+    {name = "The Chasm and The Catacombs", keyword = 'chasm', start = 29446, vidblain = false, noquest = false, min = 10, max = 20, lock = 0},
+    {name = "The Cataclysm", keyword = 'cataclysm', start = 19976, vidblain = false, noquest = false, min = 150, max = 201, lock = 120},
+    {name = "Kingsholm", keyword = 'kingsholm', start = 27522, vidblain = false, noquest = false, min = 30, max = 65, lock = 0},
+    {name = "Kobold Siege Camp", keyword = 'siege', start = 43265, vidblain = false, noquest = false, min = 80, max = 100, lock = 0},
+    {name = "Rosewood Castle", keyword = 'rosewood', start = 6901, vidblain = false, noquest = false, min = 60, max = 150, lock = 25}
+}
+
+local function normalize(value)
+    return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local byKeyword = {}
+local byName = {}
+
+for _, area in ipairs(areaTable) do
+    byKeyword[normalize(area.keyword)] = area
+    byName[normalize(area.name)] = area
+end
+
+mm.area_references = {
+    areas = areaTable,
+    byKeyword = byKeyword,
+    byName = byName,
+}
+
+function mm.area_references.get(area)
+    local key = normalize(area)
+    if key == "" then return nil end
+    return byKeyword[key] or byName[key]
+end
+
+function mm.area_references.required_level(area, allowance)
+    local ref = type(area) == "table" and area or mm.area_references.get(area)
+    if not ref then return nil end
+
+    local minLevel = tonumber(ref.min) or 0
+    local lockLevel = tonumber(ref.lock) or 0
+    local safetyAllowance = math.max(0, tonumber(allowance) or 0)
+    return math.max(lockLevel, minLevel - safetyAllowance)
+end
+
+return mm.area_references
+]==========])
+
   load_package_module("mm_navigation.lua", [==========[
 --[[
     Search and Destroy - Navigation Module
@@ -2652,6 +3035,44 @@ if type(snd.utils.trim) ~= "function" then
         return tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")
     end
 end
+
+local function ensureAreaReferencesLoaded()
+    if mm.area_references and type(mm.area_references.get) == "function" then
+        return true
+    end
+
+    local candidates = {}
+    if mm.base_dir and mm.base_dir ~= "" and mm.base_dir ~= "mm_package.xml" then
+        table.insert(candidates, tostring(mm.base_dir) .. "/mm_area_references.lua")
+    end
+
+    local source = debug.getinfo(1, "S").source or ""
+    if source:sub(1, 1) == "@" then
+        local path = source:sub(2):gsub("\\", "/")
+        local dir = path:match("^(.*)/")
+        if dir and dir ~= "" then
+            table.insert(candidates, dir .. "/mm_area_references.lua")
+        end
+    end
+
+    for _, path in ipairs(candidates) do
+        local f = io.open(path, "rb")
+        if f then
+            f:close()
+            local ok, err = pcall(dofile, path)
+            if ok and mm.area_references then
+                snd.utils.debugNote("Area references loaded from " .. tostring(path))
+                return true
+            end
+            snd.utils.debugNote("Failed loading area references from " .. tostring(path) .. ": " .. tostring(err))
+        end
+    end
+
+    snd.utils.debugNote("Area references unavailable; area guard will fail open.")
+    return false
+end
+
+ensureAreaReferencesLoaded()
 
 -- Load LuaSQL for Aardwolf.db access
 local luasql = require "luasql.sqlite3"
@@ -3026,6 +3447,210 @@ function snd.mapper.getRoomInfo(roomId)
         return results[1]
     end
     return nil
+end
+
+-------------------------------------------------------------------------------
+-- Area Level Guard
+-------------------------------------------------------------------------------
+
+local AREA_GUARD_DEFAULT_ALLOWANCE = 30
+
+local function normalizeAreaKey(value)
+    return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+function snd.mapper.areaGuardConfig()
+    local cfg = snd.config and snd.config.areaGuard or nil
+    if type(cfg) ~= "table" then
+        return {enabled = false, allowance = AREA_GUARD_DEFAULT_ALLOWANCE}
+    end
+    return cfg
+end
+
+function snd.mapper.areaGuardEnabled()
+    return snd.mapper.areaGuardConfig().enabled == true
+end
+
+function snd.mapper.areaGuardAllowance()
+    return math.max(0, tonumber(snd.mapper.areaGuardConfig().allowance) or AREA_GUARD_DEFAULT_ALLOWANCE)
+end
+
+function snd.mapper.areaGuardPlayerLevel()
+    return tonumber(snd.char and snd.char.level) or 0
+end
+
+function snd.mapper.areaGuardBypassed(ignoreLockedExits, ignoreAreaGuard)
+    return ignoreLockedExits == true or ignoreAreaGuard == true or not snd.mapper.areaGuardEnabled()
+end
+
+function snd.mapper.evaluateAreaGuard(areaKey)
+    local normalized = normalizeAreaKey(areaKey)
+    if normalized == "" then
+        return {known = false, allowed = true, area = tostring(areaKey or "")}
+    end
+
+    local refs = mm.area_references
+    local ref = refs and type(refs.get) == "function" and refs.get(normalized) or nil
+    if not ref then
+        return {known = false, allowed = true, area = tostring(areaKey or "")}
+    end
+
+    local level = snd.mapper.areaGuardPlayerLevel()
+    local allowance = snd.mapper.areaGuardAllowance()
+    local required = refs.required_level(ref, allowance) or 0
+    return {
+        known = true,
+        allowed = level >= required,
+        area = ref.name or tostring(areaKey),
+        keyword = ref.keyword or normalized,
+        min = tonumber(ref.min) or 0,
+        lock = tonumber(ref.lock) or 0,
+        required = required,
+        level = level,
+        allowance = allowance,
+    }
+end
+
+function snd.mapper.evaluateRoomAreaGuard(roomId)
+    local room = snd.mapper.getRoomInfo(roomId)
+    if not room then
+        snd.utils.debugNote("Area guard: room " .. tostring(roomId) .. " is unknown; allowing destination.")
+        return {known = false, allowed = true, roomId = tostring(roomId or "")}
+    end
+
+    local result = snd.mapper.evaluateAreaGuard(room.area)
+    result.roomId = tostring(roomId or "")
+    result.roomName = room.name
+    result.mapperArea = room.area
+    return result
+end
+
+function snd.mapper.echoAreaGuardOverride(destination)
+    local dest = snd.utils.trim(tostring(destination or ""))
+    if dest == "" then return end
+
+    cecho("<yellow>[MMAPPER]<reset> Override: ")
+    local label = "[xrtforce " .. dest .. "]"
+    local command = string.format([[expandAlias(%q, false)]], "xrtforce " .. dest)
+    if type(echoLink) == "function" then
+        echoLink(label, command, "Navigate without area or exit-level guards", true)
+    else
+        echo(label)
+    end
+    echo("\n")
+end
+
+function snd.mapper.reportAreaGuardDestinationBlocked(result, destination)
+    local lockText = ""
+    if (tonumber(result.lock) or 0) > 0 then
+        lockText = string.format("; entry lock %d", tonumber(result.lock))
+    end
+    cecho(string.format(
+        "<orange_red>[MMAPPER]<reset> Navigation blocked: %s is rated level %d%s; your level is %d.\n",
+        tostring(result.area or result.mapperArea or "That area"),
+        tonumber(result.min) or 0,
+        lockText,
+        tonumber(result.level) or 0
+    ))
+    cecho(string.format(
+        "<yellow>[MMAPPER]<reset> Area guard requires level %d with the %d-level allowance.\n",
+        tonumber(result.required) or 0,
+        tonumber(result.allowance) or AREA_GUARD_DEFAULT_ALLOWANCE
+    ))
+    snd.mapper.echoAreaGuardOverride(destination)
+end
+
+function snd.mapper.reportAreaGuardRouteBlocked(destination)
+    cecho("<orange_red>[MMAPPER]<reset> No guarded route found; every known route crosses an area above your guarded level.\n")
+    snd.mapper.echoAreaGuardOverride(destination)
+end
+
+function snd.mapper.checkAreaGuardDestination(currentRoom, destinationRoom, overrideDestination, ignoreLockedExits, ignoreAreaGuard)
+    if snd.mapper.areaGuardBypassed(ignoreLockedExits, ignoreAreaGuard) then
+        snd.utils.debugNote(string.format(
+            "Area guard destination check bypassed: room=%s force=%s",
+            tostring(destinationRoom),
+            tostring(ignoreLockedExits == true or ignoreAreaGuard == true)
+        ))
+        return true
+    end
+
+    local result = snd.mapper.evaluateRoomAreaGuard(destinationRoom)
+    if not result.known then
+        snd.utils.debugNote(string.format(
+            "Area guard destination allowed: room=%s area='%s' has no reference metadata.",
+            tostring(destinationRoom),
+            tostring(result.mapperArea or "?")
+        ))
+        return true
+    end
+
+    snd.utils.debugNote(string.format(
+        "Area guard destination: room=%s area=%s level=%d min=%d lock=%d allowance=%d required=%d allowed=%s",
+        tostring(destinationRoom),
+        tostring(result.keyword or result.mapperArea or "?"),
+        tonumber(result.level) or 0,
+        tonumber(result.min) or 0,
+        tonumber(result.lock) or 0,
+        tonumber(result.allowance) or 0,
+        tonumber(result.required) or 0,
+        tostring(result.allowed)
+    ))
+
+    if result.allowed then
+        return true
+    end
+
+    snd.mapper.reportAreaGuardDestinationBlocked(result, overrideDestination or destinationRoom)
+    return false
+end
+
+function snd.mapper.areaGuardRoomSql(roomExpression, sourceRoom, ignoreLockedExits, ignoreAreaGuard)
+    if snd.mapper.areaGuardBypassed(ignoreLockedExits, ignoreAreaGuard) then
+        return "1=1", 0
+    end
+
+    local refs = mm.area_references
+    if not refs or type(refs.areas) ~= "table" or type(refs.required_level) ~= "function" then
+        snd.utils.debugNote("Area guard SQL filter unavailable because area references are not loaded; allowing route.")
+        return "1=1", 0
+    end
+
+    local sourceInfo = snd.mapper.getRoomInfo(sourceRoom)
+    local sourceArea = normalizeAreaKey(sourceInfo and sourceInfo.area or "")
+    local level = snd.mapper.areaGuardPlayerLevel()
+    local allowance = snd.mapper.areaGuardAllowance()
+    local blocked = {}
+    local seen = {}
+    local blockedCount = 0
+
+    for _, ref in ipairs(refs.areas) do
+        local required = refs.required_level(ref, allowance) or 0
+        local keyword = normalizeAreaKey(ref.keyword)
+        local name = normalizeAreaKey(ref.name)
+        local isSourceArea = sourceArea ~= "" and (sourceArea == keyword or sourceArea == name)
+        if level < required and not isSourceArea then
+            blockedCount = blockedCount + 1
+            for _, alias in ipairs({keyword, name}) do
+                if alias ~= "" and not seen[alias] then
+                    seen[alias] = true
+                    table.insert(blocked, snd.mapper.db.escape(alias))
+                end
+            end
+        end
+    end
+
+    if #blocked == 0 then
+        return "1=1", 0
+    end
+
+    local sql = string.format(
+        "NOT EXISTS (SELECT 1 FROM rooms AS area_guard_room " ..
+        "WHERE area_guard_room.uid = %s AND LOWER(area_guard_room.area) IN (%s))",
+        roomExpression,
+        table.concat(blocked, ",")
+    )
+    return sql, blockedCount
 end
 
 --- Persist a discovered room + exits from GMCP room.info into Aardwolf.db
@@ -3721,8 +4346,10 @@ end
 -- @param dst Destination room uid
 -- @param noPortals If true, don't use portals
 -- @param noRecalls If true, don't use recall
+-- @param ignoreLockedExits If true, ignore exit-level locks
+-- @param ignoreAreaGuard If true, ignore only the area guard
 -- @return Path table, depth, or nil if no path
-function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
+function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, ignoreAreaGuard)
     if not snd.mapper.db.open() then
         return nil
     end
@@ -3730,12 +4357,13 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
     src = tostring(src)
     dst = tostring(dst)
     snd.utils.debugNote(string.format(
-        "findPath start src=%s dst=%s noPortals=%s noRecalls=%s ignoreLocked=%s",
+        "findPath start src=%s dst=%s noPortals=%s noRecalls=%s ignoreLocked=%s ignoreAreaGuard=%s",
         src,
         dst,
         tostring(noPortals == true),
         tostring(noRecalls == true),
-        tostring(ignoreLockedExits == true)
+        tostring(ignoreLockedExits == true),
+        tostring(ignoreAreaGuard == true)
     ))
     
     if src == dst then
@@ -3754,9 +4382,30 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
         myLevel + (myTier * 10)
     )
     local chaosWhere = gqActive and "(fromuid <> '*' OR ifnull(chaos, 'no') <> 'yes')" or "1=1"
+    local areaFromWhere, blockedAreaCount = snd.mapper.areaGuardRoomSql(
+        "exits.fromuid",
+        src,
+        ignoreLockedExits,
+        ignoreAreaGuard
+    )
+    local areaToWhere = snd.mapper.areaGuardRoomSql(
+        "exits.touid",
+        src,
+        ignoreLockedExits,
+        ignoreAreaGuard
+    )
+    if blockedAreaCount > 0 then
+        snd.utils.debugNote(string.format(
+            "Area guard route filter active: level=%d allowance=%d blockedAreas=%d source=%s",
+            myLevel,
+            snd.mapper.areaGuardAllowance(),
+            blockedAreaCount,
+            tostring(src)
+        ))
+    end
     
     -- Check for direct one-room path first
-    local directPath = snd.mapper.checkDirectPath(src, dst, myLevel, ignoreLockedExits)
+    local directPath = snd.mapper.checkDirectPath(src, dst, myLevel, ignoreLockedExits, ignoreAreaGuard)
     if directPath then
         snd.utils.debugNote("findPath direct one-room path found.")
         return directPath, 1
@@ -3807,8 +4456,18 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
             AND fromuid NOT IN (%s) 
             AND %s
             AND %s
+            AND %s
+            AND %s
             ORDER BY %s
-        ]], table.concat(roomsList, ","), visited, levelWhere, chaosWhere, snd.mapper.exitPreferenceOrderSql("dir"))
+        ]],
+            table.concat(roomsList, ","),
+            visited,
+            levelWhere,
+            chaosWhere,
+            areaFromWhere,
+            areaToWhere,
+            snd.mapper.exitPreferenceOrderSql("dir")
+        )
         
         local results = snd.mapper.db.query(sql) or {}
         roomSets[depth] = {}
@@ -3939,12 +4598,12 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits)
                     local jumpRoom = snd.mapper.findNearestJumpRoom(src, dst, foundFrom, ignoreLockedExits)
                     if jumpRoom then
                         snd.utils.debugNote("findPath restricted source: nearest jump room candidate " .. tostring(jumpRoom))
-                        local walkPath = snd.mapper.findPath(src, jumpRoom, true, true, ignoreLockedExits)
+                        local walkPath = snd.mapper.findPath(src, jumpRoom, true, true, ignoreLockedExits, ignoreAreaGuard)
                         if walkPath then
                             for _, step in ipairs(walkPath) do
                                 table.insert(path, step)
                             end
-                            local portalPath = snd.mapper.findPath(jumpRoom, dst, nil, nil, ignoreLockedExits)
+                            local portalPath = snd.mapper.findPath(jumpRoom, dst, nil, nil, ignoreLockedExits, ignoreAreaGuard)
                             if portalPath then
                                 for _, step in ipairs(portalPath) do
                                     table.insert(path, step)
@@ -4042,12 +4701,137 @@ function snd.mapper.markRoomRestriction(roomId, flag)
     return true, true
 end
 
+function snd.mapper.pathStartsWithJump(path, expectedType)
+    local travelType = path and path[1] and path[1].travelType
+    if expectedType then
+        return travelType == expectedType
+    end
+    return travelType == "portal" or travelType == "recall"
+end
+
+function snd.mapper.roomsShareArea(firstRoom, secondRoom)
+    local firstInfo = snd.mapper.getRoomInfo(firstRoom)
+    local secondInfo = snd.mapper.getRoomInfo(secondRoom)
+    local firstArea = firstInfo and snd.utils.trim(firstInfo.area or ""):lower() or ""
+    local secondArea = secondInfo and snd.utils.trim(secondInfo.area or ""):lower() or ""
+    return firstArea ~= "" and firstArea == secondArea
+end
+
+function snd.mapper.resolveCurrentAreaStartRoom(sourceRoom)
+    local candidates = {}
+    local seen = {}
+
+    local function addCandidate(value)
+        local candidate = snd.utils.trim(value or "")
+        local key = candidate:lower()
+        if candidate ~= "" and candidate ~= "-1" and candidate ~= "-2" and not seen[key] then
+            seen[key] = true
+            table.insert(candidates, candidate)
+        end
+    end
+
+    addCandidate(snd.room and snd.room.current and snd.room.current.arid)
+    local sourceInfo = snd.mapper.getRoomInfo(sourceRoom)
+    addCandidate(sourceInfo and sourceInfo.area)
+
+    local function lookupStart(areaKey)
+        local normalizedKey = snd.utils.trim(areaKey or ""):lower()
+        if normalizedKey == "" then return nil end
+
+        if snd.db and type(snd.db.getAreaStartRoom) == "function" then
+            local ok, startRoom = pcall(snd.db.getAreaStartRoom, normalizedKey)
+            startRoom = ok and tonumber(startRoom) or -1
+            if startRoom and startRoom > 0 then
+                return normalizedKey, tostring(startRoom)
+            end
+        end
+
+        if snd.data and snd.data.areaDefaultStartRooms then
+            local defaults = snd.data.areaDefaultStartRooms[normalizedKey]
+            local startRoom = defaults and tonumber(defaults.start) or -1
+            if startRoom and startRoom > 0 then
+                return normalizedKey, tostring(startRoom)
+            end
+        end
+
+        return nil
+    end
+
+    for _, candidate in ipairs(candidates) do
+        local areaKey, startRoom = lookupStart(candidate)
+        if areaKey then
+            return areaKey, startRoom
+        end
+
+        if snd.db and type(snd.db.getAreaKeyFromName) == "function" then
+            local ok, resolvedKey = pcall(snd.db.getAreaKeyFromName, candidate)
+            if ok and resolvedKey and tostring(resolvedKey) ~= "" then
+                areaKey, startRoom = lookupStart(resolvedKey)
+                if areaKey then
+                    return areaKey, startRoom
+                end
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blockedType, ignoreLockedExits)
+    sourceRoom = tostring(sourceRoom or "")
+    destination = tostring(destination or "")
+    local areaKey, startRoom = snd.mapper.resolveCurrentAreaStartRoom(sourceRoom)
+    if not areaKey or not startRoom or startRoom == destination then
+        return nil
+    end
+
+    local walkPath = {}
+    if sourceRoom ~= startRoom then
+        walkPath = snd.mapper.findPath(sourceRoom, startRoom, true, true, ignoreLockedExits)
+        if not walkPath then
+            snd.utils.debugNote("area-start fallback: no walk-only route to " .. tostring(areaKey) .. " start room " .. tostring(startRoom) .. ".")
+            return nil
+        end
+    end
+
+    local jumpOrder
+    if blockedType == "recall" then
+        jumpOrder = {"portal", "recall"}
+    else
+        jumpOrder = {"recall", "portal"}
+    end
+
+    local jumpLeg = nil
+    local jumpType = nil
+    for _, candidateType in ipairs(jumpOrder) do
+        local noPortals = candidateType == "recall"
+        local noRecalls = candidateType == "portal"
+        local candidate = snd.mapper.findPath(startRoom, destination, noPortals, noRecalls, ignoreLockedExits)
+        if candidate and candidate[1] and candidate[1].travelType == candidateType then
+            jumpLeg = candidate
+            jumpType = candidateType
+            break
+        end
+    end
+
+    if not jumpLeg then
+        snd.utils.debugNote("area-start fallback: start room " .. tostring(startRoom) .. " has no direct recall/portal route to " .. destination .. ".")
+        return nil
+    end
+
+    local combined = {}
+    for _, step in ipairs(walkPath) do table.insert(combined, step) end
+    for _, step in ipairs(jumpLeg) do table.insert(combined, step) end
+    return combined, areaKey, startRoom, jumpType
+end
+
 function snd.mapper.onPortalBlocked()
     if snd.mapper.isInCombat and snd.mapper.isInCombat() then
         snd.mapper.consumeRestrictionMark("portal")
         snd.utils.debugNote("Ignoring portal blocked trigger while in combat.")
         return
     end
+    snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
     local destination = snd.mapper.goingToRoom or (snd.nav and snd.nav.goingToRoom)
     local pending = snd.mapper.consumeRestrictionMark("portal")
     local wasUpdated = false
@@ -4085,6 +4869,7 @@ function snd.mapper.onRecallBlocked()
         snd.utils.debugNote("Ignoring recall blocked trigger while in combat.")
         return
     end
+    snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
     local destination = snd.mapper.goingToRoom or (snd.nav and snd.nav.goingToRoom)
     local pending = snd.mapper.consumeRestrictionMark("recall")
     local wasUpdated = false
@@ -4148,19 +4933,16 @@ function snd.mapper.handleBlockedTravel(blockedType)
         tostring(currentNoRecall)
     ))
 
-    -- If both flags are set, find nearest room that does NOT have both flags
-    -- at the same time, then continue to destination in this same xrt.
+    -- If both flags are set, first try the closest room with a usable jump.
     if currentNoPortal and currentNoRecall then
         snd.utils.debugNote("current room is both norecall/noportal; trying outward jump-room expansion first.")
         local combined, chosenType, closestRoom = snd.mapper.buildOutwardJumpRoute(currentRoom, destination, nil)
-        if not combined or #combined == 0 then
-            snd.utils.infoNote("You couldn't find a nearby room that allows recall or portal from " .. currentRoom .. ".")
-            snd.utils.debugNote("outward jump-room expansion failed from room " .. currentRoom .. ".")
-            return false
+        if combined and #combined > 0 then
+            snd.utils.infoNote("Rerouting via closest viable room " .. tostring(closestRoom) .. " using " .. tostring(chosenType) .. ".")
+            snd.mapper.executePath(combined)
+            return true
         end
-        snd.utils.infoNote("Rerouting via closest viable room " .. tostring(closestRoom) .. " using " .. tostring(chosenType) .. ".")
-        snd.mapper.executePath(combined)
-        return true
+        snd.utils.debugNote("outward jump-room expansion failed from room " .. currentRoom .. "; trying broader fallbacks.")
     end
 
     local bounceStep = nil
@@ -4205,23 +4987,44 @@ function snd.mapper.handleBlockedTravel(blockedType)
     if not reroutePath then
         local forceNoPortals = (blockedType == "portal")
         local forceNoRecalls = (blockedType == "recall")
-        reroutePath = snd.mapper.findPath(currentRoom, destination, forceNoPortals, forceNoRecalls, nil)
-    end
-
-    if not reroutePath then
-        local reroute, viaRoom, mode = snd.mapper.findNearestAlternateRoute(currentRoom, destination, blockedType, nil)
-        if reroute and #reroute > 0 then
-            reroutePath = reroute
-            if mode == "preferred" then
-                snd.utils.infoNote("Rerouting via nearby room " .. tostring(viaRoom) .. " to use " .. ((blockedType == "recall") and "portal" or "recall") .. ".")
-            else
-                snd.utils.infoNote("Rerouting via nearby room " .. tostring(viaRoom) .. " (alternate jump unavailable there, using best available route).")
-            end
+        local expectedType = (blockedType == "portal") and "recall" or "portal"
+        local candidate = snd.mapper.findPath(currentRoom, destination, forceNoPortals, forceNoRecalls, nil)
+        if candidate and (snd.mapper.pathStartsWithJump(candidate, expectedType) or snd.mapper.roomsShareArea(currentRoom, destination)) then
+            reroutePath = candidate
+        elseif candidate then
+            snd.utils.debugNote("blocked travel deferred a cross-area walk-only route until area-start fallback is tried.")
         end
     end
 
     if not reroutePath then
-        reroutePath = snd.mapper.findPath(currentRoom, destination, nil, nil)
+        local reroute, viaRoom = snd.mapper.findNearestAlternateRoute(currentRoom, destination, blockedType, nil, false)
+        if reroute and #reroute > 0 then
+            reroutePath = reroute
+            snd.utils.infoNote("Rerouting via nearby room " .. tostring(viaRoom) .. " to use " .. ((blockedType == "recall") and "portal" or "recall") .. ".")
+        end
+    end
+
+    if not reroutePath then
+        local areaRoute, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(currentRoom, destination, blockedType, nil)
+        if areaRoute and #areaRoute > 0 then
+            reroutePath = areaRoute
+            snd.utils.infoNote(string.format(
+                "Nearby jump options exhausted. Rerouting through %s start room %s, then trying %s.",
+                tostring(areaKey),
+                tostring(startRoom),
+                tostring(jumpType)
+            ))
+        end
+    end
+
+    if not reroutePath then
+        local candidate = snd.mapper.findPath(currentRoom, destination, nil, nil)
+        if candidate and (snd.mapper.pathStartsWithJump(candidate) or snd.mapper.roomsShareArea(currentRoom, destination)) then
+            reroutePath = candidate
+        elseif candidate then
+            snd.utils.infoNote("Blocked " .. blockedType .. "; refusing a walk-only route across areas from room " .. currentRoom .. ".")
+            snd.utils.debugNote("cross-area walk-only fallback rejected after nearby and area-start jump options were exhausted.")
+        end
     end
 
     if reroutePath and #reroutePath > 0 then
@@ -4235,13 +5038,24 @@ function snd.mapper.handleBlockedTravel(blockedType)
 end
 
 --- Check for direct one-room path
-function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits)
+function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits, ignoreAreaGuard)
     local where = ignoreLockedExits and "" or string.format(" AND level <= %d", level)
+    local areaFromWhere = snd.mapper.areaGuardRoomSql("exits.fromuid", src, ignoreLockedExits, ignoreAreaGuard)
+    local areaToWhere = snd.mapper.areaGuardRoomSql("exits.touid", src, ignoreLockedExits, ignoreAreaGuard)
     local sql = string.format([[
         SELECT dir FROM exits 
         WHERE fromuid = %s AND touid = %s%s
+          AND %s
+          AND %s
         ORDER BY %s LIMIT 1
-    ]], snd.mapper.db.escape(src), snd.mapper.db.escape(dst), where, snd.mapper.exitPreferenceOrderSql("dir"))
+    ]],
+        snd.mapper.db.escape(src),
+        snd.mapper.db.escape(dst),
+        where,
+        areaFromWhere,
+        areaToWhere,
+        snd.mapper.exitPreferenceOrderSql("dir")
+    )
     
     local results = snd.mapper.db.query(sql)
     if results and #results > 0 then
@@ -4286,9 +5100,15 @@ function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedE
     local portalLeg = nil
     if not closestNoRecall then
         recallLeg = snd.mapper.findPath(tostring(closestRoom), destination, true, nil, ignoreLockedExits) -- recall only
+        if not snd.mapper.pathStartsWithJump(recallLeg, "recall") then
+            recallLeg = nil
+        end
     end
     if not closestNoPortal then
         portalLeg = snd.mapper.findPath(tostring(closestRoom), destination, nil, true, ignoreLockedExits) -- portal only
+        if not snd.mapper.pathStartsWithJump(portalLeg, "portal") then
+            portalLeg = nil
+        end
     end
 
     local chosenLeg = nil
@@ -4304,8 +5124,8 @@ function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedE
     elseif portalLeg and #portalLeg > 0 then
         chosenLeg, chosenType = portalLeg, "portal"
     else
-        chosenLeg = snd.mapper.findPath(tostring(closestRoom), destination, nil, nil, ignoreLockedExits)
-        chosenType = "fallback"
+        snd.utils.debugNote("outward jump-route: candidate room has no recall or portal continuation.")
+        return nil
     end
 
     if not chosenLeg or #chosenLeg == 0 then
@@ -4333,6 +5153,7 @@ function snd.mapper.findNearestJumpRoom(src, dst, targetType, ignoreLockedExits)
     local visited = table.concat(roomsList, ",")
     local myLevel = snd.char.level or 201
     local levelWhere = ignoreLockedExits and "1=1" or string.format("exits.level <= %d", myLevel)
+    local areaWhere = snd.mapper.areaGuardRoomSql("exits.touid", src, ignoreLockedExits)
     
     while depth < maxDepth do
         depth = depth + 1
@@ -4344,8 +5165,15 @@ function snd.mapper.findNearestJumpRoom(src, dst, targetType, ignoreLockedExits)
             WHERE exits.fromuid IN (%s) 
             AND exits.touid NOT IN (%s) 
             AND %s
+            AND %s
             ORDER BY %s
-        ]], table.concat(roomsList, ","), visited, levelWhere, snd.mapper.exitPreferenceOrderSql("exits.dir"))
+        ]],
+            table.concat(roomsList, ","),
+            visited,
+            levelWhere,
+            areaWhere,
+            snd.mapper.exitPreferenceOrderSql("exits.dir")
+        )
         
         local results = snd.mapper.db.query(sql) or {}
         roomsList = {}
@@ -4407,6 +5235,7 @@ function snd.mapper.findNearestRoomWithoutFlag(src, restrictionFlag, ignoreLocke
     local head = 1
     local visited = {[source] = true}
     local parents = {}
+    local areaWhere = snd.mapper.areaGuardRoomSql("exits.touid", source, ignoreLockedExits)
 
     while head <= #queue do
         local node = queue[head]
@@ -4420,8 +5249,14 @@ function snd.mapper.findNearestRoomWithoutFlag(src, restrictionFlag, ignoreLocke
                   AND fromuid NOT IN ('*', '**')
                   AND touid NOT IN ('*', '**')
                   AND %s
+                  AND %s
                 ORDER BY %s
-            ]], snd.mapper.db.escape(node.room), levelWhere, snd.mapper.exitPreferenceOrderSql("dir"))
+            ]],
+                snd.mapper.db.escape(node.room),
+                levelWhere,
+                areaWhere,
+                snd.mapper.exitPreferenceOrderSql("dir")
+            )
             local exits = snd.mapper.db.query(sql) or {}
             for _, ex in ipairs(exits) do
                 local nextRoom = tostring(ex.touid or "")
@@ -4484,6 +5319,7 @@ function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
     local head = 1
     local visited = {[source] = true}
     local parents = {}
+    local areaWhere = snd.mapper.areaGuardRoomSql("exits.touid", source, ignoreLockedExits)
 
     while head <= #queue do
         local node = queue[head]
@@ -4497,8 +5333,14 @@ function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
                   AND fromuid NOT IN ('*', '**')
                   AND touid NOT IN ('*', '**')
                   AND %s
+                  AND %s
                 ORDER BY %s
-            ]], snd.mapper.db.escape(node.room), levelWhere, snd.mapper.exitPreferenceOrderSql("dir"))
+            ]],
+                snd.mapper.db.escape(node.room),
+                levelWhere,
+                areaWhere,
+                snd.mapper.exitPreferenceOrderSql("dir")
+            )
             local exits = snd.mapper.db.query(sql) or {}
             for _, ex in ipairs(exits) do
                 local nextRoom = tostring(ex.touid or "")
@@ -4538,7 +5380,7 @@ function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
     return nil, nil
 end
 
-function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLockedExits)
+function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLockedExits, allowGeneralFallback)
     local source = tostring(src or "")
     local destination = tostring(dst or "")
     if source == "" or destination == "" then
@@ -4548,6 +5390,7 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
     local requiredFlag = (blockedType == "recall") and "noportal" or "norecall"
     local forceNoPortals = (blockedType == "portal")
     local forceNoRecalls = (blockedType == "recall")
+    local expectedType = (blockedType == "portal") and "recall" or "portal"
     local myLevel = snd.char.level or 201
     local maxDepth = snd.mapper.config.maxSearchDepth
     local maxCandidates = 40
@@ -4557,6 +5400,7 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
     local head = 1
     local visited = {[source] = true}
     local parents = {}
+    local areaWhere = snd.mapper.areaGuardRoomSql("exits.touid", source, ignoreLockedExits)
 
     while head <= #queue do
         local node = queue[head]
@@ -4567,7 +5411,7 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
         if canUseAlternate then
             testedCandidates = testedCandidates + 1
             local leg = snd.mapper.findPath(node.room, destination, forceNoPortals, forceNoRecalls, ignoreLockedExits)
-            if leg and #leg > 0 then
+            if leg and #leg > 0 and snd.mapper.pathStartsWithJump(leg, expectedType) then
                 local walkPath = {}
                 local cursor = node.room
                 while cursor ~= source do
@@ -4587,9 +5431,10 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
                 return combined, node.room, "preferred"
             end
 
-            -- If preferred jump type is not available from this room,
-            -- still allow a general route so we can move out of the blocked room.
-            local fallbackLeg = snd.mapper.findPath(node.room, destination, nil, nil, ignoreLockedExits)
+            -- Some callers may still opt into the legacy general-route fallback.
+            local fallbackLeg = allowGeneralFallback
+                and snd.mapper.findPath(node.room, destination, nil, nil, ignoreLockedExits)
+                or nil
             if fallbackLeg and #fallbackLeg > 0 then
                 local walkPath = {}
                 local cursor = node.room
@@ -4623,8 +5468,14 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
                   AND fromuid NOT IN ('*', '**')
                   AND touid NOT IN ('*', '**')
                   AND %s
+                  AND %s
                 ORDER BY %s
-            ]], snd.mapper.db.escape(node.room), levelWhere, snd.mapper.exitPreferenceOrderSql("dir"))
+            ]],
+                snd.mapper.db.escape(node.room),
+                levelWhere,
+                areaWhere,
+                snd.mapper.exitPreferenceOrderSql("dir")
+            )
             local exits = snd.mapper.db.query(sql) or {}
             for _, ex in ipairs(exits) do
                 local nextRoom = tostring(ex.touid or "")
@@ -4665,7 +5516,7 @@ function snd.mapper.executePath(path)
         u = true, d = true,
     }
     
-    -- Helper: compress consecutive cardinal directions (s,s,e,e,e â†’ 2s3e)
+    -- Helper: compress consecutive cardinal directions (s,s,e,e,e → 2s3e)
     local function compressCardinals(dirs)
         if #dirs == 0 then return "" end
         
@@ -4747,8 +5598,26 @@ function snd.mapper.executePath(path)
 		local raw = tostring(step.dir or "")
 		local parts = raw:find(";", 1, true) and splitSemis(raw) or { raw }
         local stepSourceRoom = simulatedRoom
+        local isTravelStep = step.travelType == "portal" or step.travelType == "recall"
         local stepHasWait = false
         local encounteredWait = false
+
+        -- Do not send a jump in the same batch as the walk leading to its
+        -- source room. Waiting for GMCP here also makes restriction markers
+        -- identify the room where recall/portal was actually attempted.
+        if isTravelStep then
+            flushCardinals()
+            if #currentGroup.commands > 0 then
+                table.insert(groups, currentGroup)
+            end
+            currentGroup = {
+                commands = {},
+                delayAfter = 0,
+                waitRoomId = nil,
+                executeRoomId = tostring(stepSourceRoom or "-1"),
+            }
+        end
+
         for _, token in ipairs(parts) do
             if tostring(token):match("^%s*wait%((%d+%.?%d*)%)%s*$") then
                 stepHasWait = true
@@ -4806,9 +5675,24 @@ function snd.mapper.executePath(path)
                     travelType = step.travelType,
                 })
 			end
-		end
+        end
         if step.uid then
             simulatedRoom = tostring(step.uid)
+        end
+
+        -- Commands after a jump must likewise wait until its destination is
+        -- confirmed instead of racing into the server command queue.
+        if isTravelStep then
+            flushCardinals()
+            if #currentGroup.commands > 0 then
+                table.insert(groups, currentGroup)
+            end
+            currentGroup = {
+                commands = {},
+                delayAfter = 0,
+                waitRoomId = nil,
+                executeRoomId = tostring(simulatedRoom or "-1"),
+            }
         end
 	end
 
@@ -4995,7 +5879,8 @@ end
 --- Go to a room using portal-aware pathfinding
 -- @param roomId Destination room uid
 -- @param usePortals Whether to use portals (default: true)
-function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMode)
+-- @param guardDestination Original xrt destination for area-guard override links
+function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMode, guardDestination)
     if not roomId then
         snd.utils.infoNote("No room specified")
         return false
@@ -5052,6 +5937,18 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
             snd.onDestinationArrived()
         end
         return true
+    end
+
+    if not snd.mapper.checkAreaGuardDestination(
+        currentRoom,
+        roomId,
+        guardDestination or roomId,
+        ignoreLockedExits,
+        false
+    ) then
+        snd.mapper.goingToRoom = nil
+        snd.nav.goingToRoom = nil
+        return false
     end
 
     local pendingBlocked = snd.mapper.pendingBlockedTravel
@@ -5137,7 +6034,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
                         end
                         nowRoom = tostring(nowRoom or "")
                         if nowRoom ~= "" and nowRoom ~= "-1" and nowRoom ~= expectedRoom then
-                            snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, true)
+                            snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, true, guardDestination)
                             return
                         end
                         if attempt < 2 then
@@ -5158,7 +6055,30 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
         snd.mapper.executePath(path)
         return true
     else
+        if snd.mapper.areaGuardEnabled() and not ignoreLockedExits then
+            local unguardedPath = snd.mapper.findPath(
+                currentRoom,
+                roomId,
+                noPortals,
+                noRecalls,
+                ignoreLockedExits,
+                true
+            )
+            if unguardedPath and #unguardedPath > 0 then
+                snd.utils.debugNote(string.format(
+                    "Area guard rejected all routes to room %s; unguarded route has %d steps.",
+                    tostring(roomId),
+                    #unguardedPath
+                ))
+                snd.mapper.reportAreaGuardRouteBlocked(guardDestination or roomId)
+                snd.mapper.goingToRoom = nil
+                snd.nav.goingToRoom = nil
+                return false
+            end
+            snd.utils.debugNote("Area guard route retry found no unguarded route either.")
+        end
         snd.utils.infoNote("You couldn't find a path to " .. roomId .. " from here.")
+        snd.utils.infoNote("Try 'xrtnear " .. roomId .. "' to list reachable boundary rooms. The lookup may take a moment.")
         snd.mapper.goingToRoom = nil
         snd.nav.goingToRoom = nil
         return false
@@ -5207,18 +6127,6 @@ function snd.mapper.gotoTarget()
 end
 
 -------------------------------------------------------------------------------
--- Command Integration
--------------------------------------------------------------------------------
-
---- Override snd.commands.gotoTarget to use portal navigation
-local originalGotoTarget = snd.commands and snd.commands.gotoTarget
-
-function snd.commands.gotoTarget()
-    -- Use portal-aware navigation
-    return snd.mapper.gotoTarget()
-end
-
--------------------------------------------------------------------------------
 -- Utility Commands
 -------------------------------------------------------------------------------
 
@@ -5238,7 +6146,7 @@ function snd.mapper.listPortals(filter)
         return
     end
     
-    cecho("\n<yellow>â•â•â• Mapper Portals â•â•â•<reset>\n")
+    cecho("\n<yellow>═══ Mapper Portals ═══<reset>\n")
     
     for i, portal in ipairs(portals) do
         local ptype = portal.fromuid == "*" and "Portal" or "Recall"
@@ -5254,7 +6162,7 @@ function snd.mapper.listPortals(filter)
             i, ptype, cmdColor, portal.dir, portal.name or "?", portal.area or "?", isBounce))
     end
     
-    cecho("<yellow>â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•<reset>\n")
+    cecho("<yellow>═══════════════════════<reset>\n")
     cecho("<dim_gray>Commands: mapper portal <cmd> level <n> | mapper bounceportal <#|cmd><reset>\n")
 end
 
@@ -5310,7 +6218,7 @@ function snd.mapper.searchPortals(scope)
         return
     end
 
-    cecho(string.format("\n<yellow>â•â•â• Portal Search (%s) â•â•â•<reset>\n", scope))
+    cecho(string.format("\n<yellow>═══ Portal Search (%s) ═══<reset>\n", scope))
     for i, portal in ipairs(rows) do
         local ptype = portal.fromuid == "**" and "Recall" or "Portal"
         cecho(string.format(
@@ -5324,7 +6232,7 @@ function snd.mapper.searchPortals(scope)
             tostring(portal.touid or "?")
         ))
     end
-    cecho("<yellow>â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•<reset>\n")
+    cecho("<yellow>══════════════════════════════<reset>\n")
 end
 
 --- Add a portal to current room
@@ -5597,7 +6505,7 @@ end
 
 --- Show navigation database info
 function snd.mapper.showDbInfo()
-    cecho("\n<yellow>â•â•â• Navigation Database Info â•â•â•<reset>\n")
+    cecho("\n<yellow>═══ Navigation Database Info ═══<reset>\n")
     
     cecho("  <cyan>Database path:<reset> " .. tostring(snd.mapper.db.file) .. "\n")
     cecho("  <cyan>Connection:<reset> " .. (snd.mapper.db.isOpen and "<green>Open" or "<red>Closed") .. "<reset>\n")
@@ -5624,7 +6532,7 @@ function snd.mapper.showDbInfo()
         end
     end
     
-    cecho("<yellow>â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•<reset>\n")
+    cecho("<yellow>════════════════════════════════<reset>\n")
 end
 
 --- Set database path manually
@@ -5697,7 +6605,7 @@ function snd.mapper.xrt(dest)
     if roomNum then
         cecho("<yellow>[MMAPPER]<reset> Going to room " .. roomNum .. "\n")
         snd.mapper.debugXrtDecision(dest, roomNum, "numeric destination")
-        return snd.mapper.gotoRoom(roomNum)
+        return snd.mapper.gotoRoom(roomNum, nil, nil, nil, dest)
     end
     
     -- Try exact match on area key first (prefer snd.db startRoom data)
@@ -5706,7 +6614,7 @@ function snd.mapper.xrt(dest)
         if startRoom > 0 then
             cecho("<yellow>[MMAPPER]<reset> Going to " .. dest .. " (room " .. startRoom .. ")\n")
             snd.mapper.debugXrtDecision(dest, startRoom, "area start room from snd.db.getAreaStartRoom")
-            return snd.mapper.gotoRoom(startRoom)
+            return snd.mapper.gotoRoom(startRoom, nil, nil, nil, dest)
         end
 
         if snd.db.query then
@@ -5722,7 +6630,7 @@ function snd.mapper.xrt(dest)
                 if roomId > 0 then
                     cecho("<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. roomId .. ")\n")
                     snd.mapper.debugXrtDecision(dest, roomId, "area match from snd.db area query")
-                    return snd.mapper.gotoRoom(roomId)
+                    return snd.mapper.gotoRoom(roomId, nil, nil, nil, dest)
                 end
             end
         end
@@ -5734,7 +6642,7 @@ function snd.mapper.xrt(dest)
         if areaData and areaData.start then
             cecho("<yellow>[MMAPPER]<reset> Going to " .. dest .. " (room " .. areaData.start .. ")\n")
             snd.mapper.debugXrtDecision(dest, areaData.start, "bundled default area start")
-            return snd.mapper.gotoRoom(areaData.start)
+            return snd.mapper.gotoRoom(areaData.start, nil, nil, nil, dest)
         end
         
         -- Try partial match on area names
@@ -5742,7 +6650,7 @@ function snd.mapper.xrt(dest)
             if areaKey:lower():find(dest, 1, true) and data.start then
                 cecho("<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. data.start .. ")\n")
                 snd.mapper.debugXrtDecision(dest, data.start, "bundled partial area match")
-                return snd.mapper.gotoRoom(data.start)
+                return snd.mapper.gotoRoom(data.start, nil, nil, nil, dest)
             end
         end
     end
@@ -5758,7 +6666,7 @@ function snd.mapper.xrt(dest)
             local roomId = results[1].uid
             cecho("<yellow>[MMAPPER]<reset> Going to area matching '" .. dest .. "' (room " .. roomId .. ")\n")
             snd.mapper.debugXrtDecision(dest, roomId, "mapper db area LIKE fallback")
-            return snd.mapper.gotoRoom(roomId)
+            return snd.mapper.gotoRoom(roomId, nil, nil, nil, dest)
         end
     end
     
@@ -5777,15 +6685,15 @@ function snd.mapper.xrtforce(dest)
 
     local roomNum = tonumber(dest)
     if roomNum then
-        cecho("<yellow>[MMAPPER]<reset> Force-going to room " .. roomNum .. " (ignoring exits.level locks)\n")
-        return snd.mapper.gotoRoom(roomNum, true, true)
+        cecho("<yellow>[MMAPPER]<reset> Force-going to room " .. roomNum .. " (ignoring area and exit-level guards)\n")
+        return snd.mapper.gotoRoom(roomNum, true, true, nil, dest)
     end
 
     if snd.db and snd.db.getAreaStartRoom then
         local startRoom = tonumber(snd.db.getAreaStartRoom(dest)) or -1
         if startRoom > 0 then
-            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. startRoom .. ", ignoring exits.level locks)\n")
-            return snd.mapper.gotoRoom(startRoom, true, true)
+            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. startRoom .. ", ignoring area and exit-level guards)\n")
+            return snd.mapper.gotoRoom(startRoom, true, true, nil, dest)
         end
 
         if snd.db.query then
@@ -5799,8 +6707,8 @@ function snd.mapper.xrtforce(dest)
                 local areaKey = areaRows[1].key
                 local roomId = tonumber(areaRows[1].startRoom) or -1
                 if roomId > 0 then
-                    cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. roomId .. ", ignoring exits.level locks)\n")
-                    return snd.mapper.gotoRoom(roomId, true, true)
+                    cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. roomId .. ", ignoring area and exit-level guards)\n")
+                    return snd.mapper.gotoRoom(roomId, true, true, nil, dest)
                 end
             end
         end
@@ -5809,14 +6717,14 @@ function snd.mapper.xrtforce(dest)
     if snd.data and snd.data.areaDefaultStartRooms then
         local areaData = snd.data.areaDefaultStartRooms[dest]
         if areaData and areaData.start then
-            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. areaData.start .. ", ignoring exits.level locks)\n")
-            return snd.mapper.gotoRoom(areaData.start, true, true)
+            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. areaData.start .. ", ignoring area and exit-level guards)\n")
+            return snd.mapper.gotoRoom(areaData.start, true, true, nil, dest)
         end
 
         for areaKey, data in pairs(snd.data.areaDefaultStartRooms) do
             if areaKey:lower():find(dest, 1, true) and data.start then
-                cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. data.start .. ", ignoring exits.level locks)\n")
-                return snd.mapper.gotoRoom(data.start, true, true)
+                cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. data.start .. ", ignoring area and exit-level guards)\n")
+                return snd.mapper.gotoRoom(data.start, true, true, nil, dest)
             end
         end
     end
@@ -5829,8 +6737,8 @@ function snd.mapper.xrtforce(dest)
         local results = snd.mapper.db.query(sql)
         if results and #results > 0 then
             local roomId = results[1].uid
-            cecho("<yellow>[MMAPPER]<reset> Force-going to area matching '" .. dest .. "' (room " .. roomId .. ", ignoring exits.level locks)\n")
-            return snd.mapper.gotoRoom(roomId, true, true)
+            cecho("<yellow>[MMAPPER]<reset> Force-going to area matching '" .. dest .. "' (room " .. roomId .. ", ignoring area and exit-level guards)\n")
+            return snd.mapper.gotoRoom(roomId, true, true, nil, dest)
         end
     end
 
@@ -5929,6 +6837,10 @@ function snd.mapper.walkTo(dest)
         cecho("<yellow>[MMAPPER]<reset> Already at " .. displayName .. "\n")
         return true
     end
+
+    if not snd.mapper.checkAreaGuardDestination(currentRoom, targetRoom, dest, false, false) then
+        return false
+    end
     
     -- Use snd.mapper.findPath with portals DISABLED
     cecho("<yellow>[MMAPPER]<reset> Walking to " .. displayName .. " (no portals)...\n")
@@ -5942,6 +6854,18 @@ function snd.mapper.walkTo(dest)
         snd.mapper.executePath(path)
         return true
     else
+        if snd.mapper.areaGuardEnabled() then
+            local unguardedPath = snd.mapper.findPath(currentRoom, targetRoom, true, true, false, true)
+            if unguardedPath and #unguardedPath > 0 then
+                snd.utils.debugNote(string.format(
+                    "Area guard rejected walking route to room %s; unguarded route has %d steps.",
+                    tostring(targetRoom),
+                    #unguardedPath
+                ))
+                snd.mapper.reportAreaGuardRouteBlocked(dest)
+                return false
+            end
+        end
         cecho("<red>[MMAPPER]<reset> No walking path found to " .. displayName .. "\n")
         cecho("<dim_gray>The destination may not be reachable by walking alone.<reset>\n")
         return false
@@ -6010,7 +6934,7 @@ function snd.mapper.importFromDb()
         return false
     end
     
-    cecho("\n<yellow>â•â•â• Starting Map Import from Aardwolf.db â•â•â•<reset>\n")
+    cecho("\n<yellow>═══ Starting Map Import from Aardwolf.db ═══<reset>\n")
     
     -- Step 1: Count what we're importing
     local roomCount = snd.mapper.db.query("SELECT COUNT(*) as cnt FROM rooms")
@@ -6205,7 +7129,7 @@ function snd.mapper.importFromDb()
     saveMap()
     
     -- Summary
-    cecho("\n<green>â•â•â• Import Complete â•â•â•<reset>\n")
+    cecho("\n<green>═══ Import Complete ═══<reset>\n")
     cecho(string.format("  <cyan>Rooms:<reset> %d created\n", roomsCreated))
     cecho(string.format("  <cyan>Exits:<reset> %d created\n", exitsCreated))
     cecho(string.format("  <cyan>Areas:<reset> %d created\n", areasCreated))
@@ -6232,7 +7156,7 @@ function snd.mapper.checkImport()
         mudletAreas = mudletAreas + 1
     end
     
-    cecho("\n<yellow>â•â•â• Map Status â•â•â•<reset>\n")
+    cecho("\n<yellow>═══ Map Status ═══<reset>\n")
     cecho(string.format("  <cyan>Mudlet rooms:<reset> %d\n", mudletRooms))
     cecho(string.format("  <cyan>Mudlet areas:<reset> %d\n", mudletAreas))
     cecho(string.format("  <cyan>Rooms with no area:<reset> %d\n", noAreaRooms))
@@ -6243,7 +7167,7 @@ function snd.mapper.checkImport()
         cecho(string.format("  <cyan>Aardwolf.db rooms:<reset> %d\n", dbRooms))
     end
     
-    cecho("<yellow>â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•<reset>\n")
+    cecho("<yellow>══════════════════<reset>\n")
 end
 
 -- Deprecated command aliases removed:
@@ -6280,7 +7204,7 @@ function snd.mapper.calculateCoordinates(startRoom)
         return false
     end
     
-    cecho("\n<yellow>â•â•â• Calculating Room Coordinates â•â•â•<reset>\n")
+    cecho("\n<yellow>═══ Calculating Room Coordinates ═══<reset>\n")
     cecho(string.format("  <cyan>Starting room:<reset> %d\n", startRoom))
     
     -- Check if start room exists
@@ -6447,7 +7371,7 @@ function snd.mapper.calculateCoordinates(startRoom)
     saveMap()
     
     -- Summary
-    cecho("\n<green>â•â•â• Coordinate Calculation Complete â•â•â•<reset>\n")
+    cecho("\n<green>═══ Coordinate Calculation Complete ═══<reset>\n")
     cecho(string.format("  <cyan>Rooms processed:<reset> %d\n", processed))
     cecho(string.format("  <cyan>Coordinates applied:<reset> %d\n", applied))
     if errors > 0 then
@@ -6469,14 +7393,14 @@ end
 -- Deprecated command alias removed:
 --   mapper/snd updatecolors
 
---- Update room colors based on terrain â†’ environment mapping
+--- Update room colors based on terrain → environment mapping
 function snd.mapper.updateRoomColors()
     if not snd.mapper.db.open() then
         snd.utils.errorNote("Cannot open Aardwolf.db")
         return false
     end
     
-    cecho("\n<yellow>â•â•â• Updating Room Colors â•â•â•<reset>\n")
+    cecho("\n<yellow>═══ Updating Room Colors ═══<reset>\n")
     
     -- ANSI color codes to RGB mapping (matching MUSHclient)
     local ansiToRgb = {
@@ -6506,7 +7430,7 @@ function snd.mapper.updateRoomColors()
         return false
     end
     
-    -- Build terrain name â†’ env id and color mapping
+    -- Build terrain name → env id and color mapping
     local terrainToEnvId = {}
     local envColors = {}
     
@@ -6593,7 +7517,7 @@ function snd.mapper.updateRoomColors()
     saveMap()
     
     -- Summary
-    cecho("\n<green>â•â•â• Color Update Complete â•â•â•<reset>\n")
+    cecho("\n<green>═══ Color Update Complete ═══<reset>\n")
     cecho(string.format("  <cyan>Rooms updated:<reset> %d\n", updated))
     if skipped > 0 then
         cecho(string.format("  <yellow>Skipped (unknown terrain):<reset> %d\n", skipped))
@@ -6638,7 +7562,7 @@ function snd.mapper.showEnvironments()
         [15] = "White",
     }
     
-    cecho("\n<yellow>â•â•â• Environments â•â•â•<reset>\n")
+    cecho("\n<yellow>═══ Environments ═══<reset>\n")
     for _, env in ipairs(envQuery) do
         local colorNum = tonumber(env.color) or 0
         local colorName = ansiNames[colorNum] or "Unknown"
@@ -6648,7 +7572,7 @@ function snd.mapper.showEnvironments()
             colorNum,
             colorName))
     end
-    cecho("<yellow>â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•<reset>\n")
+    cecho("<yellow>════════════════════<reset>\n")
 end
 
 -- Deprecated command alias removed:
@@ -6666,6 +7590,756 @@ end)
 snd.utils.debugNote("Navigation module loaded")
 ]==========], true)
 
+  load_package_module("mm_frontier.lua", [==========[
+mm = mm or {}
+mm.frontier = mm.frontier or {}
+
+local frontier = mm.frontier
+local REDIRECT_PERSIST_FILE = "mmapper_redirects.lua"
+
+if frontier.exitHandler then
+  pcall(killAnonymousEventHandler, frontier.exitHandler)
+  frontier.exitHandler = nil
+end
+if frontier.dbState then
+  if frontier.dbState.conn then
+    pcall(function() frontier.dbState.conn:close() end)
+  end
+  if frontier.dbState.env then
+    pcall(function() frontier.dbState.env:close() end)
+  end
+end
+frontier.dbState = nil
+
+local directionNames = {
+  [1] = "north",
+  [2] = "northeast",
+  [3] = "east",
+  [4] = "southeast",
+  [5] = "south",
+  [6] = "southwest",
+  [7] = "west",
+  [8] = "northwest",
+  [9] = "up",
+  [10] = "down",
+  [11] = "in",
+  [12] = "out",
+}
+
+local function trim(value)
+  return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function normalize_uid(value)
+  local uid = tonumber(value)
+  if not uid or uid <= 0 then return nil end
+  return math.floor(uid)
+end
+
+local function mapper_nav()
+  return (mm and mm.nav) or (snd and snd.mapper) or nil
+end
+
+local function mapper_room_info(roomId)
+  local nav = mapper_nav()
+  if not (nav and type(nav.getRoomInfo) == "function") then return nil end
+  return nav.getRoomInfo(roomId)
+end
+
+local function current_room()
+  local room = mm.current_room and mm.current_room() or nil
+  room = tonumber(room)
+  if room and room > 0 then return room end
+  return nil
+end
+
+local function now_millis()
+  if type(getEpoch) == "function" then
+    local value = tonumber(getEpoch())
+    if value then
+      return value < 10000000000 and value * 1000 or value
+    end
+  end
+  return (os.clock() or 0) * 1000
+end
+
+frontier.redirects = {}
+frontier.redirectsLoaded = false
+
+local function sanitize_redirect(entry)
+  if type(entry) ~= "table" then return nil end
+  local target = normalize_uid(entry.target_uid)
+  local destination = normalize_uid(entry.destination_uid)
+  if not target or not destination or target == destination then return nil end
+  return {
+    target_uid = target,
+    destination_uid = destination,
+    target_name = trim(entry.target_name),
+    destination_name = trim(entry.destination_name),
+    created_at = tonumber(entry.created_at) or os.time(),
+    deleted_at = tonumber(entry.deleted_at),
+  }
+end
+
+local function active_redirect(targetUid)
+  local target = normalize_uid(targetUid)
+  if not target then return nil end
+
+  for _, entry in ipairs(frontier.redirects) do
+    if entry.target_uid == target and entry.deleted_at == nil then
+      return entry
+    end
+  end
+  return nil
+end
+
+local function enforce_single_active_redirects()
+  local activeByTarget = {}
+  local collapsed = 0
+  local now = os.time()
+
+  for _, entry in ipairs(frontier.redirects) do
+    if entry.deleted_at == nil then
+      local previous = activeByTarget[entry.target_uid]
+      if not previous then
+        activeByTarget[entry.target_uid] = entry
+      elseif (tonumber(entry.created_at) or 0) >= (tonumber(previous.created_at) or 0) then
+        previous.deleted_at = now
+        activeByTarget[entry.target_uid] = entry
+        collapsed = collapsed + 1
+      else
+        entry.deleted_at = now
+        collapsed = collapsed + 1
+      end
+    end
+  end
+
+  return collapsed
+end
+
+local function save_redirects()
+  local started = now_millis()
+  local path = type(mm.persistence_path) == "function"
+    and mm.persistence_path(REDIRECT_PERSIST_FILE)
+    or (getMudletHomeDir() .. "/persistence/" .. REDIRECT_PERSIST_FILE)
+  local file = io.open(path, "wb")
+  if not file then
+    return false, "unable to open redirect persistence file directly: " .. tostring(path)
+  end
+
+  file:write("return {\n  redirects = {\n")
+  for _, entry in ipairs(frontier.redirects) do
+    file:write(string.format(
+      "    { target_uid = %d, destination_uid = %d, target_name = %q, destination_name = %q, created_at = %d, deleted_at = %s },\n",
+      entry.target_uid,
+      entry.destination_uid,
+      entry.target_name or "",
+      entry.destination_name or "",
+      entry.created_at,
+      entry.deleted_at and tostring(entry.deleted_at) or "nil"
+    ))
+  end
+  file:write("  },\n}\n")
+  file:close()
+  mm.debug(string.format("redirect persistence save timing: %.1fms", now_millis() - started))
+  return true
+end
+
+function frontier.initialize()
+  if frontier.redirectsLoaded then return true end
+  local started = now_millis()
+  frontier.redirects = {}
+
+  local path = type(mm.persistence_path) == "function"
+    and mm.persistence_path(REDIRECT_PERSIST_FILE)
+    or (getMudletHomeDir() .. "/persistence/" .. REDIRECT_PERSIST_FILE)
+  local chunk = loadfile(path)
+  if chunk then
+    local ok, data = pcall(chunk)
+    if not ok or type(data) ~= "table" then
+      return false, "redirect persistence file is invalid"
+    end
+
+    local seen = {}
+    for _, entry in ipairs(data.redirects or {}) do
+      local cleaned = sanitize_redirect(entry)
+      if cleaned then
+        local key = tostring(cleaned.target_uid) .. ":" .. tostring(cleaned.destination_uid)
+        if not seen[key] then
+          seen[key] = true
+          table.insert(frontier.redirects, cleaned)
+        end
+      end
+    end
+  end
+
+  local collapsed = enforce_single_active_redirects()
+  if collapsed > 0 then
+    local saved, saveErr = save_redirects()
+    if not saved then
+      return false, "unable to persist single-redirect migration: " .. tostring(saveErr)
+    end
+  end
+  frontier.redirectsLoaded = true
+  mm.debug(string.format(
+    "redirect persistence load timing: %.1fms (%d rows, %d duplicate targets collapsed)",
+    now_millis() - started,
+    #frontier.redirects,
+    collapsed
+  ))
+  return true
+end
+
+local function normalize_stub_direction(value)
+  local numeric = tonumber(value)
+  if numeric and directionNames[numeric] then
+    return directionNames[numeric]
+  end
+  local text = trim(value)
+  return text ~= "" and text or "unknown"
+end
+
+local function get_native_exit_stubs(roomId)
+  local fn = type(getExitStubs1) == "function" and getExitStubs1
+    or (type(getExitStubs) == "function" and getExitStubs)
+    or nil
+  if not fn then return {} end
+
+  local ok, stubs = pcall(fn, roomId)
+  if not ok or type(stubs) ~= "table" then return {} end
+
+  local results = {}
+  local seen = {}
+  local function add(value)
+    local direction = normalize_stub_direction(value)
+    if not seen[direction] then
+      seen[direction] = true
+      table.insert(results, direction)
+    end
+  end
+
+  for key, value in pairs(stubs) do
+    if type(value) == "string" or type(value) == "number" then
+      add(value)
+    elseif value == true then
+      add(key)
+    elseif type(value) == "table" then
+      add(value.direction or value.dir or value.name or key)
+    end
+  end
+  table.sort(results)
+  return results
+end
+
+local function resolve_area(scope)
+  local nav = mapper_nav()
+  if not (nav and nav.db and type(nav.db.query) == "function") then
+    return nil, "mapper navigation database is unavailable"
+  end
+
+  scope = trim(scope)
+  if scope == "" then
+    return nil, "Usage: mapper boundaries <here|area|UID>"
+  end
+
+  if scope:lower() == "here" then
+    local roomId = current_room()
+    if not roomId then return nil, "current room is unknown; try LOOK first" end
+    local info = mapper_room_info(roomId)
+    local area = info and trim(info.area) or ""
+    if area == "" then return nil, "current room has no mapper area" end
+    return area
+  end
+
+  local roomId = normalize_uid(scope)
+  if roomId then
+    local info = mapper_room_info(roomId)
+    local area = info and trim(info.area) or ""
+    if area == "" then
+      return nil, "room " .. tostring(roomId) .. " has no mapper area"
+    end
+    return area, nil, roomId
+  end
+
+  local exact = nav.db.query(string.format(
+    "SELECT DISTINCT area FROM rooms WHERE lower(area) = lower(%s) ORDER BY area",
+    nav.db.escape(scope)
+  )) or {}
+  if #exact == 1 then return tostring(exact[1].area or "") end
+
+  local partial = nav.db.query(string.format(
+    "SELECT DISTINCT area FROM rooms WHERE lower(area) LIKE lower(%s) ORDER BY area LIMIT 21",
+    nav.db.escape("%" .. scope .. "%")
+  )) or {}
+  if #partial == 0 then
+    return nil, "no mapper area matches '" .. scope .. "'"
+  end
+  if #partial > 1 then
+    local names = {}
+    for i = 1, math.min(#partial, 20) do
+      table.insert(names, tostring(partial[i].area or "?"))
+    end
+    return nil, "area is ambiguous: " .. table.concat(names, ", ")
+  end
+  return tostring(partial[1].area or "")
+end
+
+local function add_evidence(candidates, roomId, name, area, evidence)
+  roomId = normalize_uid(roomId)
+  if not roomId then return end
+  local candidate = candidates[roomId]
+  if not candidate then
+    candidate = {
+      uid = roomId,
+      name = tostring(name or "?"),
+      area = tostring(area or ""),
+      evidence = {},
+      evidenceSeen = {},
+    }
+    candidates[roomId] = candidate
+  end
+  if evidence and not candidate.evidenceSeen[evidence] then
+    candidate.evidenceSeen[evidence] = true
+    table.insert(candidate.evidence, evidence)
+  end
+end
+
+function frontier.find_boundaries(scope)
+  local area, err, targetRoom = resolve_area(scope)
+  if not area then return nil, err end
+
+  local nav = mapper_nav()
+  local roomRows = nav.db.query(string.format(
+    "SELECT uid, name, area FROM rooms WHERE lower(area) = lower(%s) ORDER BY CAST(uid AS INTEGER)",
+    nav.db.escape(area)
+  )) or {}
+
+  local candidates = {}
+  for _, room in ipairs(roomRows) do
+    local uid = normalize_uid(room.uid)
+    if uid then
+      for _, direction in ipairs(get_native_exit_stubs(uid)) do
+        add_evidence(candidates, uid, room.name, room.area, "stub " .. direction)
+      end
+    end
+  end
+
+  local danglingRows = nav.db.query(string.format([[
+    SELECT source.uid, source.name, source.area, exits.dir, exits.touid
+    FROM exits
+    JOIN rooms AS source ON source.uid = exits.fromuid
+    LEFT JOIN rooms AS destination ON destination.uid = exits.touid
+    WHERE lower(source.area) = lower(%s)
+      AND exits.fromuid NOT IN ('*', '**')
+      AND (
+        exits.touid IS NULL
+        OR trim(CAST(exits.touid AS TEXT)) = ''
+        OR CAST(exits.touid AS TEXT) = '-1'
+        OR destination.uid IS NULL
+      )
+    ORDER BY CAST(source.uid AS INTEGER), exits.dir
+  ]], nav.db.escape(area))) or {}
+
+  for _, row in ipairs(danglingRows) do
+    add_evidence(
+      candidates,
+      row.uid,
+      row.name,
+      row.area,
+      string.format("unmapped %s -> %s", tostring(row.dir or "?"), tostring(row.touid or "?"))
+    )
+  end
+
+  local source = current_room()
+  if not source then return nil, "current room is unknown; try LOOK first" end
+
+  local reachable = {}
+  for _, candidate in pairs(candidates) do
+    local path, depth
+    if candidate.uid == source then
+      path, depth = {}, 0
+    else
+      path, depth = nav.findPath(tostring(source), tostring(candidate.uid))
+    end
+    if path then
+      candidate.path = path
+      candidate.pathLength = #path
+      candidate.depth = tonumber(depth) or #path
+      candidate.evidenceSeen = nil
+      table.insert(reachable, candidate)
+    end
+  end
+
+  table.sort(reachable, function(a, b)
+    if a.pathLength ~= b.pathLength then
+      return a.pathLength < b.pathLength
+    end
+    return a.uid < b.uid
+  end)
+  return reachable, nil, {area = area, targetRoom = targetRoom, total = #roomRows}
+end
+
+local function echo_xrt_path(candidate)
+  local label = string.format("path %d", tonumber(candidate.pathLength) or 0)
+  local command = string.format([[expandAlias("xrt %d")]], candidate.uid)
+  echoLink(label, command, "Run xrt " .. tostring(candidate.uid), true)
+end
+
+local function show_boundary_rows(rows, area)
+  cecho(string.format("\n<cyan>Reachable boundary rooms in %s:<reset>\n", tostring(area or "?")))
+  cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
+  cecho(string.format("<white>%-36s %-10s %-10s %s<reset>\n", "Room", "(uid)", "Route", "Evidence"))
+  cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
+  for _, candidate in ipairs(rows) do
+    cecho(string.format("%-36s (%-8d) ", tostring(candidate.name or "?"):sub(1, 36), candidate.uid))
+    echo_xrt_path(candidate)
+    cecho("  <dim_gray>" .. table.concat(candidate.evidence or {}, ", ") .. "<reset>\n")
+  end
+  cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
+end
+
+function frontier.show_boundaries(scope)
+  local rows, err, context = frontier.find_boundaries(scope)
+  if not rows then return false, err end
+  if #rows == 0 then
+    mm.note("No reachable boundary rooms found in " .. tostring(context.area) .. ".")
+    return true
+  end
+  show_boundary_rows(rows, context.area)
+  mm.note(string.format("Found %d reachable boundary room%s.", #rows, #rows == 1 and "" or "s"))
+  return true
+end
+
+function frontier.xrtnear(targetUid)
+  local target = normalize_uid(targetUid)
+  if not target then return false, "Usage: xrtnear <room UID>" end
+
+  if not frontier.redirectsLoaded then
+    return false, "redirect persistence is not initialized; reload the mapper package"
+  end
+
+  local redirect = active_redirect(target)
+  if redirect then
+    local nav = mapper_nav()
+    local destination = normalize_uid(redirect.destination_uid)
+    if not (nav and type(nav.xrt) == "function") then
+      return false, "mapper navigation is unavailable"
+    end
+    mm.note(string.format(
+      "xrtnear redirect: room %d -> room %d%s.",
+      target,
+      destination,
+      trim(redirect.destination_name) ~= "" and " (" .. trim(redirect.destination_name) .. ")" or ""
+    ))
+    if nav.xrt(tostring(destination)) then return true end
+    return false, string.format("stored xrtnear redirect %d -> %d could not be started", target, destination)
+  end
+
+  return frontier.show_boundaries(tostring(target))
+end
+
+local function validate_redirect_destination(destination)
+  local nav = mapper_nav()
+  local source = current_room()
+  if not (nav and type(nav.findPath) == "function") then
+    return false, "mapper navigation is unavailable"
+  end
+  if not source then
+    return false, "current room is unknown; try LOOK first"
+  end
+  if source == destination then return true end
+
+  local path = nav.findPath(tostring(source), tostring(destination))
+  if not path and type(nav.buildOutwardJumpRoute) == "function" then
+    path = nav.buildOutwardJumpRoute(tostring(source), tostring(destination), nil)
+  end
+  if not path then
+    return false, string.format(
+      "redirect room %d is not reachable from current room %d; redirect was not saved",
+      destination,
+      source
+    )
+  end
+  return true
+end
+
+local function redirect_rows(targetUid, deleted)
+  if not frontier.redirectsLoaded then
+    return nil, "redirect persistence is not initialized; reload the mapper package"
+  end
+
+  local rows = {}
+  for _, row in ipairs(frontier.redirects) do
+    local isDeleted = row.deleted_at ~= nil
+    if isDeleted == deleted and (not targetUid or row.target_uid == targetUid) then
+      table.insert(rows, row)
+    end
+  end
+  table.sort(rows, function(a, b)
+    if a.target_uid ~= b.target_uid then return a.target_uid < b.target_uid end
+    return a.destination_uid < b.destination_uid
+  end)
+  return rows
+end
+
+local function native_room_name(roomId)
+  if type(getRoomName) ~= "function" then return nil end
+  local ok, name = pcall(getRoomName, roomId)
+  name = ok and trim(name) or ""
+  return name ~= "" and name or nil
+end
+
+local function enrich_redirect(row)
+  if trim(row.target_name) == "" then
+    row.target_name = native_room_name(row.target_uid) or "?"
+  end
+  if trim(row.destination_name) == "" then
+    row.destination_name = native_room_name(row.destination_uid) or "?"
+  end
+  return row
+end
+
+local function print_redirect_rows(rows, deleted)
+  cecho(deleted and "\n<cyan>Deleted redirects:<reset>\n" or "\n<cyan>Manual redirects:<reset>\n")
+  cecho("<gray>------------------------------------------------------------------------------------------------<reset>\n")
+  cecho(string.format("<white>%-4s %-34s %-10s %-34s %-10s<reset>\n", "#", "Requested room", "(uid)", "Redirect room", "(uid)"))
+  cecho("<gray>------------------------------------------------------------------------------------------------<reset>\n")
+  for index, row in ipairs(rows) do
+    enrich_redirect(row)
+    cecho(string.format(
+      "%-4d %-34s (%-8s) %-34s ",
+      index,
+      tostring(row.target_name):sub(1, 34),
+      tostring(row.target_uid),
+      tostring(row.destination_name):sub(1, 34)
+    ))
+    local destination = normalize_uid(row.destination_uid)
+    if destination then
+      echoLink(
+        string.format("(%d)", destination),
+        string.format([[expandAlias("xrt %d")]], destination),
+        "Run xrt " .. tostring(destination),
+        true
+      )
+    else
+      cecho(string.format("(%s)", tostring(row.destination_uid or "?")))
+    end
+    echo("\n")
+  end
+  cecho("<gray>------------------------------------------------------------------------------------------------<reset>\n")
+end
+
+function frontier.list_redirects(targetUid)
+  local started = now_millis()
+  local target = trim(targetUid)
+  if target ~= "" then
+    target = normalize_uid(target)
+    if not target then return false, "Usage: mapper redirects [target UID]" end
+  else
+    target = nil
+  end
+
+  local rows, err = redirect_rows(target, false)
+  if not rows then return false, err end
+  mm.runtime = mm.runtime or {}
+  mm.runtime.redirect_last_rows = rows
+  if #rows == 0 then
+    mm.note("No manual redirects found.")
+    mm.debug(string.format("mapper redirects timing: %.1fms (0 rows)", now_millis() - started))
+    return true
+  end
+  print_redirect_rows(rows, false)
+  mm.note(string.format("Showing %d redirect%s.", #rows, #rows == 1 and "" or "s"))
+  mm.debug(string.format("mapper redirects timing: %.1fms (%d rows)", now_millis() - started, #rows))
+  return true
+end
+
+function frontier.add_redirect(targetUid, destinationUid)
+  local target = normalize_uid(targetUid)
+  local destination = normalize_uid(destinationUid)
+  if not target or not destination then
+    return false, "Usage: mapper redirect add <target UID> <destination UID>"
+  end
+  if target == destination then return false, "target and destination must be different rooms" end
+  local targetInfo = mapper_room_info(target)
+  local destinationInfo = mapper_room_info(destination)
+  if not targetInfo then return false, "target room is not in the mapper database: " .. tostring(target) end
+  if not destinationInfo then return false, "redirect room is not in the mapper database: " .. tostring(destination) end
+
+  if not frontier.redirectsLoaded then
+    return false, "redirect persistence is not initialized; reload the mapper package"
+  end
+
+  local reachable, reachErr = validate_redirect_destination(destination)
+  if not reachable then return false, reachErr end
+
+  local existing = active_redirect(target)
+  if existing then
+    if existing.destination_uid == destination then
+      return false, string.format("redirect %d -> %d already exists", target, destination)
+    end
+
+    local previousDestination = existing.destination_uid
+    local previousDestinationName = existing.destination_name
+    local previousTargetName = existing.target_name
+    local previousCreated = existing.created_at
+    existing.destination_uid = destination
+    existing.destination_name = trim(destinationInfo.name)
+    existing.target_name = trim(targetInfo.name)
+    existing.created_at = os.time()
+    local saved, saveErr = save_redirects()
+    if not saved then
+      existing.destination_uid = previousDestination
+      existing.destination_name = previousDestinationName
+      existing.target_name = previousTargetName
+      existing.created_at = previousCreated
+      return false, saveErr
+    end
+    mm.note(string.format(
+      "Updated redirect for room %d: room %d -> room %d.",
+      target,
+      previousDestination,
+      destination
+    ))
+    return true
+  end
+
+  for _, deleted in ipairs(frontier.redirects) do
+    if deleted.target_uid == target and deleted.destination_uid == destination then
+      local previousDeleted = deleted.deleted_at
+      local previousCreated = deleted.created_at
+      local previousTargetName = deleted.target_name
+      local previousDestinationName = deleted.destination_name
+      deleted.deleted_at = nil
+      deleted.created_at = os.time()
+      deleted.target_name = trim(targetInfo.name)
+      deleted.destination_name = trim(destinationInfo.name)
+      local saved, saveErr = save_redirects()
+      if not saved then
+        deleted.deleted_at = previousDeleted
+        deleted.created_at = previousCreated
+        deleted.target_name = previousTargetName
+        deleted.destination_name = previousDestinationName
+        return false, saveErr
+      end
+      mm.note(string.format("Added redirect: room %d -> room %d.", target, destination))
+      return true
+    end
+  end
+
+  local entry = {
+    target_uid = target,
+    destination_uid = destination,
+    target_name = trim(targetInfo.name),
+    destination_name = trim(destinationInfo.name),
+    created_at = os.time(),
+    deleted_at = nil,
+  }
+  table.insert(frontier.redirects, entry)
+  local saved, saveErr = save_redirects()
+  if not saved then
+    table.remove(frontier.redirects)
+    return false, saveErr
+  end
+
+  mm.note(string.format("Added redirect: room %d -> room %d.", target, destination))
+  return true
+end
+
+function frontier.delete_redirect(index)
+  local pick = tonumber(index)
+  local rows = mm.runtime and mm.runtime.redirect_last_rows or nil
+  local row = rows and rows[pick] or nil
+  if not row then
+    return false, "Run 'mapper redirects' first, then use: mapper redirect delete <index>"
+  end
+  local previousDeleted = row.deleted_at
+  row.deleted_at = os.time()
+  local saved, saveErr = save_redirects()
+  if not saved then
+    row.deleted_at = previousDeleted
+    return false, saveErr
+  end
+  table.remove(rows, pick)
+  mm.note(string.format("Deleted redirect: room %s -> room %s.", row.target_uid, row.destination_uid))
+  return true
+end
+
+function frontier.list_deleted_redirects()
+  local rows, err = redirect_rows(nil, true)
+  if not rows then return false, err end
+  table.sort(rows, function(a, b)
+    return (tonumber(a.deleted_at) or 0) > (tonumber(b.deleted_at) or 0)
+  end)
+  mm.runtime = mm.runtime or {}
+  mm.runtime.redirect_deleted_rows = rows
+  if #rows == 0 then
+    mm.note("No deleted redirects found.")
+    return true
+  end
+  print_redirect_rows(rows, true)
+  mm.note(string.format("Showing %d deleted redirect%s.", #rows, #rows == 1 and "" or "s"))
+  return true
+end
+
+function frontier.restore_redirect(which)
+  local rows = mm.runtime and mm.runtime.redirect_deleted_rows or nil
+  if not rows or #rows == 0 then
+    return false, "Run 'mapper redirect deleted' first."
+  end
+
+  local index
+  if trim(which):lower() == "last" then
+    index = 1
+  else
+    index = tonumber(which)
+  end
+  local row = index and rows[index] or nil
+  if not row then return false, "Usage: mapper redirect restore <index|last>" end
+
+  local replaced = active_redirect(row.target_uid)
+  local replacedDeleted = replaced and replaced.deleted_at or nil
+  if replaced and replaced ~= row then
+    replaced.deleted_at = os.time()
+  end
+
+  local previousDeleted = row.deleted_at
+  local previousCreated = row.created_at
+  row.deleted_at = nil
+  row.created_at = os.time()
+  local saved, saveErr = save_redirects()
+  if not saved then
+    if replaced and replaced ~= row then
+      replaced.deleted_at = replacedDeleted
+    end
+    row.deleted_at = previousDeleted
+    row.created_at = previousCreated
+    return false, saveErr
+  end
+  table.remove(rows, index)
+  if replaced and replaced ~= row then
+    mm.note(string.format(
+      "Restored redirect: room %s -> room %s (replaced room %s).",
+      row.target_uid,
+      row.destination_uid,
+      replaced.destination_uid
+    ))
+  else
+    mm.note(string.format("Restored redirect: room %s -> room %s.", row.target_uid, row.destination_uid))
+  end
+  return true
+end
+
+if frontier.xrtNearAlias then
+  killAlias(frontier.xrtNearAlias)
+end
+frontier.xrtNearAlias = tempAlias("^xrtnear(?:\\s+(.*))?$", function()
+  local target = matches[2] or ""
+  local ok, err = frontier.xrtnear(target)
+  if not ok then mm.warn(err) end
+end)
+]==========])
+
   load_package_module("mm_help.lua", [==========[
 mm = mm or {}
 
@@ -6677,6 +8351,7 @@ mm.help_index_rows = {
   { cmd = "mapper help config", desc = "Commands for configuring the mapper" },
   { cmd = "mapper help exits", desc = "Commands for managing exits" },
   { cmd = "mapper help portals", desc = "Commands for managing portals" },
+  { cmd = "mapper help boundaries", desc = "Commands for boundary discovery and manual redirects" },
   { cmd = "mapper help searching", desc = "Commands for finding rooms" },
   { cmd = "mapper help exploring", desc = "Commands to aid exploring" },
   { cmd = "mapper help moving", desc = "Commands for moving between rooms" },
@@ -6800,6 +8475,20 @@ mm.help_table = {
       { cmd = "mapper restoreportal <number|last>", desc = "Restore one deleted portal by row number, or restoreportal last" },
     }
   },
+  ['boundaries'] = {
+    header = "Boundaries and Redirects",
+    rows = {
+      { cmd = "mapper boundaries here", desc = "Show reachable boundary rooms in the current area without moving" },
+      { cmd = "mapper boundaries <area>", desc = "Show reachable boundary rooms in an area name or key" },
+      { cmd = "mapper boundaries <room UID>", desc = "Use the room's area and show its reachable boundary rooms" },
+      { cmd = "xrtnear <room UID>", desc = "Run its stored redirect when present; otherwise show reachable boundary rooms in the target area" },
+      { cmd = "mapper redirect add <target UID> <destination UID>", desc = "Set or replace the single xrtnear redirect after verifying the destination is currently reachable" },
+      { cmd = "mapper redirects [target UID]", desc = "List saved suggestions with clickable destinations, optionally limited to one target" },
+      { cmd = "mapper redirect delete <index>", desc = "Delete an entry by index from the last mapper redirects list" },
+      { cmd = "mapper redirect deleted", desc = "List deleted redirects" },
+      { cmd = "mapper redirect restore <index|last>", desc = "Restore an entry from the last deleted redirect list" },
+    }
+  },
   ['searching'] = {
     header = "Searching",
     rows = {
@@ -6835,7 +8524,8 @@ mm.help_table = {
     header = "Moving",
     rows = {
       { cmd = "mapper goto <room id>", desc = "Run to a room by its room number" },
-      { cmd = "xrtforce <area|room id>", desc = "Run like xrt but ignore exits.level checks (forced route)" },
+      { cmd = "xset areaguard <on|off>", desc = "Persistently guard xrt routes from areas more than 30 levels above you; default off" },
+      { cmd = "xrtforce <area|room id>", desc = "Run like xrt but ignore area guard and exits.level checks (forced route)" },
       { cmd = "mapper walkto <room id>", desc = "Run to a room by its room number without using any mapper portals" },
       { cmd = "mapper resume", desc = "Initiate a new run to the previous target" },
     }
@@ -6901,7 +8591,7 @@ function mm.show_help(topic)
       print_help_row(row, command_width, details_width)
     end
   elseif topic == "all" then
-    for _, key in ipairs({"config", "exits", "portals", "searching", "exploring", "moving", "utils"}) do
+    for _, key in ipairs({"config", "exits", "portals", "boundaries", "searching", "exploring", "moving", "utils"}) do
       print_section(mm.help_table[key])
     end
   elseif mm.help_table[topic] then
@@ -8196,6 +9886,52 @@ local function handle_command_inline(line)
     return true
   end
 
+  local boundaries_arg = line:match("^mapper boundaries%s*(.*)$")
+  if boundaries_arg ~= nil then
+    local ok, err = mm.frontier.show_boundaries(boundaries_arg)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  local redirect_target, redirect_destination = line:match("^mapper redirect add%s+(%d+)%s+(%d+)$")
+  if redirect_target then
+    local ok, err = mm.frontier.add_redirect(redirect_target, redirect_destination)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  local redirects_target = line:match("^mapper redirects%s*(%d*)$")
+  if redirects_target ~= nil then
+    local ok, err = mm.frontier.list_redirects(redirects_target)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  local redirect_delete = line:match("^mapper redirect delete%s+(%d+)$")
+  if redirect_delete then
+    local ok, err = mm.frontier.delete_redirect(redirect_delete)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  if line == "mapper redirect deleted" then
+    local ok, err = mm.frontier.list_deleted_redirects()
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  local redirect_restore = line:match("^mapper redirect restore%s+(.+)$")
+  if redirect_restore then
+    local ok, err = mm.frontier.restore_redirect(redirect_restore)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  if line:find("^mapper redirect") or line:find("^mapper redirects") then
+    mm.warn("Use 'mapper help boundaries' for redirect commands.")
+    return true
+  end
+
   local search_arg = line:match("^mapper area%s+(.+)$")
   if search_arg then local ok, err = mm.search_text("area", search_arg); if not ok then mm.warn(err) end; return true end
 
@@ -8500,6 +10236,12 @@ mm.alias_specs = {
   {"^mapper train(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("train", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper quest(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("quest", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper unmapped%s*(.*)$", function(m) local ok, err = mm.show_unmapped(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper boundaries%s*(.*)$", function(m) local ok, err = mm.frontier.show_boundaries(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper redirect add%s+(%d+)%s+(%d+)$", function(m) local ok, err = mm.frontier.add_redirect(m[2], m[3]); if not ok then mm.warn(err) end end},
+  {"^mapper redirects%s*(%d*)$", function(m) local ok, err = mm.frontier.list_redirects(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper redirect delete%s+(%d+)$", function(m) local ok, err = mm.frontier.delete_redirect(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper redirect deleted$", function() local ok, err = mm.frontier.list_deleted_redirects(); if not ok then mm.warn(err) end end},
+  {"^mapper redirect restore%s+(.+)$", function(m) local ok, err = mm.frontier.restore_redirect(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper next(?:%s+(%d+))?$", function(m) local ok, err = mm.next_result(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexits area%s+(.+)$", function(m) local ok, err = mm.list_cexits("area " .. m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexits(?:%s+(.+))?$", function(m) local ok, err = mm.list_cexits(m[2]); if not ok then mm.warn(err) end end},
@@ -8686,7 +10428,10 @@ function mm.handle_command(line)
 end
 
 function mm.register_aliases()
-  if mm._alias then return end
+  if mm._alias then
+    pcall(killAlias, mm._alias)
+    mm._alias = nil
+  end
   mm._alias = tempAlias("^(mapper|mapper .+|maptype .+|mapshow .+|updatecolors(?: .+)?|resetaard|recon?)$", function()
     -- Prefer Mudlet's raw command text when available so stacked separators
     -- like ";;" are preserved for downstream mapper parsing/persistence.
@@ -9850,6 +11595,15 @@ end
         local ok, ensure_err = mm.ensure_exits_chaos_column()
         if not ok then
           mm.warn("Could not ensure exits.chaos column: " .. tostring(ensure_err))
+        end
+      end
+    end)
+
+    safe_step("frontier.initialize", function()
+      if mm.frontier and mm.frontier.initialize then
+        local ok, frontier_err = mm.frontier.initialize()
+        if not ok then
+          mm.warn("Could not initialize boundary redirects: " .. tostring(frontier_err))
         end
       end
     end)

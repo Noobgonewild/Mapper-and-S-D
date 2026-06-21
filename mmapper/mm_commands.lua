@@ -481,6 +481,52 @@ local function handle_command_inline(line)
     return true
   end
 
+  local boundaries_arg = line:match("^mapper boundaries%s*(.*)$")
+  if boundaries_arg ~= nil then
+    local ok, err = mm.frontier.show_boundaries(boundaries_arg)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  local redirect_target, redirect_destination = line:match("^mapper redirect add%s+(%d+)%s+(%d+)$")
+  if redirect_target then
+    local ok, err = mm.frontier.add_redirect(redirect_target, redirect_destination)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  local redirects_target = line:match("^mapper redirects%s*(%d*)$")
+  if redirects_target ~= nil then
+    local ok, err = mm.frontier.list_redirects(redirects_target)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  local redirect_delete = line:match("^mapper redirect delete%s+(%d+)$")
+  if redirect_delete then
+    local ok, err = mm.frontier.delete_redirect(redirect_delete)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  if line == "mapper redirect deleted" then
+    local ok, err = mm.frontier.list_deleted_redirects()
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  local redirect_restore = line:match("^mapper redirect restore%s+(.+)$")
+  if redirect_restore then
+    local ok, err = mm.frontier.restore_redirect(redirect_restore)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  if line:find("^mapper redirect") or line:find("^mapper redirects") then
+    mm.warn("Use 'mapper help boundaries' for redirect commands.")
+    return true
+  end
+
   local search_arg = line:match("^mapper area%s+(.+)$")
   if search_arg then local ok, err = mm.search_text("area", search_arg); if not ok then mm.warn(err) end; return true end
 
@@ -785,6 +831,12 @@ mm.alias_specs = {
   {"^mapper train(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("train", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper quest(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("quest", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper unmapped%s*(.*)$", function(m) local ok, err = mm.show_unmapped(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper boundaries%s*(.*)$", function(m) local ok, err = mm.frontier.show_boundaries(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper redirect add%s+(%d+)%s+(%d+)$", function(m) local ok, err = mm.frontier.add_redirect(m[2], m[3]); if not ok then mm.warn(err) end end},
+  {"^mapper redirects%s*(%d*)$", function(m) local ok, err = mm.frontier.list_redirects(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper redirect delete%s+(%d+)$", function(m) local ok, err = mm.frontier.delete_redirect(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper redirect deleted$", function() local ok, err = mm.frontier.list_deleted_redirects(); if not ok then mm.warn(err) end end},
+  {"^mapper redirect restore%s+(.+)$", function(m) local ok, err = mm.frontier.restore_redirect(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper next(?:%s+(%d+))?$", function(m) local ok, err = mm.next_result(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexits area%s+(.+)$", function(m) local ok, err = mm.list_cexits("area " .. m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexits(?:%s+(.+))?$", function(m) local ok, err = mm.list_cexits(m[2]); if not ok then mm.warn(err) end end},
@@ -971,7 +1023,10 @@ function mm.handle_command(line)
 end
 
 function mm.register_aliases()
-  if mm._alias then return end
+  if mm._alias then
+    pcall(killAlias, mm._alias)
+    mm._alias = nil
+  end
   mm._alias = tempAlias("^(mapper|mapper .+|maptype .+|mapshow .+|updatecolors(?: .+)?|resetaard|recon?)$", function()
     -- Prefer Mudlet's raw command text when available so stacked separators
     -- like ";;" are preserved for downstream mapper parsing/persistence.

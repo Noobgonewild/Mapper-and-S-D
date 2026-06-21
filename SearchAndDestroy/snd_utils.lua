@@ -846,16 +846,17 @@ end
 --- Route a formatted report line to default echo or configured channel
 -- @param text string Text to report
 -- @param eventType string semantic type for color coding
+-- @param channelOverride optional explicit report channel
 -- @return true if delivered, false otherwise
-function snd.utils.reportLine(text, eventType)
+function snd.utils.reportLine(text, eventType, channelOverride)
     text = snd.utils.trim(text or "")
     if text == "" then
         return false
     end
 
     local style = snd.utils.getReportTypeStyle(eventType)
-    local channel = "default"
-    if snd.config and snd.config.reportChannel then
+    local channel = channelOverride and snd.utils.trim(tostring(channelOverride)) or "default"
+    if not channelOverride and snd.config and snd.config.reportChannel then
         channel = snd.utils.trim(snd.config.reportChannel)
     end
 

@@ -321,11 +321,11 @@
             
             <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
                 <name>gq_about_to_start</name>
-                <script>snd.triggers.gqAboutToStart()</script>
+                <script>snd.triggers.gqAboutToStart(matches)</script>
                 <mCommand></mCommand>
                 <packageName></packageName>
                 <regexCodeList>
-                    <string>^Global Quest: See 'Help Global Quests', or, type 'Gquest Join \d+' to take part\.?\s*$</string>
+                    <string>^Global Quest: See 'Help Global Quests', or, type 'Gquest Join (\d+)' to take part\.?\s*$</string>
                 </regexCodeList>
                 <regexCodePropertyList>
                     <integer>1</integer>
