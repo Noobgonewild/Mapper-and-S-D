@@ -4237,6 +4237,13 @@ snd.mapper.dirOffsets = {
 --- Calculate coordinates for all rooms using BFS from exits
 -- @param startRoom Optional starting room (default: 32418 Aylor)
 function snd.mapper.calculateCoordinates(startRoom)
+    -- Keep the legacy API as a compatibility entry point, but route it through
+    -- the shared database-driven, per-area layout engine used by mapper
+    -- calccoords, mapper rebuild map, and mapper rebuild layout.
+    if mm and mm.import and type(mm.import.recalculate_all_layouts) == "function" then
+        return mm.import.recalculate_all_layouts(mm.state and mm.state.map_db or "Aardwolf.db")
+    end
+
     startRoom = startRoom or 32418
     
     if not snd.mapper.db.open() then

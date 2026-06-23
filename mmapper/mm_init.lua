@@ -88,6 +88,11 @@ function mm.initialize()
   if mm and mm.debug then
     mm.debug("initialization begin")
   end
+  safe_step("load_settings_persistence", function()
+    if mm.load_settings_persistence then
+      mm.load_settings_persistence()
+    end
+  end)
   safe_step("register_aliases", function() mm.register_aliases() end)
   safe_step("register_events", function() mm.register_events() end)
   safe_step("minimap.init", function() mm.minimap.init() end)

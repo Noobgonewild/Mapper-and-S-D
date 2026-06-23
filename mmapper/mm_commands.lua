@@ -365,16 +365,12 @@ local function handle_command_inline(line)
   end
 
   if line == "mapper calccoords confirm" then
-    local nav = (mm and mm.nav) or (snd and snd.mapper) or nil
-    if nav and nav.calculateCoordinates then
-      nav.calculateCoordinates()
-    else
-      mm.warn("mapper calccoords requires mapper navigation module to be loaded.")
-    end
+    local ok, err = mm.import.recalculate_all_layouts(mm.state.map_db)
+    if not ok then mm.warn(err) end
     return true
   end
   if line == "mapper calccoords" then
-    mm.note("This recalculates all map room coordinates from exits. Confirm with: mapper calccoords confirm")
+    mm.note("This recalculates and saves every area layout from direct cardinal exits in the mapper database. Confirm with: mapper calccoords confirm")
     return true
   end
 
@@ -741,7 +737,7 @@ local function handle_command_inline(line)
     end
 
     if normalized == "on" or normalized == "off" then
-      mm.state.rebuild_layout_on_sync_error = mm.bool_arg(normalized, mm.state.rebuild_layout_on_sync_error)
+      mm.set_rebuild_layout_on_area_entry(normalized == "on")
       mm.note("auto rebuild layout on area entry " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off"))
       return true
     end
@@ -800,17 +796,7 @@ local function handle_command_inline(line)
 
   if line == "mapper rebuild map" or line == "mapper import rooms" then
     local ok, err = mm.import.convert_sqlite_to_mudlet(mm.state.map_db)
-    if not ok then
-      mm.warn(err)
-      return true
-    end
-    local info = mm.get_room_info and mm.get_room_info() or nil
-    if info and info.num then
-      local rid = tonumber(info.num)
-      if rid and type(setPlayerRoom) == "function" then pcall(setPlayerRoom, rid) end
-      if rid and type(centerview) == "function" then pcall(centerview, rid) end
-    end
-    mm.note("Rebuild/import complete from " .. tostring(mm.state.map_db))
+    if not ok then mm.warn(err) end
     return true
   end
 
@@ -941,7 +927,7 @@ mm.alias_specs = {
   {"^mapper underlines?(?: (on|off))?$", function(m) if m[2] then mm.state.underline_links = mm.bool_arg(m[2], mm.state.underline_links) end; mm.note("underlines " .. (mm.state.underline_links and "on" or "off")) end},
   {"^mapper autolocate(?: (on|off))?$", function(m) mm.state.auto_locate = mm.bool_arg(m[2], not mm.state.auto_locate); mm.note("autolocate " .. (mm.state.auto_locate and "on" or "off")) end},
   {"^mapper centerlocate(?: (on|off))?$", function(m) mm.state.center_on_locate = mm.bool_arg(m[2], not mm.state.center_on_locate); mm.note("centerlocate " .. (mm.state.center_on_locate and "on" or "off")) end},
-  {"^mapper rebuild layout (on|off)$", function(m) mm.state.rebuild_layout_on_sync_error = mm.bool_arg(m[2], not mm.state.rebuild_layout_on_sync_error); mm.note("auto rebuild layout on area entry " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off")) end},
+  {"^mapper rebuild layout (on|off)$", function(m) mm.set_rebuild_layout_on_area_entry(m[2] == "on"); mm.note("auto rebuild layout on area entry " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off")) end},
   {"^mapper locate$", function() send("look") end},
   {"^mapper debug(?: (on|off))?$", function(m) if m[2] then mm.state.debug = (m[2] == "on"); mm.note("debug " .. m[2]); if m[2] == "on" then mm.debug("debugging enabled; watch for setPlayerRoom/map capture lines") end else mm.note("debug " .. ((mm.state and mm.state.debug) and "on" or "off")) end end},
   {"^mapper database$", function() mm.note("Current mapper database: " .. mm.state.map_db) end},
@@ -965,8 +951,8 @@ mm.alias_specs = {
   {"^mapper bouncerecall clear$", function() local ok, err = mm.clear_bounce_recall(); if not ok then mm.warn(err) else mm.note("bouncerecall cleared.") end end},
   {"^mapper bounceportal%s+(%d+)$", function(m) local ok, portal_or_err = mm.set_bounce_portal(tonumber(m[2])); if not ok then mm.warn(portal_or_err) else mm.note("bounceportal set to #" .. tostring(m[2]) .. ": " .. tostring(portal_or_err.command)) end end},
   {"^mapper bouncerecall%s+(%d+)$", function(m) local ok, portal_or_err = mm.set_bounce_recall(tonumber(m[2])); if not ok then mm.warn(portal_or_err) else mm.note("bouncerecall set to #" .. tostring(m[2]) .. ": " .. tostring(portal_or_err.command)) end end},
-  {"^mapper rebuild map$", function() local ok, err = mm.import.convert_sqlite_to_mudlet(mm.state.map_db); if not ok then mm.warn(err) else local info = mm.get_room_info and mm.get_room_info() or nil; local rid = info and tonumber(info.num) or nil; if rid and type(setPlayerRoom) == "function" then pcall(setPlayerRoom, rid) end; if rid and type(centerview) == "function" then pcall(centerview, rid) end; mm.note("Rebuild/import complete from " .. tostring(mm.state.map_db)) end end},
-  {"^mapper import rooms$", function() local ok, err = mm.import.convert_sqlite_to_mudlet(mm.state.map_db); if not ok then mm.warn(err) else local info = mm.get_room_info and mm.get_room_info() or nil; local rid = info and tonumber(info.num) or nil; if rid and type(setPlayerRoom) == "function" then pcall(setPlayerRoom, rid) end; if rid and type(centerview) == "function" then pcall(centerview, rid) end; mm.note("Rebuild/import complete from " .. tostring(mm.state.map_db)) end end},
+  {"^mapper rebuild map$", function() local ok, err = mm.import.convert_sqlite_to_mudlet(mm.state.map_db); if not ok then mm.warn(err) end end},
+  {"^mapper import rooms$", function() local ok, err = mm.import.convert_sqlite_to_mudlet(mm.state.map_db); if not ok then mm.warn(err) end end},
   {"^mapper recolor map$", function() local ok, err = mm.apply_terrain_colors(); if not ok then mm.warn(err) end end},
   {"^mapper updatecolors$", function() local ok, info = mm.import.update_room_colors_from_sqlite(mm.state.map_db); if not ok then mm.warn(info) else mm.note(string.format("DB room colors updated: env=%d, env-colors=%d, rooms=%d, skipped=%d", info.env_rows or 0, info.colors_applied or 0, info.rooms_updated or 0, info.rooms_skipped or 0)) end end},
   {"^mapper updatecolors (.+)$", function(m) local ok, info = mm.import.update_room_colors_from_sqlite(m[2]); if not ok then mm.warn(info) else mm.note(string.format("DB room colors updated from %s: env=%d, env-colors=%d, rooms=%d, skipped=%d", tostring(info.source), info.env_rows or 0, info.colors_applied or 0, info.rooms_updated or 0, info.rooms_skipped or 0)) end end},

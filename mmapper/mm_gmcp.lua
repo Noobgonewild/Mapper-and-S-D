@@ -595,6 +595,112 @@ function mm.on_room_exits_event()
   mm.on_room_exits()
 end
 
+local AUTO_REBUILD_DELAY = 0.20
+local AUTO_REBUILD_RETRY_DELAY = 0.60
+local AUTO_REBUILD_MAX_ATTEMPTS = 3
+
+local function normalize_area_name(area)
+  return tostring(area or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+end
+
+local function run_after(delay, callback)
+  if type(tempTimer) == "function" then
+    tempTimer(delay, callback)
+  else
+    callback()
+  end
+end
+
+local function refresh_bigmap(room_id)
+  if type(setPlayerRoom) == "function" then pcall(setPlayerRoom, room_id) end
+  if type(centerview) == "function" then pcall(centerview, room_id) end
+  if type(updateMap) == "function" then pcall(updateMap) end
+end
+
+function mm.schedule_auto_layout_rebuild(room_num, room_area)
+  if not (mm.state and mm.state.rebuild_layout_on_sync_error) then return false end
+
+  local requested_room = tonumber(room_num)
+  local requested_area = normalize_area_name(room_area)
+  if not requested_room or requested_room <= 0 or requested_area == "" then return false end
+
+  mm.runtime = mm.runtime or {}
+  if normalize_area_name(mm.runtime.last_auto_rebuild_area) == requested_area then return false end
+  if normalize_area_name(mm.runtime.auto_rebuild_pending_area) == requested_area then return false end
+
+  mm.runtime.auto_rebuild_generation = (tonumber(mm.runtime.auto_rebuild_generation) or 0) + 1
+  local generation = mm.runtime.auto_rebuild_generation
+  mm.runtime.auto_rebuild_pending_area = requested_area
+
+  local function attempt(attempt_number)
+    local delay = attempt_number == 1 and AUTO_REBUILD_DELAY or AUTO_REBUILD_RETRY_DELAY
+    run_after(delay, function()
+      if not (mm.state and mm.state.rebuild_layout_on_sync_error) then return end
+      if not mm.runtime or mm.runtime.auto_rebuild_generation ~= generation then return end
+
+      -- Re-read GMCP after the delay; the area-entry packet may already have
+      -- been superseded by another movement or a portal/recall transition.
+      local info = mm.get_room_info and mm.get_room_info() or nil
+      local current_area = normalize_area_name(info and (info.zone or info.area) or "")
+      local current_room = info and tonumber(info.num) or requested_room
+      if current_area ~= requested_area or not current_room or current_room <= 0 then
+        mm.runtime.auto_rebuild_pending_area = nil
+        return
+      end
+
+      local ok, result = mm.import.rebuild_layout_from(current_room, {
+        silent = true,
+        area_only = true,
+      })
+      local applied = ok and type(result) == "table" and tonumber(result.applied) or 0
+      local area_rooms = ok and type(result) == "table" and tonumber(result.area_rooms) or nil
+      local incomplete = ok and area_rooms and applied < area_rooms
+
+      if ok and not incomplete then
+        mm.runtime.last_auto_rebuild_area = requested_area
+        mm.runtime.auto_rebuild_pending_area = nil
+        mm.debug(string.format(
+          "auto layout rebuild completed for area '%s' from room %d (%d rooms)",
+          requested_area,
+          current_room,
+          applied
+        ))
+
+        -- Let Mudlet finish processing the GMCP event before the final repaint.
+        run_after(0, function()
+          if mm.runtime and mm.runtime.auto_rebuild_generation == generation then
+            refresh_bigmap(current_room)
+          end
+        end)
+        return
+      end
+
+      if attempt_number < AUTO_REBUILD_MAX_ATTEMPTS then
+        mm.debug(string.format(
+          "auto layout rebuild for area '%s' was not ready (attempt %d/%d, applied=%d, area rooms=%s); retrying",
+          requested_area,
+          attempt_number,
+          AUTO_REBUILD_MAX_ATTEMPTS,
+          applied,
+          tostring(area_rooms or "?")
+        ))
+        attempt(attempt_number + 1)
+        return
+      end
+
+      mm.runtime.last_auto_rebuild_area = requested_area
+      mm.runtime.auto_rebuild_pending_area = nil
+      local reason = incomplete
+        and string.format("only %d of %d area rooms were reachable", applied, area_rooms)
+        or tostring(result)
+      mm.warn("Auto rebuild layout failed for area '" .. requested_area .. "': " .. reason)
+    end)
+  end
+
+  attempt(1)
+  return true
+end
+
 function mm.register_events()
   if mm._room_vnum_trigger then
     pcall(killTrigger, mm._room_vnum_trigger)
@@ -611,20 +717,7 @@ function mm.register_events()
     registerAnonymousEventHandler("gmcp.room.sectors", "mm.refresh_terrain_ids"),
     registerAnonymousEventHandler("gmcp.Room.Sectors", "mm.refresh_terrain_ids"),
     registerAnonymousEventHandler("mm.room.changed", function(_, room_num, room_area)
-      if not (mm.state and mm.state.rebuild_layout_on_sync_error) then return end
-      if room_area == "" then return end
-      mm.runtime = mm.runtime or {}
-      local prev = tostring(mm.runtime.last_auto_rebuild_attempt_area or "")
-      if room_area == prev then return end
-      local roomId = tonumber(room_num)
-      if not (roomId and roomId > 0) then return end
-      mm.runtime.last_auto_rebuild_attempt_area = room_area
-      local ok, err = mm.import.rebuild_layout_from(roomId, { silent = true })
-      if ok then
-        mm.runtime.last_auto_rebuild_area = room_area
-      else
-        mm.warn("Auto rebuild layout failed for area '" .. room_area .. "': " .. tostring(err))
-      end
+      mm.schedule_auto_layout_rebuild(room_num, room_area)
     end),
   }
 

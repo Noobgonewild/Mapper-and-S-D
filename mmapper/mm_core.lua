@@ -124,6 +124,54 @@ end
 local PORTAL_PERSIST_FILE = "mmapper_portals.lua"
 local DELETED_CEXITS_PERSIST_FILE = "mmapper_deleted_cexits.lua"
 local DELETED_PORTALS_PERSIST_FILE = "mmapper_deleted_portals.lua"
+local SETTINGS_PERSIST_FILE = "mmapper_settings.lua"
+
+function mm.load_settings_persistence()
+  local chunk = mm.load_persistence_chunk(SETTINGS_PERSIST_FILE)
+  if not chunk then return false end
+
+  local ok, data = pcall(chunk)
+  if not ok or type(data) ~= "table" then return false end
+  if type(data.rebuild_layout_on_sync_error) == "boolean" then
+    mm.state.rebuild_layout_on_sync_error = data.rebuild_layout_on_sync_error
+  end
+  return true
+end
+
+function mm.save_settings_persistence()
+  local f = mm.open_persistence_file(SETTINGS_PERSIST_FILE, "wb")
+  if not f then
+    return false, "unable to open mapper settings persistence file for writing"
+  end
+  f:write("return " .. serialize_value({
+    rebuild_layout_on_sync_error = mm.state.rebuild_layout_on_sync_error == true,
+  }))
+  f:close()
+  return true
+end
+
+function mm.set_rebuild_layout_on_area_entry(enabled)
+  mm.state.rebuild_layout_on_sync_error = enabled == true
+  mm.runtime = mm.runtime or {}
+  mm.runtime.auto_rebuild_generation = (tonumber(mm.runtime.auto_rebuild_generation) or 0) + 1
+  mm.runtime.auto_rebuild_pending_area = nil
+
+  local ok, err = mm.save_settings_persistence()
+  if not ok then mm.warn("Could not save auto layout setting: " .. tostring(err)) end
+
+  -- Enabling while already inside an area should also repair the current view.
+  if enabled and type(mm.schedule_auto_layout_rebuild) == "function" then
+    local info = mm.get_room_info and mm.get_room_info() or nil
+    local room_id = info and tonumber(info.num) or nil
+    local area = info and tostring(info.zone or info.area or "") or ""
+    if room_id and room_id > 0 and area ~= "" then
+      mm.runtime.last_auto_rebuild_area = nil
+      mm.schedule_auto_layout_rebuild(room_id, area)
+    end
+  end
+
+  return mm.state.rebuild_layout_on_sync_error
+end
 
 local function sanitize_deleted_cexit_entry(entry)
   if type(entry) ~= "table" then return nil end
