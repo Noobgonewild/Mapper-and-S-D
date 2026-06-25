@@ -37,11 +37,12 @@ snd.cp.pendingResetCloseTimer = snd.cp.pendingResetCloseTimer or nil
 --- Request a cp check while suppressing duplicate sends in a short window.
 -- @param delay number|nil Optional delay in seconds before sending
 -- @param reason string|nil Optional debug reason for why check was requested
-function snd.cp.requestCheck(delay, reason)
+-- @param force boolean|nil Bypass the duplicate-send interval when a refresh is required
+function snd.cp.requestCheck(delay, reason, force)
     local now = os.clock()
     local minInterval = 0.75
 
-    if snd.cp.lastCheckRequestAt and (now - snd.cp.lastCheckRequestAt) < minInterval then
+    if not force and snd.cp.lastCheckRequestAt and (now - snd.cp.lastCheckRequestAt) < minInterval then
         return false
     end
 
@@ -1214,6 +1215,12 @@ end
 function snd.cp.onMobKilled()
     snd.utils.debugNote("Campaign mob killed!")
     local shouldSyncAfterKill = true
+    local killedTargetsBefore = 0
+    for _, target in ipairs(snd.targets.list or {}) do
+        if target.activity == "cp" and target.killed then
+            killedTargetsBefore = killedTargetsBefore + 1
+        end
+    end
     local confirmedKilledMob = ""
     if snd.conwin and snd.conwin.getRecentKilledMobName then
         confirmedKilledMob = snd.conwin.getRecentKilledMobName(3) or ""
@@ -1310,10 +1317,24 @@ function snd.cp.onMobKilled()
         snd.clearTarget()
     end
     
-    -- Trigger cp check to update status (throttled to avoid duplicate sends).
+    local killedTargetsAfter = 0
+    for _, target in ipairs(snd.targets.list or {}) do
+        if target.activity == "cp" and target.killed then
+            killedTargetsAfter = killedTargetsAfter + 1
+        end
+    end
+    local markedTargetKilled = killedTargetsAfter > killedTargetsBefore
+
+    -- The server confirmed a campaign kill, but no CP entry gained the [Killed]
+    -- state in S&D's target window. Force a refresh without waiting for AutoCheck.
+    if not markedTargetKilled then
+        snd.utils.debugNote("Campaign kill marked no CP target killed; forcing cp check")
+        snd.cp.requestCheck(0.1, "cp.onMobKilled:no-target-marked-killed", true)
+
+    -- Otherwise, trigger cp check according to the normal AutoCheck policy.
     -- Do not re-check immediately after the last kill; completion parsing/DB close
     -- should proceed without a terminal "not on campaign" sync race.
-    if shouldSyncAfterKill and (not snd.shouldAutoCheckAfterKill or snd.shouldAutoCheckAfterKill("cp")) then
+    elseif shouldSyncAfterKill and (not snd.shouldAutoCheckAfterKill or snd.shouldAutoCheckAfterKill("cp")) then
         snd.cp.requestCheck(0.1, "cp.onMobKilled")
     end
     

@@ -82,7 +82,7 @@ local function ensureAreaReferencesLoaded()
     end
 
     local candidates = {}
-    if mm.base_dir and mm.base_dir ~= "" and mm.base_dir ~= "mm_package.xml" then
+    if mm.base_dir and mm.base_dir ~= "" then
         table.insert(candidates, tostring(mm.base_dir) .. "/mm_area_references.lua")
     end
 

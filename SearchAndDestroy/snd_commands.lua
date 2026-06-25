@@ -2649,7 +2649,7 @@ function snd.commands.showConfigHelp()
     cecho("  <cyan>expressmin<reset>   <number>  Min kills before express applies\n")
     cecho("  <cyan>autocheck<reset>    <on|smart|off>  Post-kill CP/GQ recheck mode\n")
     cecho("  <cyan>autocheck kills<reset> <number>  SMART mode: run check every N kills\n")
-   
+    
     cecho("  <cyan>xcp mode<reset>     <db|qw|ht>  Post-arrival CP/GQ target mode\n")
     cecho("                db = use stored DB/mapped rooms only\n")
     cecho("                qw = live where and accept only exact selected-target mob names\n")

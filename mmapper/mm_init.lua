@@ -11,6 +11,14 @@ local function file_exists(path)
   return true
 end
 
+local function loader_note(message)
+  cecho("<cyan>[MMAPPER]<reset> " .. tostring(message) .. "\n")
+end
+
+local function loader_error(message)
+  cecho("<orange_red>[MMAPPER ERROR]<reset> " .. tostring(message) .. "\n")
+end
+
 local function resolve_base_dir()
   if mm.base_dir and mm.base_dir ~= "" then
     return mm.base_dir
@@ -40,17 +48,22 @@ local function resolve_base_dir()
   return home .. "/mmapper"
 end
 
+local loadedCount = 0
+local errorCount = 0
+
 local function load_module(base, file)
   local full = base .. "/" .. file
   local ok, err = pcall(dofile, full)
   if not ok then
-    error(string.format("MMAPPER failed to load '%s': %s", full, tostring(err)))
+    errorCount = errorCount + 1
+    loader_error(string.format("Failed to load %s from %s: %s", file, full, tostring(err)))
+    return false
   end
+  loadedCount = loadedCount + 1
   if mm and mm.debug then
     mm.debug("module loaded: " .. tostring(file))
-  elseif mm and mm.note then
-    mm.note("module loaded: " .. tostring(file))
   end
+  return true
 end
 
 local base = resolve_base_dir()
@@ -58,16 +71,7 @@ mm.base_dir = base
 
 load_module(base, "mm_core.lua")
 load_module(base, "mm_area_references.lua")
-do
-  local ok, err = pcall(load_module, base, "mm_navigation.lua")
-  if not ok then
-    if mm and mm.warn then
-      mm.warn("Optional module mm_navigation.lua not loaded: " .. tostring(err))
-    else
-      cecho("<orange_red>[MMAPPER]<reset> Optional module mm_navigation.lua not loaded: " .. tostring(err) .. "\n")
-    end
-  end
-end
+load_module(base, "mm_navigation.lua")
 load_module(base, "mm_frontier.lua")
 load_module(base, "mm_help.lua")
 load_module(base, "mm_minimap.lua")
@@ -75,10 +79,16 @@ load_module(base, "mm_commands.lua")
 load_module(base, "mm_import.lua")
 load_module(base, "mm_gmcp.lua")
 
+local summary = string.format("<green>Loaded %d modules<reset>", loadedCount)
+if errorCount > 0 then
+  summary = summary .. string.format(" <red>(%d errors)<reset>", errorCount)
+end
+loader_note(summary .. " from " .. tostring(base))
+
 local function safe_step(label, fn)
   local ok, err = pcall(fn)
   if not ok then
-    mm.warn("Initialization step failed (" .. tostring(label) .. "): " .. tostring(err))
+    loader_error("Initialization step failed (" .. tostring(label) .. "): " .. tostring(err))
     return false
   end
   return true
