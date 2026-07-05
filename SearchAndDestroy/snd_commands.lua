@@ -440,7 +440,7 @@ function snd.commands.conwin(args)
         snd.conwin.refresh()
     elseif args == "clear" then
         snd.conwin.clear("manual")
-    elseif args == "scan" or args == "consider" then
+    elseif args == "consider" then
         snd.conwin.setMode(args)
         snd.utils.infoNote("ConWin room-action mode set to: " .. args)
     elseif args:match("^mode%s+") then
@@ -448,7 +448,7 @@ function snd.commands.conwin(args)
         if snd.conwin.setMode(mode) then
             snd.utils.infoNote("ConWin room-action mode set to: " .. mode)
         else
-            snd.utils.infoNote("Usage: snd conwin mode <consider|scan|off>")
+            snd.utils.infoNote("Usage: snd conwin mode <consider|off>")
         end
     elseif args:match("^fontsize%s+%d+$") then
         local n = tonumber(args:match("^fontsize%s+(%d+)$"))
@@ -1343,6 +1343,8 @@ function snd.commands.processQuickWhereResult()
 
     local countByRoom = {}
     local killsByRoom = {}
+    local priorityByRoom = {}
+    local priorityRoomByRoom = {}
     local sum = 0
     local function loadRoomStats(mobName)
         if not mobName or mobName == "" or #roomidList == 0 then
@@ -1350,7 +1352,18 @@ function snd.commands.processQuickWhereResult()
         end
 
         local sql = string.format(
-            "SELECT roomid, seen_count, kill_count FROM mobs WHERE lower(mob) = lower(%s) AND roomid in (%s);",
+            [[
+                SELECT m.roomid,
+                       m.seen_count,
+                       m.kill_count,
+                       mt.priority_room,
+                       CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match
+                FROM mobs m
+                LEFT JOIN mob_tags mt
+                  ON lower(mt.mob) = lower(m.mob)
+                 AND lower(mt.zone) = lower(m.zone)
+                WHERE lower(m.mob) = lower(%s) AND m.roomid in (%s);
+            ]],
             snd.db.escape(mobName),
             table.concat(roomidList, ",")
         )
@@ -1369,6 +1382,8 @@ function snd.commands.processQuickWhereResult()
         if roomId then
             countByRoom[roomId] = seen
             killsByRoom[roomId] = kills
+            priorityByRoom[roomId] = tonumber(row.priority_match) == 1
+            priorityRoomByRoom[roomId] = tonumber(row.priority_room)
             sum = sum + seen
         end
     end
@@ -1377,6 +1392,8 @@ function snd.commands.processQuickWhereResult()
         local roomId = tonumber(entry.rmid) or -1
         entry.seen_count = countByRoom[roomId] or 0
         entry.kill_count = killsByRoom[roomId] or 0
+        entry.priority_match = priorityByRoom[roomId] == true
+        entry.priority_room = priorityRoomByRoom[roomId]
         if sum > 0 then
             entry.percentage = entry.seen_count / sum
         else
@@ -1385,6 +1402,12 @@ function snd.commands.processQuickWhereResult()
     end
 
     table.sort(results, function(a, b)
+        local aPriority = a.priority_match == true
+        local bPriority = b.priority_match == true
+        if aPriority ~= bPriority then
+            return aPriority
+        end
+
         if (a.seen_count or 0) > (b.seen_count or 0) then
             return true
         elseif (a.seen_count or 0) < (b.seen_count or 0) then
@@ -1399,6 +1422,34 @@ function snd.commands.processQuickWhereResult()
 
         return (a.rmid or 0) < (b.rmid or 0)
     end)
+
+    if snd.debug and snd.debug.mobTag then
+        local parts = {}
+        for i, entry in ipairs(results or {}) do
+            if i > 8 then
+                table.insert(parts, "...")
+                break
+            end
+            table.insert(parts, string.format(
+                "#%d rmid=%s area=%s seen=%s kills=%s priority_room=%s priority_match=%s",
+                i,
+                tostring(entry.rmid or ""),
+                tostring(entry.arid or ""),
+                tostring(entry.seen_count or ""),
+                tostring(entry.kill_count or ""),
+                tostring(entry.priority_room or ""),
+                tostring(entry.priority_match == true)
+            ))
+        end
+        snd.debug.mobTag(string.format(
+            "quickWhereResult mob='%s' area='%s' roomName='%s' candidates=%d %s",
+            tostring(chanceMob or ""),
+            tostring(areaKey or ""),
+            tostring(lastMatch and lastMatch.room or ""),
+            #(results or {}),
+            table.concat(parts, " | ")
+        ))
+    end
 
     local firstRoomId = nil
     local quickWhereRooms = {}
@@ -1474,9 +1525,213 @@ function snd.commands.processQuickWhereResult()
 
 end
 
+function snd.commands.processQuickWhereNoMatch()
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    local current = snd.targets and snd.targets.current or nil
+    if not quickWhere or not current then
+        return false
+    end
+
+    local activity = tostring(current.activity or quickWhere.scope or "")
+    if activity ~= "cp" and activity ~= "gq" and activity ~= "quest" then
+        return false
+    end
+
+    local mobName = snd.utils.trim(current.name or "")
+    if mobName == "" then
+        return false
+    end
+
+    if not (snd.db and snd.db.getMobLocations) then
+        return false
+    end
+
+    local areaKey = resolveQuickWhereAreaKey()
+    local rows = snd.db.getMobLocations(mobName, areaKey, { legacy = true }) or {}
+    if #rows == 0 and areaKey ~= "" then
+        rows = snd.db.getMobLocations(mobName, "", { legacy = true }) or {}
+    end
+    if #rows == 0 then
+        return false
+    end
+
+    local results = {}
+    local totalSeen = 0
+    for _, row in ipairs(rows) do
+        local roomId = tonumber(row.roomid) or -1
+        local seen = tonumber(row.seen_count) or 0
+        totalSeen = totalSeen + seen
+        table.insert(results, {
+            rmid = roomId,
+            name = row.room or "",
+            arid = row.zone or areaKey,
+            seen_count = seen,
+            kill_count = tonumber(row.kill_count) or 0,
+            nowhere = tonumber(row.nowhere) == 1,
+            nohunt = tonumber(row.nohunt) == 1,
+            priority_room = tonumber(row.priority_room),
+        })
+    end
+
+    for _, entry in ipairs(results) do
+        if totalSeen > 0 then
+            entry.percentage = (entry.seen_count or 0) / totalSeen
+        else
+            entry.percentage = 0
+        end
+    end
+
+    snd.utils.infoNote("\nMob not found. It might be dead, use a different keyword, or be flagged nowhere.")
+    snd.utils.infoNote("You have previously seen " .. mobName .. " in:")
+    if snd.mapper and snd.mapper.searchRoomsResults then
+        snd.mapper.searchRoomsResults(results, {
+            reason = string.format(
+                "quickWhereNoMatch(keyword='%s', scope='%s', dbRooms=%d)",
+                tostring(quickWhere.lookupKeyword or quickWhere.requestedKeyword or ""),
+                tostring(quickWhere.scope or ""),
+                #results
+            )
+        })
+    end
+
+    local quickWhereRooms = {}
+    for _, entry in ipairs(results) do
+        local roomId = tonumber(entry.rmid) or -1
+        if roomId > 0 then
+            table.insert(quickWhereRooms, roomId)
+        end
+    end
+
+    if #quickWhereRooms > 0 then
+        current.roomId = quickWhereRooms[1]
+        current.area = areaKey ~= "" and areaKey or (results[1] and results[1].arid) or current.area
+        current.matchedMobName = mobName
+    end
+
+    quickWhere.rooms = quickWhereRooms
+    quickWhere.index = 1
+    quickWhere.active = #quickWhereRooms > 0
+    quickWhere.processed = true
+    quickWhere.completed = true
+    quickWhere.awaitingCommandEcho = false
+    quickWhere.probePending = false
+    quickWhere.pendingMatches = {}
+    if snd.commands.buildQuickWhereTargetKeyFromCurrent then
+        quickWhere.targetKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
+    end
+    persistQuickWhereScope(quickWhere.scope or activity)
+
+    return #quickWhereRooms > 0
+end
+
 -------------------------------------------------------------------------------
 -- ht - Hunt Trick
 -------------------------------------------------------------------------------
+
+local function ensureHuntTrickStore()
+    snd.nav = snd.nav or {}
+    snd.nav.huntTrick = snd.nav.huntTrick or {}
+    snd.nav.huntTrick.tempTriggers = snd.nav.huntTrick.tempTriggers or {}
+end
+
+local function clearHuntTrickTriggers()
+    if not snd.nav or not snd.nav.huntTrick or not snd.nav.huntTrick.tempTriggers then
+        return
+    end
+
+    for _, id in ipairs(snd.nav.huntTrick.tempTriggers) do
+        pcall(function() killTrigger(id) end)
+    end
+    snd.nav.huntTrick.tempTriggers = {}
+end
+
+local function addHuntTrickTrigger(regex, fn)
+    ensureHuntTrickStore()
+    if type(tempRegexTrigger) ~= "function" then
+        return false
+    end
+
+    local id = tempRegexTrigger(regex, fn)
+    if id then
+        table.insert(snd.nav.huntTrick.tempTriggers, id)
+        return true
+    end
+    return false
+end
+
+local function registerHuntTrickTriggers()
+    clearHuntTrickTriggers()
+
+    local added = 0
+    local function add(regex, fn)
+        if addHuntTrickTrigger(regex, fn) then
+            added = added + 1
+        end
+    end
+
+    add("^\\s*You are (?:almost )?certain that .+ is (north|south|east|west|up|down) from here\\.$", function()
+        if snd.commands and snd.commands.huntTrickContinue then
+            snd.commands.huntTrickContinue()
+        end
+    end)
+    add("^\\s*You are confident that .+ passed through here, heading (north|south|east|west|up|down)\\.$", function()
+        if snd.commands and snd.commands.huntTrickContinue then
+            snd.commands.huntTrickContinue()
+        end
+    end)
+    add("^.+ is here!$", function()
+        if snd.commands and snd.commands.huntTrickContinue then
+            snd.commands.huntTrickContinue()
+        end
+    end)
+    add("^You seem unable to hunt that target for some reason\\.$", function()
+        if snd.commands and snd.commands.huntTrickComplete then
+            snd.commands.huntTrickComplete()
+        end
+    end)
+    add("^No one in this area by the name '.+'\\.$|^You couldn't find a path to .+ from here\\.$|^No one in this area by that name\\.$", function()
+        if snd.commands and snd.commands.huntTrickFail then
+            snd.commands.huntTrickFail()
+        end
+    end)
+    add("^Not while you are fighting!$|^You can't hunt while (?:resting|sitting)\\.$|^You dream about going on a nice hunting trip, with pony rides, and campfires too\\.$", function()
+        if snd.commands and snd.commands.stopHunt then
+            snd.commands.stopHunt()
+        end
+    end)
+
+    return added > 0
+end
+
+local function markHuntTrickLineHandled()
+    if not snd.nav or not snd.nav.huntTrick then
+        return true
+    end
+
+    local line = ""
+    if type(getCurrentLine) == "function" then
+        line = getCurrentLine() or ""
+    end
+    if line == "" then
+        return true
+    end
+
+    if snd.nav.huntTrick.lastHandledLine == line then
+        return false
+    end
+
+    snd.nav.huntTrick.lastHandledLine = line
+    if type(tempTimer) == "function" then
+        local handledLine = line
+        tempTimer(0, function()
+            if snd.nav and snd.nav.huntTrick and snd.nav.huntTrick.lastHandledLine == handledLine then
+                snd.nav.huntTrick.lastHandledLine = nil
+            end
+        end)
+    end
+
+    return true
+end
 
 function snd.commands.ht(args)
     args = snd.utils.trim(args or "")
@@ -1511,27 +1766,39 @@ function snd.commands.ht(args)
         return
     end
 
-    -- Enable hunt triggers
-    snd.triggers.enableGroup("Hunt")
-
     -- Initialize hunt trick state
+    clearHuntTrickTriggers()
+    if snd.commands.stopAutoHunt then
+        snd.commands.stopAutoHunt(true)
+    end
     snd.nav.huntTrick = {
         keyword = keyword,
         index = startIndex,
         firstTarget = true,
         active = true,
         exactMatchText = exactMatchText,
+        tempTriggers = {},
     }
 
+    -- Use command-owned temp triggers so ht works even when the imported
+    -- SND_Hunt folder is stale or disabled in the live profile.
+    snd.triggers.disableGroup("Hunt")
+    if not registerHuntTrickTriggers() then
+        snd.triggers.enableGroup("Hunt")
+    end
+
     if startIndex > 1 then
-        send(string.format("hunt %d.%s", startIndex, keyword), false)
+        snd.commands.sendGameCommand(string.format("hunt %d.%s", startIndex, keyword), false)
     else
-        send("hunt " .. keyword, false)
+        snd.commands.sendGameCommand("hunt " .. keyword, false)
     end
 end
 
 function snd.commands.huntTrickContinue()
     if not snd.nav or not snd.nav.huntTrick or not snd.nav.huntTrick.active then
+        return
+    end
+    if not markHuntTrickLineHandled() then
         return
     end
 
@@ -1546,11 +1813,14 @@ function snd.commands.huntTrickContinue()
         return
     end
 
-    send(string.format("hunt %d.%s", ix, keyword), false)
+    snd.commands.sendGameCommand(string.format("hunt %d.%s", ix, keyword), false)
 end
 
 function snd.commands.huntTrickComplete()
     if not snd.nav or not snd.nav.huntTrick or not snd.nav.huntTrick.active then
+        return
+    end
+    if not markHuntTrickLineHandled() then
         return
     end
 
@@ -1589,6 +1859,9 @@ function snd.commands.huntTrickFail()
     if not snd.nav or not snd.nav.huntTrick or not snd.nav.huntTrick.active then
         return
     end
+    if not markHuntTrickLineHandled() then
+        return
+    end
 
     local firstTarget = snd.nav and snd.nav.huntTrick and snd.nav.huntTrick.firstTarget
     snd.commands.stopHunt(true)
@@ -1602,11 +1875,13 @@ end
 
 --- Stop hunt trick
 function snd.commands.stopHunt(silent)
+    clearHuntTrickTriggers()
     if snd.nav.huntTrick then
         snd.nav.huntTrick.active = false
         snd.nav.huntTrick.index = 1
         snd.nav.huntTrick.firstTarget = true
         snd.nav.huntTrick.exactMatchText = nil
+        snd.nav.huntTrick.lastHandledLine = nil
     end
     snd.triggers.disableGroup("Hunt")
     if not silent then
@@ -1845,7 +2120,7 @@ function snd.commands.xkill()
     if snd.conwin and snd.conwin.noteAttackByKeyword then
         snd.conwin.noteAttackByKeyword(normalizedKeyword, 1)
     end
-    send(fullCmd, false)
+    send(fullCmd)
 end
 
 -------------------------------------------------------------------------------
@@ -1944,7 +2219,21 @@ function snd.commands.gotoTarget()
     end
     
     local target = snd.targets.current
+    if snd.debug and snd.debug.mobTag then
+        snd.debug.mobTag(string.format(
+            "gotoTarget current activity=%s name='%s' area='%s' areaName='%s' roomName='%s' roomId=%s",
+            tostring(target.activity or ""),
+            tostring(target.name or ""),
+            tostring(target.area or target.arid or ""),
+            tostring(target.areaName or ""),
+            tostring(target.roomName or ""),
+            tostring(target.roomId or "")
+        ))
+    end
     if target.roomId and target.roomId ~= "" then
+        if snd.debug and snd.debug.mobTag then
+            snd.debug.mobTag("gotoTarget using existing roomId=" .. tostring(target.roomId))
+        end
         snd.utils.infoNote("Going to room " .. target.roomId)
         snd.commands.gotoRoomViaAlias(target.roomId)
         return
@@ -1959,6 +2248,43 @@ function snd.commands.gotoTarget()
                 or (snd.char and snd.char.level),
         })
         local firstMatch = results and results[1] and tonumber(results[1].rmid) or nil
+        local priorityRoom = nil
+        if snd.db and snd.db.getMobTags then
+            local tags = snd.db.getMobTags(target.name or "", target.area or target.arid or "")
+            priorityRoom = tags and tonumber(tags.priority_room) or nil
+        end
+        if priorityRoom and results then
+            for _, entry in ipairs(results) do
+                local roomId = tonumber(entry.rmid)
+                if roomId and roomId == priorityRoom then
+                    firstMatch = priorityRoom
+                    break
+                end
+            end
+        end
+        if snd.debug and snd.debug.mobTag then
+            local parts = {}
+            for i, entry in ipairs(results or {}) do
+                if i > 8 then
+                    table.insert(parts, "...")
+                    break
+                end
+                table.insert(parts, string.format(
+                    "#%d rmid=%s area=%s name='%s'",
+                    i,
+                    tostring(entry.rmid or ""),
+                    tostring(entry.arid or ""),
+                    tostring(entry.name or "")
+                ))
+            end
+            snd.debug.mobTag(string.format(
+                "gotoTarget roomName search priority_room=%s selected=%s candidates=%d %s",
+                tostring(priorityRoom or ""),
+                tostring(firstMatch or ""),
+                #(results or {}),
+                table.concat(parts, " | ")
+            ))
+        end
 
         -- Prime nx quick-where cycling from direct room-name searches too.
         -- This keeps `nx` cycling functional even when a fresh `qw` parse was
@@ -1969,7 +2295,11 @@ function snd.commands.gotoTarget()
                 for _, entry in ipairs(results) do
                     local roomId = tonumber(entry.rmid) or -1
                     if roomId > 0 then
-                        table.insert(roomIds, roomId)
+                        if priorityRoom and roomId == priorityRoom then
+                            table.insert(roomIds, 1, roomId)
+                        else
+                            table.insert(roomIds, roomId)
+                        end
                     end
                 end
             end
@@ -2071,7 +2401,11 @@ function snd.commands.xset(args)
     local value = parts[2]
     local normalized = value and value:lower() or nil
     
-    if setting == "debug" then
+    if setting == "help" or setting == "h" or setting == "?" then
+        snd.commands.showConfigHelp()
+        return
+
+    elseif setting == "debug" then
         if not normalized or normalized == "" then
             snd.utils.infoNote("Debug mode: " .. (snd.config.debugMode and "ON" or "OFF"))
         elseif normalized == "on" or normalized == "true" or normalized == "1" then
@@ -2093,6 +2427,20 @@ function snd.commands.xset(args)
             return
         end
         
+    elseif setting == "mobdebug" then
+        if not normalized or normalized == "" then
+            snd.utils.infoNote("Mob tag debug: " .. (snd.config.mobTagDebug and "ON" or "OFF"))
+        elseif normalized == "on" or normalized == "true" or normalized == "1" then
+            snd.config.mobTagDebug = true
+            snd.utils.infoNote("Mob tag debug: ON")
+        elseif normalized == "off" or normalized == "false" or normalized == "0" then
+            snd.config.mobTagDebug = false
+            snd.utils.infoNote("Mob tag debug: OFF")
+        else
+            snd.utils.infoNote("Usage: xset mobdebug <on|off>")
+            return
+        end
+
     elseif setting == "silent" then
         if not normalized or normalized == "" then
             snd.utils.infoNote("Silent mode: " .. (snd.config.silentMode and "ON" or "OFF"))
@@ -2139,14 +2487,15 @@ function snd.commands.xset(args)
         end
         
     elseif setting == "nxaction" then
-        local valid = {smartscan = true, con = true, scan = true, scanhere = true, qs = true, none = true}
+        local valid = {smartscan = true, qs = true, none = true}
         if not normalized or normalized == "" then
+            snd.config.nxAction = snd.normalizeNxAction and snd.normalizeNxAction(snd.config.nxAction) or snd.config.nxAction
             snd.utils.infoNote("Next action: " .. snd.config.nxAction)
         elseif valid[normalized] then
             snd.config.nxAction = normalized
             snd.utils.infoNote("Next action: " .. snd.config.nxAction)
         else
-            snd.utils.infoNote("Usage: xset nxaction <smartscan|con|scan|scanhere|qs|none>")
+            snd.utils.infoNote("Usage: xset nxaction <smartscan|qs|none>")
             return
         end
         
@@ -2200,20 +2549,6 @@ function snd.commands.xset(args)
             return
         end
         
-    elseif setting == "mobdetect" then
-        if not normalized or normalized == "" then
-            snd.utils.infoNote("Mobdetect mode: " .. tostring(snd.config.mobdetect or "off"):upper())
-        elseif normalized == "off" or normalized == "on" or normalized == "always" then
-            snd.config.mobdetect = normalized
-            snd.utils.infoNote("Mobdetect mode: " .. string.upper(normalized))
-            if normalized == "always" then
-                snd.utils.infoNote("WARNING: Mobdetect ALWAYS bypasses maze/PvP/player safety guards.")
-            end
-        else
-            snd.utils.infoNote("Usage: xset mobdetect <on|off|always>")
-            return
-        end
-
     elseif setting == "window" then
         snd.config.window.enabled = (value == "on" or value == "true" or value == "1")
         snd.utils.infoNote("Window: " .. (snd.config.window.enabled and "ON" or "OFF"))
@@ -2504,35 +2839,111 @@ local function emitHelpCommandLink(commandText, commandToSend, hint)
     end
 end
 
-function snd.commands.showHelp()
-    cecho("\n<white>Search and Destroy - Mudlet Port<reset>\n")
+local SND_HELP_COMMAND_WIDTH = 38
+local SND_HELP_DESC_WIDTH = 76
+
+local function helpWrapText(text, width)
+    local words, lines, line = {}, {}, ""
+    for word in tostring(text or ""):gmatch("%S+") do
+        table.insert(words, word)
+    end
+    if #words == 0 then
+        return {""}
+    end
+    for _, word in ipairs(words) do
+        if line == "" then
+            line = word
+        elseif #line + 1 + #word <= width then
+            line = line .. " " .. word
+        else
+            table.insert(lines, line)
+            line = word
+        end
+    end
+    if line ~= "" then
+        table.insert(lines, line)
+    end
+    return lines
+end
+
+local function emitHelpTitle(title)
+    cecho("\n<white>" .. tostring(title or "") .. "<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
-    cecho("<yellow>Targeting & Combat<reset>\n")
-    cecho("  "); emitHelpCommandLink("xcp <n>", "xcp 1", "Select target by number"); cecho("       - Select target by number\n")
-    cecho("  "); emitHelpCommandLink("xcp", "xcp", "Show clickable target list"); cecho("           - Show clickable target list\n")
-    cecho("  "); emitHelpCommandLink("xcp mode <db|qw|ht>", "xcp mode", "Set post-xcp action mode"); cecho(" - Set post-xcp action\n")
-    cecho("  "); emitHelpCommandLink("nx", "nx", "Go to next/current target"); cecho("            - Go to next/current target\n")
-    cecho("  "); emitHelpCommandLink("xkill", "xkill", "Kill current target"); cecho("         - Kill current target with precise temporary selector\n")
-    cecho("\n<yellow>Navigation & Search<reset>\n")
-    cecho("  "); emitHelpCommandLink("qw [mob]", "qw", "Quick where"); cecho("      - Live where + mapper room list\n")
-    cecho("  "); emitHelpCommandLink("qwx [mob]", "qwx", "Quick where exact"); cecho("    - Quick where exact match\n")
-    cecho("  "); emitHelpCommandLink("ht [mob]", "ht", "Hunt trick"); cecho("      - Hunt trick (track mob)\n")
-    cecho("  "); emitHelpCommandLink("ah [mob]", "ah", "Auto hunt"); cecho("       - Auto-hunt loop\n")
-    cecho("  "); emitHelpCommandLink("xrt <area|roomid>", "xhelp commands", "See xrt help"); cecho(" - Navigate via mapper pathing\n")
-    cecho("  "); emitHelpCommandLink("walkto <area|roomid>", "xhelp commands", "See walkto help"); cecho(" - Walk only (no portals/recalls)\n")
-    cecho("\n<yellow>Windows & UI<reset>\n")
-    cecho("  "); emitHelpCommandLink("snd conwin", "snd conwin help", "Open ConWin commands"); cecho("    - Open conwin commands\n")
-    cecho("  "); emitHelpCommandLink("snd window font <n>", "snd window font 10", "Set S&D window font size"); cecho(" - Set window font size\n")
-    cecho("\n<yellow>Data & Reporting<reset>\n")
-    cecho("  "); emitHelpCommandLink("snd status", "snd status", "Show status"); cecho("    - Show current status\n")
-    cecho("  "); emitHelpCommandLink("snd db", "snd db", "Show database info/path"); cecho("        - Show database info/path\n")
-    cecho("  "); emitHelpCommandLink("snd channel", "snd channel", "Show/set report channel"); cecho("   - Show/set report channel\n")
-    cecho("  "); emitHelpCommandLink("snd history", "snd history", "Show history"); cecho("   - Show last 20 history rows\n")
-    cecho("  "); emitHelpCommandLink("snd stats cp/gq/quest", "snd stats help", "Show stats commands"); cecho(" - Stats by type (campaign/gq/quest)\n")
-    cecho("\n<yellow>Help<reset>\n")
-    cecho("  "); emitHelpCommandLink("xhelp", "xhelp", "Show this help"); cecho("         - Show this help\n")
-    cecho("  "); emitHelpCommandLink("xhelp commands", "xhelp commands", "Detailed commands help"); cecho(" - Detailed command usage and examples\n")
-    cecho("  "); emitHelpCommandLink("xhelp config", "xhelp config", "Configuration help"); cecho("   - Configuration help\n")
+end
+
+local function emitHelpSection(title)
+    cecho("\n<yellow>" .. tostring(title or "") .. "<reset>\n")
+end
+
+local function emitPlainHelpRow(commandText, description, commandWidth, descWidth)
+    commandWidth = commandWidth or SND_HELP_COMMAND_WIDTH
+    descWidth = descWidth or SND_HELP_DESC_WIDTH
+    local cmdLines = helpWrapText(commandText, commandWidth)
+    local descLines = helpWrapText(description, descWidth)
+    local total = math.max(#cmdLines, #descLines)
+    for i = 1, total do
+        local cmd = cmdLines[i] or ""
+        local desc = descLines[i] or ""
+        cecho(string.format("  <cyan>%-" .. commandWidth .. "s<reset>  <light_grey>%s<reset>\n", cmd, desc))
+    end
+end
+
+local function emitLinkedHelpRow(commandText, commandToSend, hint, description, commandWidth, descWidth)
+    commandWidth = commandWidth or SND_HELP_COMMAND_WIDTH
+    descWidth = descWidth or SND_HELP_DESC_WIDTH
+    local text = tostring(commandText or "")
+    local descLines = helpWrapText(description, descWidth)
+    cecho("  ")
+    emitHelpCommandLink(text, commandToSend or text, hint)
+    cecho(string.rep(" ", math.max(1, commandWidth - #text)) .. "  <light_grey>" .. descLines[1] .. "<reset>\n")
+    for i = 2, #descLines do
+        cecho(string.format("  <cyan>%-" .. commandWidth .. "s<reset>  <light_grey>%s<reset>\n", "", descLines[i]))
+    end
+end
+
+function snd.commands.showHelp()
+    emitHelpTitle("Search and Destroy - Mudlet Port")
+    emitHelpSection("Targeting & Combat")
+    emitLinkedHelpRow("xcp <n>", "xcp 1", "Select target by number", "Select target by number")
+    emitLinkedHelpRow("xcp", "xcp", "Show clickable target list", "Show clickable target list")
+    emitLinkedHelpRow("xcp mode <db|qw|ht>", "xcp mode", "Set post-xcp action mode", "Set post-xcp action")
+    emitLinkedHelpRow("nx", "nx", "Go to next/current target", "Go to next/current target")
+    emitLinkedHelpRow("xkill", "xkill", "Kill current target", "Kill current target with precise temporary selector")
+
+    emitHelpSection("Navigation & Search")
+    emitLinkedHelpRow("qw [mob]", "qw", "Quick where", "Live where + mapper room list")
+    emitLinkedHelpRow("qwx [mob]", "qwx", "Quick where exact", "Quick where exact match")
+    emitLinkedHelpRow("ht [mob]", "ht", "Hunt trick", "Hunt trick (track mob)")
+    emitLinkedHelpRow("ah [mob]", "ah", "Auto hunt", "Auto-hunt loop")
+    emitLinkedHelpRow("xrt <area|roomid>", "xhelp commands", "See xrt help", "Navigate via mapper pathing")
+    emitLinkedHelpRow("walkto <area|roomid>", "xhelp commands", "See walkto help", "Walk only (no portals/recalls)")
+
+    emitHelpSection("Mob Tags")
+    emitLinkedHelpRow("xset mob help", "xset mob help", "Show mob tag commands", "Show mob tag commands")
+    emitLinkedHelpRow("xset mob priority <mob>", "xset mob help", "Prefer current room for this mob", "Prefer current room for this mob")
+    emitLinkedHelpRow("xset mob nohunt <mob>", "xset mob help", "Keep listed, skip auto-hunt", "Keep listed, skip auto-hunt")
+    emitLinkedHelpRow("xset mob nowhere <mob>", "xset mob help", "Use stored DB rooms when where fails", "Use stored DB rooms when where fails")
+    emitLinkedHelpRow("xset mob tags [filter]", "xset mob tags", "List tagged mobs", "List tagged mobs")
+
+    emitHelpSection("Windows & UI")
+    emitLinkedHelpRow("snd conwin", "snd conwin help", "Open ConWin commands", "Open conwin commands")
+    emitLinkedHelpRow("snd window font <n>", "snd window font 10", "Set S&D window font size", "Set window font size")
+
+    emitHelpSection("Data & Reporting")
+    emitLinkedHelpRow("snd status", "snd status", "Show status", "Show current status")
+    emitLinkedHelpRow("snd db", "snd db", "Show database info/path", "Show database info/path")
+    emitLinkedHelpRow("snd channel", "snd channel", "Show/set report channel", "Show/set report channel")
+    emitLinkedHelpRow("snd history", "snd history", "Show history", "Show last 20 history rows")
+    emitLinkedHelpRow("snd stats cp/gq/quest", "snd stats help", "Show stats commands", "Stats by type (campaign/gq/quest)")
+
+    emitHelpSection("Debug")
+    emitLinkedHelpRow("xset debug <on|off>", "xset debug", "Toggle S&D debug", "General S&D debug notes")
+    emitLinkedHelpRow("xset mobdebug <on|off>", "xset mobdebug", "Toggle mob tag debug", "Mob tag, priority, and go-list routing diagnostics")
+
+    emitHelpSection("Help")
+    emitLinkedHelpRow("xhelp", "xhelp", "Show this help", "Show this help")
+    emitLinkedHelpRow("xhelp commands", "xhelp commands", "Detailed commands help", "Detailed command usage and examples")
+    emitLinkedHelpRow("xhelp config", "xhelp config", "Configuration help", "Configuration help")
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
@@ -2541,156 +2952,95 @@ function snd.commands.showConwinHelp()
     local enabled = (snd.config and snd.config.conwin and snd.config.conwin.enabled) and "on" or "off"
     local repopulate = (snd.config and snd.config.conwin and snd.config.conwin.repopulate) or 3
     local focusMode = ((snd.config and snd.config.conwin and snd.config.conwin.strictFocusIdOnly) and "strict" or "fallback")
-    cecho("\n<white>Search and Destroy - ConWin Commands<reset>\n")
-    cecho("<gray>----------------------------------------<reset>\n")
+    emitHelpTitle("Search and Destroy - ConWin Commands")
     cecho(string.format("  <dim_gray>Status:<reset> enabled=<cyan>%s<reset>, mode=<cyan>%s<reset>, repopulate=<cyan>%s<reset>, focusid=<cyan>%s<reset>\n", enabled, mode, tostring(repopulate), focusMode))
-    cecho("  ")
-    cechoLink("<cyan>snd conwin help<reset>", [[snd.commands.snd("conwin help")]], "Show conwin help", true)
-    cecho("         - Show this help\n")
-    cecho("  ")
-    cechoLink("<cyan>snd conwin on<reset>", [[snd.commands.snd("conwin on")]], "Enable ConWin", true)
-    cecho(" | ")
-    cechoLink("<cyan>off<reset>", [[snd.commands.snd("conwin off")]], "Disable ConWin", true)
-    cecho(" | ")
-    cechoLink("<cyan>toggle<reset>", [[snd.commands.snd("conwin toggle")]], "Toggle ConWin", true)
-    cecho(" - Enable/disable/toggle ConWin\n")
-    cecho("  ")
-    cechoLink("<cyan>snd conwin refresh<reset>", [[snd.commands.snd("conwin refresh")]], "Run consider all now", true)
-    cecho("      - Run consider all and refresh list\n")
-    cecho("  ")
-    cechoLink("<cyan>snd conwin clear<reset>", [[snd.commands.snd("conwin clear")]], "Clear current ConWin list", true)
-    cecho("        - Clear current ConWin mob list\n")
-    cecho("  ")
-    cechoLink("<cyan>snd conwin consider<reset>", [[snd.commands.snd("conwin consider")]], "Set room-action mode consider", true)
-    cecho(" | ")
-    cechoLink("<cyan>scan<reset>", [[snd.commands.snd("conwin scan")]], "Set room-action mode scan", true)
-    cecho(" | ")
-    cechoLink("<cyan>mode off<reset>", [[snd.commands.snd("conwin mode off")]], "Disable room-action mode", true)
-    cecho(" - Action on room change\n")
-    cecho("  ")
-    cechoLink("<cyan>snd conwin fontsize 10<reset>", [[snd.commands.snd("conwin fontsize 10")]], "Set ConWin font size", true)
-    cecho(" - Set ConWin font size (6-24)\n")
-    cecho("  ")
-    cechoLink("<cyan>snd conwin killcommand <command><reset>", [[snd.commands.snd("conwin killcommand")]], "Show current kill command", true)
-    cecho(" - Show current kill command (append <command> to set)\n")
-    cecho("  ")
-    cechoLink("<cyan>snd conwin repopulate 3<reset>", [[snd.commands.snd("conwin repopulate 3")]], "Refresh list after N kills", true)
-    cecho("  - Refresh list after N kills (0 disables)\n")
-    cecho("  ")
-    cechoLink("<cyan>snd conwin focusid <strict | fallback><reset>", [[snd.commands.snd("conwin focusid")]], "Show current focus-id mode", true)
-    cecho(" - Show focus-id mode (strict requires explicit duplicate selection)\n")
-    cecho("  ")
-    cechoLink("<cyan>snd conwin aligntags <on|off><reset>", [[snd.commands.snd("conwin aligntags")]], "Show alignment tag display setting", true)
-    cecho(" - Show alignment tags setting ((G)/(E) prefixes)\n")
+    emitLinkedHelpRow("snd conwin help", "snd conwin help", "Show conwin help", "Show this help")
+    emitLinkedHelpRow("snd conwin on|off|toggle", "snd conwin toggle", "Toggle ConWin", "Enable/disable/toggle ConWin")
+    emitLinkedHelpRow("snd conwin refresh", "snd conwin refresh", "Run consider all now", "Run consider all and refresh list")
+    emitLinkedHelpRow("snd conwin clear", "snd conwin clear", "Clear current ConWin list", "Clear current ConWin mob list")
+    emitLinkedHelpRow("snd conwin mode <consider|off>", "snd conwin mode off", "Set room-action mode", "Action on room change")
+    emitLinkedHelpRow("snd conwin fontsize <n>", "snd conwin fontsize 10", "Set ConWin font size", "Set ConWin font size (6-24)")
+    emitLinkedHelpRow("snd conwin killcommand <command>", "snd conwin killcommand", "Show current kill command", "Show current kill command; append <command> to set")
+    emitLinkedHelpRow("snd conwin repopulate <n>", "snd conwin repopulate 3", "Refresh list after N kills", "Refresh list after N kills; 0 disables")
+    emitLinkedHelpRow("snd conwin focusid <strict|fallback>", "snd conwin focusid", "Show current focus-id mode", "Show focus-id mode; strict requires explicit duplicate selection")
+    emitLinkedHelpRow("snd conwin aligntags <on|off>", "snd conwin aligntags", "Show alignment tag display setting", "Show alignment tags setting ((G)/(E) prefixes)")
     cecho("\n<dim_gray>Clicking a mob line sends kill command.\n")
     cecho("<dim_gray>ConWin chooses distinctive kill selectors; duplicate exact names use numbered form (e.g. kill 2.name).<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
 function snd.commands.showCommandHelp()
-    cecho("\n<white>Search and Destroy - Commands<reset>\n")
-    cecho("<gray>----------------------------------------<reset>\n")
-    cecho("<yellow>Target Selection:<reset>\n")
-    cecho("  <cyan>xcp<reset>              Show all targets\n")
-    cecho("  <cyan>xcp <n><reset>          Select target #n\n")
-    cecho("  <cyan>xcp mode <db|qw|ht><reset>  Post-arrival target mode (db=stored list, qw=exact live where, ht=hunt then exact where)\n")
-    cecho("\n<yellow>Navigation:<reset>\n")
-    cecho("  <cyan>nx<reset>               Go to current target\n")
-    cecho("  <cyan>xrt <area|roomid><reset>  Go to area or room (portal-aware)\n")
-    cecho("  <cyan>xrtforce <area|roomid><reset>  Go to area/room (ignores area and exit-level guards)\n")
-    cecho("  <cyan>walkto <area|roomid><reset>  Walk to area or room (no portals)\n")
-    cecho("  <cyan>qw [keyword]<reset>     Live where + mapper room list; selected target uses exact returned-name matching\n")
-    cecho("  <cyan>ht [keyword]<reset>     Hunt trick to mob; selected target follows with exact live where\n")
-    cecho("\n<yellow>Configuration:<reset>\n")
-    cecho("  <cyan>xset<reset>             Show all settings\n")
-    cecho("  <cyan>xset areaguard <on|off><reset>  Toggle persisted navigation area guard\n")
-    cecho("  <cyan>xset sound [on|off|volume <n%>]<reset> Toggle/query sound alerts\n")
-    cecho("  <cyan>xset keyword <kw><reset>  Set mob keyword\n")
-    cecho("  <cyan>xset startroom<reset>   Set area start room\n")
-    cecho("\n<yellow>History & Reporting:<reset>\n")
-    cecho("  <cyan>snd channel<reset>              Show current S&D report channel\n")
-    cecho("  <cyan>snd channel default<reset>      Use default colored echo output\n")
-    cecho("  <cyan>snd channel <cmd><reset>        Send history row reports via channel command\n")
+    emitHelpTitle("Search and Destroy - Commands")
+    emitHelpSection("Target Selection")
+    emitPlainHelpRow("xcp", "Show all targets")
+    emitPlainHelpRow("xcp <n>", "Select target #n")
+    emitPlainHelpRow("xcp mode <db|qw|ht>", "Post-arrival target mode (db=stored list, qw=exact live where, ht=hunt then exact where)")
+
+    emitHelpSection("Navigation")
+    emitPlainHelpRow("nx", "Go to current target")
+    emitPlainHelpRow("xrt <area|roomid>", "Go to area or room (portal-aware)")
+    emitPlainHelpRow("xrtforce <area|roomid>", "Go to area/room (ignores area, portal, and exit-level guards)")
+    emitPlainHelpRow("walkto <area|roomid>", "Walk to area or room (no portals)")
+    emitPlainHelpRow("qw [keyword]", "Live where + mapper room list; selected target uses exact returned-name matching")
+    emitPlainHelpRow("ht [keyword]", "Hunt trick to mob; selected target follows with exact live where")
+
+    emitHelpSection("Configuration")
+    emitPlainHelpRow("xset", "Show all settings")
+    emitPlainHelpRow("xset areaguard <on|off>", "Toggle persisted navigation area guard")
+    emitPlainHelpRow("xset sound [on|off|volume <n%>]", "Toggle/query sound alerts")
+    emitPlainHelpRow("xset keyword <kw>", "Set mob keyword")
+    emitPlainHelpRow("xset startroom", "Set area start room")
+
+    emitHelpSection("History & Reporting")
+    emitPlainHelpRow("snd channel", "Show current S&D report channel")
+    emitPlainHelpRow("snd channel default", "Use default colored echo output")
+    emitPlainHelpRow("snd channel <cmd>", "Send history row reports via channel command")
     cecho("  <dim_gray>Examples: snd channel gt | snd channel ct | snd channel say<reset>\n")
-    cecho("  <cyan>snd history<reset>              Show last 20 history rows (echo only)\n")
-    cecho("  <cyan>snd history last <n><reset>     Show last n rows (echo only)\n")
-    cecho("  <cyan>snd history <q|quest|cp|campaign|gq|gquest><reset>  Filter by run type\n")
-    cecho("  <cyan>snd history <type> last <n><reset>           Filtered rows + count (e.g. q/cp/gq)\n")
-    cecho("  <cyan>snd history report <n> [channel]<reset>   Report one shown row (optional channel override)\n")
+    emitPlainHelpRow("snd history", "Show last 20 history rows (echo only)")
+    emitPlainHelpRow("snd history last <n>", "Show last n rows (echo only)")
+    emitPlainHelpRow("snd history <q|quest|cp|campaign|gq|gquest>", "Filter by run type")
+    emitPlainHelpRow("snd history <type> last <n>", "Filtered rows + count (e.g. q/cp/gq)")
+    emitPlainHelpRow("snd history report <n> [channel]", "Report one shown row (optional channel override)")
     cecho("  <dim_gray>Tip: left-click row number in snd history for configured channel; right-click for menu.<reset>\n")
-    cecho("\n<yellow>ConWin:<reset>\n")
-    cecho("  <cyan>snd conwin help<reset>           ConWin command family\n")
-    cecho("  <cyan>snd conwin on|off|toggle<reset>  Toggle consider window\n")
-    cecho("  <cyan>snd conwin fontsize <n><reset>   Set ConWin font size\n")
+
+    emitHelpSection("ConWin")
+    emitPlainHelpRow("snd conwin help", "ConWin command family")
+    emitPlainHelpRow("snd conwin on|off|toggle", "Toggle consider window")
+    emitPlainHelpRow("snd conwin fontsize <n>", "Set ConWin font size")
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
 function snd.commands.showConfigHelp()
-    cecho("\n<white>Search and Destroy - Configuration<reset>\n")
-    cecho("<gray>----------------------------------------<reset>\n")
-    cecho("<yellow>Settings (xset <name> <value>):<reset>\n")
-    cecho("  <cyan>debug<reset>        <on|off>  Show internal debug notes\n")
-    cecho("                Examples: xset debug on | xset debug off\n")
-    cecho("  <cyan>silent<reset>       <on|off>  Hide regular [S&D] info notes\n")
-    cecho("                Error notes still show.\n")
-    cecho("  <cyan>speed<reset>        <run|walk>  Default travel mode for nx/go\n")
-    cecho("                run=xrt (portal-aware), walk=walkto (no portals)\n")
-    cecho("  <cyan>areaguard<reset>    <on|off>  Avoid areas more than 30 levels above you\n")
-    cecho("                Area entry locks remain absolute. Default: off.\n")
-    cecho("  <cyan>nxaction<reset>     <smartscan|con|scan|scanhere|qs|none>\n")
-    cecho("                default   = qs\n")
-    cecho("                smartscan = local smart scan routine (scan for activity targets; fallback to quick scan when none)\n")
-    cecho("                con       = send 'con'\n")
-    cecho("                scan      = send 'scan'\n")
-    cecho("                scanhere  = send 'scan here'\n")
-    cecho("                qs        = scan current target keyword (or plain scan)\n")
-    cecho("                none      = do nothing on arrival\n")
-    cecho("  <cyan>express<reset>      <on|off>  Prefer known fixed-room targets\n")
-    cecho("  <cyan>expressmin<reset>   <number>  Min kills before express applies\n")
-    cecho("  <cyan>autocheck<reset>    <on|smart|off>  Post-kill CP/GQ recheck mode\n")
-    cecho("  <cyan>autocheck kills<reset> <number>  SMART mode: run check every N kills\n")
-    
-    cecho("  <cyan>xcp mode<reset>     <db|qw|ht>  Post-arrival CP/GQ target mode\n")
-    cecho("                db = use stored DB/mapped rooms only\n")
-    cecho("                qw = live where and accept only exact selected-target mob names\n")
-    cecho("                ht = live hunt, then exact live where\n")
-    cecho("  <cyan>mob tags<reset>     xset mob help|tags|delete|nowhere|nohunt|priority\n")
-    cecho("  <cyan>window<reset>       on/off - GUI window\n")
-    cecho("  <cyan>sound<reset>        on/off/volume - Sound alerts and volume\n")
-    cecho("  <cyan>areacolors<reset>   on/off - Color-band area labels in target list\n")
+    emitHelpTitle("Search and Destroy - Configuration")
+    emitHelpSection("Settings (xset <name> <value>)")
+    emitPlainHelpRow("debug <on|off>", "Show internal debug notes. Examples: xset debug on | xset debug off")
+    emitPlainHelpRow("mobdebug <on|off>", "Show focused mob tag/priority routing diagnostics")
+    emitPlainHelpRow("silent <on|off>", "Hide regular [S&D] info notes. Error notes still show.")
+    emitPlainHelpRow("speed <run|walk>", "Default travel mode for nx/go. run=xrt (portal-aware), walk=walkto (no portals)")
+    emitPlainHelpRow("areaguard <on|off>", "Avoid areas more than 30 levels above you. Area entry locks remain absolute. Default: off.")
+    emitPlainHelpRow("nxaction <smartscan|qs|none>", "default=qs; smartscan scans selected current-area target; none does nothing on arrival")
+    emitPlainHelpRow("express <on|off>", "Prefer known fixed-room targets")
+    emitPlainHelpRow("expressmin <number>", "Min kills before express applies")
+    emitPlainHelpRow("autocheck <on|smart|off>", "Post-kill CP/GQ recheck mode")
+    emitPlainHelpRow("autocheck kills <number>", "SMART mode: run check every N kills")
+    emitPlainHelpRow("xcp mode <db|qw|ht>", "Post-arrival CP/GQ target mode; db=stored DB rooms, qw=exact live where, ht=hunt then exact where")
+    emitPlainHelpRow("mob tags", "xset mob help|tags|delete|nowhere|nohunt|priority")
+    emitPlainHelpRow("window <on|off>", "GUI window")
+    emitPlainHelpRow("sound <on|off|volume>", "Sound alerts and volume")
+    emitPlainHelpRow("areacolors <on|off>", "Color-band area labels in target list")
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
 function snd.commands.showMobHelp()
-    cecho("\n<white>Search and Destroy - xset mob help<reset>\n")
-    cecho("<gray>----------------------------------------<reset>\n")
-    cecho("<yellow>Mob Tagging Commands:<reset>\n")
-    cecho("  <cyan>xset mob nowhere <mob><reset>\n")
-    cecho("    Toggle the <orange>nowhere<reset> flag for a mob in the current zone.\n")
-    cecho("    Flagged mobs are hidden from search results and target lists.\n")
-    cecho("    <dim_gray>Example: xset mob nowhere city guard<reset>\n")
-    cecho("  <cyan>xset mob nohunt <mob><reset>\n")
-    cecho("    Toggle the <orange>nohunt<reset> flag in the current zone.\n")
-    cecho("    Flagged mobs still show in results, but auto-hunt will skip them.\n")
-    cecho("    <dim_gray>Example: xset mob nohunt aggressive sentinel<reset>\n")
-    cecho("  <cyan>xset mob priority <mob><reset>\n")
-    cecho("    Set this room as the mob's priority room.\n")
-    cecho("    If multiple rooms match, this room is preferred first.\n")
-    cecho("    <dim_gray>Example: xset mob priority goblin scout<reset>\n")
-    cecho("  <cyan>xset mob unpriority <mob><reset>\n")
-    cecho("    Clear the mob's priority room assignment.\n")
-    cecho("    <dim_gray>Example: xset mob unpriority goblin scout<reset>\n")
-    cecho("  <cyan>xset mob tags [zone]<reset>\n")
-    cecho("    List tagged mobs (nowhere/nohunt/priority) for current or named zone.\n")
-    cecho("    This also caches row numbers for indexed deletion.\n")
-    cecho("    <dim_gray>Examples: xset mob tags | xset mob tags bloodlust<reset>\n")
-    cecho("  <cyan>xset mob clearflags <mob><reset>\n")
-    cecho("    Remove all mob flags (nowhere/nohunt/priority) for this zone.\n")
-    cecho("    <dim_gray>Example: xset mob clearflags city guard<reset>\n")
-    cecho("  <cyan>xset mob delete <index><reset>\n")
-    cecho("    Delete a specific tag row by index from your last 'xset mob tags' output.\n")
-    cecho("    Workflow: run tags, then delete by #.\n")
-    cecho("    <dim_gray>Example: xset mob tags, then xset mob delete 3<reset>\n")
+    emitHelpTitle("Search and Destroy - xset mob help")
+    emitHelpSection("Mob Tagging Commands")
+    emitPlainHelpRow("xset mob nowhere <mob>", "Toggle the nowhere flag for a mob in the current zone. For mobs that where/qw cannot find, SnD keeps them visible and falls back to stored DB rooms. Example: xset mob nowhere city guard")
+    emitPlainHelpRow("xset mob nohunt <mob>", "Toggle the nohunt flag in the current zone. Still shows in results, but auto-hunt skips it. Example: xset mob nohunt aggressive sentinel")
+    emitPlainHelpRow("xset mob priority <mob>", "Set this room as the mob's priority room. If multiple rooms match, this room is preferred first.")
+    emitPlainHelpRow("xset mob unpriority <mob>", "Clear the mob's priority room assignment")
+    emitPlainHelpRow("xset mob tags [zone]", "List tagged mobs for current or named zone; caches row numbers for indexed deletion")
+    emitPlainHelpRow("xset mob clearflags <mob>", "Remove all mob flags for this zone. Example: xset mob clearflags city guard")
+    emitPlainHelpRow("xset mob delete <index>", "Delete a tag row by index from your last 'xset mob tags' output. Workflow: run tags, then delete by #.")
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
@@ -2762,6 +3112,7 @@ function snd.commands.showConfig()
     cecho("\n<white>Search and Destroy - Current Settings<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
     cecho(string.format("  <cyan>debug<reset>       %s\n", snd.config.debugMode and "ON" or "OFF"))
+    cecho(string.format("  <cyan>mobdebug<reset>    %s\n", snd.config.mobTagDebug and "ON" or "OFF"))
     cecho(string.format("  <cyan>silent<reset>      %s\n", snd.config.silentMode and "ON" or "OFF"))
     cecho(string.format("  <cyan>speed<reset>       %s\n", snd.config.speed))
     cecho(string.format("  <cyan>areaguard<reset>   %s (allowance=%d)\n",
@@ -2774,7 +3125,6 @@ function snd.commands.showConfig()
     cecho(string.format("  <cyan>autocheck<reset>   %s (kills=%d)\n",
         string.upper(snd.getAutocheckMode and snd.getAutocheckMode() or "on"),
         tonumber(snd.config.autocheck and snd.config.autocheck.smartKills) or 3))
-    cecho(string.format("  <cyan>mobdetect<reset>   %s\n", string.upper(tostring(snd.config.mobdetect or "off"))))
     cecho(string.format("  <cyan>window<reset>      %s\n", snd.config.window.enabled and "ON" or "OFF"))
     cecho(string.format("  <cyan>sound<reset>       %s (volume=%d%%)\n", snd.config.soundEnabled and "ON" or "OFF", tonumber(snd.config.soundVolume) or 100))
     cecho(string.format("  <cyan>areacolors<reset>  %s\n", snd.config.areaColors ~= false and "ON" or "OFF"))

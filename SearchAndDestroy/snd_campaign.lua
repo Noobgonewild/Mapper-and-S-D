@@ -679,6 +679,13 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
         if minLvl == 0 and maxLvl == 0 then return true end
         return playerLevel >= minLvl and playerLevel <= (maxLvl + 25)
     end
+    local function rowMatchesPriority(row)
+        if not row then return false end
+        local priorityRoom = tonumber(row.priority_room)
+        local roomId = tonumber(row.roomid)
+        return tonumber(row.priority_match) == 1
+            or (priorityRoom ~= nil and roomId ~= nil and priorityRoom == roomId)
+    end
 
     local function tryMapperFallback()
         if hint == "" then return nil end
@@ -739,6 +746,7 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
                         roomName = row.room,
                         roomId = tonumber(row.roomid),
                         seenCount = tonumber(row.seen_count) or 0,
+                        priorityMatch = rowMatchesPriority(row),
                         fromDb = true,
                     })
                 end
@@ -746,6 +754,9 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
         end
         if #primary > 0 then
             table.sort(primary, function(a, b)
+                if (a.priorityMatch == true) ~= (b.priorityMatch == true) then
+                    return a.priorityMatch == true
+                end
                 return (a.seenCount or 0) > (b.seenCount or 0)
             end)
             return primary
@@ -759,11 +770,14 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
         if zone ~= "" then
             local agg = byZone[zone]
             if not agg then
-                agg = { rooms = {}, totalSeen = 0 }
+                agg = { rooms = {}, totalSeen = 0, priorityMatch = false }
                 byZone[zone] = agg
                 table.insert(zoneOrder, zone)
             end
             table.insert(agg.rooms, row)
+            if rowMatchesPriority(row) then
+                agg.priorityMatch = true
+            end
             agg.totalSeen = agg.totalSeen + (tonumber(row.seen_count) or 0)
         end
     end
@@ -775,12 +789,22 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
     for _, zone in ipairs(zoneOrder) do
         local agg = byZone[zone]
         table.sort(agg.rooms, function(a, b)
+            local aPriority = rowMatchesPriority(a)
+            local bPriority = rowMatchesPriority(b)
+            if aPriority ~= bPriority then
+                return aPriority
+            end
             return (tonumber(a.seen_count) or 0) > (tonumber(b.seen_count) or 0)
         end)
         agg.bestRow = agg.rooms[1]
     end
 
     table.sort(zoneOrder, function(a, b)
+        local aPriority = byZone[a].priorityMatch == true
+        local bPriority = byZone[b].priorityMatch == true
+        if aPriority ~= bPriority then
+            return aPriority
+        end
         return (byZone[a].totalSeen or 0) > (byZone[b].totalSeen or 0)
     end)
 
@@ -796,6 +820,7 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
                 roomName = row and row.room or "",
                 roomId = row and tonumber(row.roomid) or nil,
                 seenCount = agg.totalSeen,
+                priorityMatch = agg.priorityMatch == true,
                 fromDb = true,
             })
         end
@@ -888,6 +913,11 @@ function snd.cp.reconcileSelectionAfterRebuild()
     end
 end
 
+local function entryHasMobPriority(entry)
+    local priorityRoom = tonumber(entry and entry.priority_room)
+    return priorityRoom ~= nil and priorityRoom > 0
+end
+
 --- Build the main target list from campaign targets
 function snd.cp.buildMainTargetList()
     -- Remove existing CP targets but preserve GQ and Quest targets
@@ -923,21 +953,8 @@ function snd.cp.buildMainTargetList()
         for _, zone in ipairs(resolved) do
             local arid = zone.arid or ""
             local tags = snd.db and snd.db.getMobTags and snd.db.getMobTags(target.mob, arid) or nil
-            if not (tags and tags.nowhere) then
-                zone.tags = tags
-                table.insert(visible, zone)
-            end
-        end
-        if #visible == 0 then
-            table.insert(visible, {
-                arid = target.arid or "",
-                areaName = target.loc or "",
-                roomName = "",
-                roomId = nil,
-                fromDb = false,
-                fromMapper = true,
-            })
-            snd.utils.debugNote("CP fallback: all resolved rows filtered for '" .. tostring(target.mob) .. "', preserving campaign hint row")
+            zone.tags = tags
+            table.insert(visible, zone)
         end
         local total = #visible
         for j, zone in ipairs(visible) do
@@ -971,6 +988,7 @@ function snd.cp.buildMainTargetList()
             }
 
             if zone.tags then
+                entry.nowhere = zone.tags.nowhere
                 entry.nohunt = zone.tags.nohunt
                 entry.priority_room = zone.tags.priority_room
             end
@@ -979,6 +997,21 @@ function snd.cp.buildMainTargetList()
                 entry.rmid = tonumber(entry.priority_room)
             elseif zone.roomId then
                 entry.rmid = zone.roomId
+            end
+
+            if snd.debug and snd.debug.mobTag and (entry.priority_room or entry.nowhere or entry.nohunt) then
+                snd.debug.mobTag(string.format(
+                    "CP build mob='%s' area=%s roomName='%s' rmid=%s nowhere=%s nohunt=%s priority_room=%s sourceRoomId=%s seen=%s",
+                    tostring(entry.mob or ""),
+                    tostring(entry.arid or ""),
+                    tostring(entry.roomName or ""),
+                    tostring(entry.rmid or ""),
+                    tostring(entry.nowhere == true),
+                    tostring(entry.nohunt == true),
+                    tostring(entry.priority_room or ""),
+                    tostring(zone.roomId or ""),
+                    tostring(zone.seenCount or "")
+                ))
             end
 
             if zone.fromMapper then
@@ -1024,6 +1057,11 @@ function snd.cp.buildMainTargetList()
     table.sort(cpEntries, function(a, b)
         if a.dead ~= b.dead then
             return not a.dead
+        end
+        local aPriority = entryHasMobPriority(a)
+        local bPriority = entryHasMobPriority(b)
+        if aPriority ~= bPriority then
+            return aPriority
         end
         local aLow = a.lowConfidence == true
         local bLow = b.lowConfidence == true
@@ -1166,6 +1204,11 @@ function snd.cp.updateTargetStatus()
     table.sort(cpList, function(a, b)
         if a.dead ~= b.dead then
             return not a.dead
+        end
+        local aPriority = entryHasMobPriority(a)
+        local bPriority = entryHasMobPriority(b)
+        if aPriority ~= bPriority then
+            return aPriority
         end
         local aLow = a.lowConfidence == true
         local bLow = b.lowConfidence == true
@@ -1620,6 +1663,21 @@ function snd.cp.selectTarget(index)
         end
         snd.utils.infoNote("Invalid target index: " .. index)
         return false
+    end
+
+    if snd.debug and snd.debug.mobTag then
+        snd.debug.mobTag(string.format(
+            "CP select index=%s mob='%s' area=%s loc='%s' roomName='%s' rmid=%s priority_room=%s nowhere=%s nohunt=%s",
+            tostring(index),
+            tostring(target.mob or ""),
+            tostring(target.arid or ""),
+            tostring(target.loc or ""),
+            tostring(target.roomName or ""),
+            tostring(target.rmid or ""),
+            tostring(target.priority_room or ""),
+            tostring(target.nowhere == true),
+            tostring(target.nohunt == true)
+        ))
     end
     
     snd.setTarget({

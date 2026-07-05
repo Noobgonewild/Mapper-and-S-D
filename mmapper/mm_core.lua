@@ -19,6 +19,7 @@ mm.state = mm.state or {
   native_mapper_db = "Aardwolf.db",
   auto_locate = true,
   center_on_locate = false,
+  portal_guard_enabled = true,
   rebuild_layout_on_sync_error = false,
   debug = false,
 }
@@ -135,6 +136,9 @@ function mm.load_settings_persistence()
   if type(data.rebuild_layout_on_sync_error) == "boolean" then
     mm.state.rebuild_layout_on_sync_error = data.rebuild_layout_on_sync_error
   end
+  if type(data.portal_guard_enabled) == "boolean" then
+    mm.state.portal_guard_enabled = data.portal_guard_enabled
+  end
   return true
 end
 
@@ -145,6 +149,7 @@ function mm.save_settings_persistence()
   end
   f:write("return " .. serialize_value({
     rebuild_layout_on_sync_error = mm.state.rebuild_layout_on_sync_error == true,
+    portal_guard_enabled = mm.state.portal_guard_enabled ~= false,
   }))
   f:close()
   return true
@@ -171,6 +176,22 @@ function mm.set_rebuild_layout_on_area_entry(enabled)
   end
 
   return mm.state.rebuild_layout_on_sync_error
+end
+
+function mm.portal_guard_status_text()
+  return string.format(
+    "portalguard %s: when on, guarded routes only use portals within 30 levels of your current level; xrtforce bypasses this safety.",
+    (mm.state.portal_guard_enabled ~= false) and "on" or "off"
+  )
+end
+
+function mm.set_portal_guard(enabled)
+  mm.state.portal_guard_enabled = enabled ~= false
+  local ok, err = mm.save_settings_persistence()
+  if not ok then
+    return false, err
+  end
+  return true
 end
 
 local function sanitize_deleted_cexit_entry(entry)
@@ -571,8 +592,18 @@ function mm.apply_bounce_settings_to_snd()
   ensure_portal_settings()
   local bouncePortal = find_portal_by_id(mm.portals.settings.bounce_portal_id)
   local bounceRecall = find_portal_by_id(mm.portals.settings.bounce_recall_id)
-  nav.config.bouncePortal = bouncePortal and { dir = bouncePortal.command, uid = bouncePortal.touid or bouncePortal.target_uid } or nil
-  nav.config.bounceRecall = bounceRecall and { dir = bounceRecall.command, uid = bounceRecall.touid or bounceRecall.target_uid } or nil
+  nav.config.bouncePortal = bouncePortal and {
+    dir = bouncePortal.command,
+    uid = bouncePortal.touid or bouncePortal.target_uid,
+    level = tonumber(bouncePortal.level) or 0,
+    travelType = "portal",
+  } or nil
+  nav.config.bounceRecall = bounceRecall and {
+    dir = bounceRecall.command,
+    uid = bounceRecall.touid or bounceRecall.target_uid,
+    level = tonumber(bounceRecall.level) or 0,
+    travelType = "recall",
+  } or nil
   if snd and snd.config then
     snd.config.mapper = snd.config.mapper or {}
     snd.config.mapper.bouncePortalId = bouncePortal and tostring(bouncePortal.portal_id) or nil

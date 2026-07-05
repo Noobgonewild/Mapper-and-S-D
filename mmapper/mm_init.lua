@@ -73,6 +73,7 @@ load_module(base, "mm_core.lua")
 load_module(base, "mm_area_references.lua")
 load_module(base, "mm_navigation.lua")
 load_module(base, "mm_frontier.lua")
+load_module(base, "mm_bookmarks.lua")
 load_module(base, "mm_help.lua")
 load_module(base, "mm_minimap.lua")
 load_module(base, "mm_commands.lua")
@@ -131,6 +132,15 @@ function mm.initialize()
       local ok, frontier_err = mm.frontier.initialize()
       if not ok then
         mm.warn("Could not initialize boundary redirects: " .. tostring(frontier_err))
+      end
+    end
+  end)
+
+  safe_step("bookmarks.initialize", function()
+    if mm.bookmarks and mm.bookmarks.initialize then
+      local ok, bookmark_err = mm.bookmarks.initialize()
+      if not ok then
+        mm.warn("Could not initialize mapper bookmarks: " .. tostring(bookmark_err))
       end
     end
   end)

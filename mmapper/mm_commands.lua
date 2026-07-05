@@ -121,6 +121,28 @@ local function portal_command_for_selected_id(selected_id)
   return nil
 end
 
+local function handle_portalguard(mode)
+  mode = tostring(mode or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+  if mode == "" then
+    mm.note(mm.portal_guard_status_text())
+    return true
+  end
+  if mode ~= "on" and mode ~= "off" then
+    mm.warn("Usage: mapper portalguard [on|off]")
+    return true
+  end
+
+  local enabled = mode == "on"
+  local ok, err = mm.set_portal_guard(enabled)
+  if not ok then
+    mm.warn("Could not save portalguard setting: " .. tostring(err))
+    return true
+  end
+  mm.note("Portal safety " .. (enabled and "ON" or "OFF") .. ".")
+  mm.note(mm.portal_guard_status_text())
+  return true
+end
+
 local function handle_command_inline(line)
   line = normalize_line(line)
 
@@ -200,6 +222,11 @@ local function handle_command_inline(line)
   if ui_flag then
     set_mapper_ui_flag(ui_flag, ui_mode)
     return true
+  end
+
+  local portalguard_mode = line:match("^mapper portalguard%s*(%S*)$")
+  if portalguard_mode ~= nil then
+    return handle_portalguard(portalguard_mode)
   end
 
   local mapper_portal_raw = line:match("^mapper portal%s+(.+)$")
@@ -812,6 +839,16 @@ mm.alias_specs = {
   {"^mapper find%s+(.+)$", function(m) local ok, err = mm.search_text("find", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper list%s+(.+)$", function(m) local ok, err = mm.search_text("list", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper notes(?:%s+(.+))?$", function(m) local ok, err = mm.search_notes(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks$", function() local ok, err = mm.bookmarks.list(); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks add$", function() local ok, err = mm.bookmarks.add(); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks add%s+(.+)$", function(m) local ok, err = mm.bookmarks.add(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks go%s+#(%d+)$", function(m) local ok, err = mm.bookmarks.go_index(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks delete%s+#(%d+)$", function(m) local ok, err = mm.bookmarks.delete_index(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks delete%s+(%d+)$", function(m) local ok, err = mm.bookmarks.delete_room(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks rename%s+#(%d+)%s+(.+)$", function(m) local ok, err = mm.bookmarks.rename_index(m[2], m[3]); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks listdeleted$", function() local ok, err = mm.bookmarks.list_deleted(); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks restore%s+#(%d+)$", function(m) local ok, err = mm.bookmarks.restore_index(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks%s+(.+)$", function(m) local ok, err = mm.bookmarks.list(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper searchnotes%s+(.+)$", function(m) local ok, err = mm.search_notes_text(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper shops?(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("shops", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper train(?:%s+(.+))?$", function(m) local ok, err = mm.search_special("train", m[2]); if not ok then mm.warn(err) end end},
@@ -927,6 +964,7 @@ mm.alias_specs = {
   {"^mapper underlines?(?: (on|off))?$", function(m) if m[2] then mm.state.underline_links = mm.bool_arg(m[2], mm.state.underline_links) end; mm.note("underlines " .. (mm.state.underline_links and "on" or "off")) end},
   {"^mapper autolocate(?: (on|off))?$", function(m) mm.state.auto_locate = mm.bool_arg(m[2], not mm.state.auto_locate); mm.note("autolocate " .. (mm.state.auto_locate and "on" or "off")) end},
   {"^mapper centerlocate(?: (on|off))?$", function(m) mm.state.center_on_locate = mm.bool_arg(m[2], not mm.state.center_on_locate); mm.note("centerlocate " .. (mm.state.center_on_locate and "on" or "off")) end},
+  {"^mapper portalguard%s*(%S*)$", function(m) handle_portalguard(m[2]) end},
   {"^mapper rebuild layout (on|off)$", function(m) mm.set_rebuild_layout_on_area_entry(m[2] == "on"); mm.note("auto rebuild layout on area entry " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off")) end},
   {"^mapper locate$", function() send("look") end},
   {"^mapper debug(?: (on|off))?$", function(m) if m[2] then mm.state.debug = (m[2] == "on"); mm.note("debug " .. m[2]); if m[2] == "on" then mm.debug("debugging enabled; watch for setPlayerRoom/map capture lines") end else mm.note("debug " .. ((mm.state and mm.state.debug) and "on" or "off")) end end},
@@ -975,7 +1013,7 @@ mm.alias_specs = {
 }
 
 mm.stubbed = {
-  "mapper findpath", "mapper bookmarks", "mapper clearcache",
+  "mapper findpath", "mapper clearcache",
   "mapper fullportal",
   "mapper areas",
   "mapper zoom in", "mapper zoom out",

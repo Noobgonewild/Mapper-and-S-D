@@ -311,9 +311,33 @@ local function add_evidence(candidates, roomId, name, area, evidence)
   end
 end
 
-function frontier.find_boundaries(scope)
+local function path_between(nav, source, destination, noPortals, noRecalls, ignoreAreaGuard)
+  source = normalize_uid(source)
+  destination = normalize_uid(destination)
+  if not source or not destination or not (nav and type(nav.findPath) == "function") then
+    return nil
+  end
+  if source == destination then return {}, 0 end
+  return nav.findPath(tostring(source), tostring(destination), noPortals, noRecalls, nil, ignoreAreaGuard)
+end
+
+local function target_boundary_distance(nav, target, candidateUid)
+  local path, depth = path_between(nav, target, candidateUid, true, true, true)
+  if path then return #path, tonumber(depth) or #path end
+
+  -- Some map edges are one-way. Reverse reachability is still useful as a
+  -- proximity hint, but walk-only so portals/recalls do not skew "near".
+  path, depth = path_between(nav, candidateUid, target, true, true, true)
+  if path then return #path, tonumber(depth) or #path end
+
+  return nil, nil
+end
+
+function frontier.find_boundaries(scope, options)
+  options = type(options) == "table" and options or {}
   local area, err, targetRoom = resolve_area(scope)
   if not area then return nil, err end
+  local rankTarget = normalize_uid(options.rankTarget or targetRoom)
 
   local nav = mapper_nav()
   local roomRows = nav.db.query(string.format(
@@ -372,12 +396,22 @@ function frontier.find_boundaries(scope)
       candidate.path = path
       candidate.pathLength = #path
       candidate.depth = tonumber(depth) or #path
+      if options.targetAware and rankTarget then
+        candidate.targetDistance, candidate.targetDepth = target_boundary_distance(nav, rankTarget, candidate.uid)
+      end
       candidate.evidenceSeen = nil
       table.insert(reachable, candidate)
     end
   end
 
   table.sort(reachable, function(a, b)
+    if options.rankByTarget then
+      local aTarget = tonumber(a.targetDistance) or math.huge
+      local bTarget = tonumber(b.targetDistance) or math.huge
+      if aTarget ~= bTarget then
+        return aTarget < bTarget
+      end
+    end
     if a.pathLength ~= b.pathLength then
       return a.pathLength < b.pathLength
     end
@@ -386,23 +420,43 @@ function frontier.find_boundaries(scope)
   return reachable, nil, {area = area, targetRoom = targetRoom, total = #roomRows}
 end
 
-local function echo_xrt_path(candidate)
-  local label = string.format("path %d", tonumber(candidate.pathLength) or 0)
-  local command = string.format([[expandAlias("xrt %d")]], candidate.uid)
-  echoLink(label, command, "Run xrt " .. tostring(candidate.uid), true)
+local function echo_xrt_link(label, uid)
+  local command = string.format([[expandAlias("xrt %d")]], uid)
+  echoLink(label, command, "Run xrt " .. tostring(uid), true)
 end
 
-local function show_boundary_rows(rows, area)
-  cecho(string.format("\n<cyan>Reachable boundary rooms in %s:<reset>\n", tostring(area or "?")))
-  cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
-  cecho(string.format("<white>%-36s %-10s %-10s %s<reset>\n", "Room", "(uid)", "Route", "Evidence"))
-  cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
-  for _, candidate in ipairs(rows) do
-    cecho(string.format("%-36s (%-8d) ", tostring(candidate.name or "?"):sub(1, 36), candidate.uid))
-    echo_xrt_path(candidate)
-    cecho("  <dim_gray>" .. table.concat(candidate.evidence or {}, ", ") .. "<reset>\n")
+local function echo_xrt_path(candidate)
+  local label = string.format("path %d", tonumber(candidate.pathLength) or 0)
+  echo_xrt_link(label, candidate.uid)
+end
+
+local function show_boundary_rows(rows, area, options)
+  options = type(options) == "table" and options or {}
+  local targetRoom = normalize_uid(options.targetRoom)
+  if targetRoom then
+    cecho(string.format("\n<cyan>Reachable boundary rooms by mapped distance from room %d in %s:<reset>\n", targetRoom, tostring(area or "?")))
+    cecho("<gray>------------------------------------------------------------------------------------------------<reset>\n")
+    cecho(string.format("<white>%-34s %-10s %-10s %-10s %s<reset>\n", "Room", "(uid)", "Route", "MapDist", "Evidence"))
+    cecho("<gray>------------------------------------------------------------------------------------------------<reset>\n")
+    for _, candidate in ipairs(rows) do
+      local mapped = candidate.targetDistance and string.format("map %d", candidate.targetDistance) or "map ?"
+      cecho(string.format("%-34s (%-8d) ", tostring(candidate.name or "?"):sub(1, 34), candidate.uid))
+      echo_xrt_path(candidate)
+      cecho(string.format("  %-10s <dim_gray>%s<reset>\n", mapped, table.concat(candidate.evidence or {}, ", ")))
+    end
+    cecho("<gray>------------------------------------------------------------------------------------------------<reset>\n")
+  else
+    cecho(string.format("\n<cyan>Reachable boundary rooms in %s:<reset>\n", tostring(area or "?")))
+    cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
+    cecho(string.format("<white>%-36s %-10s %-10s %s<reset>\n", "Room", "(uid)", "Route", "Evidence"))
+    cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
+    for _, candidate in ipairs(rows) do
+      cecho(string.format("%-36s (%-8d) ", tostring(candidate.name or "?"):sub(1, 36), candidate.uid))
+      echo_xrt_path(candidate)
+      cecho("  <dim_gray>" .. table.concat(candidate.evidence or {}, ", ") .. "<reset>\n")
+    end
+    cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
   end
-  cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
 end
 
 function frontier.show_boundaries(scope)
@@ -417,6 +471,58 @@ function frontier.show_boundaries(scope)
   return true
 end
 
+function frontier.show_near_boundaries(targetUid)
+  local target = normalize_uid(targetUid)
+  if not target then return false, "Usage: xrtnear <room UID>" end
+
+  local rows, err, context = frontier.find_boundaries(tostring(target), {
+    targetAware = true,
+    rankByTarget = true,
+    rankTarget = target,
+  })
+  if not rows then return false, err end
+  if #rows == 0 then
+    mm.note("No reachable boundary rooms found near room " .. tostring(target) .. ".")
+    return true
+  end
+
+  local hasMappedDistance = false
+  for _, candidate in ipairs(rows) do
+    if candidate.targetDistance ~= nil then
+      hasMappedDistance = true
+      break
+    end
+  end
+  if not hasMappedDistance then
+    mm.note(string.format(
+      "No mapped walk-distance from room %d to reachable boundaries; showing reachable boundary rooms in %s instead.",
+      target,
+      tostring(context.area or "?")
+    ))
+    show_boundary_rows(rows, context.area)
+    mm.note(string.format("Found %d reachable boundary room%s.", #rows, #rows == 1 and "" or "s"))
+    return true
+  end
+
+  show_boundary_rows(rows, context.area, {targetRoom = target})
+  mm.note(string.format(
+    "Found %d reachable boundary room%s with mapped distance from room %d.",
+    #rows,
+    #rows == 1 and "" or "s",
+    target
+  ))
+  return true
+end
+
+local function show_reachable_target(target, path)
+  local info = mapper_room_info(target) or {}
+  local name = trim(info.name) ~= "" and trim(info.name) or "room"
+  cecho("\n<cyan>Mapper has a route to the target room:<reset>\n")
+  cecho(string.format("  %-36s (%-8d) ", tostring(name):sub(1, 36), target))
+  echo_xrt_link(string.format("path %d", path and #path or 0), target)
+  cecho("\n")
+end
+
 function frontier.xrtnear(targetUid)
   local target = normalize_uid(targetUid)
   if not target then return false, "Usage: xrtnear <room UID>" end
@@ -425,9 +531,20 @@ function frontier.xrtnear(targetUid)
     return false, "redirect persistence is not initialized; reload the mapper package"
   end
 
+  local nav = mapper_nav()
+  if not (nav and type(nav.findPath) == "function") then
+    return false, "mapper navigation is unavailable"
+  end
+
+  local source = current_room()
+  if not source then return false, "current room is unknown; try LOOK first" end
+  if source == target then
+    mm.note(string.format("Already in room %d.", target))
+    return true
+  end
+
   local redirect = active_redirect(target)
   if redirect then
-    local nav = mapper_nav()
     local destination = normalize_uid(redirect.destination_uid)
     if not (nav and type(nav.xrt) == "function") then
       return false, "mapper navigation is unavailable"
@@ -442,7 +559,16 @@ function frontier.xrtnear(targetUid)
     return false, string.format("stored xrtnear redirect %d -> %d could not be started", target, destination)
   end
 
-  return frontier.show_boundaries(tostring(target))
+  local directPath = path_between(nav, source, target)
+  if not directPath and type(nav.buildOutwardJumpRoute) == "function" then
+    directPath = nav.buildOutwardJumpRoute(tostring(source), tostring(target), nil)
+  end
+  if directPath then
+    show_reachable_target(target, directPath)
+    return true
+  end
+
+  return frontier.show_near_boundaries(tostring(target))
 end
 
 local function validate_redirect_destination(destination)

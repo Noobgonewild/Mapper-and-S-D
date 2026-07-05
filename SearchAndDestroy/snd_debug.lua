@@ -40,6 +40,19 @@ function snd.debug.log(message)
     end
 end
 
+function snd.debug.mobTag(message)
+    if snd.config and (snd.config.mobTagDebug or snd.config.debugMode) then
+        local text = "MOBTAG DEBUG: " .. tostring(message)
+        if snd.config.debugMode and snd.utils and snd.utils.debugNote then
+            snd.utils.debugNote(text)
+        elseif type(cecho) == "function" then
+            cecho("<dim_gray>[S&D DEBUG]<reset> <gray>" .. text .. "<reset>\n")
+        elseif type(echo) == "function" then
+            echo("[S&D DEBUG] " .. text .. "\n")
+        end
+    end
+end
+
 function snd.debug.recordSearch(context)
     if type(context) ~= "table" then
         return

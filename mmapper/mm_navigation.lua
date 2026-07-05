@@ -494,9 +494,42 @@ end
 -------------------------------------------------------------------------------
 
 local AREA_GUARD_DEFAULT_ALLOWANCE = 30
+local PORTAL_GUARD_ALLOWANCE = 30
 
 local function normalizeAreaKey(value)
     return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+function snd.mapper.portalGuardEnabled()
+    return not (mm and mm.state and mm.state.portal_guard_enabled == false)
+end
+
+function snd.mapper.portalGuardBypassed(ignoreLockedExits)
+    return ignoreLockedExits == true or not snd.mapper.portalGuardEnabled()
+end
+
+function snd.mapper.portalGuardSql(fromExpression, levelExpression, playerLevel, ignoreLockedExits)
+    if snd.mapper.portalGuardBypassed(ignoreLockedExits) then
+        return "1=1"
+    end
+
+    local allowedLevel = (tonumber(playerLevel) or 0) + PORTAL_GUARD_ALLOWANCE
+    return string.format(
+        "(%s NOT IN ('*','**') OR %s <= %d)",
+        fromExpression,
+        levelExpression,
+        allowedLevel
+    )
+end
+
+function snd.mapper.portalStepAllowed(step, ignoreLockedExits)
+    if snd.mapper.portalGuardBypassed(ignoreLockedExits) then
+        return true
+    end
+
+    local portalLevel = tonumber(step and step.level) or 0
+    local allowedLevel = (tonumber(snd.char and snd.char.level) or 0) + PORTAL_GUARD_ALLOWANCE
+    return portalLevel <= allowedLevel
 end
 
 function snd.mapper.areaGuardConfig()
@@ -573,7 +606,7 @@ function snd.mapper.echoAreaGuardOverride(destination)
     local label = "[xrtforce " .. dest .. "]"
     local command = string.format([[expandAlias(%q, false)]], "xrtforce " .. dest)
     if type(echoLink) == "function" then
-        echoLink(label, command, "Navigate without area or exit-level guards", true)
+        echoLink(label, command, "Navigate without area, portal, or exit-level guards", true)
     else
         echo(label)
     end
@@ -1032,6 +1065,9 @@ function snd.mapper.searchMobLocations(mobName, areaKey)
             name = row.room or "",
             arid = row.zone or zone,
             seen_count = seen,
+            nowhere = tonumber(row.nowhere) == 1,
+            nohunt = tonumber(row.nohunt) == 1,
+            priority_room = tonumber(row.priority_room),
         })
     end
 
@@ -1041,6 +1077,34 @@ function snd.mapper.searchMobLocations(mobName, areaKey)
         else
             result.percentage = 0
         end
+    end
+
+    if snd.debug and snd.debug.mobTag then
+        local parts = {}
+        for i, result in ipairs(results or {}) do
+            if i > 8 then
+                table.insert(parts, "...")
+                break
+            end
+            table.insert(parts, string.format(
+                "#%d rmid=%s area=%s seen=%s priority_room=%s nowhere=%s nohunt=%s",
+                i,
+                tostring(result.rmid or ""),
+                tostring(result.arid or ""),
+                tostring(result.seen_count or ""),
+                tostring(result.priority_room or ""),
+                tostring(result.nowhere == true),
+                tostring(result.nohunt == true)
+            ))
+        end
+        snd.debug.mobTag(string.format(
+            "mapper.searchMobLocations mob='%s' zone='%s' matched='%s' results=%d %s",
+            tostring(mobName or ""),
+            tostring(zone or ""),
+            tostring(matchedName or ""),
+            #(results or {}),
+            table.concat(parts, " | ")
+        ))
     end
 
     if snd.targets and snd.targets.current then
@@ -1103,26 +1167,73 @@ function snd.mapper.searchRoomsRows(rows, mobName, options)
     end
 
     if mobName and #roomidList > 0 then
-        local countByRoom = {}
-        local sum = 0
-        local select = string.format(
-            "SELECT roomid, seen_count FROM mobs WHERE mob = %s AND roomid in (%s);",
-            snd.db.escape(mobName),
-            table.concat(roomidList, ",")
-        )
+        if snd.db and snd.db.ensureMobTagsTable then
+            snd.db.ensureMobTagsTable()
+        end
 
-        local rowsSeen = snd.db.query(select) or {}
+        local countByRoom = {}
+        local killsByRoom = {}
+        local priorityByRoom = {}
+        local priorityRoomByRoom = {}
+        local nowhereByRoom = {}
+        local nohuntByRoom = {}
+        local sum = 0
+
+        local function loadRoomStats(name)
+            if not name or name == "" then
+                return {}
+            end
+
+            local select = string.format(
+                [[
+                    SELECT m.roomid,
+                           m.seen_count,
+                           m.kill_count,
+                           mt.priority_room,
+                           mt.nowhere,
+                           mt.nohunt,
+                           CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match
+                    FROM mobs m
+                    LEFT JOIN mob_tags mt
+                      ON lower(mt.mob) = lower(m.mob)
+                     AND lower(mt.zone) = lower(m.zone)
+                    WHERE lower(m.mob) = lower(%s) AND m.roomid in (%s);
+                ]],
+                snd.db.escape(name),
+                table.concat(roomidList, ",")
+            )
+
+            return snd.db.query(select) or {}
+        end
+
+        local rowsSeen = loadRoomStats(mobName)
+        if #rowsSeen == 0 and mobName:find("%-") then
+            rowsSeen = loadRoomStats(mobName:gsub("%-", " "))
+        end
+
         for _, row in ipairs(rowsSeen) do
             local roomId = tonumber(row.roomid)
             local seen = tonumber(row.seen_count) or 0
+            local kills = tonumber(row.kill_count) or 0
             if roomId then
                 countByRoom[roomId] = seen
+                killsByRoom[roomId] = kills
+                priorityByRoom[roomId] = tonumber(row.priority_match) == 1
+                priorityRoomByRoom[roomId] = tonumber(row.priority_room)
+                nowhereByRoom[roomId] = tonumber(row.nowhere) == 1
+                nohuntByRoom[roomId] = tonumber(row.nohunt) == 1
                 sum = sum + seen
             end
         end
 
         for _, result in ipairs(results) do
-            result.seen_count = countByRoom[result.rmid] or 0
+            local roomId = tonumber(result.rmid) or -1
+            result.seen_count = countByRoom[roomId] or 0
+            result.kill_count = killsByRoom[roomId] or 0
+            result.priority_match = priorityByRoom[roomId] == true
+            result.priority_room = priorityRoomByRoom[roomId]
+            result.nowhere = nowhereByRoom[roomId] == true
+            result.nohunt = nohuntByRoom[roomId] == true
             if sum > 0 then
                 result.percentage = result.seen_count / sum
             else
@@ -1131,14 +1242,55 @@ function snd.mapper.searchRoomsRows(rows, mobName, options)
         end
 
         table.sort(results, function(a, b)
+            local aPriority = a.priority_match == true
+            local bPriority = b.priority_match == true
+            if aPriority ~= bPriority then
+                return aPriority
+            end
+
             if (a.seen_count or 0) > (b.seen_count or 0) then
                 return true
             elseif (a.seen_count or 0) < (b.seen_count or 0) then
                 return false
-            else
-                return (a.rmid or 0) < (b.rmid or 0)
             end
+
+            if (a.kill_count or 0) > (b.kill_count or 0) then
+                return true
+            elseif (a.kill_count or 0) < (b.kill_count or 0) then
+                return false
+            end
+
+            return (a.rmid or 0) < (b.rmid or 0)
         end)
+
+        if snd.debug and snd.debug.mobTag then
+            local parts = {}
+            for i, result in ipairs(results or {}) do
+                if i > 8 then
+                    table.insert(parts, "...")
+                    break
+                end
+                table.insert(parts, string.format(
+                    "#%d rmid=%s area=%s seen=%s kills=%s priority_room=%s priority_match=%s nowhere=%s nohunt=%s",
+                    i,
+                    tostring(result.rmid or ""),
+                    tostring(result.arid or ""),
+                    tostring(result.seen_count or ""),
+                    tostring(result.kill_count or ""),
+                    tostring(result.priority_room or ""),
+                    tostring(result.priority_match == true),
+                    tostring(result.nowhere == true),
+                    tostring(result.nohunt == true)
+                ))
+            end
+            snd.debug.mobTag(string.format(
+                "mapper.searchRoomsRows mob='%s' activity='%s' candidates=%d %s",
+                tostring(mobName or ""),
+                tostring(activity or ""),
+                #(results or {}),
+                table.concat(parts, " | ")
+            ))
+        end
     end
 
     if not (options and options.silent) then
@@ -1281,6 +1433,39 @@ function snd.mapper.searchRoomsResults(results, context)
         mapperAreaIndex = mapperAreaIndex + 1
     end
 
+    if snd.debug and snd.debug.mobTag then
+        local parts = {}
+        local firstRoomIndex = nil
+        local firstRoomId = nil
+        for i = 0, math.max(0, mapperAreaIndex - 1) do
+            local entry = snd.nav.gotoList[i]
+            if entry then
+                if #parts < 9 then
+                    table.insert(parts, string.format(
+                        "%d:%s=%s",
+                        i,
+                        tostring(entry.type or ""),
+                        tostring(entry.id or "")
+                    ))
+                elseif #parts == 9 then
+                    table.insert(parts, "...")
+                end
+                if not firstRoomIndex and entry.type == "room" then
+                    firstRoomIndex = i
+                    firstRoomId = entry.id
+                end
+            end
+        end
+        snd.debug.mobTag(string.format(
+            "mapper.searchRoomsResults reason='%s' goto_entries=%d first_room_index=%s first_room=%s %s",
+            tostring(reason or ""),
+            tonumber(mapperAreaIndex) or 0,
+            tostring(firstRoomIndex or ""),
+            tostring(firstRoomId or ""),
+            table.concat(parts, " | ")
+        ))
+    end
+
     if mapperAreaIndex == 0 then
         snd.utils.infoNote("No matching rooms found.")
         if snd.debug and snd.debug.log then
@@ -1358,10 +1543,13 @@ end
 --- Set bounce portal (for norecall rooms)
 -- @param portalDir Portal command
 -- @param portalDestUid Destination room uid
-function snd.mapper.setBouncePortal(portalDir, portalDestUid)
+-- @param level Optional portal level
+function snd.mapper.setBouncePortal(portalDir, portalDestUid, level)
     snd.mapper.config.bouncePortal = {
         dir = portalDir,
-        uid = portalDestUid
+        uid = portalDestUid,
+        level = tonumber(level) or 0,
+        travelType = "portal"
     }
     snd.utils.infoNote("Bounce portal set: " .. portalDir)
 end
@@ -1369,10 +1557,13 @@ end
 --- Set bounce recall (for noportal rooms)
 -- @param recallDir Recall command
 -- @param recallDestUid Destination room uid
-function snd.mapper.setBounceRecall(recallDir, recallDestUid)
+-- @param level Optional portal level
+function snd.mapper.setBounceRecall(recallDir, recallDestUid, level)
     snd.mapper.config.bounceRecall = {
         dir = recallDir,
-        uid = recallDestUid
+        uid = recallDestUid,
+        level = tonumber(level) or 0,
+        travelType = "recall"
     }
     snd.utils.infoNote("Bounce recall set: " .. recallDir)
 end
@@ -1421,6 +1612,7 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
         myLevel,
         myLevel + (myTier * 10)
     )
+    local portalGuardWhere = snd.mapper.portalGuardSql("fromuid", "level", myLevel, ignoreLockedExits)
     local chaosWhere = gqActive and "(fromuid <> '*' OR ifnull(chaos, 'no') <> 'yes')" or "1=1"
     local areaFromWhere, blockedAreaCount = snd.mapper.areaGuardRoomSql(
         "exits.fromuid",
@@ -1498,11 +1690,13 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
             AND %s
             AND %s
             AND %s
+            AND %s
             ORDER BY %s
         ]],
             table.concat(roomsList, ","),
             visited,
             levelWhere,
+            portalGuardWhere,
             chaosWhere,
             areaFromWhere,
             areaToWhere,
@@ -1623,14 +1817,23 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
             
             if (foundFrom == "*" and srcNoPortal) or (foundFrom == "**" and srcNoRecall) then
                 -- Need to use bounce portal/recall
-                if not srcNoRecall and snd.mapper.config.bounceRecall then
-                    table.insert(path, snd.mapper.config.bounceRecall)
-                    if tostring(dst) == tostring(snd.mapper.config.bounceRecall.uid) then
+                local bounceRecall = (not srcNoRecall and snd.mapper.config.bounceRecall) or nil
+                local bouncePortal = (not srcNoPortal and snd.mapper.config.bouncePortal) or nil
+                if bounceRecall and not snd.mapper.portalStepAllowed(bounceRecall, ignoreLockedExits) then
+                    bounceRecall = nil
+                end
+                if bouncePortal and not snd.mapper.portalStepAllowed(bouncePortal, ignoreLockedExits) then
+                    bouncePortal = nil
+                end
+
+                if bounceRecall then
+                    table.insert(path, bounceRecall)
+                    if tostring(dst) == tostring(bounceRecall.uid) then
                         return path, foundDepth
                     end
-                elseif not srcNoPortal and snd.mapper.config.bouncePortal then
-                    table.insert(path, snd.mapper.config.bouncePortal)
-                    if tostring(dst) == tostring(snd.mapper.config.bouncePortal.uid) then
+                elseif bouncePortal then
+                    table.insert(path, bouncePortal)
+                    if tostring(dst) == tostring(bouncePortal.uid) then
                         return path, foundDepth
                     end
                 else
@@ -1941,7 +2144,7 @@ function snd.mapper.onRecallBlocked()
     snd.nav.goingToRoom = nil
 end
 
-function snd.mapper.handleBlockedTravel(blockedType)
+function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
     local destination = snd.mapper.goingToRoom or (snd.nav and snd.nav.goingToRoom)
     if not destination then
         return
@@ -1976,7 +2179,7 @@ function snd.mapper.handleBlockedTravel(blockedType)
     -- If both flags are set, first try the closest room with a usable jump.
     if currentNoPortal and currentNoRecall then
         snd.utils.debugNote("current room is both norecall/noportal; trying outward jump-room expansion first.")
-        local combined, chosenType, closestRoom = snd.mapper.buildOutwardJumpRoute(currentRoom, destination, nil)
+        local combined, chosenType, closestRoom = snd.mapper.buildOutwardJumpRoute(currentRoom, destination, ignoreLockedExits)
         if combined and #combined > 0 then
             snd.utils.infoNote("Rerouting via closest viable room " .. tostring(closestRoom) .. " using " .. tostring(chosenType) .. ".")
             snd.mapper.executePath(combined)
@@ -2001,10 +2204,13 @@ function snd.mapper.handleBlockedTravel(blockedType)
     end
 
     local reroutePath = nil
+    if bounceStep and not snd.mapper.portalStepAllowed(bounceStep, ignoreLockedExits) then
+        bounceStep = nil
+    end
     if bounceStep and bounceStep.dir and bounceStep.uid then
         local nextLeg = nil
         if tostring(bounceStep.uid) ~= destination then
-            nextLeg = snd.mapper.findPath(tostring(bounceStep.uid), destination, nil, nil)
+            nextLeg = snd.mapper.findPath(tostring(bounceStep.uid), destination, nil, nil, ignoreLockedExits)
         else
             nextLeg = {}
         end
@@ -2014,6 +2220,7 @@ function snd.mapper.handleBlockedTravel(blockedType)
                 {
                     dir = bounceStep.dir,
                     uid = bounceStep.uid,
+                    level = tonumber(bounceStep.level) or 0,
                     travelType = (blockedType == "recall") and "portal" or "recall",
                 }
             }
@@ -2028,7 +2235,7 @@ function snd.mapper.handleBlockedTravel(blockedType)
         local forceNoPortals = (blockedType == "portal")
         local forceNoRecalls = (blockedType == "recall")
         local expectedType = (blockedType == "portal") and "recall" or "portal"
-        local candidate = snd.mapper.findPath(currentRoom, destination, forceNoPortals, forceNoRecalls, nil)
+        local candidate = snd.mapper.findPath(currentRoom, destination, forceNoPortals, forceNoRecalls, ignoreLockedExits)
         if candidate and (snd.mapper.pathStartsWithJump(candidate, expectedType) or snd.mapper.roomsShareArea(currentRoom, destination)) then
             reroutePath = candidate
         elseif candidate then
@@ -2037,7 +2244,7 @@ function snd.mapper.handleBlockedTravel(blockedType)
     end
 
     if not reroutePath then
-        local reroute, viaRoom = snd.mapper.findNearestAlternateRoute(currentRoom, destination, blockedType, nil, false)
+        local reroute, viaRoom = snd.mapper.findNearestAlternateRoute(currentRoom, destination, blockedType, ignoreLockedExits, false)
         if reroute and #reroute > 0 then
             reroutePath = reroute
             snd.utils.infoNote("Rerouting via nearby room " .. tostring(viaRoom) .. " to use " .. ((blockedType == "recall") and "portal" or "recall") .. ".")
@@ -2045,7 +2252,7 @@ function snd.mapper.handleBlockedTravel(blockedType)
     end
 
     if not reroutePath then
-        local areaRoute, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(currentRoom, destination, blockedType, nil)
+        local areaRoute, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(currentRoom, destination, blockedType, ignoreLockedExits)
         if areaRoute and #areaRoute > 0 then
             reroutePath = areaRoute
             snd.utils.infoNote(string.format(
@@ -2058,7 +2265,7 @@ function snd.mapper.handleBlockedTravel(blockedType)
     end
 
     if not reroutePath then
-        local candidate = snd.mapper.findPath(currentRoom, destination, nil, nil)
+        local candidate = snd.mapper.findPath(currentRoom, destination, nil, nil, ignoreLockedExits)
         if candidate and (snd.mapper.pathStartsWithJump(candidate) or snd.mapper.roomsShareArea(currentRoom, destination)) then
             reroutePath = candidate
         elseif candidate then
@@ -3001,7 +3208,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
         snd.mapper.goingToRoom = roomId
         snd.nav.goingToRoom = roomId
         snd.mapper.pendingBlockedTravel = nil
-        if snd.mapper.handleBlockedTravel(pendingBlocked.blockedType) then
+        if snd.mapper.handleBlockedTravel(pendingBlocked.blockedType, ignoreLockedExits) then
             return true
         end
     elseif pendingBlocked and tostring(pendingBlocked.destination or "") == roomId then
@@ -3475,7 +3682,9 @@ function snd.mapper.setBouncePortalByIndex(index)
     
     snd.mapper.config.bouncePortal = {
         dir = portal.dir,
-        uid = portal.touid
+        uid = portal.touid,
+        level = tonumber(portal.level) or 0,
+        travelType = "portal"
     }
     snd.utils.infoNote("Bounce portal set to #" .. index .. ": " .. portal.dir)
     return true
@@ -3497,7 +3706,7 @@ function snd.mapper.setBouncePortalByCommand(command)
                 snd.utils.errorNote("Portal '" .. portalCommand .. "' is a recall portal; choose a regular portal.")
                 return false
             end
-            snd.mapper.setBouncePortal(portal.dir, portal.touid)
+            snd.mapper.setBouncePortal(portal.dir, portal.touid, portal.level)
             snd.utils.infoNote("Bounce portal set to #" .. tostring(i) .. ": " .. portal.dir)
             return true
         end
@@ -3531,7 +3740,9 @@ function snd.mapper.setBounceRecallByIndex(index)
     
     snd.mapper.config.bounceRecall = {
         dir = portal.dir,
-        uid = portal.touid
+        uid = portal.touid,
+        level = tonumber(portal.level) or 0,
+        travelType = "recall"
     }
     snd.utils.infoNote("Bounce recall set to #" .. index .. ": " .. portal.dir)
     return true
@@ -3725,14 +3936,14 @@ function snd.mapper.xrtforce(dest)
 
     local roomNum = tonumber(dest)
     if roomNum then
-        cecho("<yellow>[MMAPPER]<reset> Force-going to room " .. roomNum .. " (ignoring area and exit-level guards)\n")
+        cecho("<yellow>[MMAPPER]<reset> Force-going to room " .. roomNum .. " (ignoring area, portal, and exit-level guards)\n")
         return snd.mapper.gotoRoom(roomNum, true, true, nil, dest)
     end
 
     if snd.db and snd.db.getAreaStartRoom then
         local startRoom = tonumber(snd.db.getAreaStartRoom(dest)) or -1
         if startRoom > 0 then
-            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. startRoom .. ", ignoring area and exit-level guards)\n")
+            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. startRoom .. ", ignoring area, portal, and exit-level guards)\n")
             return snd.mapper.gotoRoom(startRoom, true, true, nil, dest)
         end
 
@@ -3747,7 +3958,7 @@ function snd.mapper.xrtforce(dest)
                 local areaKey = areaRows[1].key
                 local roomId = tonumber(areaRows[1].startRoom) or -1
                 if roomId > 0 then
-                    cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. roomId .. ", ignoring area and exit-level guards)\n")
+                    cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. roomId .. ", ignoring area, portal, and exit-level guards)\n")
                     return snd.mapper.gotoRoom(roomId, true, true, nil, dest)
                 end
             end
@@ -3757,13 +3968,13 @@ function snd.mapper.xrtforce(dest)
     if snd.data and snd.data.areaDefaultStartRooms then
         local areaData = snd.data.areaDefaultStartRooms[dest]
         if areaData and areaData.start then
-            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. areaData.start .. ", ignoring area and exit-level guards)\n")
+            cecho("<yellow>[MMAPPER]<reset> Force-going to " .. dest .. " (room " .. areaData.start .. ", ignoring area, portal, and exit-level guards)\n")
             return snd.mapper.gotoRoom(areaData.start, true, true, nil, dest)
         end
 
         for areaKey, data in pairs(snd.data.areaDefaultStartRooms) do
             if areaKey:lower():find(dest, 1, true) and data.start then
-                cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. data.start .. ", ignoring area and exit-level guards)\n")
+                cecho("<yellow>[MMAPPER]<reset> Force-going to " .. areaKey .. " (room " .. data.start .. ", ignoring area, portal, and exit-level guards)\n")
                 return snd.mapper.gotoRoom(data.start, true, true, nil, dest)
             end
         end
@@ -3777,7 +3988,7 @@ function snd.mapper.xrtforce(dest)
         local results = snd.mapper.db.query(sql)
         if results and #results > 0 then
             local roomId = results[1].uid
-            cecho("<yellow>[MMAPPER]<reset> Force-going to area matching '" .. dest .. "' (room " .. roomId .. ", ignoring area and exit-level guards)\n")
+            cecho("<yellow>[MMAPPER]<reset> Force-going to area matching '" .. dest .. "' (room " .. roomId .. ", ignoring area, portal, and exit-level guards)\n")
             return snd.mapper.gotoRoom(roomId, true, true, nil, dest)
         end
     end

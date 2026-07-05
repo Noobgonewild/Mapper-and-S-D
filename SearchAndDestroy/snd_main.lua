@@ -18,7 +18,7 @@ snd = snd or {}
 -- Version Information
 -------------------------------------------------------------------------------
 
-snd.version = "7.0.0"
+snd.version = "7.1.0"
 snd.schemaVersion = 6
 snd.fullVersion = "Search & Destroy v" .. snd.version
 
@@ -109,7 +109,7 @@ local defaultConfig = {
     -- GQ extra aliases
     gqExtraAliases = true,
     
-    -- Next action after arriving at target (smartscan, con, scan, qs, none)
+    -- Next action after arriving at target (smartscan, qs, none)
     nxAction = "qs",
     
     -- xcp post-arrival action mode: db|qw|ht (legacy "off" loads as db)
@@ -136,8 +136,8 @@ local defaultConfig = {
         gqKillCounter = 0,
     },
 
-    -- Mobdetect behavior on room arrival after target confirmation: off|on|always
-    mobdetect = "off",
+    -- Focused diagnostics for mob tag priority/nohunt/nowhere decisions
+    mobTagDebug = false,
 
     -- Table display settings
     tableNotes = false,
@@ -187,6 +187,28 @@ end
 if persistedStateEarly and type(persistedStateEarly.config) == "table" then
     mergeTables(snd.config, persistedStateEarly.config)
 end
+
+local removedNxActionFallbacks = {
+    con = "none",
+    scanhere = "none",
+    scan = "smartscan",
+}
+
+local validNxActions = {
+    smartscan = true,
+    qs = true,
+    none = true,
+}
+
+function snd.normalizeNxAction(action)
+    local normalized = tostring(action or ""):lower()
+    if validNxActions[normalized] then
+        return normalized
+    end
+    return removedNxActionFallbacks[normalized] or "qs"
+end
+
+snd.config.nxAction = snd.normalizeNxAction(snd.config.nxAction)
 
 -------------------------------------------------------------------------------
 -- Room State
@@ -320,6 +342,8 @@ snd.quest = snd.quest or {
     nextQuestText = "",
     silentCooldownRequest = false,
     lastCooldownRequest = 0,
+    readySoundTimerId = nil,
+    readySoundLastPlayedAt = 0,
     blessingBonus = 0,
     pendingReward = nil,
     rewardTimer = nil,
@@ -518,6 +542,7 @@ snd.scan = snd.scan or {
     runningSmartScan = false,
     conAfterScan = false,
     mobCountHere = 0,
+    pendingNxAction = nil,
     
     lastMobDamaged = nil,
     lastMobKilled = nil,
@@ -559,14 +584,239 @@ function snd.scan.quickScan()
     end
 end
 
-function snd.scan.smartScan()
-    if snd.scan.hasActivityTarget() then
-        snd.scan.runningSmartScan = true
-        snd.utils.debugNote("Performing smart scan.")
-        send("scan", false)
-    else
-        snd.scan.quickScan()
+function snd.scan.currentAreaKey()
+    local area = snd.room and snd.room.current and snd.room.current.arid or ""
+    if snd.utils and snd.utils.trim then
+        return snd.utils.trim(area)
     end
+    return tostring(area or "")
+end
+
+function snd.scan.targetAreaKey(target)
+    local area = target and (target.arid or target.area) or ""
+    if snd.utils and snd.utils.trim then
+        return snd.utils.trim(area)
+    end
+    return tostring(area or "")
+end
+
+function snd.scan.targetIsAlive(target)
+    if not target then return false end
+    if target.dead or target.killed then return false end
+    if tostring(target.status or ""):lower() == "dead" then return false end
+    if target.remaining ~= nil and tonumber(target.remaining) == 0 then return false end
+    return true
+end
+
+function snd.scan.targetIsInCurrentArea(target)
+    local currentArea = snd.scan.currentAreaKey()
+    if currentArea == "" then return false end
+    return snd.scan.targetAreaKey(target) == currentArea
+end
+
+function snd.scan.targetKeyword(target)
+    if not target then return "" end
+    local keyword = target.keyword or ""
+    if snd.utils and snd.utils.trim then
+        keyword = snd.utils.trim(keyword)
+    else
+        keyword = tostring(keyword or "")
+    end
+    if keyword ~= "" then return keyword end
+
+    local name = target.name or target.mob or target.matchedMobName or ""
+    if snd.gmcp and snd.gmcp.guessMobKeyword then
+        local guessed = snd.gmcp.guessMobKeyword(name, snd.scan.targetAreaKey(target))
+        if snd.utils and snd.utils.trim then
+            guessed = snd.utils.trim(guessed)
+        end
+        if guessed and guessed ~= "" then return guessed end
+    end
+    if snd.utils and snd.utils.findKeyword then
+        return snd.utils.findKeyword(name)
+    end
+    return tostring(name or ""):lower()
+end
+
+function snd.scan.currentTargetMatchesSmartScan(activeTab)
+    local current = snd.targets and snd.targets.current or nil
+    if not snd.scan.targetIsAlive(current) then return false end
+    if activeTab and activeTab ~= "" and current.activity ~= activeTab then
+        return false
+    end
+    return snd.scan.targetIsInCurrentArea(current)
+end
+
+function snd.scan.currentTargetFromListEntry(target)
+    if not target then return nil end
+    return {
+        keyword = snd.scan.targetKeyword(target),
+        name = target.name or target.mob or "",
+        roomName = target.roomName or "",
+        roomId = target.roomId or target.rmid,
+        area = target.arid or target.area or "",
+        areaName = target.loc or target.areaName or "",
+        index = target.displayIndex or target.index,
+        activity = target.activity,
+        matchedMobName = target.matchedMobName,
+    }
+end
+
+function snd.scan.resolveSmartScanTarget(options)
+    local opts = options or {}
+    local activeTab = snd.getActiveTab and snd.getActiveTab() or nil
+    if activeTab ~= "quest" and activeTab ~= "gq" and activeTab ~= "cp" then
+        activeTab = nil
+    end
+
+    if snd.scan.currentTargetMatchesSmartScan(activeTab) then
+        return snd.targets.current
+    end
+
+    local currentArea = snd.scan.currentAreaKey()
+    if currentArea == "" or not snd.targets or not snd.targets.list then
+        return nil
+    end
+
+    for _, target in ipairs(snd.targets.list) do
+        if (not activeTab or target.activity == activeTab)
+            and snd.scan.targetIsAlive(target)
+            and snd.scan.targetAreaKey(target) == currentArea
+        then
+            local currentTarget = snd.scan.currentTargetFromListEntry(target)
+            if opts.select ~= false and currentTarget then
+                snd.setTarget(currentTarget)
+            end
+            return currentTarget or target
+        end
+    end
+
+    return nil
+end
+
+function snd.scan.smartScan()
+    local target = snd.scan.resolveSmartScanTarget({select = true})
+    local keyword = snd.scan.targetKeyword(target)
+    if keyword ~= "" then
+        send("scan " .. keyword, false)
+        return true
+    end
+    return false
+end
+
+function snd.scan.currentRoomId()
+    local roomId = snd.room and snd.room.current and snd.room.current.rmid or nil
+    if roomId ~= nil and tostring(roomId) ~= "" then
+        return tostring(roomId)
+    end
+    return ""
+end
+
+function snd.scan.runNxAction(action)
+    action = snd.normalizeNxAction(action)
+    if action == "smartscan" then
+        return snd.scan.smartScan()
+    elseif action == "qs" then
+        snd.scan.quickScan()
+        return true
+    end
+    return false
+end
+
+function snd.scan.clearPendingNxAction()
+    local pending = snd.scan.pendingNxAction
+    if pending and pending.timer then
+        pcall(function() killTimer(pending.timer) end)
+    end
+    snd.scan.pendingNxAction = nil
+end
+
+function snd.scan.runPendingNxAction(roomId, reason)
+    local pending = snd.scan.pendingNxAction
+    if not pending then
+        return false
+    end
+    if roomId and tostring(roomId) ~= tostring(pending.roomId) then
+        return false
+    end
+
+    local action = pending.action
+    local pendingRoomId = tostring(pending.roomId or "")
+    snd.scan.clearPendingNxAction()
+
+    local currentRoomId = snd.scan.currentRoomId()
+    if pendingRoomId ~= "" and currentRoomId ~= "" and currentRoomId ~= pendingRoomId then
+        snd.utils.debugNote("Dropping deferred nxAction after room changed.")
+        return false
+    end
+
+    local ran = snd.scan.runNxAction(action)
+    if ran then
+        snd.utils.debugNote("Running deferred nxAction " .. action .. " (" .. tostring(reason or "resolved") .. ").")
+    end
+    return ran
+end
+
+function snd.scan.cancelPendingNxAction(roomId, reason)
+    local pending = snd.scan.pendingNxAction
+    if not pending then
+        return false
+    end
+    if roomId and tostring(roomId) ~= tostring(pending.roomId) then
+        return false
+    end
+
+    snd.utils.debugNote("Skipping deferred nxAction " .. tostring(pending.action) .. " (" .. tostring(reason or "cancelled") .. ").")
+    snd.scan.clearPendingNxAction()
+    return true
+end
+
+function snd.scan.conwinConsiderWillResolveRoom()
+    local conwinConfig = snd.config and snd.config.conwin or nil
+    if not snd.conwin or not conwinConfig or not conwinConfig.enabled then
+        return false
+    end
+    return tostring(conwinConfig.mode or "consider"):lower() == "consider"
+end
+
+function snd.scan.deferNxActionUntilConwin(action, roomId)
+    action = snd.normalizeNxAction(action)
+    if action == "none" then
+        return false
+    end
+
+    roomId = tostring(roomId or snd.scan.currentRoomId() or "")
+    snd.scan.clearPendingNxAction()
+
+    local pending = {
+        action = action,
+        roomId = roomId,
+    }
+    snd.scan.pendingNxAction = pending
+
+    if type(tempTimer) == "function" then
+        pending.timer = tempTimer(0.8, function()
+            if snd.scan and snd.scan.pendingNxAction == pending then
+                snd.scan.runPendingNxAction(roomId, "conwin-timeout")
+            end
+        end)
+    end
+
+    snd.utils.debugNote("Deferring nxAction " .. action .. " until ConWin consider resolves.")
+    return true
+end
+
+function snd.scan.handleArrivalNxAction(action)
+    action = snd.normalizeNxAction(action)
+    if action == "none" then
+        return false
+    end
+
+    if snd.scan.conwinConsiderWillResolveRoom() then
+        return snd.scan.deferNxActionUntilConwin(action, snd.scan.currentRoomId())
+    end
+
+    return snd.scan.runNxAction(action)
 end
 
 -------------------------------------------------------------------------------
@@ -865,6 +1115,7 @@ function snd.loadState()
     -- Merge loaded state with defaults
     if state.config then
         mergeTables(snd.config, state.config)
+        snd.config.nxAction = snd.normalizeNxAction(snd.config.nxAction)
     end
     
     if state.colors then
@@ -984,9 +1235,34 @@ function snd.getActivityPriority(activity)
     return activityPriority[activity] or 99
 end
 
+function snd.reindexTargetsAfterSort()
+    if not snd.targets or not snd.targets.list then return end
+
+    local cpDisplayIndex = 0
+    local cpListIndex = 0
+    for _, target in ipairs(snd.targets.list) do
+        if target.activity == "cp" then
+            cpListIndex = cpListIndex + 1
+            target.cpListIndex = cpListIndex
+            if snd.scan.targetIsAlive(target) then
+                cpDisplayIndex = cpDisplayIndex + 1
+                target.displayIndex = cpDisplayIndex
+            else
+                target.displayIndex = nil
+            end
+        end
+    end
+end
+
 --- Sort target list by priority (GQ > Quest > CP)
 -- Call this to ensure targets are displayed in priority order
 function snd.sortTargetsByPriority()
+    if not snd.targets or not snd.targets.list then return end
+
+    for i, target in ipairs(snd.targets.list) do
+        target._sortOrdinal = i
+    end
+
     table.sort(snd.targets.list, function(a, b)
         local prioA = snd.getActivityPriority(a.activity)
         local prioB = snd.getActivityPriority(b.activity)
@@ -994,10 +1270,39 @@ function snd.sortTargetsByPriority()
         if prioA ~= prioB then
             return prioA < prioB  -- Lower priority value = higher priority
         end
+
+        local aliveA = snd.scan.targetIsAlive(a)
+        local aliveB = snd.scan.targetIsAlive(b)
+        if aliveA ~= aliveB then
+            return aliveA
+        end
+
+        local currentAreaA = aliveA and snd.scan.targetIsInCurrentArea(a)
+        local currentAreaB = aliveB and snd.scan.targetIsInCurrentArea(b)
+        if currentAreaA ~= currentAreaB then
+            return currentAreaA
+        end
+
+        local lowA = a.lowConfidence == true or a.unlikely == true
+        local lowB = b.lowConfidence == true or b.unlikely == true
+        if lowA ~= lowB then
+            return not lowA
+        end
         
         -- Same activity type, sort by index
-        return (a.index or 0) < (b.index or 0)
+        local indexA = a.sourceIndex or a.campaignIndex or a.index or a._sortOrdinal or 0
+        local indexB = b.sourceIndex or b.campaignIndex or b.index or b._sortOrdinal or 0
+        if indexA ~= indexB then
+            return indexA < indexB
+        end
+
+        return (a._sortOrdinal or 0) < (b._sortOrdinal or 0)
     end)
+
+    for _, target in ipairs(snd.targets.list) do
+        target._sortOrdinal = nil
+    end
+    snd.reindexTargetsAfterSort()
 end
 
 --- Clear the current target
@@ -1161,9 +1466,12 @@ function snd.onRoomChange()
     end
 
     -- Skip per-room GUI refresh while mid-route; the 2s periodic timer covers updates during travel.
-    -- Refresh on arrival (wasNavigating=true, now nil) or during manual movement.
+    -- Sort/refresh on arrival (wasNavigating=true, now nil) or during manual movement.
     local stillNavigating = (snd.nav.goingToRoom or snd.mapper.goingToRoom) ~= nil
     if not (wasNavigating and stillNavigating) then
+        if snd.targets and snd.targets.list then
+            snd.sortTargetsByPriority()
+        end
         if snd.gui and snd.gui.refresh then
             snd.gui.refresh()
         end
@@ -1212,22 +1520,12 @@ function snd.onDestinationArrived()
         end
     end
     
-    local action = snd.config.nxAction
+    local action = snd.normalizeNxAction(snd.config.nxAction)
+    snd.config.nxAction = action
     if snd.isCurrentRoomSafe() then
         snd.utils.debugNote("Skipping nxAction in safe room: " .. tostring(snd.room.current and snd.room.current.rmid))
     else
-        -- Execute next action based on config
-        if action == "smartscan" then
-            snd.scan.smartScan()
-        elseif action == "con" then
-            send("con", false)
-        elseif action == "scan" then
-            send("scan", false)
-        elseif action == "scanhere" then
-            send("scan here", false)
-        elseif action == "qs" then
-            snd.scan.quickScan()
-        end
+        snd.scan.handleArrivalNxAction(action)
     end
 
     local current = snd.targets and snd.targets.current
@@ -1282,6 +1580,10 @@ function snd.cleanup()
     snd.saveState()
     
     -- Kill any timers we created
+    if snd.quest and snd.quest.stopReadySoundReminder then
+        snd.quest.stopReadySoundReminder()
+    end
+
     -- Cleanup GUI
     if snd.gui and snd.gui.cleanup then
         snd.gui.cleanup()

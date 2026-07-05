@@ -555,6 +555,7 @@ function snd.triggers.questCooldownMinutes(matches)
     snd.quest.available = false
     snd.quest.target.status = "0"
     snd.quest.setCooldown(minutes, {lessThanMinute = false, text = ""})
+    snd.quest.stopReadySoundReminder()
     if snd.gui and snd.gui.refresh then
         snd.gui.refresh()
     end
@@ -570,6 +571,7 @@ function snd.triggers.questCooldownLessThanMinute()
     snd.quest.available = false
     snd.quest.target.status = "0"
     snd.quest.setCooldown(1, {lessThanMinute = true, text = "Less than a minute remaining"})
+    snd.quest.stopReadySoundReminder()
     if snd.gui and snd.gui.refresh then
         snd.gui.refresh()
     end
@@ -577,6 +579,50 @@ end
 
 local function playQuestReadyWarning()
     playConfiguredSound("SearchAndDestroy/quest_ready.wav", "sounds/quest_ready.wav")
+end
+
+function snd.quest.stopReadySoundReminder()
+    if snd.quest.readySoundTimerId then
+        killTimer(snd.quest.readySoundTimerId)
+        snd.quest.readySoundTimerId = nil
+    end
+end
+
+function snd.quest.playReadySoundReminder()
+    if not (snd.quest and snd.quest.available and not snd.quest.active) then
+        if snd.quest and snd.quest.stopReadySoundReminder then
+            snd.quest.stopReadySoundReminder()
+        end
+        return
+    end
+
+    playQuestReadyWarning()
+    snd.quest.readySoundLastPlayedAt = os.time()
+end
+
+function snd.quest.startReadySoundReminder(opts)
+    local options = opts or {}
+    if not (snd.quest and snd.quest.available and not snd.quest.active) then
+        return
+    end
+
+    if snd.quest.readySoundTimerId then
+        return
+    end
+
+    if options.playNow ~= false then
+        local now = os.time()
+        local lastPlayed = tonumber(snd.quest.readySoundLastPlayedAt) or 0
+        if now - lastPlayed >= 2 then
+            snd.quest.playReadySoundReminder()
+        end
+    end
+
+    snd.quest.readySoundTimerId = tempTimer(60, function()
+        if snd.quest and snd.quest.playReadySoundReminder then
+            snd.quest.playReadySoundReminder()
+        end
+    end, true)
 end
 
 function snd.triggers.gqAboutToStart(matches)
@@ -593,16 +639,14 @@ function snd.triggers.targetKilledSound()
 end
 
 function snd.triggers.questReady()
-    if snd.quest and snd.quest.consumeSilentCooldownRequest and snd.quest.consumeSilentCooldownRequest() then
-        if type(deleteLine) == "function" then
-            deleteLine()
-        end
+    if snd.quest and snd.quest.consumeSilentCooldownRequest then
+        snd.quest.consumeSilentCooldownRequest()
     end
     snd.quest.active = false
     snd.quest.available = true
     snd.quest.target.status = "0"
     snd.quest.setCooldown(0, {lessThanMinute = false, text = ""})
-    playQuestReadyWarning()
+    snd.quest.startReadySoundReminder()
     if snd.gui and snd.gui.refresh then
         snd.gui.refresh()
     end
@@ -986,7 +1030,7 @@ function snd.triggers.qwMatch(matches)
                 quickWhere.awaitingCommandEcho = true
                 if type(tempTimer) == "function" then
                     local activeQuickWhere = quickWhere
-                    tempTimer(0.05, function()
+                    tempTimer(0, function()
                         if snd.nav and snd.nav.quickWhere == activeQuickWhere
                             and activeQuickWhere.processed == false
                             and activeQuickWhere.probePending == true
@@ -1059,11 +1103,21 @@ function snd.triggers.qwNoMatch()
             killTimer(snd.nav.quickWhere.processTimer)
             snd.nav.quickWhere.processTimer = nil
         end
+        local handledByDb = false
+        if snd.commands and snd.commands.processQuickWhereNoMatch then
+            local ok, result = pcall(snd.commands.processQuickWhereNoMatch)
+            handledByDb = ok and result == true
+            if not ok then
+                snd.utils.errorNote("QW DEBUG: processing no-match fallback failed: " .. tostring(result))
+            end
+        end
         snd.nav.quickWhere.lastMatch = nil
-        snd.nav.quickWhere.processed = true
-        snd.nav.quickWhere.completed = true
-        snd.nav.quickWhere.awaitingCommandEcho = false
-        snd.nav.quickWhere.probePending = false
+        if not handledByDb then
+            snd.nav.quickWhere.processed = true
+            snd.nav.quickWhere.completed = true
+            snd.nav.quickWhere.awaitingCommandEcho = false
+            snd.nav.quickWhere.probePending = false
+        end
         snd.triggers.disableQuickWhereTriggers()
     end
 end

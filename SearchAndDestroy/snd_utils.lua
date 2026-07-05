@@ -638,6 +638,7 @@ function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
 
     if #words > 0 then
         if mode == "where" then
+            appendUnique(candidates, seen, guessedKeyword)
             appendUnique(candidates, seen, words[#words])
             for len = 2, #words do
                 local start = #words - len + 1

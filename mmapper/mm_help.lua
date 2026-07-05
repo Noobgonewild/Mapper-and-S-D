@@ -1,6 +1,6 @@
 mm = mm or {}
 
-mm.help_header = "                              (GMCP Mapper Help)"
+mm.help_header = "GMCP Mapper Help"
 
 mm.help_index_rows = {
   { cmd = "mapper help", desc = "Show this list" },
@@ -9,6 +9,7 @@ mm.help_index_rows = {
   { cmd = "mapper help exits", desc = "Commands for managing exits" },
   { cmd = "mapper help portals", desc = "Commands for managing portals" },
   { cmd = "mapper help boundaries", desc = "Commands for boundary discovery and manual redirects" },
+  { cmd = "mapper help bookmarks", desc = "Commands for saving useful rooms by area" },
   { cmd = "mapper help searching", desc = "Commands for finding rooms" },
   { cmd = "mapper help exploring", desc = "Commands to aid exploring" },
   { cmd = "mapper help moving", desc = "Commands for moving between rooms" },
@@ -112,6 +113,7 @@ mm.help_table = {
     rows = {
       { cmd = "mapper portals", desc = "List known hand-held portals" },
       { cmd = "mapper rebuildportals", desc = "Rebuild portal list from exits with commands starting 'dinv portal use <id>'" },
+      { cmd = "mapper portalguard [on|off]", desc = "Guard portal routes unless your level is within 30 of the portal level; xrtforce bypasses it" },
       { cmd = "mapper portals here/<area>", desc = "List known hand-held portals only to this or another area (by area keyword)." },
       { cmd = "mapper portal <command> level <number>", desc = "Link a handheld portal to the current room as a special exit from everwhere else. The level suffix is required (ex: 'mapper portal recall level 50'). To stack commands use ;; as separator (ex: 'mapper portal hold amulet;;enter level 50')." },
       { cmd = "mapper fullportal {<command>} {<room_id>} <level> (quiet)", desc = "Set all portal aspects in one command without being there." },
@@ -138,12 +140,30 @@ mm.help_table = {
       { cmd = "mapper boundaries here", desc = "Show reachable boundary rooms in the current area without moving" },
       { cmd = "mapper boundaries <area>", desc = "Show reachable boundary rooms in an area name or key" },
       { cmd = "mapper boundaries <room UID>", desc = "Use the room's area and show its reachable boundary rooms" },
-      { cmd = "xrtnear <room UID>", desc = "Run its stored redirect when present; otherwise show reachable boundary rooms in the target area" },
+      { cmd = "xrtnear <room UID>", desc = "Run its stored redirect when present; if the mapper has a route, show it; otherwise show reachable boundary rooms ranked by mapped walk distance when known" },
       { cmd = "mapper redirect add <target UID> <destination UID>", desc = "Set or replace the single xrtnear redirect after verifying the destination is currently reachable" },
       { cmd = "mapper redirects [target UID]", desc = "List saved suggestions with clickable destinations, optionally limited to one target" },
       { cmd = "mapper redirect delete <index>", desc = "Delete an entry by index from the last mapper redirects list" },
       { cmd = "mapper redirect deleted", desc = "List deleted redirects" },
       { cmd = "mapper redirect restore <index|last>", desc = "Restore an entry from the last deleted redirect list" },
+    }
+  },
+  ['bookmarks'] = {
+    header = "Bookmarks",
+    rows = {
+      { cmd = "mapper bookmarks", desc = "List bookmarks in your current area with clickable xrt links" },
+      { cmd = "mapper bookmarks here", desc = "List bookmarks in your current area" },
+      { cmd = "mapper bookmarks <area>", desc = "List bookmarks in one exact or uniquely matched area" },
+      { cmd = "mapper bookmarks add", desc = "Bookmark the current room using the room name as the label" },
+      { cmd = "mapper bookmarks add <label>", desc = "Bookmark the current room using a custom label" },
+      { cmd = "mapper bookmarks add <roomID>", desc = "Bookmark the given room using its room name as the label" },
+      { cmd = "mapper bookmarks add <roomID> as <label>", desc = "Bookmark the given room using a custom label" },
+      { cmd = "mapper bookmarks go #<index>", desc = "Run xrt to a bookmark from the last mapper bookmarks list" },
+      { cmd = "mapper bookmarks delete #<index>", desc = "Delete a bookmark from the last mapper bookmarks list" },
+      { cmd = "mapper bookmarks delete <roomID>", desc = "Delete the active bookmark for a specific room id" },
+      { cmd = "mapper bookmarks rename #<index> <label>", desc = "Rename a bookmark from the last mapper bookmarks list" },
+      { cmd = "mapper bookmarks listdeleted", desc = "List the last 20 deleted bookmarks" },
+      { cmd = "mapper bookmarks restore #<index>", desc = "Restore a bookmark from the last deleted bookmark list" },
     }
   },
   ['searching'] = {
@@ -182,7 +202,8 @@ mm.help_table = {
     rows = {
       { cmd = "mapper goto <room id>", desc = "Run to a room by its room number" },
       { cmd = "xset areaguard <on|off>", desc = "Persistently guard xrt routes from areas more than 30 levels above you; default off" },
-      { cmd = "xrtforce <area|room id>", desc = "Run like xrt but ignore area guard and exits.level checks (forced route)" },
+      { cmd = "mapper portalguard [on|off]", desc = "Guard portal routes unless your level is within 30 of the portal level; xrtforce bypasses it" },
+      { cmd = "xrtforce <area|room id>", desc = "Run like xrt but ignore area guard, portalguard, and exits.level checks (forced route)" },
       { cmd = "mapper walkto <room id>", desc = "Run to a room by its room number without using any mapper portals" },
       { cmd = "mapper resume", desc = "Initiate a new run to the previous target" },
     }
@@ -210,13 +231,13 @@ local function print_help_row(row, command_width, details_width)
     for i = 1, total do
       local cmd = cmd_lines[i] or ""
       local desc = desc_lines[i] or ""
-      cecho(string.format("<light_steel_blue>%-" .. command_width .. "s<reset>  <light_grey>%s<reset>\n", cmd, desc))
+      cecho(string.format("<cyan>%-" .. command_width .. "s<reset>  <light_grey>%s<reset>\n", cmd, desc))
     end
     return
   end
 
   if row.text then
-    cecho("<dark_sea_green>" .. row.text .. "<reset>\n")
+    cecho("<light_grey>" .. row.text .. "<reset>\n")
     return
   end
 
@@ -224,11 +245,11 @@ local function print_help_row(row, command_width, details_width)
 end
 
 function mm.show_help(topic)
-  local command_width = 42
-  local details_width = 78
+  local command_width = 34
+  local details_width = 76
 
   local function print_section(section)
-    cecho("\n<medium_purple>" .. section.header .. "<reset>\n\n")
+    cecho("\n<yellow>" .. section.header .. "<reset>\n\n")
     for _, row in ipairs(section.rows) do
       print_help_row(row, command_width, details_width)
     end
@@ -240,7 +261,7 @@ function mm.show_help(topic)
       or (row.text and row.text:lower():find(needle, 1, true))
   end
 
-  cecho("\n<deep_sky_blue>" .. mm.help_header .. "<reset>\n")
+  cecho("\n<white>" .. mm.help_header .. "<reset>\n\n")
   topic = (topic or ""):gsub("^%s+", ""):gsub("%s+$", "")
 
   if topic == "" then
@@ -248,7 +269,7 @@ function mm.show_help(topic)
       print_help_row(row, command_width, details_width)
     end
   elseif topic == "all" then
-    for _, key in ipairs({"config", "exits", "portals", "boundaries", "searching", "exploring", "moving", "utils"}) do
+    for _, key in ipairs({"config", "exits", "portals", "boundaries", "bookmarks", "searching", "exploring", "moving", "utils"}) do
       print_section(mm.help_table[key])
     end
   elseif mm.help_table[topic] then
@@ -260,13 +281,13 @@ function mm.show_help(topic)
         print_help_row(row, command_width, details_width)
       end
     else
-      cecho("<cornflower_blue>Searching help for: <tomato>" .. needle .. "<reset>\n")
+      cecho("<orange>[MAPPER]<reset> <cyan>Searching help for: <yellow>" .. needle .. "<reset>\n")
       for _, section in pairs(mm.help_table) do
         local shown = false
         for _, row in ipairs(section.rows) do
           if row_matches(row, needle) then
             if not shown then
-              cecho("\n<medium_purple>" .. section.header .. "<reset>\n\n")
+              cecho("\n<yellow>" .. section.header .. "<reset>\n\n")
               shown = true
             end
             print_help_row(row, command_width, details_width)

@@ -608,13 +608,28 @@ function snd.db.getMobLocations(mobName, zone, opts)
     opts = opts or {}
     local useLegacySql = opts.legacy == true
     local roomHint = snd.utils and snd.utils.trim and snd.utils.trim(opts.roomHint or "") or tostring(opts.roomHint or "")
+    if snd.db.ensureMobTagsTable then
+        snd.db.ensureMobTagsTable()
+    end
 
     local function fetchLocations(name)
         local sql
         if zone and zone ~= "" then
             if useLegacySql then
                 sql = string.format(
-                    "SELECT * FROM mobs WHERE lower(mob) = lower(%s) AND zone = %s ORDER BY seen_count DESC, kill_count DESC",
+                    [[
+                        SELECT m.*,
+                               mt.priority_room,
+                               mt.nowhere,
+                               mt.nohunt,
+                               CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match
+                        FROM mobs m
+                        LEFT JOIN mob_tags mt
+                          ON lower(mt.mob) = lower(m.mob)
+                         AND lower(mt.zone) = lower(m.zone)
+                        WHERE lower(m.mob) = lower(%s) AND lower(m.zone) = lower(%s)
+                        ORDER BY priority_match DESC, m.seen_count DESC, m.kill_count DESC, m.roomid ASC
+                    ]],
                     snd.db.escape(name),
                     snd.db.escape(zone)
                 )
@@ -623,19 +638,28 @@ function snd.db.getMobLocations(mobName, zone, opts)
                     sql = string.format([[
                         SELECT * FROM (
                             SELECT m.*,
+                                   mt.priority_room,
+                                   mt.nowhere,
+                                   mt.nohunt,
+                                   CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match,
                                    ROW_NUMBER() OVER (
-                                       PARTITION BY lower(m.mob), lower(m.zone)
-                                       ORDER BY m.seen_count DESC, m.kill_count DESC, m.roomid ASC
-                                   ) AS rn
-                            FROM (
-                                SELECT * FROM mobs
-                                WHERE lower(mob) = lower(%s)
-                                  AND lower(zone) = lower(%s)
-                                  AND lower(room) = lower(%s)
-                            ) m
+                                        PARTITION BY lower(m.mob), lower(m.zone)
+                                        ORDER BY
+                                            CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END DESC,
+                                            m.seen_count DESC,
+                                            m.kill_count DESC,
+                                            m.roomid ASC
+                                    ) AS rn
+                            FROM mobs m
+                            LEFT JOIN mob_tags mt
+                              ON lower(mt.mob) = lower(m.mob)
+                             AND lower(mt.zone) = lower(m.zone)
+                            WHERE lower(m.mob) = lower(%s)
+                              AND lower(m.zone) = lower(%s)
+                              AND lower(m.room) = lower(%s)
                         ) ranked
                         WHERE rn = 1
-                        ORDER BY seen_count DESC, kill_count DESC, roomid ASC
+                        ORDER BY priority_match DESC, seen_count DESC, kill_count DESC, roomid ASC
                     ]],
                         snd.db.escape(name),
                         snd.db.escape(zone),
@@ -652,15 +676,26 @@ function snd.db.getMobLocations(mobName, zone, opts)
                     sql = string.format([[
                         SELECT * FROM (
                             SELECT m.*,
+                                   mt.priority_room,
+                                   mt.nowhere,
+                                   mt.nohunt,
+                                   CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match,
                                    ROW_NUMBER() OVER (
-                                       PARTITION BY lower(m.mob), lower(m.zone)
-                                       ORDER BY m.seen_count DESC, m.kill_count DESC, m.roomid ASC
-                                   ) AS rn
+                                        PARTITION BY lower(m.mob), lower(m.zone)
+                                        ORDER BY
+                                            CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END DESC,
+                                            m.seen_count DESC,
+                                            m.kill_count DESC,
+                                            m.roomid ASC
+                                    ) AS rn
                             FROM mobs m
+                            LEFT JOIN mob_tags mt
+                              ON lower(mt.mob) = lower(m.mob)
+                             AND lower(mt.zone) = lower(m.zone)
                             WHERE lower(m.mob) = lower(%s) AND lower(m.zone) = lower(%s)
                         ) ranked
                         WHERE rn = 1
-                        ORDER BY seen_count DESC, kill_count DESC, roomid ASC
+                        ORDER BY priority_match DESC, seen_count DESC, kill_count DESC, roomid ASC
                     ]],
                         snd.db.escape(name),
                         snd.db.escape(zone)
@@ -670,7 +705,19 @@ function snd.db.getMobLocations(mobName, zone, opts)
         else
             if useLegacySql then
                 sql = string.format(
-                    "SELECT * FROM mobs WHERE lower(mob) = lower(%s) ORDER BY seen_count DESC, kill_count DESC",
+                    [[
+                        SELECT m.*,
+                               mt.priority_room,
+                               mt.nowhere,
+                               mt.nohunt,
+                               CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match
+                        FROM mobs m
+                        LEFT JOIN mob_tags mt
+                          ON lower(mt.mob) = lower(m.mob)
+                         AND lower(mt.zone) = lower(m.zone)
+                        WHERE lower(m.mob) = lower(%s)
+                        ORDER BY priority_match DESC, m.seen_count DESC, m.kill_count DESC, m.roomid ASC
+                    ]],
                     snd.db.escape(name)
                 )
             else
@@ -678,18 +725,27 @@ function snd.db.getMobLocations(mobName, zone, opts)
                     sql = string.format([[
                         SELECT * FROM (
                             SELECT m.*,
+                                   mt.priority_room,
+                                   mt.nowhere,
+                                   mt.nohunt,
+                                   CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match,
                                    ROW_NUMBER() OVER (
-                                       PARTITION BY lower(m.mob), lower(m.zone)
-                                       ORDER BY m.seen_count DESC, m.kill_count DESC, m.roomid ASC
-                                   ) AS rn
-                            FROM (
-                                SELECT * FROM mobs
-                                WHERE lower(mob) = lower(%s)
-                                  AND lower(room) = lower(%s)
-                            ) m
+                                        PARTITION BY lower(m.mob), lower(m.zone)
+                                        ORDER BY
+                                            CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END DESC,
+                                            m.seen_count DESC,
+                                            m.kill_count DESC,
+                                            m.roomid ASC
+                                    ) AS rn
+                            FROM mobs m
+                            LEFT JOIN mob_tags mt
+                              ON lower(mt.mob) = lower(m.mob)
+                             AND lower(mt.zone) = lower(m.zone)
+                            WHERE lower(m.mob) = lower(%s)
+                              AND lower(m.room) = lower(%s)
                         ) ranked
                         WHERE rn = 1
-                        ORDER BY seen_count DESC, kill_count DESC, roomid ASC
+                        ORDER BY priority_match DESC, seen_count DESC, kill_count DESC, roomid ASC
                     ]],
                         snd.db.escape(name),
                         snd.db.escape(roomHint)
@@ -704,15 +760,26 @@ function snd.db.getMobLocations(mobName, zone, opts)
                     sql = string.format([[
                         SELECT * FROM (
                             SELECT m.*,
+                                   mt.priority_room,
+                                   mt.nowhere,
+                                   mt.nohunt,
+                                   CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match,
                                    ROW_NUMBER() OVER (
-                                       PARTITION BY lower(m.mob), lower(m.zone)
-                                       ORDER BY m.seen_count DESC, m.kill_count DESC, m.roomid ASC
-                                   ) AS rn
+                                        PARTITION BY lower(m.mob), lower(m.zone)
+                                        ORDER BY
+                                            CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END DESC,
+                                            m.seen_count DESC,
+                                            m.kill_count DESC,
+                                            m.roomid ASC
+                                    ) AS rn
                             FROM mobs m
+                            LEFT JOIN mob_tags mt
+                              ON lower(mt.mob) = lower(m.mob)
+                             AND lower(mt.zone) = lower(m.zone)
                             WHERE lower(m.mob) = lower(%s)
                         ) ranked
                         WHERE rn = 1
-                        ORDER BY seen_count DESC, kill_count DESC, roomid ASC
+                        ORDER BY priority_match DESC, seen_count DESC, kill_count DESC, roomid ASC
                     ]],
                         snd.db.escape(name)
                     )
@@ -730,6 +797,38 @@ function snd.db.getMobLocations(mobName, zone, opts)
         results = fetchLocations(matchedName)
     end
 
+    if snd.debug and snd.debug.mobTag then
+        local parts = {}
+        for i, row in ipairs(results or {}) do
+            if i > 8 then
+                table.insert(parts, "...")
+                break
+            end
+            table.insert(parts, string.format(
+                "#%d zone=%s roomid=%s seen=%s kills=%s priority_room=%s priority_match=%s nowhere=%s nohunt=%s",
+                i,
+                tostring(row.zone or ""),
+                tostring(row.roomid or ""),
+                tostring(row.seen_count or ""),
+                tostring(row.kill_count or ""),
+                tostring(row.priority_room or ""),
+                tostring(row.priority_match or ""),
+                tostring(row.nowhere or ""),
+                tostring(row.nohunt or "")
+            ))
+        end
+        snd.debug.mobTag(string.format(
+            "getMobLocations mob='%s' matched='%s' zone='%s' legacy=%s roomHint='%s' rows=%d %s",
+            tostring(mobName or ""),
+            tostring(matchedName or ""),
+            tostring(zone or ""),
+            tostring(useLegacySql),
+            tostring(roomHint or ""),
+            #(results or {}),
+            table.concat(parts, " | ")
+        ))
+    end
+
     return results, matchedName
 end
 
@@ -740,7 +839,7 @@ end
 function snd.db.getBestMobLocation(mobName, zone)
     local locations = snd.db.getMobLocations(mobName, zone)
     if #locations > 0 then
-        return locations[1]  -- Sorted by seen_count DESC, kill_count DESC
+        return locations[1]  -- Sorted by priority match, then seen/kill counts.
     end
     return nil
 end

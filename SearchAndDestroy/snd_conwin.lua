@@ -18,7 +18,6 @@ CW.mobs = CW.mobs or {}
 CW.awaiting = CW.awaiting or false
 CW.doneTimer = CW.doneTimer or nil
 CW.lastRoomId = CW.lastRoomId or nil
-CW.mobDetectDispatched = CW.mobDetectDispatched or false
 CW.lastAutoRoomId = CW.lastAutoRoomId or nil
 CW.lastAutoConsiderAt = CW.lastAutoConsiderAt or 0
 CW.lastEnemy = CW.lastEnemy or ""
@@ -52,7 +51,7 @@ local function cfg()
         enabled = true,
         fontSize = 9,
         x = "70%", y = "52%", width = "28%", height = "43%",
-        mode = "consider", -- consider | scan | off
+        mode = "consider", -- consider | off
         strictFocusIdOnly = false, -- When true, ambiguous duplicate targets require currentEnemyMobId for HP overlay/death mark.
         killCommand = "kill",
         repopulate = 3, -- Refresh window after N confirmed kills (0 = disabled)
@@ -60,6 +59,13 @@ local function cfg()
         clearOnEmptyRoomchars = true,
         alignTags = true,
     }
+    local mode = tostring(snd.config.conwin.mode or "consider"):lower()
+    if mode == "scan" then
+        mode = "off"
+    elseif mode ~= "consider" and mode ~= "off" then
+        mode = "consider"
+    end
+    snd.config.conwin.mode = mode
     return snd.config.conwin
 end
 
@@ -70,6 +76,14 @@ local function gmcp_get(path)
         node = node[key]
     end
     return node
+end
+
+local function currentRoomId()
+    local roomId = snd and snd.room and snd.room.current and snd.room.current.rmid or nil
+    if roomId ~= nil and tostring(roomId) ~= "" then
+        return tostring(roomId)
+    end
+    return tostring(gmcp_get("room.info.num") or "")
 end
 
 local function trim(s) return (tostring(s or ""):gsub("^%s+",""):gsub("%s+$","")) end
@@ -140,7 +154,7 @@ end
 function CW.isCurrentRoomPk()
     local details = gmcp_get("room.info.details")
     if details ~= nil and tokenizedContainsPk(details) then return true end
-    local roomId = tostring(gmcp_get("room.info.num") or "")
+    local roomId = currentRoomId()
     if roomId ~= "" and snd.mapper and type(snd.mapper.getRoomInfo) == "function" then
         local room = snd.mapper.getRoomInfo(roomId)
         if room and room.info then
@@ -169,21 +183,26 @@ local function activeActivityLabel(target)
     return nil
 end
 
-function CW.tryMobDetectConfirmedTarget()
-    if CW.mobDetectDispatched then return false end
-    local mode = tostring(snd and snd.config and snd.config.mobdetect or "off"):lower()
-    if mode == "off" then return false end
-
-    local roomId = tostring(gmcp_get("room.info.num") or "")
+function CW.detectActiveTargetInRoom()
+    local roomId = currentRoomId()
     if roomId == "" or roomId ~= tostring(CW.lastRoomId or "") then return false end
 
     local current = snd and snd.targets and snd.targets.current or nil
+    local pendingAction = snd and snd.scan and snd.scan.pendingNxAction and snd.scan.pendingNxAction.action or nil
+    if pendingAction == "smartscan" and snd.scan and snd.scan.resolveSmartScanTarget then
+        current = snd.scan.resolveSmartScanTarget({select = true})
+    end
     if not current then return false end
-    if current.dead or tostring(current.status or ""):lower() == "dead" then return false end
+    if snd and snd.scan and snd.scan.targetIsAlive then
+        if not snd.scan.targetIsAlive(current) then return false end
+    elseif current.dead or tostring(current.status or ""):lower() == "dead" then
+        return false
+    end
     local activityLabel = activeActivityLabel(current)
     if not activityLabel then return false end
 
-    local targetName = normalizeMobName(current.name or "")
+    local targetName = normalizeMobName(current.name or current.mob or current.matchedMobName or "")
+    if targetName == "" then return false end
     local present = false
     for _, m in ipairs(CW.mobs or {}) do
         if not m.dead and normalizeMobName(m.name) == targetName then
@@ -192,20 +211,31 @@ function CW.tryMobDetectConfirmedTarget()
         end
     end
     if not present then return false end
-    
-    if snd and snd.mapper and type(snd.mapper.isInCombat) == "function" and snd.mapper.isInCombat() then
-        return false
-    end
-    
-    if mode ~= "always" then
-        if snd and snd.room and snd.room.current and snd.room.current.maze and snd.room.current.maze ~= 0 then return false end
-        if CW.isCurrentRoomPk() then return false end
-        if CW.roomHasPlayers() then return false end
-    end
 
-    
-    return true
+    return {
+        roomId = roomId,
+        activityLabel = activityLabel,
+        target = current,
+    }
 end
+
+function CW.resolveCurrentRoomTargetForNxAction()
+    local targetHere = CW.detectActiveTargetInRoom()
+
+    if not targetHere then
+        if snd and snd.scan and snd.scan.runPendingNxAction then
+            snd.scan.runPendingNxAction(CW.lastRoomId, "target-not-found")
+        end
+        return false
+    else
+        if snd and snd.scan and snd.scan.cancelPendingNxAction then
+            snd.scan.cancelPendingNxAction(targetHere.roomId, "target-found")
+        end
+
+        return true
+    end
+end
+
 function CW.clear(_reason)
     CW.mobs = {}
     CW.killsSinceRefresh = 0
@@ -218,7 +248,7 @@ end
 function CW.isCurrentRoomSafe()
     local details = gmcp_get("room.info.details")
     if details ~= nil and tokenizedContainsSafe(details) then return true end
-    local roomId = tostring(gmcp_get("room.info.num") or "")
+    local roomId = currentRoomId()
     if roomId ~= "" and snd.mapper and type(snd.mapper.isSafeRoom) == "function" then
         if snd.mapper.isSafeRoom(roomId) then return true end
     end
@@ -604,7 +634,6 @@ end
 
 function CW.startCapture()
     CW.awaiting = true
-    CW.mobDetectDispatched = false
     CW.clear("start")
 end
 
@@ -612,7 +641,7 @@ function CW.finishCapture()
     CW.awaiting = false
     if CW.doneTimer then killTimer(CW.doneTimer) CW.doneTimer = nil end
     CW.render()
-    CW.tryMobDetectConfirmedTarget()
+    CW.resolveCurrentRoomTargetForNxAction()
 end
 
 function CW.deferFinish()
@@ -675,7 +704,7 @@ function CW.refresh(source)
     end
     source = tostring(source or "manual")
     if source == "auto" then
-        local roomId = tostring(gmcp_get("room.info.num") or "")
+        local roomId = currentRoomId()
         local now = os.time()
         if roomId ~= "" and CW.lastAutoRoomId == roomId and (now - (CW.lastAutoConsiderAt or 0)) < 15 then
             return
@@ -689,7 +718,7 @@ function CW.refresh(source)
 end
 
 function CW.onRoomInfo()
-    local roomId = tostring(gmcp_get("room.info.num") or "")
+    local roomId = currentRoomId()
     local moved = false
     if roomId ~= "" and CW.lastRoomId and roomId ~= CW.lastRoomId then
         moved = true
@@ -702,18 +731,14 @@ function CW.onRoomInfo()
 
     if not moved or not cfg().enabled then return end
     local mode = tostring(cfg().mode or "consider"):lower()
-    if mode ~= "consider" and mode ~= "scan" then return end
+    if mode ~= "consider" then return end
 
     if CW.isCurrentRoomSafe() then
         CW.clear("safe-room")
         return
     end
 
-    if mode == "consider" then
-        CW.refresh("auto")
-    elseif mode == "scan" then
-        send("scan", false)
-    end
+    CW.refresh("auto")
 end
 
 function CW.onRoomcharsEnd()
@@ -988,7 +1013,7 @@ end
 
 function CW.setMode(mode)
     mode = tostring(mode or ""):lower()
-    if mode ~= "consider" and mode ~= "scan" and mode ~= "off" then
+    if mode ~= "consider" and mode ~= "off" then
         return false
     end
     cfg().mode = mode

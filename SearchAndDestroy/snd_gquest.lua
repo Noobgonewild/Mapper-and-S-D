@@ -29,6 +29,11 @@ snd.gq.parsing = {
     infoEndTimer = nil,
 }
 
+local function entryHasMobPriority(entry)
+    local priorityRoom = tonumber(entry and entry.priority_room)
+    return priorityRoom ~= nil and priorityRoom > 0
+end
+
 -------------------------------------------------------------------------------
 -- GQuest Info Processing
 -------------------------------------------------------------------------------
@@ -323,15 +328,25 @@ function snd.gq.buildMainTargetList()
             entry.nohunt = tags.nohunt
             entry.priority_room = tags.priority_room
         end
-        if not entry.nowhere then
-            local dk = string.format("%s|%s|%s", tostring(target.mob or ""):lower(), tostring(target.arid or ""):lower(), tostring(target.loc or ""):lower())
-            entry._dupkey = dk
-            entry.duplicates = duplicateCounts[dk] or 1
-            if entry.priority_room and tonumber(entry.priority_room) and tonumber(entry.priority_room) > 0 then
-                entry.rmid = tonumber(entry.priority_room)
-            end
-            table.insert(gqEntries, entry)
+        local dk = string.format("%s|%s|%s", tostring(target.mob or ""):lower(), tostring(target.arid or ""):lower(), tostring(target.loc or ""):lower())
+        entry._dupkey = dk
+        entry.duplicates = duplicateCounts[dk] or 1
+        if entry.priority_room and tonumber(entry.priority_room) and tonumber(entry.priority_room) > 0 then
+            entry.rmid = tonumber(entry.priority_room)
         end
+        if snd.debug and snd.debug.mobTag and (entry.priority_room or entry.nowhere or entry.nohunt) then
+            snd.debug.mobTag(string.format(
+                "GQ build mob='%s' area=%s loc='%s' rmid=%s nowhere=%s nohunt=%s priority_room=%s",
+                tostring(entry.mob or ""),
+                tostring(entry.arid or ""),
+                tostring(entry.loc or ""),
+                tostring(entry.rmid or ""),
+                tostring(entry.nowhere == true),
+                tostring(entry.nohunt == true),
+                tostring(entry.priority_room or "")
+            ))
+        end
+        table.insert(gqEntries, entry)
     end
 
     local duplicateIndexSeen = {}
@@ -370,6 +385,11 @@ function snd.gq.buildMainTargetList()
     table.sort(gqEntries, function(a, b)
         if a.dead ~= b.dead then
             return not a.dead
+        end
+        local aPriority = entryHasMobPriority(a)
+        local bPriority = entryHasMobPriority(b)
+        if aPriority ~= bPriority then
+            return aPriority
         end
         if (a._areaGroup or 0) ~= (b._areaGroup or 0) then
             return (a._areaGroup or 0) < (b._areaGroup or 0)
@@ -722,6 +742,21 @@ function snd.gq.selectTarget(index)
     if not target then
         snd.utils.infoNote("Invalid target index: " .. index)
         return false
+    end
+
+    if snd.debug and snd.debug.mobTag then
+        snd.debug.mobTag(string.format(
+            "GQ select index=%s mob='%s' area=%s loc='%s' roomName='%s' rmid=%s priority_room=%s nowhere=%s nohunt=%s",
+            tostring(index),
+            tostring(target.mob or ""),
+            tostring(target.arid or ""),
+            tostring(target.loc or ""),
+            tostring(target.roomName or ""),
+            tostring(target.rmid or ""),
+            tostring(target.priority_room or ""),
+            tostring(target.nowhere == true),
+            tostring(target.nohunt == true)
+        ))
     end
     
     snd.setTarget({
