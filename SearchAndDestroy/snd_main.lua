@@ -274,6 +274,7 @@ snd.campaign = snd.campaign or {
     levelTaken = 0,
     historyId = 0,
     completeBy = "",
+    acceptedAt = 0,
     completedToday = 0,
     completedTodayDate = "",
     targets = {},      -- Full target list from cp info
@@ -286,6 +287,7 @@ snd.campaign = snd.campaign or {
     tpReward = 0,
     trainReward = 0,
     pracReward = 0,
+    dailyQpBonus = 0,
     persistedCompleteBy = "",
     persistedQpReward = 0,
     persistedGoldReward = 0,
@@ -1463,6 +1465,9 @@ function snd.onRoomChange()
         snd.onDestinationArrived()
         snd.nav.goingToRoom = nil
         snd.mapper.goingToRoom = nil
+        if snd.mapper and snd.mapper.notifyBigmapNavigationState then
+            snd.mapper.notifyBigmapNavigationState("destination_arrived")
+        end
     end
 
     -- Skip per-room GUI refresh while mid-route; the 2s periodic timer covers updates during travel.

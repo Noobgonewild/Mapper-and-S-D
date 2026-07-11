@@ -142,35 +142,6 @@ local function tokenizedContainsSafe(info)
 end
 
 
-local function tokenizedContainsPk(info)
-    local v = tostring(info or ""):lower()
-    if v == "" then return false end
-    for token in v:gmatch("[^,%s]+") do
-        if token == "pk" then return true end
-    end
-    return false
-end
-
-function CW.isCurrentRoomPk()
-    local details = gmcp_get("room.info.details")
-    if details ~= nil and tokenizedContainsPk(details) then return true end
-    local roomId = currentRoomId()
-    if roomId ~= "" and snd.mapper and type(snd.mapper.getRoomInfo) == "function" then
-        local room = snd.mapper.getRoomInfo(roomId)
-        if room and room.info then
-            return tokenizedContainsPk(room.info)
-        end
-    end
-    return false
-end
-
-function CW.roomHasPlayers()
-    -- TODO: Aardwolf GMCP does not currently provide a documented room-players list.
-    -- If a reliable source becomes available (GMCP payload or deterministic tagged output),
-    -- implement player-presence detection here and re-enable this safety guard.
-    return false
-end
-
 local function activeActivityLabel(target)
     local activity = tostring(target and target.activity or ""):lower()
     if activity == "cp" and snd and snd.campaign and snd.campaign.active then

@@ -57,6 +57,34 @@ function mm.get_room_exits()
   return nil
 end
 
+function mm.get_room_area_info()
+  local packet = mm.get_room_packet()
+  if packet and type(packet.area) == "table" then
+    return packet.area
+  end
+  if gmcp and gmcp.room and type(gmcp.room.area) == "table" then
+    return gmcp.room.area
+  end
+  if gmcp and gmcp.Room and type(gmcp.Room.Area) == "table" then
+    return gmcp.Room.Area
+  end
+  return nil
+end
+
+function mm.get_room_sectors_packet()
+  local packet = mm.get_room_packet()
+  if packet and type(packet.sectors) == "table" then
+    return packet.sectors
+  end
+  if gmcp and gmcp.room and type(gmcp.room.sectors) == "table" then
+    return gmcp.room.sectors
+  end
+  if gmcp and gmcp.Room and type(gmcp.Room.Sectors) == "table" then
+    return gmcp.Room.Sectors
+  end
+  return nil
+end
+
 
 local function style_triplet(seg)
   if type(seg) ~= "table" then return nil end
@@ -111,10 +139,8 @@ end
 
 function mm.refresh_terrain_ids()
   mm.terrain_ids = mm.terrain_ids or {}
-  local sectors = gmcp and gmcp.room and gmcp.room.sectors and gmcp.room.sectors.sectors
-  if not sectors then
-    sectors = gmcp and gmcp.Room and gmcp.Room.Sectors and gmcp.Room.Sectors.sectors
-  end
+  local packet = mm.get_room_sectors_packet()
+  local sectors = packet and packet.sectors
   if type(sectors) ~= "table" then return false end
 
   local count = 0
@@ -158,6 +184,9 @@ function mm.apply_terrain_colors()
     return false, "no terrain env ids available yet (wait for gmcp room.sectors)"
   end
 
+  if mm and mm.bump_stats then
+    mm.bump_stats("env_colors_set", applied)
+  end
   mm.note("Applied mapper terrain colors to " .. tostring(applied) .. " sector environments.")
   return true, applied
 end
@@ -168,7 +197,14 @@ function mm.apply_room_terrain(room_id, terrain_name)
   mm.refresh_terrain_ids()
   local env = mm.terrain_ids and mm.terrain_ids[tostring(terrain_name)]
   if not env then return end
-  pcall(setRoomEnv, tonumber(room_id), env)
+  local ok, result = pcall(setRoomEnv, tonumber(room_id), env)
+  if mm and mm.bump_stats then
+    if ok and result ~= false then
+      mm.bump_stats("room_colors_set")
+    else
+      mm.bump_stats("failed")
+    end
+  end
 end
 
 local function room_exists(room_id)
@@ -254,43 +290,55 @@ local function find_room_by_user_data(vnum)
   return nil
 end
 
+local function native_bigmap_active()
+  if mm.minimap and mm.minimap.is_native_mode then
+    return mm.minimap.is_native_mode()
+  end
+  return mm.state and mm.state.minimap and mm.state.minimap.bigmap_mode == "native"
+end
+
+local function local_bigmap_active()
+  return not native_bigmap_active()
+end
+
 
 local function sync_to_room_id(room_id, reason)
   room_id = tonumber(room_id)
   if not room_id then return false end
-  if type(setPlayerRoom) ~= "function" then
+  if type(centerview) ~= "function" then
     mm.runtime = mm.runtime or {}
-    if not mm.runtime.missing_set_player_room_warned then
-      mm.runtime.missing_set_player_room_warned = true
+    if not mm.runtime.missing_centerview_warned then
+      mm.runtime.missing_centerview_warned = true
+      mm.warn("Mudlet centerview() is unavailable; native bigmap tracking is disabled.")
     else
-      mm.debug("setPlayerRoom() missing; skipping bigmap sync for room " .. tostring(room_id) .. " (" .. tostring(reason or "direct") .. ")")
+      mm.debug("centerview() missing; skipping bigmap sync for room " .. tostring(room_id) .. " (" .. tostring(reason or "direct") .. ")")
     end
-
-    if mm.state and mm.state.rebuild_layout_on_sync_error then
-      mm.debug("Bigmap sync unavailable; auto layout rebuild now occurs on area entry.")
-    end
-
     return false
   end
 
-  local ok, err = pcall(setPlayerRoom, room_id)
-  if not ok then
-    mm.warn("Failed to set bigmap location to room " .. tostring(room_id) .. " (" .. tostring(reason or "direct") .. "): " .. tostring(err))
-    mm.debug("setPlayerRoom failed (" .. tostring(reason or "direct") .. "): " .. tostring(err))
+  -- Mudlet uses centerview() to set both the mapper's player room and view.
+  -- There is no separate setPlayerRoom() mapper API.
+  local ok, result = pcall(centerview, room_id)
+  if not ok or result == false then
+    local detail = ok and "centerview() returned false" or tostring(result)
+    mm.warn("Failed to center native bigmap on room " .. tostring(room_id) .. " (" .. tostring(reason or "direct") .. "): " .. detail)
+    mm.debug("centerview failed (" .. tostring(reason or "direct") .. "): " .. detail)
     return false
+  end
+
+  if type(getPlayerRoom) == "function" then
+    local got_room, player_room = pcall(getPlayerRoom)
+    if got_room and tonumber(player_room) and tonumber(player_room) ~= room_id then
+      mm.debug(string.format(
+        "centerview verification failed (%s): requested=%s actual=%s",
+        tostring(reason or "direct"), tostring(room_id), tostring(player_room)))
+      return false
+    end
   end
 
   mm.runtime = mm.runtime or {}
   mm.runtime.last_player_room = room_id
-
-  if type(centerview) == "function" then
-    local okc, errc = pcall(centerview, room_id)
-    if not okc then
-      mm.debug("centerview failed for room " .. tostring(room_id) .. " (" .. tostring(reason or "direct") .. "): " .. tostring(errc))
-    end
-  end
-
-  mm.debug("setPlayerRoom -> " .. tostring(room_id) .. " (" .. tostring(reason or "direct") .. ")")
+  mm.debug("centerview -> " .. tostring(room_id) .. " (" .. tostring(reason or "direct") .. ")")
   return true
 end
 
@@ -318,8 +366,8 @@ local function sync_from_runtime_coords(reason)
   return sync_to_room_id(rid, reason or "runtime_coords")
 end
 
-local function sync_current_room(info)
-  if type(setPlayerRoom) ~= "function" then return end
+local function sync_current_room(info, reason)
+  if type(centerview) ~= "function" then return false end
 
   local gmcp_uid = tonumber(info and info.num)
   local coord = (info and info.coord) or {}
@@ -334,13 +382,13 @@ local function sync_current_room(info)
   if gmcp_uid then
     local exists = room_exists(gmcp_uid)
     mm.debug("gmcp room id exists in map DB=" .. tostring(exists))
-    if exists and sync_to_room_id(gmcp_uid, "gmcp_room_direct") then
+    if exists and sync_to_room_id(gmcp_uid, reason or "gmcp_room_direct") then
       mm.runtime = mm.runtime or {}
       if not mm.runtime.located_once then
         mm.runtime.located_once = true
         mm.note("Mapper synchronized to room " .. tostring(gmcp_uid) .. ".")
       end
-      return
+      return true
     end
     if not exists then
       mm.debug("gmcp room id " .. tostring(gmcp_uid) .. " missing in loaded map; trying coordinate/userdata fallback")
@@ -349,15 +397,23 @@ local function sync_current_room(info)
 
   local target_uid = locate_room_by_coords(info)
   if target_uid then
-    if sync_to_room_id(target_uid, "gmcp_coords_fallback") then return end
+    if sync_to_room_id(target_uid, reason or "gmcp_coords_fallback") then return true end
   end
 
   target_uid = find_room_by_user_data(info and info.num)
   if target_uid then
-    if sync_to_room_id(target_uid, "gmcp_userdata_fallback") then return end
+    if sync_to_room_id(target_uid, reason or "gmcp_userdata_fallback") then return true end
   end
 
   mm.warn("Bigmap location unresolved. GMCP room=" .. tostring(info and info.num) .. " coords=" .. tostring(gx) .. "," .. tostring(gy) .. "," .. tostring(gz))
+  return false
+end
+
+function mm.sync_native_bigmap_to_current_room(reason)
+  if not native_bigmap_active() then return false end
+  local info = mm.get_room_info and mm.get_room_info() or nil
+  if not info then return false end
+  return sync_current_room(info, reason)
 end
 
 function mm.on_room_info()
@@ -374,25 +430,29 @@ function mm.on_room_info()
   mm.runtime.last_coords_z = tonumber(coord.z or info.z) or mm.runtime.last_coords_z
   mm.runtime.last_zone = tostring(info.zone or info.area or mm.runtime.last_zone or "")
 
-  sync_current_room(info)
+  if mm.minimap and mm.minimap.on_navigation_state_changed then
+    mm.minimap.on_navigation_state_changed("room_update")
+  end
 
-  -- Keep the big map centered after every movement update.
-  -- Prefer the last successfully mapped room; fall back to GMCP room id.
-  local center_room = tonumber(mm.runtime and mm.runtime.last_player_room) or tonumber(info.num)
-  if center_room and type(centerview) == "function" then
-    local okc, errc = pcall(centerview, center_room)
-    if not okc then
-      mm.debug("centerview failed in on_room_info for room " .. tostring(center_room) .. ": " .. tostring(errc))
-    end
+  local native_mode = native_bigmap_active()
+  if native_mode and (not mm.state or mm.state.auto_locate ~= false) then
+    sync_current_room(info)
   end
 
   local room_id = tonumber(info.num) or info.num
+  local center_room = native_mode and
+    (tonumber(mm.runtime and mm.runtime.last_player_room) or tonumber(info.num)) or room_id
   local room_name = tostring(info.name or "")
   local area_name = tostring(info.zone or info.area or "")
   if mm.minimap and mm.minimap.set_room_title then
     mm.minimap.set_room_title(room_name, room_id, area_name)
   end
-  mm.apply_room_terrain(room_id, info.terrain)
+  if not native_mode and mm.minimap and mm.minimap.update_local_map then
+    mm.minimap.update_local_map(center_room or room_id)
+  end
+  if native_mode then
+    mm.apply_room_terrain(room_id, info.terrain)
+  end
 
   mm.runtime = mm.runtime or {}
   if tostring(mm.runtime.last_reported_room_num or "") ~= tostring(room_id or "") then
@@ -538,6 +598,9 @@ function mm.on_map_end()
     if mm.minimap and mm.minimap.set_room_title then
       mm.minimap.set_room_title(room_name, info.num, info.zone or info.area)
     end
+    if local_bigmap_active() and mm.minimap and mm.minimap.update_local_map then
+      mm.minimap.update_local_map(info.num)
+    end
   end
 end
 
@@ -549,19 +612,22 @@ function mm.on_room_vnum_line()
   local rname = tostring(matches[3] or "")
   if not vnum then return end
 
-  if room_exists(vnum) and sync_to_room_id(vnum, "vnum_line") then
-    if mm.minimap and mm.minimap.set_room_title and rname ~= "" then
-      mm.minimap.set_room_title(rname, vnum, mm.runtime and mm.runtime.last_zone)
+  if mm.minimap and mm.minimap.set_room_title and rname ~= "" then
+    mm.minimap.set_room_title(rname, vnum, mm.runtime and mm.runtime.last_zone)
+  end
+
+  if local_bigmap_active() then
+    if mm.minimap and mm.minimap.update_local_map then
+      mm.minimap.update_local_map(vnum)
     end
     return
   end
 
+  if room_exists(vnum) and sync_to_room_id(vnum, "vnum_line") then return end
+
   local mapped = find_room_by_user_data(vnum)
   if mapped then
     sync_to_room_id(mapped, "vnum_userdata")
-    if mm.minimap and mm.minimap.set_room_title and rname ~= "" then
-      mm.minimap.set_room_title(rname, vnum, mm.runtime and mm.runtime.last_zone)
-    end
   end
 end
 
@@ -577,12 +643,60 @@ function mm.on_room_packet()
   -- Keep for debug compatibility only. Specific room handlers process updates.
 end
 
+local continent_area_keys = {
+  mesolar = true,
+  ["the continent of mesolar"] = true,
+  southern = true,
+  ["southern ocean"] = true,
+  gelidus = true,
+  abend = true,
+  ["the dark continent, abend"] = true,
+  alagh = true,
+  uncharted = true,
+  ["uncharted oceans"] = true,
+  vidblain = true,
+  ["vidblain, the ever dark"] = true,
+}
+
+local function room_area_key(info)
+  local area = tostring(info and (info.zone or info.area) or ""):lower()
+    :gsub("^%s+", ""):gsub("%s+$", "")
+  if area ~= "" then return area end
+
+  local room_id = info and info.num
+  if room_id and snd and snd.mapper and snd.mapper.getRoomInfo then
+    local room = snd.mapper.getRoomInfo(tostring(room_id))
+    area = tostring(room and room.area or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+  end
+  return area
+end
+
+function mm.is_continent_room(info)
+  return continent_area_keys[room_area_key(info)] == true
+end
+
+function mm.sync_hybrid_bigmap_to_room(info)
+  if mm.is_continent_room(info) then
+    return mm.minimap.activate_bigmap_native(), true
+  else
+    return mm.minimap.activate_bigmap_local(), false
+  end
+end
+
 function mm.on_room_info_event()
   local info = mm.get_room_info()
   local room_num = tostring(info and info.num or "")
   local room_area = tostring(info and (info.zone or info.area) or "")
 
+  local switched, continent = false, false
+  if mm.minimap and mm.minimap.get_bigmap_mode and mm.minimap.get_bigmap_mode() == "hybrid" then
+    switched, continent = mm.sync_hybrid_bigmap_to_room(info)
+  end
   mm.on_room_info()
+  if switched and continent then raiseWindow("mapper") end
+  if snd and snd.mapper and snd.mapper.requestMetadataForRoom then
+    snd.mapper.requestMetadataForRoom(info)
+  end
   if type(raiseEvent) == "function" then
     -- Integration surface: external scripts can listen to "mm.room.changed"
     raiseEvent("mm.room.changed", room_num, room_area)
@@ -595,118 +709,70 @@ function mm.on_room_exits_event()
   mm.on_room_exits()
 end
 
-local AUTO_REBUILD_DELAY = 0.20
-local AUTO_REBUILD_RETRY_DELAY = 0.60
-local AUTO_REBUILD_MAX_ATTEMPTS = 3
-
-local function normalize_area_name(area)
-  return tostring(area or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
-end
-
-local function run_after(delay, callback)
-  if type(tempTimer) == "function" then
-    tempTimer(delay, callback)
-  else
-    callback()
+function mm.on_room_area_event()
+  local area = mm.get_room_area_info()
+  if type(area) ~= "table" then
+    mm.debug("gmcp.room.area event; area payload missing")
+    return
+  end
+  if snd and snd.mapper and snd.mapper.persistAreaInfo then
+    local ok, err = snd.mapper.persistAreaInfo(area)
+    if not ok then
+      mm.debug("gmcp.room.area persist skipped/failed: " .. tostring(err))
+    end
   end
 end
 
-local function refresh_bigmap(room_id)
-  if type(setPlayerRoom) == "function" then pcall(setPlayerRoom, room_id) end
-  if type(centerview) == "function" then pcall(centerview, room_id) end
-  if type(updateMap) == "function" then pcall(updateMap) end
+function mm.on_room_sectors_event()
+  local packet = mm.get_room_sectors_packet()
+  mm.refresh_terrain_ids()
+  if type(packet) ~= "table" then
+    mm.debug("gmcp.room.sectors event; sectors payload missing")
+    return
+  end
+  if snd and snd.mapper and snd.mapper.persistSectors then
+    local ok, err = snd.mapper.persistSectors(packet)
+    if not ok then
+      mm.debug("gmcp.room.sectors persist skipped/failed: " .. tostring(err))
+    end
+  end
 end
 
-function mm.schedule_auto_layout_rebuild(room_num, room_area)
-  if not (mm.state and mm.state.rebuild_layout_on_sync_error) then return false end
+-- Compatibility shim for sessions that still have the removed auto-rebuild
+-- event handler registered from an older script load.
+function mm.schedule_auto_layout_rebuild()
+  return false
+end
 
-  local requested_room = tonumber(room_num)
-  local requested_area = normalize_area_name(room_area)
-  if not requested_room or requested_room <= 0 or requested_area == "" then return false end
-
-  mm.runtime = mm.runtime or {}
-  if normalize_area_name(mm.runtime.last_auto_rebuild_area) == requested_area then return false end
-  if normalize_area_name(mm.runtime.auto_rebuild_pending_area) == requested_area then return false end
-
-  mm.runtime.auto_rebuild_generation = (tonumber(mm.runtime.auto_rebuild_generation) or 0) + 1
-  local generation = mm.runtime.auto_rebuild_generation
-  mm.runtime.auto_rebuild_pending_area = requested_area
-
-  local function attempt(attempt_number)
-    local delay = attempt_number == 1 and AUTO_REBUILD_DELAY or AUTO_REBUILD_RETRY_DELAY
-    run_after(delay, function()
-      if not (mm.state and mm.state.rebuild_layout_on_sync_error) then return end
-      if not mm.runtime or mm.runtime.auto_rebuild_generation ~= generation then return end
-
-      -- Re-read GMCP after the delay; the area-entry packet may already have
-      -- been superseded by another movement or a portal/recall transition.
-      local info = mm.get_room_info and mm.get_room_info() or nil
-      local current_area = normalize_area_name(info and (info.zone or info.area) or "")
-      local current_room = info and tonumber(info.num) or requested_room
-      if current_area ~= requested_area or not current_room or current_room <= 0 then
-        mm.runtime.auto_rebuild_pending_area = nil
-        return
-      end
-
-      local ok, result = mm.import.rebuild_layout_from(current_room, {
-        silent = true,
-        area_only = true,
-      })
-      local applied = ok and type(result) == "table" and tonumber(result.applied) or 0
-      local area_rooms = ok and type(result) == "table" and tonumber(result.area_rooms) or nil
-      local incomplete = ok and area_rooms and applied < area_rooms
-
-      if ok and not incomplete then
-        mm.runtime.last_auto_rebuild_area = requested_area
-        mm.runtime.auto_rebuild_pending_area = nil
-        mm.debug(string.format(
-          "auto layout rebuild completed for area '%s' from room %d (%d rooms)",
-          requested_area,
-          current_room,
-          applied
-        ))
-
-        -- Let Mudlet finish processing the GMCP event before the final repaint.
-        run_after(0, function()
-          if mm.runtime and mm.runtime.auto_rebuild_generation == generation then
-            refresh_bigmap(current_room)
-          end
-        end)
-        return
-      end
-
-      if attempt_number < AUTO_REBUILD_MAX_ATTEMPTS then
-        mm.debug(string.format(
-          "auto layout rebuild for area '%s' was not ready (attempt %d/%d, applied=%d, area rooms=%s); retrying",
-          requested_area,
-          attempt_number,
-          AUTO_REBUILD_MAX_ATTEMPTS,
-          applied,
-          tostring(area_rooms or "?")
-        ))
-        attempt(attempt_number + 1)
-        return
-      end
-
-      mm.runtime.last_auto_rebuild_area = requested_area
-      mm.runtime.auto_rebuild_pending_area = nil
-      local reason = incomplete
-        and string.format("only %d of %d area rooms were reachable", applied, area_rooms)
-        or tostring(result)
-      mm.warn("Auto rebuild layout failed for area '" .. requested_area .. "': " .. reason)
-    end)
+local function kill_trigger_field(field)
+  local id = mm[field]
+  if id and type(killTrigger) == "function" then
+    pcall(killTrigger, id)
   end
-
-  attempt(1)
-  return true
+  mm[field] = nil
 end
 
 function mm.register_events()
-  if mm._room_vnum_trigger then
-    pcall(killTrigger, mm._room_vnum_trigger)
-    mm._room_vnum_trigger = nil
+  if mm._events then
+    if type(killAnonymousEventHandler) ~= "function" then return end
+    for _, event_id in ipairs(mm._events) do
+      pcall(killAnonymousEventHandler, event_id)
+    end
+    mm._events = nil
   end
-  if mm._events then return end
+
+  kill_trigger_field("_room_vnum_trigger")
+  kill_trigger_field("_map_start_trigger")
+  kill_trigger_field("_map_line_trigger")
+  kill_trigger_field("_map_end_trigger")
+  kill_trigger_field("_coords_trigger")
+  kill_trigger_field("_roomchars_open_trigger")
+  kill_trigger_field("_roomchars_close_trigger")
+  kill_trigger_field("_roomobjs_open_trigger")
+  kill_trigger_field("_roomobjs_close_trigger")
+  kill_trigger_field("_rdesc_open_trigger")
+  kill_trigger_field("_rdesc_close_trigger")
+
   mm._events = {
     registerAnonymousEventHandler("gmcp.room.info", "mm.on_room_info_event"),
     registerAnonymousEventHandler("gmcp.Room.Info", "mm.on_room_info_event"),
@@ -714,11 +780,10 @@ function mm.register_events()
     registerAnonymousEventHandler("gmcp.Room.Exits", "mm.on_room_exits_event"),
     registerAnonymousEventHandler("gmcp.room", "mm.on_room_packet"),
     registerAnonymousEventHandler("gmcp.Room", "mm.on_room_packet"),
-    registerAnonymousEventHandler("gmcp.room.sectors", "mm.refresh_terrain_ids"),
-    registerAnonymousEventHandler("gmcp.Room.Sectors", "mm.refresh_terrain_ids"),
-    registerAnonymousEventHandler("mm.room.changed", function(_, room_num, room_area)
-      mm.schedule_auto_layout_rebuild(room_num, room_area)
-    end),
+    registerAnonymousEventHandler("gmcp.room.area", "mm.on_room_area_event"),
+    registerAnonymousEventHandler("gmcp.Room.Area", "mm.on_room_area_event"),
+    registerAnonymousEventHandler("gmcp.room.sectors", "mm.on_room_sectors_event"),
+    registerAnonymousEventHandler("gmcp.Room.Sectors", "mm.on_room_sectors_event"),
   }
 
   -- Capture every line while the map block is active; Aardwolf map lines contain

@@ -9,18 +9,17 @@ mm.state = mm.state or {
   backups_compressed = false,
   show_up_down = false,
   underline_links = true,
-  minimap = { enabled = true, show_room = true, show_exits = true, show_coords = true, echo = true },
+  minimap = { enabled = true, show_room = true, show_exits = true, show_coords = true, echo = true, bigmap_mode = "hybrid", local_radius = 4, local_room_size = 15 },
   windows = {
     minimap = { x = "70%", y = "0%", width = "30%", height = "35%", max_lines = 16, enabled = true, locked = false, font_size = 8 },
     bigmap = { x = "45%", y = "35%", width = "55%", height = "65%", max_lines = 60, enabled = true, locked = false, font_size = 9 },
   },
   last_target = nil,
   map_db = "Aardwolf.db",
-  native_mapper_db = "Aardwolf.db",
+  native_mapper_db = "mmapper_converted_map.dat",
   auto_locate = true,
-  center_on_locate = false,
+  center_on_locate = true,
   portal_guard_enabled = true,
-  rebuild_layout_on_sync_error = false,
   debug = false,
 }
 
@@ -81,6 +80,108 @@ local function now_millis()
   return (os.clock() or 0) * 1000
 end
 
+local STATS_FIELDS = {
+  "rooms_updated",
+  "areas_updated",
+  "exits_updated",
+  "env_rows_updated",
+  "coords_stored",
+  "coords_set",
+  "layouts_rebuilt",
+  "room_colors_set",
+  "env_colors_set",
+  "skipped",
+  "failed",
+}
+
+function mm.ensure_stats()
+  mm.runtime = mm.runtime or {}
+  local stats = mm.runtime.stats
+  if type(stats) ~= "table" then
+    stats = {}
+    mm.runtime.stats = stats
+  end
+  stats.started_at = tonumber(stats.started_at) or now_millis()
+  for _, field in ipairs(STATS_FIELDS) do
+    stats[field] = tonumber(stats[field]) or 0
+  end
+  return stats
+end
+
+function mm.reset_stats()
+  mm.runtime = mm.runtime or {}
+  mm.runtime.stats = { started_at = now_millis() }
+  mm.ensure_stats()
+  mm.note("Mapper stats reset.")
+end
+
+function mm.bump_stats(field, amount)
+  local stats = mm.ensure_stats()
+  local value = tonumber(amount) or 1
+  if value == 0 then return end
+  stats[field] = (tonumber(stats[field]) or 0) + value
+end
+
+function mm.bump_stats_many(changes)
+  if type(changes) ~= "table" then return end
+  for field, amount in pairs(changes) do
+    mm.bump_stats(field, amount)
+  end
+end
+
+local function elapsed_text(started_at)
+  local elapsed = math.max(0, math.floor((now_millis() - (tonumber(started_at) or now_millis())) / 1000))
+  local hours = math.floor(elapsed / 3600)
+  local minutes = math.floor((elapsed % 3600) / 60)
+  local seconds = elapsed % 60
+  return string.format("%02d:%02d:%02d ago", hours, minutes, seconds)
+end
+
+local function print_stat(label, value)
+  cecho(string.format("    <cyan>%-19s<reset> %8d\n", label .. ":", tonumber(value) or 0))
+end
+
+local function pending_room_persist_count()
+  local pending = snd and snd.mapper and snd.mapper.pendingPersists
+  if type(pending) ~= "table" then return 0 end
+  local count = 0
+  for _ in pairs(pending) do
+    count = count + 1
+  end
+  return count
+end
+
+function mm.show_stats()
+  local stats = mm.ensure_stats()
+  local pending = pending_room_persist_count()
+  cecho("\n<CornflowerBlue>[MMAPPER]<reset> <white>Mapper stats since load/reset<reset>\n\n")
+
+  cecho("  <yellow>DB updates<reset>\n")
+  print_stat("Rooms updated", stats.rooms_updated)
+  print_stat("Areas updated", stats.areas_updated)
+  print_stat("Exits updated", stats.exits_updated)
+  print_stat("Coords stored", stats.coords_stored)
+  print_stat("Env rows updated", stats.env_rows_updated)
+
+  cecho("\n  <yellow>Map updates<reset>\n")
+  print_stat("Coords set", stats.coords_set)
+  print_stat("Layouts rebuilt", stats.layouts_rebuilt)
+  print_stat("Room colors set", stats.room_colors_set)
+  print_stat("Env colors set", stats.env_colors_set)
+
+  cecho("\n  <yellow>Problems<reset>\n")
+  print_stat("Skipped", stats.skipped)
+  print_stat("Failed", stats.failed)
+
+  cecho("\n  <yellow>Status<reset>\n")
+  cecho("    <cyan>Live room env colors:<reset> " .. (type(setRoomEnv) == "function" and "on" or "unavailable") .. "\n")
+  cecho("    <cyan>Bulk env colors:<reset> manual\n")
+  if pending > 0 then
+    cecho("    <cyan>Pending room persists:<reset> " .. tostring(pending) .. " not counted yet\n")
+  end
+  cecho("    <cyan>Since:<reset> " .. elapsed_text(stats.started_at) .. "\n")
+end
+
 local function persistence_dir()
   return getMudletHomeDir() .. "/persistence"
 end
@@ -133,11 +234,28 @@ function mm.load_settings_persistence()
 
   local ok, data = pcall(chunk)
   if not ok or type(data) ~= "table" then return false end
-  if type(data.rebuild_layout_on_sync_error) == "boolean" then
-    mm.state.rebuild_layout_on_sync_error = data.rebuild_layout_on_sync_error
-  end
   if type(data.portal_guard_enabled) == "boolean" then
     mm.state.portal_guard_enabled = data.portal_guard_enabled
+  end
+  if type(data.native_mapper_db) == "string" and data.native_mapper_db ~= "" then
+    mm.state.native_mapper_db = data.native_mapper_db
+  end
+  if type(data.auto_locate) == "boolean" then
+    mm.state.auto_locate = data.auto_locate
+    mm.state.center_on_locate = data.auto_locate
+  end
+  if type(data.minimap) == "table" then
+    mm.state.minimap = mm.state.minimap or {}
+    if data.minimap.bigmap_mode == "local" or data.minimap.bigmap_mode == "native" or
+        data.minimap.bigmap_mode == "hybrid" then
+      mm.state.minimap.bigmap_mode = data.minimap.bigmap_mode
+    end
+    if tonumber(data.minimap.local_radius) then
+      mm.state.minimap.local_radius = tonumber(data.minimap.local_radius)
+    end
+    if tonumber(data.minimap.local_room_size) then
+      mm.state.minimap.local_room_size = tonumber(data.minimap.local_room_size)
+    end
   end
   return true
 end
@@ -148,34 +266,17 @@ function mm.save_settings_persistence()
     return false, "unable to open mapper settings persistence file for writing"
   end
   f:write("return " .. serialize_value({
-    rebuild_layout_on_sync_error = mm.state.rebuild_layout_on_sync_error == true,
     portal_guard_enabled = mm.state.portal_guard_enabled ~= false,
+    native_mapper_db = mm.state.native_mapper_db or "mmapper_converted_map.dat",
+    auto_locate = mm.state.auto_locate ~= false,
+    minimap = {
+      bigmap_mode = (mm.state.minimap and mm.state.minimap.bigmap_mode) or "hybrid",
+      local_radius = tonumber(mm.state.minimap and mm.state.minimap.local_radius) or 4,
+      local_room_size = tonumber(mm.state.minimap and mm.state.minimap.local_room_size) or 15,
+    },
   }))
   f:close()
   return true
-end
-
-function mm.set_rebuild_layout_on_area_entry(enabled)
-  mm.state.rebuild_layout_on_sync_error = enabled == true
-  mm.runtime = mm.runtime or {}
-  mm.runtime.auto_rebuild_generation = (tonumber(mm.runtime.auto_rebuild_generation) or 0) + 1
-  mm.runtime.auto_rebuild_pending_area = nil
-
-  local ok, err = mm.save_settings_persistence()
-  if not ok then mm.warn("Could not save auto layout setting: " .. tostring(err)) end
-
-  -- Enabling while already inside an area should also repair the current view.
-  if enabled and type(mm.schedule_auto_layout_rebuild) == "function" then
-    local info = mm.get_room_info and mm.get_room_info() or nil
-    local room_id = info and tonumber(info.num) or nil
-    local area = info and tostring(info.zone or info.area or "") or ""
-    if room_id and room_id > 0 and area ~= "" then
-      mm.runtime.last_auto_rebuild_area = nil
-      mm.schedule_auto_layout_rebuild(room_id, area)
-    end
-  end
-
-  return mm.state.rebuild_layout_on_sync_error
 end
 
 function mm.portal_guard_status_text()
@@ -741,33 +842,6 @@ function mm.ensure_dir(path)
   return mm.dir_exists(path)
 end
 
-local function copy_file_binary(src, dst)
-  local inFile, inErr = io.open(src, "rb")
-  if not inFile then
-    return false, "unable to open source: " .. tostring(inErr)
-  end
-  local outFile, outErr = io.open(dst, "wb")
-  if not outFile then
-    inFile:close()
-    return false, "unable to create destination: " .. tostring(outErr)
-  end
-
-  local data = inFile:read("*a")
-  if data == nil then
-    inFile:close()
-    outFile:close()
-    return false, "failed to read source"
-  end
-
-  local ok, writeErr = outFile:write(data)
-  inFile:close()
-  outFile:close()
-  if not ok then
-    return false, "failed to write destination: " .. tostring(writeErr)
-  end
-  return true
-end
-
 local function resolved_map_db_path()
   local p = tostring(mm.state.map_db or "")
   if p == "" then return nil end
@@ -815,12 +889,20 @@ function mm.create_backup(force, quiet_override)
   end
 
   local stamp = os.date("!%Y%m%d_%H%M%S")
-  local base = tostring(mm.state.map_db or "mapper.db"):gsub("[/\\]", "_")
+  local base = tostring(mm.state.map_db or "mapper.db"):gsub("[/\\:*?\"<>|]", "_")
   local backupPath = string.format("%s/%s.%s.bak", dir, base, stamp)
+  local suffix = 1
+  while mm.path_exists(backupPath) do
+    backupPath = string.format("%s/%s.%s_%d.bak", dir, base, stamp, suffix)
+    suffix = suffix + 1
+  end
 
-  local ok, copyErr = copy_file_binary(source, backupPath)
+  if not (mm.exec_mapper_db and mm.sql_escape) then
+    return false, "SQLite backup helpers are unavailable"
+  end
+  local ok, backupErr = mm.exec_mapper_db("VACUUM INTO " .. mm.sql_escape(backupPath))
   if not ok then
-    return false, copyErr
+    return false, "transactional SQLite backup failed: " .. tostring(backupErr)
   end
 
   local compressed = false
@@ -869,6 +951,7 @@ end
 
 function mm.set_native_mapper_db(path)
   mm.state.native_mapper_db = path
+  if mm.save_settings_persistence then mm.save_settings_persistence() end
   local resolved = mm.resolve_native_mapper_db(path)
   mm.note("Native mapper DB set to: " .. tostring(resolved))
 end
@@ -907,7 +990,13 @@ function mm.load_native_mapper_db(path)
   end
 
   mm.state.native_mapper_db = path or mm.state.native_mapper_db
+  if mm.save_settings_persistence then mm.save_settings_persistence() end
+  mm.runtime = mm.runtime or {}
+  mm.runtime.native_mapper_db_loaded_path = resolved
   mm.note("Loaded native Mudlet mapper DB: " .. resolved)
+  if mm.sync_native_bigmap_to_current_room then
+    mm.sync_native_bigmap_to_current_room("native_map_loaded")
+  end
   return true
 end
 
@@ -2156,8 +2245,57 @@ function mm.where_room(dest)
   if not (nav and type(nav.findPath) == "function") then
     return false, "mapper where requires mapper navigation module"
   end
-  local path, depth = nav.findPath(src, dest)
+  -- mapper where only displays a route; keep level, portal, and area guards
+  -- scoped to commands that actually move the character. Mirror xrt's
+  -- outward-jump planner first, since plain findPath can miss routes when the
+  -- current room blocks both portal and recall.
+  local path, depth
+  if type(nav.buildOutwardJumpRoute) == "function" then
+    path = nav.buildOutwardJumpRoute(tostring(src), tostring(dest), true)
+    if path and #path > 0 then
+      depth = #path
+    else
+      path = nil
+    end
+  end
+  if not path then
+    path, depth = nav.findPath(src, dest, nil, nil, true, true)
+  end
   if not path then return false, string.format("path from %s to %s not found", tostring(src), tostring(dest)) end
+
+  local room_rows = mm.query_mapper_db(string.format(
+    "SELECT name, area, info FROM rooms WHERE uid = %d LIMIT 1",
+    dest
+  ))
+  local room = room_rows and room_rows[1] or nil
+  if room then
+    local name = mm.strip_ansi(room.name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local area = mm.strip_ansi(room.area or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local info = tostring(room.info or ""):lower()
+    local color = nil
+    local marker = nil
+    if info:find("pk", 1, true) then
+      color = "red"
+      marker = "PK"
+    elseif info:find("safe", 1, true) then
+      color = "green"
+      marker = "safe"
+    end
+
+    local room_label = name ~= "" and name or tostring(dest)
+    if marker then
+      room_label = string.format("%s (%s)", room_label, marker)
+    end
+    if color then
+      room_label = string.format("<%s>%s<reset>", color, room_label)
+    end
+    if area ~= "" then
+      cecho(string.format("<CornflowerBlue>[MMAPPER]<reset> %s / %s\n", room_label, area))
+    else
+      cecho(string.format("<CornflowerBlue>[MMAPPER]<reset> %s\n", room_label))
+    end
+  end
+
   local steps = {}
   for _, p in ipairs(path) do table.insert(steps, tostring(p.dir or "")) end
   mm.note(string.format("Path to %d: %s", dest, table.concat(steps, " ; ")))

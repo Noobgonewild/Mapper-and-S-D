@@ -944,44 +944,48 @@ end
 function snd.utils.reportCampaignCompletion(rewards, durationSeconds)
     rewards = rewards or {}
     local qp = tonumber(rewards.qp) or 0
+    local dailyQpBonus = tonumber(rewards.dailyQpBonus) or 0
+    local baseQp = tonumber(rewards.baseQp) or 0
+    if dailyQpBonus > 0 and baseQp <= 0 then
+        baseQp = math.max(qp - dailyQpBonus, 0)
+    end
     local gold = tonumber(rewards.gold) or 0
     local tp = tonumber(rewards.tp) or 0
     local trains = tonumber(rewards.trains) or 0
     local pracs = tonumber(rewards.pracs) or 0
     local durationText = snd.utils.formatQuestCompletionDuration(durationSeconds)
 
-    local parts = {
-        string.format("<red>QP: %d<reset>", qp),
-        string.format("<yellow>Gold: %d<reset>", gold),
-    }
-    if tp > 0 then table.insert(parts, string.format("<white>TP: %d<reset>", tp)) end
-    if trains > 0 then table.insert(parts, string.format("<cyan>Trains: %d<reset>", trains)) end
-    if pracs > 0 then table.insert(parts, string.format("<green>Pracs: %d<reset>", pracs)) end
-    if durationText ~= "" then table.insert(parts, string.format("<cyan>Duration: %s<reset>", durationText)) end
-    local rewardText = table.concat(parts, ", ")
-
     local channel = "default"
     if snd.config and snd.config.reportChannel then
         channel = snd.utils.trim(snd.config.reportChannel)
     end
 
+    local qpText = dailyQpBonus > 0
+        and string.format("%dqp + %ddaily", baseQp, dailyQpBonus)
+        or tostring(qp)
+
     if snd.utils.isDefaultReportChannel(channel) then
-        local message = string.format(
+        local parts = {
+            string.format("<red>QP: %s<reset>", qpText),
+            string.format("<yellow>Gold: %d<reset>", gold),
+        }
+        if tp > 0 then table.insert(parts, string.format("<white>TP: %d<reset>", tp)) end
+        if trains > 0 then table.insert(parts, string.format("<cyan>Trains: %d<reset>", trains)) end
+        if pracs > 0 then table.insert(parts, string.format("<green>Pracs: %d<reset>", pracs)) end
+        if durationText ~= "" then table.insert(parts, string.format("<cyan>Duration: %s<reset>", durationText)) end
+        cecho(string.format(
             "\n<orange>[S&D]<reset> <green>Campaign complete!<reset> %s\n",
-            rewardText
-        )
-        if type(tempTimer) == "function" then
-            tempTimer(0.5, function()
-                cecho(message)
-            end)
-        else
-            cecho(message)
-        end
+            table.concat(parts, ", ")
+        ))
         return true
     end
 
+    local channelQpText = dailyQpBonus > 0
+        and string.format("%dqp + %ddaily", baseQp, dailyQpBonus)
+        or tostring(qp)
+
     local channelParts = {
-        string.format("@RQP: %d@W", qp),
+        string.format("@RQP: %s@W", channelQpText),
         string.format("@YGold: %d@W", gold),
     }
     if tp > 0 then table.insert(channelParts, string.format("@WTP: %d@W", tp)) end
@@ -989,12 +993,6 @@ function snd.utils.reportCampaignCompletion(rewards, durationSeconds)
     if pracs > 0 then table.insert(channelParts, string.format("@GPracs: %d@W", pracs)) end
     if durationText ~= "" then table.insert(channelParts, string.format("@CDuration: %s@W", durationText)) end
     local payload = string.format("@GCampaign complete!@W %s", table.concat(channelParts, ", "))
-    if type(tempTimer) == "function" then
-        tempTimer(0.2, function()
-            snd.utils.dispatchReportChannel(channel, payload)
-        end)
-        return true
-    end
     return snd.utils.dispatchReportChannel(channel, payload)
 end
 

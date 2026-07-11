@@ -311,23 +311,23 @@ local function add_evidence(candidates, roomId, name, area, evidence)
   end
 end
 
-local function path_between(nav, source, destination, noPortals, noRecalls, ignoreAreaGuard)
+local function path_between(nav, source, destination, noPortals, noRecalls, ignoreLockedExits, ignoreAreaGuard)
   source = normalize_uid(source)
   destination = normalize_uid(destination)
   if not source or not destination or not (nav and type(nav.findPath) == "function") then
     return nil
   end
   if source == destination then return {}, 0 end
-  return nav.findPath(tostring(source), tostring(destination), noPortals, noRecalls, nil, ignoreAreaGuard)
+  return nav.findPath(tostring(source), tostring(destination), noPortals, noRecalls, ignoreLockedExits, ignoreAreaGuard)
 end
 
 local function target_boundary_distance(nav, target, candidateUid)
-  local path, depth = path_between(nav, target, candidateUid, true, true, true)
+  local path, depth = path_between(nav, target, candidateUid, true, true, true, true)
   if path then return #path, tonumber(depth) or #path end
 
   -- Some map edges are one-way. Reverse reachability is still useful as a
   -- proximity hint, but walk-only so portals/recalls do not skew "near".
-  path, depth = path_between(nav, candidateUid, target, true, true, true)
+  path, depth = path_between(nav, candidateUid, target, true, true, true, true)
   if path then return #path, tonumber(depth) or #path end
 
   return nil, nil
@@ -390,7 +390,9 @@ function frontier.find_boundaries(scope, options)
     if candidate.uid == source then
       path, depth = {}, 0
     else
-      path, depth = nav.findPath(tostring(source), tostring(candidate.uid))
+      -- Boundary discovery is display-only; use an unguarded route lookup
+      -- rather than xrt's movement guards.
+      path, depth = path_between(nav, source, candidate.uid, nil, nil, true, true)
     end
     if path then
       candidate.path = path

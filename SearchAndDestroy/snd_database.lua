@@ -1073,7 +1073,8 @@ end
 --- Start tracking a new activity in history
 -- @param historyType Type of activity (quest/gquest/campaign)
 -- @param levelTaken Level when started
-function snd.db.historyStart(historyType, levelTaken)
+-- @param startTime number|nil Optional captured start time; defaults to os.time().
+function snd.db.historyStart(historyType, levelTaken, startTime)
     -- Check if history table exists (it was added in schema v6)
     local tables = snd.db.getTables()
     local hasHistory = false
@@ -1099,7 +1100,7 @@ function snd.db.historyStart(historyType, levelTaken)
         historyType,
         snd.db.HISTORY_STATUS_INPROGRESS,
         levelTaken or snd.char.level or 0,
-        os.time()
+        tonumber(startTime) or os.time()
     )
     local ok = snd.db.execute(sql)
     if not ok then
@@ -1119,8 +1120,9 @@ end
 -- @param status Final status (complete/failed/skipped)
 -- @param rewards Optional table of rewards {qp, tp, trains, pracs, gold}
 --   Pass nil to preserve existing reward values.
+-- @param endTime number|nil Optional captured completion time; defaults to os.time().
 -- @return table|nil Updated history row with computed duration_seconds, or nil if no row was updated.
-function snd.db.historyEnd(historyType, status, rewards)
+function snd.db.historyEnd(historyType, status, rewards, endTime)
     if tonumber(historyType) == snd.db.HISTORY_TYPE_QUEST then
         snd.db.purgeStaleQuestHistory(3600)
     end
@@ -1140,7 +1142,7 @@ function snd.db.historyEnd(historyType, status, rewards)
             snd.utils.debugNote("historyEnd: unable to resolve rowid for latest in-progress history row")
             return nil
         end
-        local now = os.time()
+        local now = tonumber(endTime) or os.time()
         local updateSql
         if rewards == nil then
             updateSql = string.format(

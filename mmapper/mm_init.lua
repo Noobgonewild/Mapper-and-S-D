@@ -99,23 +99,30 @@ function mm.initialize()
   if mm and mm.debug then
     mm.debug("initialization begin")
   end
+  mm.runtime = mm.runtime or {}
+  mm.runtime.native_mapper_db_loaded_path = nil
   safe_step("load_settings_persistence", function()
     if mm.load_settings_persistence then
       mm.load_settings_persistence()
     end
   end)
+  local configured_mode = mm.minimap and mm.minimap.get_bigmap_mode and mm.minimap.get_bigmap_mode()
   safe_step("register_aliases", function() mm.register_aliases() end)
   safe_step("register_events", function() mm.register_events() end)
   safe_step("minimap.init", function() mm.minimap.init() end)
 
-  local loaded, err = mm.load_native_mapper_db()
-  if not loaded then
-    local native_path = mm.resolve_native_mapper_db(mm.state.native_mapper_db)
-    if native_path and mm.path_exists(native_path) and mm.looks_like_sqlite(native_path) then
-      mm.debug("Native mapper DB autoload skipped: configured path is SQLite live mapper DB.")
-    else
-      mm.warn("Native mapper DB was not auto-loaded: " .. tostring(err))
+  if configured_mode == "native" then
+    local loaded, err = mm.load_native_mapper_db()
+    if not loaded then
+      local native_path = mm.resolve_native_mapper_db(mm.state.native_mapper_db)
+      if native_path and mm.path_exists(native_path) and mm.looks_like_sqlite(native_path) then
+        mm.debug("Native mapper DB autoload skipped: configured path is SQLite live mapper DB.")
+      else
+        mm.warn("Native mapper DB was not auto-loaded: " .. tostring(err))
+      end
     end
+  else
+    mm.debug("Native mapper DB autoload skipped while bigmap local/hybrid mode is active.")
   end
 
   safe_step("ensure_exits_chaos_column", function()

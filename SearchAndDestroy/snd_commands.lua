@@ -3683,12 +3683,12 @@ function snd.commands.reportStatsLine(reportText, typeLabel, channelOverride)
     if channel:lower() == "group" then
         channel = "gtell"
     end
-    if snd.utils.isDefaultReportChannel(channel) then
-        snd.utils.reportLine(reportText, typeLabel, channel)
-        return
-    end
     local style = snd.utils.getReportTypeStyle(typeLabel)
     local payload = string.format("%s[%s]@W %s", snd.utils.getReportAardColor(typeLabel), style.label, reportText)
+    if snd.utils.isDefaultReportChannel(channel) then
+        snd.utils.aardEchoLine(payload)
+        return
+    end
     if snd.utils and snd.utils.dispatchReportChannel then
         snd.utils.dispatchReportChannel(channel, payload)
     else
@@ -3804,16 +3804,26 @@ function snd.commands.reportHistoryLikeRow(row, channelOverride, statsLabel)
     if channel:lower() == "group" then
         channel = "gtell"
     end
-    if snd.utils.isDefaultReportChannel(channel) then
-        local text = statsLabel
-            and snd.commands.buildStatsHistoryRowText(row, statsLabel)
-            or snd.commands.buildHistoryRowText(row)
-        snd.utils.reportLine(text, historyTypeLabel(row.type), channel)
+    if statsLabel then
+        local payload = snd.commands.buildStatsHistoryRowChannelText(row, statsLabel)
+        if snd.utils.isDefaultReportChannel(channel) then
+            snd.utils.aardEchoLine(payload)
+            return
+        end
+        if snd.utils and snd.utils.dispatchReportChannel then
+            snd.utils.dispatchReportChannel(channel, payload)
+        else
+            snd.commands.sendGameCommand(channel .. " " .. payload, false)
+        end
         return
     end
-    local payload = statsLabel
-        and snd.commands.buildStatsHistoryRowChannelText(row, statsLabel)
-        or snd.commands.buildHistoryRowChannelText(row)
+
+    local payload = snd.commands.buildHistoryRowChannelText(row)
+    if snd.utils.isDefaultReportChannel(channel) then
+        snd.utils.aardEchoLine(payload)
+        return
+    end
+
     if snd.utils and snd.utils.dispatchReportChannel then
         snd.utils.dispatchReportChannel(channel, payload)
     else
@@ -3948,13 +3958,12 @@ function snd.commands.buildStatsHistoryRowText(row, statsLabel)
         return ""
     end
     return string.format(
-        "%s Stats - %s | %s | lvl %s | %s -> %s | rewards: %s",
-        statsTypeTitle(row.type),
+        "[%s] %s | %s | lvl %s | %s | rewards: %s",
+        string.upper(historyTypeLabel(row.type)),
         string.upper(tostring(statsLabel or "run")),
         formatDuration(row.start_time, row.end_time, row.status),
         tostring(row.level_taken or 0),
-        formatLocalDateTime(row.start_time),
-        formatLocalDateTime(row.end_time),
+        formatHistoryDate(row),
         formatRewardSummary(row)
     )
 end
@@ -4114,12 +4123,12 @@ function snd.commands.reportHistoryRow(index, channelOverride)
         channel = "gtell"
     end
 
+    local payload = snd.commands.buildHistoryRowChannelText(row)
     if snd.utils.isDefaultReportChannel(channel) then
-        snd.utils.reportLine(snd.commands.buildHistoryRowText(row), historyTypeLabel(row.type), channel)
+        snd.utils.aardEchoLine(payload)
         return
     end
 
-    local payload = snd.commands.buildHistoryRowChannelText(row)
     if snd.utils and snd.utils.dispatchReportChannel then
         snd.utils.dispatchReportChannel(channel, payload)
     elseif snd.commands and snd.commands.sendGameCommand then

@@ -242,8 +242,27 @@ function snd.gmcp.onRoomInfo()
         terrain = ri.terrain or "",
     }
 
+    local roomChanged = snd.room.current.rmid ~= snd.room.previous.rmid
+
+    if snd.mapper then
+        local navigating = (snd.nav.goingToRoom or snd.mapper.goingToRoom) ~= nil
+        if navigating then
+            if snd.mapper.bufferRoomPersist then
+                snd.mapper.bufferRoomPersist(ri)
+            end
+        else
+            -- Not navigating: flush any orphaned buffer then persist immediately.
+            if snd.mapper.flushPendingPersists then
+                snd.mapper.flushPendingPersists()
+            end
+            if snd.mapper.persistDiscoveredRoom then
+                snd.mapper.persistDiscoveredRoom(ri)
+            end
+        end
+    end
+
     -- Only process if room actually changed
-    if snd.room.current.rmid ~= snd.room.previous.rmid then
+    if roomChanged then
         -- Defensive init in case state restore or load order omits room history.
         snd.room.history = snd.room.history or {}
         -- Room history tracking is intentionally disabled for now.
@@ -255,23 +274,6 @@ function snd.gmcp.onRoomInfo()
         --     rmid = snd.room.previous.rmid,
         --     arid = snd.room.previous.arid,
         -- })
-
-        if snd.mapper then
-            local navigating = (snd.nav.goingToRoom or snd.mapper.goingToRoom) ~= nil
-            if navigating then
-                if snd.mapper.bufferRoomPersist then
-                    snd.mapper.bufferRoomPersist(ri)
-                end
-            else
-                -- Not navigating: flush any orphaned buffer then persist immediately.
-                if snd.mapper.flushPendingPersists then
-                    snd.mapper.flushPendingPersists()
-                end
-                if snd.mapper.persistDiscoveredRoom then
-                    snd.mapper.persistDiscoveredRoom(ri)
-                end
-            end
-        end
 
         -- Notify main module of room change
         snd.onRoomChange()
@@ -592,6 +594,8 @@ function snd.gmcp.queueQuestReward(qp, gold, tp, trains, pracs)
     snd.quest.blessingBonus = 0
     snd.quest.extraBonus = 0
 
+    local completedAt = os.time()
+
     snd.quest.pendingReward = {
         qp = qp + tierBonus,
         gold = gold,
@@ -599,6 +603,7 @@ function snd.gmcp.queueQuestReward(qp, gold, tp, trains, pracs)
         trains = trains,
         pracs = pracs,
         tierBonus = tierBonus,
+        completedAt = completedAt,
     }
 
     if snd.quest.rewardTimer then
@@ -624,6 +629,7 @@ function snd.gmcp.emitQuestReward()
     local trains = reward.trains or 0
     local pracs = reward.pracs or 0
     local durationSeconds = nil
+    local completedAt = tonumber(reward.completedAt) or os.time()
 
     if snd.db then
         local endedHistory = snd.db.historyEnd(snd.db.HISTORY_TYPE_QUEST, snd.db.HISTORY_STATUS_COMPLETE, {
@@ -632,7 +638,7 @@ function snd.gmcp.emitQuestReward()
             tp = tp,
             trains = trains,
             pracs = pracs,
-        })
+        }, completedAt)
         if endedHistory then
             totalQp = tonumber(endedHistory.qp_rewards) or totalQp
             gold = tonumber(endedHistory.gold_rewards) or gold

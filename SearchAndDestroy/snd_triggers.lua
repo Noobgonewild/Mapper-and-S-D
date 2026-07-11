@@ -170,14 +170,23 @@ end
 
 --- Campaign complete trigger
 function snd.triggers.cpComplete()
-    if snd.cp and snd.cp.onComplete then
-        snd.cp.onComplete()
+    if snd.cp and snd.cp.startCompletionPending then
+        snd.cp.startCompletionPending()
+    end
+end
+
+--- First campaign of the day bonus trigger
+-- Matches: "You receive 13 quest points bonus for your first campaign completed today."
+function snd.triggers.cpFirstDailyBonus(matches)
+    if not matches or not matches[2] then return end
+    if snd.cp and snd.cp.applyFirstDailyBonus then
+        snd.cp.applyFirstDailyBonus(matches[2])
     end
 end
 
 --- Campaign completion separator trigger
 function snd.triggers.cpCompleteSeparator()
-    -- Completion now finalizes directly on the campaign completion line.
+    -- Completion now finalizes from the daily-bonus trigger or a short timer.
     -- Keep this trigger as a harmless no-op for compatibility.
 end
 

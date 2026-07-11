@@ -26,9 +26,13 @@ snd.cp.parsing = {
     capturedTimeLeftSeconds = nil,
     completionPending = false,
     completionSeparatorsSeen = 0,
+    completionTimer = nil,
+    completionStartCompletedToday = nil,
 }
 snd.cp.pendingResetClose = snd.cp.pendingResetClose or nil
 snd.cp.pendingResetCloseTimer = snd.cp.pendingResetCloseTimer or nil
+
+local CP_COMPLETION_BONUS_WAIT = 0.5
 
 -------------------------------------------------------------------------------
 -- Campaign Check Request Throttling
@@ -195,6 +199,36 @@ local function rowRewardsMatch(row, rewards)
         (tonumber(row.prac_rewards) or 0) == (tonumber(rewards.pracs) or 0)
 end
 
+local function cancelCompletionTimer()
+    if snd.cp.parsing.completionTimer and type(killTimer) == "function" then
+        pcall(function() killTimer(snd.cp.parsing.completionTimer) end)
+    end
+    snd.cp.parsing.completionTimer = nil
+end
+
+local function rewardValue(currentValue, row, rowField)
+    local value = tonumber(currentValue) or 0
+    if value <= 0 and row then
+        value = tonumber(row[rowField]) or value
+    end
+    return value
+end
+
+local function buildCompletionRewards(row)
+    local baseQp = rewardValue(snd.campaign.qpReward, row, "qp_rewards")
+    local dailyQpBonus = tonumber(snd.campaign.dailyQpBonus) or 0
+
+    return {
+        qp = baseQp + dailyQpBonus,
+        baseQp = baseQp,
+        dailyQpBonus = dailyQpBonus,
+        gold = rewardValue(snd.campaign.goldReward, row, "gold_rewards"),
+        tp = rewardValue(snd.campaign.tpReward, row, "tp_rewards"),
+        trains = rewardValue(snd.campaign.trainReward, row, "train_rewards"),
+        pracs = rewardValue(snd.campaign.pracReward, row, "prac_rewards"),
+    }
+end
+
 --- Persist the current campaign identity snapshot captured from cp info.
 function snd.cp.persistCampaignIdentitySnapshot(completeBy)
     snd.campaign.persistedCompleteBy = snd.cp.normalizeCompleteBy(completeBy)
@@ -292,6 +326,7 @@ function snd.cp.closeHistorySession(status, rewards, reason, opts)
 
     snd.campaign.historyId = 0
     snd.campaign.completeBy = ""
+    snd.campaign.acceptedAt = 0
     if snd.saveState then
         snd.saveState()
     end
@@ -343,7 +378,12 @@ function snd.cp.openHistorySession(levelTaken, completeBy)
     end
 
     if not historyId then
-        historyId = snd.db.historyStart(snd.db.HISTORY_TYPE_CAMPAIGN, levelTaken or snd.char.level or 0)
+        local acceptedAt = tonumber(snd.campaign.acceptedAt) or 0
+        historyId = snd.db.historyStart(
+            snd.db.HISTORY_TYPE_CAMPAIGN,
+            levelTaken or snd.char.level or 0,
+            acceptedAt > 0 and acceptedAt or nil
+        )
     end
 
     snd.campaign.historyId = tonumber(historyId) or 0
@@ -1392,8 +1432,11 @@ end
 --- Handle campaign complete
 function snd.cp.onComplete()
     local endedHistory = nil
+    local latest = nil
+    local completionRewards = buildCompletionRewards(nil)
     if snd.db and snd.db.getLatestCampaignHistoryRow and snd.db.historyEndById then
-        local latest = snd.db.getLatestCampaignHistoryRow()
+        latest = snd.db.getLatestCampaignHistoryRow()
+        local latestRewards = buildCompletionRewards(latest)
         local latestId = latest and tonumber(latest.id) or nil
         local latestStatus = latest and tonumber(latest.status) or nil
         local latestCompleteBy = (latestId and snd.db.getCompleteByByHistoryId) and
@@ -1431,9 +1474,10 @@ function snd.cp.onComplete()
             end
 
             if canComplete then
+                completionRewards = latestRewards
                 endedHistory = snd.cp.closeHistorySession(
                     snd.db.HISTORY_STATUS_COMPLETE,
-                    nil,
+                    completionRewards,
                     "campaign complete",
                     {forceHistoryId = latestId, skipReattachProbe = true}
                 )
@@ -1449,50 +1493,82 @@ function snd.cp.onComplete()
 
     if endedHistory then
         snd.utils.reportCampaignCompletion({
-            qp = tonumber(endedHistory.qp_rewards) or snd.campaign.qpReward or 0,
-            gold = tonumber(endedHistory.gold_rewards) or snd.campaign.goldReward or 0,
-            tp = tonumber(endedHistory.tp_rewards) or snd.campaign.tpReward or 0,
-            trains = tonumber(endedHistory.train_rewards) or snd.campaign.trainReward or 0,
-            pracs = tonumber(endedHistory.prac_rewards) or snd.campaign.pracReward or 0,
+            qp = tonumber(endedHistory.qp_rewards) or completionRewards.qp or 0,
+            baseQp = completionRewards.baseQp,
+            dailyQpBonus = completionRewards.dailyQpBonus,
+            gold = tonumber(endedHistory.gold_rewards) or completionRewards.gold or 0,
+            tp = tonumber(endedHistory.tp_rewards) or completionRewards.tp or 0,
+            trains = tonumber(endedHistory.train_rewards) or completionRewards.trains or 0,
+            pracs = tonumber(endedHistory.prac_rewards) or completionRewards.pracs or 0,
         }, tonumber(endedHistory.duration_seconds))
     else
-        snd.utils.reportCampaignCompletion({
-            qp = snd.campaign.qpReward or 0,
-            gold = snd.campaign.goldReward or 0,
-            tp = snd.campaign.tpReward or 0,
-            trains = snd.campaign.trainReward or 0,
-            pracs = snd.campaign.pracReward or 0,
-        }, nil)
+        snd.utils.reportCampaignCompletion(completionRewards, nil)
     end
 
-    snd.cp.incrementCampaignsCompletedToday()
+    snd.cp.recordCampaignCompletionToday()
     snd.cp.clearCampaign()
 end
 
---- Mark campaign completion as pending until campaign reward footer is fully printed.
+--- Mark campaign completion as pending so the first-campaign daily bonus can arrive.
 function snd.cp.startCompletionPending()
+    cancelCompletionTimer()
     snd.cp.parsing.completionPending = true
-    -- cp_complete fires on the CONGRATULATIONS line that appears between
-    -- the two dashed separators, so only one subsequent separator is needed
-    -- to finalize completion.
     snd.cp.parsing.completionSeparatorsSeen = 0
+    if snd.cp.normalizeCampaignTodayCounter then
+        snd.cp.normalizeCampaignTodayCounter()
+    end
+    snd.cp.parsing.completionStartCompletedToday = tonumber(snd.campaign.completedToday) or 0
+    snd.campaign.dailyQpBonus = 0
+
+    if type(tempTimer) ~= "function" then
+        snd.cp.finalizePendingCompletion("no completion timer available")
+        return
+    end
+
+    snd.cp.parsing.completionTimer = tempTimer(CP_COMPLETION_BONUS_WAIT, function()
+        snd.cp.parsing.completionTimer = nil
+        snd.cp.finalizePendingCompletion("first campaign bonus wait expired")
+    end)
 end
 
---- Observe campaign completion footer separators and complete once the closing line arrives.
-function snd.cp.onCompletionSeparator()
+--- Finalize a pending campaign completion once the daily bonus is known or timed out.
+function snd.cp.finalizePendingCompletion(reason)
     if not snd.cp.parsing.completionPending then
         return false
     end
 
-    snd.cp.parsing.completionSeparatorsSeen = (tonumber(snd.cp.parsing.completionSeparatorsSeen) or 0) + 1
-    if snd.cp.parsing.completionSeparatorsSeen < 1 then
-        return true
-    end
-
     snd.cp.parsing.completionPending = false
     snd.cp.parsing.completionSeparatorsSeen = 0
+    cancelCompletionTimer()
+
+    if reason and reason ~= "" then
+        snd.utils.debugNote("Finalizing campaign completion (" .. tostring(reason) .. ")")
+    end
+
     snd.cp.onComplete()
     return true
+end
+
+--- Capture the first-campaign daily QP bonus and close the pending completion early.
+function snd.cp.applyFirstDailyBonus(qpBonus)
+    local bonus = tonumber(qpBonus) or 0
+    if bonus <= 0 then
+        return false
+    end
+
+    if not snd.cp.parsing.completionPending then
+        snd.utils.debugNote("Ignoring first campaign daily bonus; no completion is pending")
+        return false
+    end
+
+    snd.campaign.dailyQpBonus = bonus
+    snd.utils.debugNote("First campaign daily bonus captured: " .. tostring(bonus) .. "qp")
+    return snd.cp.finalizePendingCompletion("first campaign daily bonus captured")
+end
+
+--- Observe campaign completion footer separators. Completion waits for bonus or timer.
+function snd.cp.onCompletionSeparator()
+    return snd.cp.parsing.completionPending == true
 end
 
 --- Handle campaign quit/cleared
@@ -1513,6 +1589,12 @@ function snd.cp.onNotOnCampaign()
         "Not on campaign (tracked completeBy='" .. tostring(snd.campaign.completeBy or "") ..
         "', historyId=" .. tostring(snd.campaign.historyId or 0) .. ")"
     )
+
+    if snd.cp.parsing.completionPending then
+        snd.cp.finalizePendingCompletion("not-on-campaign confirmation arrived during completion wait")
+        return
+    end
+
     if snd.db and snd.cp.hasOpenHistorySession() then
         snd.cp.closeHistorySession(snd.db.HISTORY_STATUS_RESET, nil, "verified not on campaign")
     end
@@ -1522,6 +1604,7 @@ end
 --- Handle the first positive signal that a campaign has been accepted.
 function snd.cp.onCampaignAccepted()
     snd.campaign.canGetNew = false
+    snd.campaign.acceptedAt = os.time()
 
     if snd.gmcp and snd.gmcp.setCampaignActiveForAutoNoexp then
         snd.gmcp.setCampaignActiveForAutoNoexp()
@@ -1533,6 +1616,7 @@ function snd.cp.clearCampaign()
     snd.campaign.active = false
     snd.campaign.levelTaken = 0
     snd.campaign.completeBy = ""
+    snd.campaign.acceptedAt = 0
     snd.campaign.targets = {}
     snd.campaign.checkList = {}
     snd.campaign.qpReward = 0
@@ -1540,9 +1624,12 @@ function snd.cp.clearCampaign()
     snd.campaign.tpReward = 0
     snd.campaign.trainReward = 0
     snd.campaign.pracReward = 0
+    snd.campaign.dailyQpBonus = 0
     snd.campaign.targetType = nil
+    cancelCompletionTimer()
     snd.cp.parsing.completionPending = false
     snd.cp.parsing.completionSeparatorsSeen = 0
+    snd.cp.parsing.completionStartCompletedToday = nil
 
     -- Clear targets if no gquest
     if not snd.gquest.active then
@@ -1572,6 +1659,11 @@ end
 function snd.cp.onCanGetNew()
     snd.campaign.canGetNew = true
     snd.utils.debugNote("Can get new campaign")
+
+    if snd.cp.parsing.completionPending then
+        snd.cp.finalizePendingCompletion("campaign eligibility arrived during completion wait")
+        return
+    end
 
     if snd.db and snd.cp.hasOpenHistorySession() and not snd.campaign.active then
         snd.cp.closeHistorySession(snd.db.HISTORY_STATUS_RESET, nil, "campaign eligibility indicates prior campaign ended")
@@ -1618,6 +1710,22 @@ function snd.cp.incrementCampaignsCompletedToday()
     snd.campaign.completedTodayDate = snd.cp.getTodayDateKey()
     if snd.saveState then
         snd.saveState()
+    end
+end
+
+--- Record a local campaign completion unless the server count already advanced.
+function snd.cp.recordCampaignCompletionToday()
+    snd.cp.normalizeCampaignTodayCounter()
+    local startCount = tonumber(snd.cp.parsing.completionStartCompletedToday)
+    local currentCount = tonumber(snd.campaign.completedToday) or 0
+
+    if startCount == nil or currentCount <= startCount then
+        snd.cp.incrementCampaignsCompletedToday()
+    else
+        snd.cp.parsing.completionStartCompletedToday = nil
+        if snd.saveState then
+            snd.saveState()
+        end
     end
 end
 

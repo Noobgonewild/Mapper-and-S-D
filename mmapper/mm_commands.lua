@@ -8,6 +8,14 @@ local function show_window_status(which)
   end
 
   mm.note(string.format("%s status: %s, position=%s,%s size=%s x %s, locked=%s", which, cfg.enabled and "shown" or "hidden", tostring(cfg.x), tostring(cfg.y), tostring(cfg.width), tostring(cfg.height), tostring(cfg.locked)))
+  if which == "bigmap" and mm.minimap and mm.minimap.get_bigmap_mode then
+    local mode, radius = mm.minimap.get_bigmap_mode()
+    local active = mm.minimap.get_active_bigmap_mode and mm.minimap.get_active_bigmap_mode() or mode
+    local suffix = (mode == "local" or mode == "hybrid") and
+      string.format(" radius=%d", tonumber(radius) or 4) or ""
+    if mode == "hybrid" then suffix = suffix .. " active=" .. tostring(active) end
+    mm.note(string.format("bigmap display: %s%s", tostring(mode), suffix))
+  end
 end
 
 local function handle_window_command(which, action, a, b)
@@ -41,6 +49,23 @@ local function run_inspect(source)
   end
 end
 
+local function rebuild_rooms_lookup()
+  if not (snd and snd.mapper and snd.mapper.rebuildRoomsLookup) then
+    mm.warn("Mapper database lookup rebuild is not available.")
+    return
+  end
+  local ok, info = snd.mapper.rebuildRoomsLookup()
+  if not ok then
+    mm.warn(info)
+    return
+  end
+  mm.note(string.format(
+    "rooms_lookup rebuilt from rooms: %d room rows, %d lookup rows.",
+    tonumber(info.rooms) or 0,
+    tonumber(info.lookup) or 0
+  ))
+end
+
 local function ensure_mapper_ui_config()
   snd = snd or {}
   snd.config = snd.config or {}
@@ -62,6 +87,19 @@ local function mapper_ui_status_text()
     ui.visited and "on" or "off",
     ui.chips and "on" or "off"
   )
+end
+
+local function set_native_follow(enabled, command_name)
+  enabled = enabled ~= false
+  mm.state.auto_locate = enabled
+  mm.state.center_on_locate = enabled
+  if mm.save_settings_persistence then
+    mm.save_settings_persistence()
+  end
+  mm.note(string.format("%s %s", command_name or "autolocate", enabled and "on" or "off"))
+  if enabled and mm.sync_native_bigmap_to_current_room then
+    mm.sync_native_bigmap_to_current_room("native_follow_enabled")
+  end
 end
 
 local function set_mapper_ui_flag(flag, mode)
@@ -151,6 +189,16 @@ local function handle_command_inline(line)
     return true
   end
 
+  if line == "mapper stats" then
+    mm.show_stats()
+    return true
+  end
+
+  if line == "mapper stats reset" then
+    mm.reset_stats()
+    return true
+  end
+
   local help_topic = line:match("^mapper help%s+(.+)$")
   if line == "mapper help" or help_topic then
     mm.show_help(help_topic)
@@ -160,6 +208,48 @@ local function handle_command_inline(line)
   local window_only = line:match("^mapper%s+(%S+)$")
   if window_only and (window_only == "minimap" or window_only == "bigmap" or window_only == "map") then
     show_window_status((window_only == "map") and "bigmap" or window_only)
+    return true
+  end
+
+  local bigmap_arg = line:match("^mapper%s+bigmap%s+(%S+)$") or line:match("^mapper%s+map%s+(%S+)$")
+  if bigmap_arg and (bigmap_arg == "local" or bigmap_arg == "native" or bigmap_arg == "hybrid") then
+    mm.minimap.set_bigmap_mode(bigmap_arg)
+    return true
+  end
+
+  local bigmap_radius = line:match("^mapper%s+bigmap%s+radius%s+(%d+)$")
+    or line:match("^mapper%s+map%s+radius%s+(%d+)$")
+    or line:match("^mapper%s+localmap%s+radius%s+(%d+)$")
+  if bigmap_radius then
+    mm.minimap.set_local_radius(bigmap_radius)
+    return true
+  end
+
+  local bigmap_room_size = line:match("^mapper%s+bigmap%s+roomsize%s+(%d+)$")
+    or line:match("^mapper%s+map%s+roomsize%s+(%d+)$")
+    or line:match("^mapper%s+localmap%s+roomsize%s+(%d+)$")
+  if bigmap_room_size then
+    mm.minimap.set_local_room_size(bigmap_room_size)
+    return true
+  end
+
+  if line == "mapper bigmap roomsize" or line == "mapper map roomsize" or
+      line == "mapper localmap roomsize" then
+    local _, _, room_size = mm.minimap.get_bigmap_mode()
+    mm.note(string.format("Bigmap local room size is %d pixels.", tonumber(room_size) or 15))
+    return true
+  end
+
+  if line == "mapper localmap" then
+    show_window_status("bigmap")
+    return true
+  end
+
+  if line == "mapper bigmap refresh" or line == "mapper map refresh" or line == "mapper localmap refresh" then
+    if mm.minimap and mm.minimap.update_local_map then
+      mm.minimap.update_local_map(nil, { force = true })
+      mm.note("Bigmap local view refreshed.")
+    end
     return true
   end
 
@@ -397,7 +487,7 @@ local function handle_command_inline(line)
     return true
   end
   if line == "mapper calccoords" then
-    mm.note("This recalculates and saves every area layout from direct cardinal exits in the mapper database. Confirm with: mapper calccoords confirm")
+    mm.note("This refreshes classified cardinal links/stubs, recalculates every area layout, and saves the native map. Maze/teleport exits remain navigation routes but are excluded from coordinates. Confirm with: mapper calccoords confirm")
     return true
   end
 
@@ -645,7 +735,7 @@ local function handle_command_inline(line)
     if dbg == "on" or dbg == "off" then
       mm.state.debug = (dbg == "on")
       mm.note("debug " .. dbg)
-      if dbg == "on" then mm.debug("debugging enabled; watch for setPlayerRoom/map capture lines") end
+      if dbg == "on" then mm.debug("debugging enabled; watch for centerview/map capture lines") end
       return true
     end
     mm.warn("Usage: mapper debug [on|off]")
@@ -684,9 +774,9 @@ local function handle_command_inline(line)
   end
 
   onoff = line:match("^mapper autolocate%s+(%S+)$")
-  if onoff == "on" or onoff == "off" then mm.state.auto_locate = mm.bool_arg(onoff, mm.state.auto_locate); mm.note("autolocate " .. (mm.state.auto_locate and "on" or "off")); return true end
+  if onoff == "on" or onoff == "off" then set_native_follow(mm.bool_arg(onoff, mm.state.auto_locate), "autolocate"); return true end
   onoff = line:match("^mapper centerlocate%s+(%S+)$")
-  if onoff == "on" or onoff == "off" then mm.state.center_on_locate = mm.bool_arg(onoff, mm.state.center_on_locate); mm.note("centerlocate " .. (mm.state.center_on_locate and "on" or "off")); return true end
+  if onoff == "on" or onoff == "off" then set_native_follow(mm.bool_arg(onoff, mm.state.auto_locate), "centerlocate"); return true end
 
   local backups_arg = line:match("^mapper backups%s*(.-)%s*$")
   if backups_arg ~= nil and line:find("^mapper backups") then
@@ -764,8 +854,7 @@ local function handle_command_inline(line)
     end
 
     if normalized == "on" or normalized == "off" then
-      mm.set_rebuild_layout_on_area_entry(normalized == "on")
-      mm.note("auto rebuild layout on area entry " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off"))
+      mm.warn("Automatic layout rebuild on area entry has been removed. Use 'mapper rebuild layout' when you want a manual repair.")
       return true
     end
 
@@ -776,8 +865,7 @@ local function handle_command_inline(line)
       return true
     end
 
-    mm.warn("Usage: mapper rebuild layout [on|off|<room_id>]")
-    mm.note("auto rebuild layout on area entry " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off"))
+    mm.warn("Usage: mapper rebuild layout [<room_id>]")
     return true
   end
 
@@ -827,11 +915,18 @@ local function handle_command_inline(line)
     return true
   end
 
+  if line == "mapper rebuild lookup" or line == "mapper rebuild rooms_lookup" then
+    rebuild_rooms_lookup()
+    return true
+  end
+
   return false
 end
 
 mm.alias_specs = {
   {"^mapper help(?: (.*))?$", function(m) mm.show_help(m[2]) end},
+  {"^mapper stats$", function() mm.show_stats() end},
+  {"^mapper stats reset$", function() mm.reset_stats() end},
   {"^mapper goto (.+)$", function(m) local ok, err = mm.goto_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper walkto (.+)$", function(m) local ok, err = mm.walkto_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper where%s*(.*)$", function(m) local ok, err = mm.where_room(m[2]); if not ok then mm.warn(err) end end},
@@ -962,12 +1057,11 @@ mm.alias_specs = {
   {"^mapper backups uncompressed$", function() mm.state.backups_compressed = false; mm.note("backups compression off") end},
   {"^mapper updown$", function() mm.state.show_up_down = not mm.state.show_up_down; mm.note("updown " .. (mm.state.show_up_down and "on" or "off")) end},
   {"^mapper underlines?(?: (on|off))?$", function(m) if m[2] then mm.state.underline_links = mm.bool_arg(m[2], mm.state.underline_links) end; mm.note("underlines " .. (mm.state.underline_links and "on" or "off")) end},
-  {"^mapper autolocate(?: (on|off))?$", function(m) mm.state.auto_locate = mm.bool_arg(m[2], not mm.state.auto_locate); mm.note("autolocate " .. (mm.state.auto_locate and "on" or "off")) end},
-  {"^mapper centerlocate(?: (on|off))?$", function(m) mm.state.center_on_locate = mm.bool_arg(m[2], not mm.state.center_on_locate); mm.note("centerlocate " .. (mm.state.center_on_locate and "on" or "off")) end},
+  {"^mapper autolocate(?: (on|off))?$", function(m) set_native_follow(mm.bool_arg(m[2], not mm.state.auto_locate), "autolocate") end},
+  {"^mapper centerlocate(?: (on|off))?$", function(m) set_native_follow(mm.bool_arg(m[2], not mm.state.auto_locate), "centerlocate") end},
   {"^mapper portalguard%s*(%S*)$", function(m) handle_portalguard(m[2]) end},
-  {"^mapper rebuild layout (on|off)$", function(m) mm.set_rebuild_layout_on_area_entry(m[2] == "on"); mm.note("auto rebuild layout on area entry " .. (mm.state.rebuild_layout_on_sync_error and "on" or "off")) end},
   {"^mapper locate$", function() send("look") end},
-  {"^mapper debug(?: (on|off))?$", function(m) if m[2] then mm.state.debug = (m[2] == "on"); mm.note("debug " .. m[2]); if m[2] == "on" then mm.debug("debugging enabled; watch for setPlayerRoom/map capture lines") end else mm.note("debug " .. ((mm.state and mm.state.debug) and "on" or "off")) end end},
+  {"^mapper debug(?: (on|off))?$", function(m) if m[2] then mm.state.debug = (m[2] == "on"); mm.note("debug " .. m[2]); if m[2] == "on" then mm.debug("debugging enabled; watch for centerview/map capture lines") end else mm.note("debug " .. ((mm.state and mm.state.debug) and "on" or "off")) end end},
   {"^mapper database$", function() mm.note("Current mapper database: " .. mm.state.map_db) end},
   {"^mapper set database (.+)$", function(m) mm.state.map_db = m[2]; mm.note("Mapper database set to " .. m[2]) end},
   {"^mapper native db$", function() mm.note("Native mapper DB: " .. tostring(mm.resolve_native_mapper_db(mm.state.native_mapper_db))) end},
@@ -991,6 +1085,8 @@ mm.alias_specs = {
   {"^mapper bouncerecall%s+(%d+)$", function(m) local ok, portal_or_err = mm.set_bounce_recall(tonumber(m[2])); if not ok then mm.warn(portal_or_err) else mm.note("bouncerecall set to #" .. tostring(m[2]) .. ": " .. tostring(portal_or_err.command)) end end},
   {"^mapper rebuild map$", function() local ok, err = mm.import.convert_sqlite_to_mudlet(mm.state.map_db); if not ok then mm.warn(err) end end},
   {"^mapper import rooms$", function() local ok, err = mm.import.convert_sqlite_to_mudlet(mm.state.map_db); if not ok then mm.warn(err) end end},
+  {"^mapper rebuild lookup$", function() rebuild_rooms_lookup() end},
+  {"^mapper rebuild rooms_lookup$", function() rebuild_rooms_lookup() end},
   {"^mapper recolor map$", function() local ok, err = mm.apply_terrain_colors(); if not ok then mm.warn(err) end end},
   {"^mapper updatecolors$", function() local ok, info = mm.import.update_room_colors_from_sqlite(mm.state.map_db); if not ok then mm.warn(info) else mm.note(string.format("DB room colors updated: env=%d, env-colors=%d, rooms=%d, skipped=%d", info.env_rows or 0, info.colors_applied or 0, info.rooms_updated or 0, info.rooms_skipped or 0)) end end},
   {"^mapper updatecolors (.+)$", function(m) local ok, info = mm.import.update_room_colors_from_sqlite(m[2]); if not ok then mm.warn(info) else mm.note(string.format("DB room colors updated from %s: env=%d, env-colors=%d, rooms=%d, skipped=%d", tostring(info.source), info.env_rows or 0, info.colors_applied or 0, info.rooms_updated or 0, info.rooms_skipped or 0)) end end},
