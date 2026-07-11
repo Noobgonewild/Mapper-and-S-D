@@ -2224,8 +2224,16 @@ function mm.import.update_room_colors_from_sqlite(source_path)
       end
     end
 
-    if type(saveMap) == "function" then
-      pcall(saveMap)
+    local save_target = mm.runtime and mm.runtime.native_mapper_db_loaded_path
+    if not save_target then
+      local configured_target = mm.resolve_native_mapper_db(mm.state and mm.state.native_mapper_db)
+      if configured_target and mm.path_exists(configured_target) and not mm.looks_like_sqlite(configured_target) then
+        save_target = configured_target
+      end
+    end
+    local save_ok, save_err = save_native_map(save_target)
+    if not save_ok then
+      error("room colors were applied but the native map could not be saved: " .. tostring(save_err))
     end
 
     if mm and mm.bump_stats then
@@ -2242,6 +2250,7 @@ function mm.import.update_room_colors_from_sqlite(source_path)
       colors_applied = colorsApplied,
       rooms_updated = updated,
       rooms_skipped = skipped,
+      saved_to = save_target,
     }
   end)
 
