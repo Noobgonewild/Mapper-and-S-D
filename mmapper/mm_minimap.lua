@@ -1291,6 +1291,17 @@ local function render_local_error(window, message)
     clean_local_label(message, 120))
 end
 
+local function render_local_nomap(window, room_size)
+  clear_local_drawables(window)
+  window.graph = nil
+  local width, height = local_canvas_dimensions(window)
+  local size = clamp_local_room_size(room_size)
+  new_local_drawable(window, "nomap", (width - size) / 2, (height - size) / 2,
+    size, size,
+    "background-color: rgba(105,105,105,155); border: 3px solid " .. LOCAL_CURRENT_COLOR .. ";")
+  if window.background and window.background.lower then pcall(window.background.lower, window.background) end
+end
+
 mm.minimap._build_local_graph = build_local_graph
 
 function mm.minimap.update_local_map(room_id, update_opts)
@@ -1306,6 +1317,14 @@ function mm.minimap.update_local_map(room_id, update_opts)
     }
     mm.minimap.redraw("bigmap")
     return false
+  end
+
+  local requested_id = tostring(room_id or "")
+  local info = mm.get_room_info and mm.get_room_info() or nil
+  if requested_id == "-1" or requested_id:find("^nomap_") or
+      (info and tonumber(info.num) == -1) then
+    render_local_nomap(window, opts.local_room_size)
+    return true
   end
 
   local center_id = resolve_local_room_id(room_id)
