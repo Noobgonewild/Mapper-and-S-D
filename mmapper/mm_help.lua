@@ -92,6 +92,7 @@ mm.help_table = {
       { cmd = "mapper ui visited on/off", desc = "Enable or disable visited-room styling in quick-where cycles" },
       { cmd = "mapper ui chips on/off", desc = "Enable or disable compact status chips in mapper output headers" },
       { cmd = "mapper ui reset", desc = "Reset mapper/S&D UI style toggles to defaults (all on)" },
+      { cmd = "mapper init start", desc = "Search local drives for Aardwolf.db and SnDdb.db and report each found path with file size without changing files" },
       { cmd = "mapper saferoom", desc = "Mark current room safe (appends 'safe' to rooms.info, preserving existing flags)" },
       { cmd = "mapper saferoom on/off", desc = "Toggle the safe flag on the current room" },
       { cmd = "mapper saferoom <roomId>", desc = "Mark the given room id as safe" },

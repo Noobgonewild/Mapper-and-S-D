@@ -1408,8 +1408,15 @@ local function activate_current_bigmap_surface(reason)
 
   if active_bigmap_mode() == "local" then
     mm.minimap.update_local_map(nil, { force = true })
-  elseif mm.minimap.backend == "mudlet_mapper" and mm.sync_native_bigmap_to_current_room then
-    mm.sync_native_bigmap_to_current_room(reason or "bigmap_backend_switch")
+  elseif mm.minimap.backend == "mudlet_mapper" then
+    if mm.schedule_native_mapper_load then
+      mm.schedule_native_mapper_load(reason or "bigmap_backend_switch")
+    else
+      ensure_native_bigmap_data()
+      if mm.sync_native_bigmap_to_current_room then
+        mm.sync_native_bigmap_to_current_room(reason or "bigmap_backend_switch")
+      end
+    end
   end
   return true
 end
@@ -1455,10 +1462,6 @@ function mm.minimap.set_bigmap_mode(mode)
     mm.save_settings_persistence()
   end
 
-  if requested == "native" then
-    ensure_native_bigmap_data()
-  end
-
   activate_current_bigmap_surface("bigmap_mode_switch")
   if requested == "native" and mm.minimap.backend ~= "mudlet_mapper" then
     opts.bigmap_mode = "local"
@@ -1475,7 +1478,6 @@ function mm.minimap.activate_bigmap_native()
   if active_bigmap_mode() == "native" then return false end
   mm.runtime = mm.runtime or {}
   mm.runtime.hybrid_bigmap_backend = "native"
-  ensure_native_bigmap_data()
   activate_current_bigmap_surface("gmcp_continent_room")
   return true
 end

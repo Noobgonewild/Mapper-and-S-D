@@ -594,6 +594,8 @@ local function load_layout_graph(source_path, opts)
       layout_stub_exits = 0,
       layout_stub_reasons = {},
       terrain_colors = {},
+      terrain_env_ids = {},
+      environment_colors = {},
       room_order = {},
       source_room_count = inspect.room_count,
       source_exit_count = inspect.exit_count,
@@ -616,6 +618,13 @@ local function load_layout_graph(source_path, opts)
       local uid = trim(row.uid)
       if name ~= "" then graph.terrain_colors[name] = rgb end
       if uid ~= "" then graph.terrain_colors[uid] = rgb end
+      local numeric_uid = tonumber(row.uid)
+      if numeric_uid then
+        local mudlet_env = numeric_uid + 16
+        if name ~= "" then graph.terrain_env_ids[name] = mudlet_env end
+        if uid ~= "" then graph.terrain_env_ids[uid] = mudlet_env end
+        graph.environment_colors[mudlet_env] = rgb
+      end
     end
 
     local function ensure_area(key)
@@ -1863,6 +1872,23 @@ local function process_batch(job, list, callback)
   return job.index > #list
 end
 
+local function apply_import_environment_colors(job)
+  if type(setCustomEnvColor) ~= "function" then return end
+  local applied = 0
+  for env_id, rgb in pairs(job.graph.environment_colors or {}) do
+    local ok, result = pcall(setCustomEnvColor, env_id, rgb[1], rgb[2], rgb[3], 255)
+    if ok and result ~= false then
+      applied = applied + 1
+    else
+      record_job_failure(job, "environment-color", env_id)
+    end
+  end
+  if applied > 0 and mm and mm.bump_stats then
+    mm.bump_stats("env_colors_set", applied)
+  end
+  job.totals.environment_colors = applied
+end
+
 local function create_import_room(job, room_id)
   local room = job.graph.rooms[room_id]
   local ok, added = pcall(addRoom, room_id)
@@ -1889,7 +1915,18 @@ local function create_import_room(job, room_id)
   end
   if room.terrain and room.terrain ~= "" then
     if type(setRoomUserData) == "function" then pcall(setRoomUserData, room_id, "terrain", tostring(room.terrain)) end
-    if mm.apply_room_terrain then pcall(mm.apply_room_terrain, room_id, tostring(room.terrain)) end
+    local terrain_key = trim(room.terrain):lower()
+    local env_id = job.graph.terrain_env_ids and job.graph.terrain_env_ids[terrain_key]
+    if env_id and type(setRoomEnv) == "function" then
+      local env_ok, env_result = pcall(setRoomEnv, room_id, env_id)
+      if env_ok and env_result ~= false then
+        if mm and mm.bump_stats then mm.bump_stats("room_colors_set") end
+      else
+        record_job_failure(job, "room-environment", room_id)
+      end
+    elseif mm.apply_room_terrain then
+      pcall(mm.apply_room_terrain, room_id, tostring(room.terrain))
+    end
   end
 end
 
@@ -2042,6 +2079,10 @@ local function start_all_area_job(mode, source_path, target_path)
   }
 
   if mode == "rebuild" then
+    apply_import_environment_colors(job)
+  end
+
+  if mode == "rebuild" then
     for room_id in pairs(getRooms() or {}) do
       room_id = tonumber(room_id)
       if room_id then table.insert(job.delete_rooms, room_id) end
@@ -2085,6 +2126,44 @@ function mm.import.recalculate_all_layouts(source_path)
   return start_all_area_job("layout", source_path or mm.state.map_db, nil)
 end
 
+function mm.import.apply_environment_colors_from_sqlite(source_path)
+  local source = mm.resolve_native_mapper_db(source_path or mm.state.map_db)
+  if not source or not mm.path_exists(source) then
+    return false, "source DB not found: " .. tostring(source)
+  end
+
+  local env, conn, open_err = open_sqlite(source)
+  if not conn then return false, open_err end
+
+  local ok, result_or_err = pcall(function()
+    local env_rows, env_err = sqlite_query(conn, "SELECT uid, color FROM environments")
+    if not env_rows then error("failed loading environments: " .. tostring(env_err)) end
+    if #env_rows == 0 then error("no environments found in sqlite DB") end
+    if type(setCustomEnvColor) ~= "function" then error("setCustomEnvColor unavailable") end
+
+    local applied = 0
+    for _, row in ipairs(env_rows) do
+      local uid = tonumber(row.uid)
+      if uid then
+        local rgb = ansi_to_rgb[tonumber(row.color)] or {192, 192, 192}
+        local color_ok, color_result = pcall(setCustomEnvColor, uid + 16, rgb[1], rgb[2], rgb[3], 255)
+        if color_ok and color_result ~= false then applied = applied + 1 end
+      end
+    end
+    if applied == 0 then error("no environment colors could be applied") end
+    return { source = source, env_rows = #env_rows, colors_applied = applied }
+  end)
+
+  conn:close()
+  env:close()
+  if not ok then return false, tostring(result_or_err) end
+
+  if mm and mm.bump_stats then mm.bump_stats("env_colors_set", result_or_err.colors_applied) end
+  mm.runtime = mm.runtime or {}
+  mm.runtime.terrain_colors_applied = true
+  return true, result_or_err
+end
+
 function mm.import.update_room_colors_from_sqlite(source_path)
   local source = mm.resolve_native_mapper_db(source_path or mm.state.map_db)
   if not source or not mm.path_exists(source) then
@@ -2120,8 +2199,8 @@ function mm.import.update_room_colors_from_sqlite(source_path)
     if type(setCustomEnvColor) == "function" then
       for envId, colorCode in pairs(envColorCode) do
         local rgb = ansi_to_rgb[colorCode] or {192, 192, 192}
-        local okColor = pcall(setCustomEnvColor, envId, rgb[1], rgb[2], rgb[3], 255)
-        if okColor then colorsApplied = colorsApplied + 1 end
+        local okColor, colorResult = pcall(setCustomEnvColor, envId, rgb[1], rgb[2], rgb[3], 255)
+        if okColor and colorResult ~= false then colorsApplied = colorsApplied + 1 end
       end
     end
 
@@ -2134,8 +2213,8 @@ function mm.import.update_room_colors_from_sqlite(source_path)
       local terrain = row.terrain and tostring(row.terrain):lower() or nil
       local envId = terrain and terrainToEnv[terrain] or nil
       if roomId and envId and type(setRoomEnv) == "function" then
-        local okRoom = pcall(setRoomEnv, roomId, envId)
-        if okRoom then
+        local okRoom, roomResult = pcall(setRoomEnv, roomId, envId)
+        if okRoom and roomResult ~= false then
           updated = updated + 1
         else
           skipped = skipped + 1
@@ -2154,6 +2233,8 @@ function mm.import.update_room_colors_from_sqlite(source_path)
       if updated > 0 then mm.bump_stats("room_colors_set", updated) end
       if skipped > 0 then mm.bump_stats("skipped", skipped) end
     end
+    mm.runtime = mm.runtime or {}
+    mm.runtime.terrain_colors_applied = colorsApplied > 0 and true or nil
 
     return {
       source = source,

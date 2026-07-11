@@ -199,6 +199,16 @@ local function handle_command_inline(line)
     return true
   end
 
+  if line == "mapper init start" then
+    local ok, err = mm.init_start()
+    if not ok then mm.warn(err) end
+    return true
+  end
+  if line == "mapper init" then
+    mm.warn("Usage: mapper init start")
+    return true
+  end
+
   local help_topic = line:match("^mapper help%s+(.+)$")
   if line == "mapper help" or help_topic then
     mm.show_help(help_topic)
@@ -927,6 +937,8 @@ mm.alias_specs = {
   {"^mapper help(?: (.*))?$", function(m) mm.show_help(m[2]) end},
   {"^mapper stats$", function() mm.show_stats() end},
   {"^mapper stats reset$", function() mm.reset_stats() end},
+  {"^mapper init start$", function() local ok, err = mm.init_start(); if not ok then mm.warn(err) end end},
+  {"^mapper init$", function() mm.warn("Usage: mapper init start") end},
   {"^mapper goto (.+)$", function(m) local ok, err = mm.goto_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper walkto (.+)$", function(m) local ok, err = mm.walkto_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper where%s*(.*)$", function(m) local ok, err = mm.where_room(m[2]); if not ok then mm.warn(err) end end},

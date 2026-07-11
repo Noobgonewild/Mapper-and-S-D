@@ -187,6 +187,8 @@ function mm.apply_terrain_colors()
   if mm and mm.bump_stats then
     mm.bump_stats("env_colors_set", applied)
   end
+  mm.runtime = mm.runtime or {}
+  mm.runtime.terrain_colors_applied = true
   mm.note("Applied mapper terrain colors to " .. tostring(applied) .. " sector environments.")
   return true, applied
 end
@@ -725,7 +727,7 @@ end
 
 function mm.on_room_sectors_event()
   local packet = mm.get_room_sectors_packet()
-  mm.refresh_terrain_ids()
+  local refreshed = mm.refresh_terrain_ids()
   if type(packet) ~= "table" then
     mm.debug("gmcp.room.sectors event; sectors payload missing")
     return
@@ -735,6 +737,11 @@ function mm.on_room_sectors_event()
     if not ok then
       mm.debug("gmcp.room.sectors persist skipped/failed: " .. tostring(err))
     end
+  end
+  mm.runtime = mm.runtime or {}
+  if refreshed and not mm.runtime.terrain_colors_applied then
+    local ok, err = mm.apply_terrain_colors()
+    if not ok then mm.debug("terrain color application deferred: " .. tostring(err)) end
   end
 end
 

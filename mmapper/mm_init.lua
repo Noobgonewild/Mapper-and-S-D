@@ -95,12 +95,80 @@ local function safe_step(label, fn)
   return true
 end
 
+local NATIVE_LOAD_MAX_ATTEMPTS = 10
+local NATIVE_LOAD_RETRY_DELAY = 0.2
+
+local function cancel_native_startup_load()
+  mm.runtime = mm.runtime or {}
+  mm.runtime.native_startup_generation = (tonumber(mm.runtime.native_startup_generation) or 0) + 1
+  if mm.runtime.native_startup_timer and type(killTimer) == "function" then
+    pcall(killTimer, mm.runtime.native_startup_timer)
+  end
+  mm.runtime.native_startup_timer = nil
+  return mm.runtime.native_startup_generation
+end
+
+local function native_startup_load(generation, attempt, reason)
+  mm.runtime = mm.runtime or {}
+  if generation ~= mm.runtime.native_startup_generation then return end
+  mm.runtime.native_startup_timer = nil
+
+  local configured_mode = mm.minimap and mm.minimap.get_bigmap_mode and mm.minimap.get_bigmap_mode()
+  if configured_mode ~= "native" then return end
+
+  local native_path = mm.resolve_native_mapper_db(mm.state.native_mapper_db)
+  if not native_path or not mm.path_exists(native_path) then
+    mm.warn("Native mapper DB was not auto-loaded: native mapper DB not found at " .. tostring(native_path))
+    return
+  end
+  if mm.looks_like_sqlite(native_path) then
+    mm.debug("Native mapper DB autoload skipped: configured path is SQLite live mapper DB.")
+    return
+  end
+  if mm.runtime.native_mapper_db_loaded_path == native_path then
+    if mm.sync_native_bigmap_to_current_room then
+      mm.sync_native_bigmap_to_current_room(reason or "native_map_already_loaded")
+    end
+    return
+  end
+
+  local window = mm.minimap and mm.minimap.windows and mm.minimap.windows.bigmap
+  local mapper_ready = mm.minimap and mm.minimap.backend == "mudlet_mapper" and window and window.mapper
+  local loaded, err = false, "embedded mapper widget is not open yet"
+  if mapper_ready then
+    loaded, err = mm.load_native_mapper_db()
+  end
+  if loaded then return end
+
+  if attempt < NATIVE_LOAD_MAX_ATTEMPTS and type(tempTimer) == "function" then
+    mm.debug(string.format(
+      "Native mapper startup load attempt %d/%d deferred: %s",
+      attempt, NATIVE_LOAD_MAX_ATTEMPTS, tostring(err)))
+    mm.runtime.native_startup_timer = tempTimer(NATIVE_LOAD_RETRY_DELAY, function()
+      native_startup_load(generation, attempt + 1, reason)
+    end)
+    return
+  end
+
+  mm.warn("Native mapper DB was not auto-loaded after " .. tostring(attempt) .. " attempts: " .. tostring(err))
+end
+
+function mm.schedule_native_mapper_load(reason)
+  local generation = cancel_native_startup_load()
+  if type(tempTimer) == "function" then
+    mm.runtime.native_startup_timer = tempTimer(0, function()
+      native_startup_load(generation, 1, reason)
+    end)
+  else
+    native_startup_load(generation, 1, reason)
+  end
+end
+
 function mm.initialize()
   if mm and mm.debug then
     mm.debug("initialization begin")
   end
   mm.runtime = mm.runtime or {}
-  mm.runtime.native_mapper_db_loaded_path = nil
   safe_step("load_settings_persistence", function()
     if mm.load_settings_persistence then
       mm.load_settings_persistence()
@@ -112,16 +180,9 @@ function mm.initialize()
   safe_step("minimap.init", function() mm.minimap.init() end)
 
   if configured_mode == "native" then
-    local loaded, err = mm.load_native_mapper_db()
-    if not loaded then
-      local native_path = mm.resolve_native_mapper_db(mm.state.native_mapper_db)
-      if native_path and mm.path_exists(native_path) and mm.looks_like_sqlite(native_path) then
-        mm.debug("Native mapper DB autoload skipped: configured path is SQLite live mapper DB.")
-      else
-        mm.warn("Native mapper DB was not auto-loaded: " .. tostring(err))
-      end
-    end
+    mm.schedule_native_mapper_load("native_startup")
   else
+    cancel_native_startup_load()
     mm.debug("Native mapper DB autoload skipped while bigmap local/hybrid mode is active.")
   end
 

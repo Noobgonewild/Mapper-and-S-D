@@ -923,6 +923,169 @@ function mm.create_backup(force, quiet_override)
   return true, backupPath
 end
 
+local INIT_DB_FILENAMES = {"Aardwolf.db", "SnDdb.db"}
+local INIT_DB_NAME_LOOKUP = {
+  ["aardwolf.db"] = "Aardwolf.db",
+  ["snddb.db"] = "SnDdb.db",
+}
+
+local function trim_text(value)
+  return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function normalize_fs_path(path)
+  local p = tostring(path or ""):gsub("\\", "/"):gsub("/+", "/")
+  if package.config:sub(1, 1) == "\\" then
+    p = p:lower()
+  end
+  return p:gsub("/$", "")
+end
+
+local function basename(path)
+  return tostring(path or ""):gsub("\\", "/"):match("([^/]+)$") or ""
+end
+
+local function init_file_attrs(path)
+  local ok, lfs = pcall(require, "lfs")
+  if ok and lfs and type(lfs.attributes) == "function" then
+    local attrs = lfs.attributes(path)
+    if attrs then
+      return tonumber(attrs.modification) or 0, tonumber(attrs.size) or 0
+    end
+  end
+
+  local f = io.open(path, "rb")
+  if not f then return 0, 0 end
+  local size = f:seek("end") or 0
+  f:close()
+  return 0, size
+end
+
+local function init_search_command()
+  local is_windows = package.config:sub(1, 1) == "\\"
+  if is_windows then
+    local ps = [[
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+$ErrorActionPreference = 'SilentlyContinue';
+$names = @('Aardwolf.db', 'SnDdb.db');
+$roots = Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Root };
+foreach ($root in $roots) {
+  Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { -not $_.PSIsContainer -and $names -contains $_.Name } |
+    ForEach-Object { [Console]::WriteLine($_.FullName) }
+}
+]]
+    ps = ps:gsub("[\r\n]+", " ")
+    return 'powershell -NoProfile -ExecutionPolicy Bypass -Command "' .. ps:gsub('"', '\\"') .. '"'
+  end
+
+  return [[find / -type f \( -name Aardwolf.db -o -name SnDdb.db \) 2>/dev/null]]
+end
+
+local function init_empty_candidate_set()
+  return {
+    ["Aardwolf.db"] = {},
+    ["SnDdb.db"] = {},
+    _seen = {},
+  }
+end
+
+local function init_add_candidate(candidates, path)
+  local cleaned = trim_text(path)
+  if cleaned == "" then return end
+
+  local canonical = INIT_DB_NAME_LOOKUP[basename(cleaned):lower()]
+  if not canonical then return end
+  if not mm.path_exists(cleaned) then return end
+
+  local normalized = normalize_fs_path(cleaned)
+  if candidates._seen[canonical .. "|" .. normalized] then return end
+  candidates._seen[canonical .. "|" .. normalized] = true
+
+  local mtime, size = init_file_attrs(cleaned)
+  table.insert(candidates[canonical], {
+    path = cleaned,
+    mtime = mtime,
+    size = size,
+  })
+end
+
+local function init_discover_candidates()
+  if type(io.popen) ~= "function" then
+    return nil, "filesystem search requires io.popen, which is unavailable in this Mudlet build"
+  end
+
+  local candidates = init_empty_candidate_set()
+  local cmd = init_search_command()
+  local pipe, err = io.popen(cmd, "r")
+  if not pipe then
+    return nil, "unable to start filesystem search: " .. tostring(err)
+  end
+
+  for line in pipe:lines() do
+    init_add_candidate(candidates, line)
+  end
+  pipe:close()
+  return candidates
+end
+
+local function init_format_size(bytes)
+  local n = tonumber(bytes) or 0
+  if n >= 1024 * 1024 * 1024 then
+    return string.format("%.2f GiB (%d bytes)", n / (1024 * 1024 * 1024), n)
+  end
+  if n >= 1024 * 1024 then
+    return string.format("%.2f MiB (%d bytes)", n / (1024 * 1024), n)
+  end
+  if n >= 1024 then
+    return string.format("%.2f KiB (%d bytes)", n / 1024, n)
+  end
+  return tostring(n) .. " bytes"
+end
+
+local function init_report_candidates(filename, rows)
+  rows = rows or {}
+  table.sort(rows, function(a, b)
+    if a.mtime ~= b.mtime then return a.mtime > b.mtime end
+    if a.size ~= b.size then return a.size > b.size end
+    return tostring(a.path) < tostring(b.path)
+  end)
+
+  if #rows == 0 then
+    mm.warn(filename .. ": not found")
+    return false
+  end
+
+  local suffix = (#rows == 1) and "" or "s"
+  mm.note(string.format("%s: found %d location%s", filename, #rows, suffix))
+  for i, row in ipairs(rows) do
+    mm.note(string.format("  %d. %s | size: %s", i, tostring(row.path), init_format_size(row.size)))
+  end
+  return true
+end
+
+function mm.init_start()
+  mm.note("Searching local drives for Aardwolf.db and SnDdb.db. This can take a while.")
+  local candidates, search_err = init_discover_candidates()
+  if not candidates then
+    return false, search_err
+  end
+
+  local found_any = false
+  for _, filename in ipairs(INIT_DB_FILENAMES) do
+    if init_report_candidates(filename, candidates[filename]) then
+      found_any = true
+    end
+  end
+
+  if not found_any then
+    return false, "no Aardwolf.db or SnDdb.db files were found"
+  end
+
+  mm.note("Mapper init search complete. No files were copied or changed.")
+  return true, "mapper init search complete"
+end
+
 
 function mm.read_file_header(path, n)
   local f = io.open(path, "rb")
@@ -993,7 +1156,15 @@ function mm.load_native_mapper_db(path)
   if mm.save_settings_persistence then mm.save_settings_persistence() end
   mm.runtime = mm.runtime or {}
   mm.runtime.native_mapper_db_loaded_path = resolved
+  mm.runtime.terrain_colors_applied = nil
   mm.note("Loaded native Mudlet mapper DB: " .. resolved)
+  if mm.import and mm.import.apply_environment_colors_from_sqlite then
+    local colors_ok, colors_err = mm.import.apply_environment_colors_from_sqlite(mm.state.map_db)
+    if not colors_ok then mm.debug("Native map terrain colors deferred: " .. tostring(colors_err)) end
+  elseif mm.apply_terrain_colors then
+    local colors_ok, colors_err = mm.apply_terrain_colors()
+    if not colors_ok then mm.debug("Native map terrain colors deferred: " .. tostring(colors_err)) end
+  end
   if mm.sync_native_bigmap_to_current_room then
     mm.sync_native_bigmap_to_current_room("native_map_loaded")
   end
