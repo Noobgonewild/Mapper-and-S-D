@@ -33,12 +33,204 @@ snd.db.killCache = snd.db.killCache or {}
 snd.db.killCacheLastPrune = snd.db.killCacheLastPrune or 0
 snd.db.killCooldownSeconds = 3          -- dedupe duplicate kill events for same mob+room
 snd.db.killCacheMaxAgeSeconds = 30      -- short-lived kill dedupe cache
+snd.db.schemaVersion = 6
+snd.db.createdEmpty = false
 
--- Database file path - UPDATE THIS to your actual database location
--- Common locations:
---   MUSHclient: C:/Users/YOU/MUSHclient/worlds/plugins/snd.db
---   Or copy it to Mudlet profile: getMudletHomeDir() .. "/snd.db"
+-- Default database path: directly inside the active Mudlet profile.
 snd.db.file = getMudletHomeDir() .. "/SnDdb.db"
+
+local SND_CORE_TABLES = { "area", "mobs", "mob_keyword_exceptions", "history" }
+local SND_REQUIRED_COLUMNS = {
+    area = { "name", "key", "minlvl", "maxlvl", "lock", "startRoom", "noquest", "vidblain", "userKey" },
+    mobs = { "mob", "room", "roomid", "zone", "seen_count", "kill_count" },
+    mob_keyword_exceptions = { "area_name", "mob_name", "keyword" },
+    history = { "id", "type", "level_taken", "start_time", "end_time", "status", "qp_rewards", "tp_rewards", "train_rewards", "prac_rewards", "gold_rewards" },
+}
+local SND_SCHEMA_SQL = {
+    [[CREATE TABLE IF NOT EXISTS area (
+        name TEXT NOT NULL,
+        key TEXT NOT NULL,
+        minlvl INTEGER NOT NULL,
+        maxlvl INTEGER NOT NULL,
+        lock INTEGER NOT NULL,
+        startRoom INTEGER,
+        noquest TEXT,
+        vidblain TEXT,
+        userKey TEXT)]],
+    [[CREATE TABLE IF NOT EXISTS mobs (
+        mob TEXT NOT NULL COLLATE NOCASE,
+        room TEXT NOT NULL COLLATE NOCASE,
+        roomid INTEGER NOT NULL,
+        zone TEXT NOT NULL,
+        seen_count INTEGER NOT NULL DEFAULT 0,
+        kill_count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(mob, roomid))]],
+    [[CREATE TABLE IF NOT EXISTS mob_keyword_exceptions (
+        area_name TEXT NOT NULL,
+        mob_name TEXT NOT NULL,
+        keyword TEXT NOT NULL,
+        UNIQUE(area_name, mob_name))]],
+    [[CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY,
+        type INTEGER NOT NULL,
+        level_taken INTEGER NOT NULL,
+        start_time INTEGER NOT NULL,
+        end_time INTEGER,
+        status INTEGER DEFAULT 1,
+        qp_rewards INTEGER DEFAULT 0,
+        tp_rewards INTEGER DEFAULT 0,
+        train_rewards INTEGER DEFAULT 0,
+        prac_rewards INTEGER DEFAULT 0,
+        gold_rewards INTEGER DEFAULT 0)]],
+    [[CREATE TABLE IF NOT EXISTS campaign_history_identity (
+        id INTEGER PRIMARY KEY,
+        complete_by TEXT NOT NULL UNIQUE,
+        history_id INTEGER NOT NULL UNIQUE)]],
+    [[CREATE TABLE IF NOT EXISTS mob_tags (
+        id INTEGER PRIMARY KEY,
+        mob TEXT NOT NULL COLLATE NOCASE,
+        zone TEXT NOT NULL COLLATE NOCASE,
+        nowhere INTEGER NOT NULL DEFAULT 0,
+        nohunt INTEGER NOT NULL DEFAULT 0,
+        priority_room INTEGER DEFAULT NULL,
+        UNIQUE(mob, zone))]],
+    [[CREATE INDEX IF NOT EXISTS area_key ON area(key)]],
+    [[CREATE INDEX IF NOT EXISTS mobs_zone_mob_room ON mobs(zone, mob, room)]],
+    [[CREATE INDEX IF NOT EXISTS history_end_time_status_type ON history(end_time, status, type)]],
+    [[CREATE INDEX IF NOT EXISTS history_start_time_type ON history(start_time, type)]],
+    [[CREATE INDEX IF NOT EXISTS history_type_status ON history(type, status)]],
+    [[CREATE INDEX IF NOT EXISTS idx_campaign_identity_complete_by ON campaign_history_identity(complete_by)]],
+    [[CREATE INDEX IF NOT EXISTS idx_campaign_identity_history_id ON campaign_history_identity(history_id)]],
+    [[CREATE INDEX IF NOT EXISTS idx_mob_tags_zone ON mob_tags(zone)]],
+    [[CREATE INDEX IF NOT EXISTS idx_mob_tags_mob ON mob_tags(mob)]],
+    [[CREATE UNIQUE INDEX IF NOT EXISTS idx_mob_tags_key_nocase ON mob_tags(lower(mob), lower(zone))]],
+}
+
+local function database_file_exists(path)
+    local ok, lfs = pcall(require, "lfs")
+    if ok and lfs and type(lfs.attributes) == "function" then
+        return lfs.attributes(path) ~= nil
+    end
+    local file = io.open(path, "rb")
+    if not file then return false end
+    file:close()
+    return true
+end
+
+local function database_looks_like_sqlite(path)
+    local file = io.open(path, "rb")
+    if not file then return false end
+    local header = file:read(16)
+    file:close()
+    return header == "SQLite format 3\0"
+end
+
+local function close_sql_cursor(cursor)
+    if type(cursor) == "userdata" and type(cursor.close) == "function" then
+        pcall(function() cursor:close() end)
+    end
+end
+
+local function execute_on_connection(conn, sql)
+    local result, err = conn:execute(sql)
+    if not result then return false, tostring(err) end
+    close_sql_cursor(result)
+    return true
+end
+
+local function table_set_from_connection(conn)
+    local cursor, err = conn:execute("SELECT name FROM sqlite_master WHERE type='table'")
+    if not cursor then return nil, tostring(err) end
+    local tables = {}
+    local row = cursor:fetch({}, "a")
+    while row do
+        tables[tostring(row.name)] = true
+        row = cursor:fetch(row, "a")
+    end
+    close_sql_cursor(cursor)
+    return tables
+end
+
+local function column_set_from_connection(conn, table_name)
+    local safe_name = tostring(table_name):gsub("'", "''")
+    local cursor, err = conn:execute("PRAGMA table_info('" .. safe_name .. "')")
+    if not cursor then return nil, tostring(err) end
+    local columns = {}
+    local row = cursor:fetch({}, "a")
+    while row do
+        columns[tostring(row.name)] = true
+        row = cursor:fetch(row, "a")
+    end
+    close_sql_cursor(cursor)
+    return columns
+end
+
+local function scalar_from_connection(conn, sql)
+    local cursor, err = conn:execute(sql)
+    if not cursor then return nil, err end
+    if type(cursor) ~= "userdata" or type(cursor.fetch) ~= "function" then
+        return cursor
+    end
+    local row = cursor:fetch({}, "n")
+    close_sql_cursor(cursor)
+    return row and row[1] or nil
+end
+
+local function create_empty_snd_schema(conn)
+    local ok, err = execute_on_connection(conn, "BEGIN IMMEDIATE")
+    if ok then
+        for _, sql in ipairs(SND_SCHEMA_SQL) do
+            ok, err = execute_on_connection(conn, sql)
+            if not ok then break end
+        end
+    end
+    if ok then
+        ok, err = execute_on_connection(conn, "PRAGMA user_version = " .. tostring(snd.db.schemaVersion))
+    end
+    if ok then
+        local committed, commit_err = execute_on_connection(conn, "COMMIT")
+        if not committed then
+            ok, err = false, commit_err
+            pcall(function() conn:execute("ROLLBACK") end)
+        end
+    else
+        pcall(function() conn:execute("ROLLBACK") end)
+    end
+    return ok, err
+end
+
+local function validate_existing_snd_database(conn)
+    local tables, err = table_set_from_connection(conn)
+    if not tables then return false, err end
+    local missing = {}
+    for _, name in ipairs(SND_CORE_TABLES) do
+        if not tables[name] then table.insert(missing, name) end
+    end
+    if #missing > 0 then
+        return false, "missing core tables: " .. table.concat(missing, ", ")
+    end
+    local missing_columns = {}
+    for table_name, required_columns in pairs(SND_REQUIRED_COLUMNS) do
+        local columns, columns_err = column_set_from_connection(conn, table_name)
+        if not columns then
+            table.insert(missing_columns, table_name .. ".? (" .. tostring(columns_err) .. ")")
+        else
+            for _, column_name in ipairs(required_columns) do
+                if not columns[column_name] then
+                    table.insert(missing_columns, table_name .. "." .. column_name)
+                end
+            end
+        end
+    end
+    if #missing_columns > 0 then
+        return false, "missing core columns: " .. table.concat(missing_columns, ", ")
+    end
+    local integrity = tostring(scalar_from_connection(conn, "PRAGMA quick_check") or "unknown")
+    if integrity ~= "ok" then
+        return false, "SQLite quick_check: " .. integrity
+    end
+    return true
+end
 
 -------------------------------------------------------------------------------
 -- Database Connection
@@ -50,15 +242,6 @@ function snd.db.open()
         return true
     end
     
-    -- Check if file exists
-    local f = io.open(snd.db.file, "r")
-    if not f then
-        snd.utils.errorNote("Database file not found: " .. snd.db.file)
-        snd.utils.infoNote("Please copy your snd.db file to: " .. getMudletHomeDir())
-        return false
-    end
-    f:close()
-    
     -- Create environment
     snd.db.env = luasql.sqlite3()
     if not snd.db.env then
@@ -66,14 +249,50 @@ function snd.db.open()
         return false
     end
     
-    -- Open connection
+    -- Opening a missing SQLite path creates a new file.  Existing files are
+    -- never removed, replaced, truncated, or recreated here.
+    local existed = database_file_exists(snd.db.file)
+    if existed and not database_looks_like_sqlite(snd.db.file) then
+        snd.db.env:close()
+        snd.db.env = nil
+        snd.utils.errorNote("Existing database file is not valid SQLite and was left untouched: " .. tostring(snd.db.file))
+        return false
+    end
     local err
     snd.db.conn, err = snd.db.env:connect(snd.db.file)
     if not snd.db.conn then
+        snd.db.env:close()
+        snd.db.env = nil
         snd.utils.errorNote("Failed to open database: " .. tostring(err))
         return false
     end
-    
+
+    if existed then
+        local valid, validation_err = validate_existing_snd_database(snd.db.conn)
+        if not valid then
+            snd.db.conn:close()
+            snd.db.env:close()
+            snd.db.conn = nil
+            snd.db.env = nil
+            snd.utils.errorNote("Existing database was left untouched: " .. tostring(validation_err))
+            snd.utils.infoNote("Expected S&D database path: " .. tostring(snd.db.file))
+            return false
+        end
+        snd.db.createdEmpty = false
+    else
+        local created, create_err = create_empty_snd_schema(snd.db.conn)
+        if not created then
+            snd.db.conn:close()
+            snd.db.env:close()
+            snd.db.conn = nil
+            snd.db.env = nil
+            snd.utils.errorNote("Could not initialize new S&D database at " .. tostring(snd.db.file) .. ": " .. tostring(create_err))
+            snd.utils.infoNote("The failed database file was not deleted or replaced.")
+            return false
+        end
+        snd.db.createdEmpty = true
+    end
+
     snd.db.isOpen = true
     snd.utils.debugNote("Database opened: " .. snd.db.file)
     return true
@@ -204,8 +423,16 @@ function snd.db.initialize(silent)
     -- Get stats
     local stats = snd.db.getStats()
     if not silent then
-        snd.utils.infoNote(string.format("Database loaded: %d mobs, %d areas, %d keywords",
-            stats.mobs, stats.areas, stats.keywords))
+        if snd.db.createdEmpty then
+            snd.utils.infoNote("Created new empty S&D database: " .. tostring(snd.db.file))
+            snd.utils.errorNote("The new SnDdb.db has 0 mobs and 0 areas. Replace it manually with the supplied populated SnDdb.db if you want preloaded search data.")
+        else
+            snd.utils.infoNote(string.format("Database loaded: %d mobs, %d areas, %d keywords",
+                stats.mobs, stats.areas, stats.keywords))
+            if stats.mobs == 0 and stats.areas == 0 then
+                snd.utils.errorNote("SnDdb.db is valid but empty. Replace it manually with the supplied populated SnDdb.db if you want preloaded search data.")
+            end
+        end
     end
     
     return true
@@ -402,6 +629,42 @@ function snd.db.getTables()
         cursor:close()
     end
     return tables
+end
+
+local function connection_scalar(sql)
+    if not snd.db.isOpen or not snd.db.conn then return nil end
+    return scalar_from_connection(snd.db.conn, sql)
+end
+
+function snd.db.getStatus()
+    local status = {
+        filename = "SnDdb.db",
+        path = snd.db.file,
+        exists = database_file_exists(snd.db.file),
+        expectedSchema = snd.db.schemaVersion,
+        createdEmpty = snd.db.createdEmpty == true,
+    }
+    if not status.exists then
+        status.state = "NOT FOUND"
+        return status
+    end
+    if not snd.db.isOpen and not snd.db.open() then
+        status.state = "FOUND BUT CANNOT OPEN"
+        return status
+    end
+    local valid, validation_err = validate_existing_snd_database(snd.db.conn)
+    if not valid then
+        status.state = "FOUND BUT INVALID"
+        status.error = validation_err
+        return status
+    end
+    status.schemaVersion = tonumber(connection_scalar("PRAGMA user_version")) or 0
+    status.integrity = tostring(connection_scalar("PRAGMA quick_check") or "unknown")
+    status.state = status.integrity == "ok" and "FOUND" or "FOUND BUT INVALID"
+    if status.state ~= "FOUND" then
+        status.error = "SQLite quick_check: " .. status.integrity
+    end
+    return status
 end
 
 -------------------------------------------------------------------------------

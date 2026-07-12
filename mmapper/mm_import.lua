@@ -1789,6 +1789,7 @@ local function finish_map_job(job)
   if job.target_path then
     mm.runtime = mm.runtime or {}
     mm.runtime.native_mapper_db_loaded_path = job.target_path
+    mm.runtime.hybrid_native_unavailable_reason = nil
   end
 
   if job.target_path then mm.note("Map saved to: " .. tostring(job.target_path)) end

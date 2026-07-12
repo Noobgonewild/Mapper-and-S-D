@@ -86,6 +86,11 @@ if errorCount > 0 then
 end
 loader_note(summary .. " from " .. tostring(base))
 
+if errorCount > 0 then
+  loader_error("MMapper initialization stopped because one or more modules failed after the installation preflight passed. This is a module error, not a folder-placement error.")
+  return
+end
+
 local function safe_step(label, fn)
   local ok, err = pcall(fn)
   if not ok then
@@ -108,21 +113,42 @@ local function cancel_native_startup_load()
   return mm.runtime.native_startup_generation
 end
 
+local function fallback_hybrid_bigmap_to_local(reason)
+  local configured_mode = mm.minimap and mm.minimap.get_bigmap_mode and mm.minimap.get_bigmap_mode()
+  if configured_mode ~= "hybrid" then return false end
+
+  mm.runtime = mm.runtime or {}
+  mm.runtime.hybrid_native_unavailable_reason = tostring(reason or "native mapper data unavailable")
+  if mm.minimap and mm.minimap.activate_bigmap_local then
+    mm.minimap.activate_bigmap_local()
+  end
+  mm.warn("Native bigmap unavailable; hybrid mode is using the local bigmap instead (" ..
+    mm.runtime.hybrid_native_unavailable_reason .. ").")
+  return true
+end
+
 local function native_startup_load(generation, attempt, reason)
   mm.runtime = mm.runtime or {}
   if generation ~= mm.runtime.native_startup_generation then return end
   mm.runtime.native_startup_timer = nil
 
-  local configured_mode = mm.minimap and mm.minimap.get_bigmap_mode and mm.minimap.get_bigmap_mode()
-  if configured_mode ~= "native" then return end
+  local active_mode = mm.minimap and mm.minimap.get_active_bigmap_mode and
+    mm.minimap.get_active_bigmap_mode()
+  if active_mode ~= "native" then return end
 
   local native_path = mm.resolve_native_mapper_db(mm.state.native_mapper_db)
   if not native_path or not mm.path_exists(native_path) then
-    mm.warn("Native mapper DB was not auto-loaded: native mapper DB not found at " .. tostring(native_path))
+    local load_err = "native mapper DB not found at " .. tostring(native_path)
+    if not fallback_hybrid_bigmap_to_local(load_err) then
+      mm.warn("Native mapper DB was not auto-loaded: " .. load_err)
+    end
     return
   end
   if mm.looks_like_sqlite(native_path) then
-    mm.debug("Native mapper DB autoload skipped: configured path is SQLite live mapper DB.")
+    local load_err = "configured path is the SQLite live mapper DB, not a Mudlet native map export"
+    if not fallback_hybrid_bigmap_to_local(load_err) then
+      mm.warn("Native mapper DB was not auto-loaded: " .. load_err)
+    end
     return
   end
   if mm.runtime.native_mapper_db_loaded_path == native_path then
@@ -150,7 +176,10 @@ local function native_startup_load(generation, attempt, reason)
     return
   end
 
-  mm.warn("Native mapper DB was not auto-loaded after " .. tostring(attempt) .. " attempts: " .. tostring(err))
+  local load_err = "load failed after " .. tostring(attempt) .. " attempts: " .. tostring(err)
+  if not fallback_hybrid_bigmap_to_local(load_err) then
+    mm.warn("Native mapper DB was not auto-loaded: " .. load_err)
+  end
 end
 
 function mm.schedule_native_mapper_load(reason)
@@ -169,9 +198,31 @@ function mm.initialize()
     mm.debug("initialization begin")
   end
   mm.runtime = mm.runtime or {}
+  -- Retry native hybrid support once on each package/profile load. If it is
+  -- unavailable, the runtime latch prevents every room event from reopening a
+  -- blank native widget; hybrid remains on the working local surface instead.
+  mm.runtime.hybrid_native_unavailable_reason = nil
   safe_step("load_settings_persistence", function()
     if mm.load_settings_persistence then
       mm.load_settings_persistence()
+    end
+  end)
+
+  local mapper_db_ready = false
+  safe_step("ensure_mapper_database", function()
+    if not mm.ensure_mapper_database then
+      mm.warn("Mapper database initializer is unavailable.")
+      return
+    end
+    local ok, result = mm.ensure_mapper_database(mm.state and mm.state.map_db)
+    if not ok then
+      mm.warn("Mapper database unavailable: " .. tostring(result))
+      return
+    end
+    mapper_db_ready = true
+    if result and result.created then
+      mm.note("Created new empty mapper database: " .. tostring(result.path))
+      mm.warn("The new Aardwolf.db has 0 rooms and 0 exits. Replace it manually with the supplied populated Aardwolf.db if you want preloaded map data.")
     end
   end)
   local configured_mode = mm.minimap and mm.minimap.get_bigmap_mode and mm.minimap.get_bigmap_mode()
@@ -186,14 +237,16 @@ function mm.initialize()
     mm.debug("Native mapper DB autoload skipped while bigmap local/hybrid mode is active.")
   end
 
-  safe_step("ensure_exits_chaos_column", function()
-    if mm.ensure_exits_chaos_column then
-      local ok, ensure_err = mm.ensure_exits_chaos_column()
-      if not ok then
-        mm.warn("Could not ensure exits.chaos column: " .. tostring(ensure_err))
+  if mapper_db_ready then
+    safe_step("ensure_exits_chaos_column", function()
+      if mm.ensure_exits_chaos_column then
+        local ok, ensure_err = mm.ensure_exits_chaos_column()
+        if not ok then
+          mm.warn("Could not ensure exits.chaos column: " .. tostring(ensure_err))
+        end
       end
-    end
-  end)
+    end)
+  end
 
   safe_step("frontier.initialize", function()
     if mm.frontier and mm.frontier.initialize then
@@ -204,14 +257,16 @@ function mm.initialize()
     end
   end)
 
-  safe_step("bookmarks.initialize", function()
-    if mm.bookmarks and mm.bookmarks.initialize then
-      local ok, bookmark_err = mm.bookmarks.initialize()
-      if not ok then
-        mm.warn("Could not initialize mapper bookmarks: " .. tostring(bookmark_err))
+  if mapper_db_ready then
+    safe_step("bookmarks.initialize", function()
+      if mm.bookmarks and mm.bookmarks.initialize then
+        local ok, bookmark_err = mm.bookmarks.initialize()
+        if not ok then
+          mm.warn("Could not initialize mapper bookmarks: " .. tostring(bookmark_err))
+        end
       end
-    end
-  end)
+    end)
+  end
 
   safe_step("load_portal_persistence", function()
     if mm.load_portal_persistence and mm.load_portal_persistence() then

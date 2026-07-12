@@ -3739,31 +3739,47 @@ end
 function snd.commands.showDbInfo()
     cecho("\n<white>Search and Destroy - Database Info<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
-    
-    cecho("  <yellow>Current DB path:<reset>\n")
-    cecho("    " .. tostring(snd.db.file) .. "\n\n")
-    
-    -- Check if file exists
-    local f = io.open(snd.db.file, "r")
-    if f then
-        f:close()
-        cecho("  <green>File EXISTS<reset>\n")
-    else
-        cecho("  <red>File NOT FOUND<reset>\n")
+
+    local status = snd.db.getStatus and snd.db.getStatus() or {
+        state = "STATUS UNAVAILABLE",
+        path = snd.db.file,
+        expectedSchema = snd.schemaVersion or 6,
+    }
+    cecho("  <yellow>Required default filename:<reset> SnDdb.db\n")
+    cecho("  <yellow>Resolved database path:<reset>\n")
+    cecho("    " .. tostring(status.path) .. "\n")
+    local statusColor = status.state == "FOUND" and "<green>" or "<red>"
+    cecho("  <yellow>Status:<reset> " .. statusColor .. tostring(status.state) .. "<reset>\n")
+    if status.error then
+        cecho("  <yellow>Problem:<reset> <red>" .. tostring(status.error) .. "<reset>\n")
     end
-    
+    if status.schemaVersion ~= nil then
+        cecho(string.format("  <yellow>Schema:<reset> %d (expected %d)\n",
+            tonumber(status.schemaVersion) or 0, tonumber(status.expectedSchema) or 0))
+    end
+    if status.integrity then
+        cecho("  <yellow>Integrity:<reset> " .. tostring(status.integrity) .. "\n")
+    end
     cecho("  <yellow>Connection:<reset> " .. (snd.db.isOpen and "<green>Open" or "<red>Closed") .. "<reset>\n")
-    
-    if snd.db.isOpen then
+
+    if status.state == "FOUND" and snd.db.isOpen then
         local stats = snd.db.getStats()
         cecho(string.format("  <yellow>Contents:<reset> %d mobs, %d areas, %d keywords\n",
             stats.mobs, stats.areas, stats.keywords))
-        
+        if stats.mobs == 0 and stats.areas == 0 then
+            cecho("  <orange_red>Database classification: EMPTY.<reset> No preloaded mob or area data.\n")
+        end
+
         -- Show tables
         local tables = snd.db.getTables()
         cecho("  <yellow>Tables:<reset> " .. table.concat(tables, ", ") .. "\n")
     end
-    
+
+    if status.createdEmpty then
+        cecho("  <orange_red>Created during this session as a new empty database.<reset>\n")
+        cecho("  Replace it manually with the supplied populated SnDdb.db if desired.\n")
+    end
+
     cecho("\n  <yellow>Mudlet profile dir:<reset>\n")
     cecho("    " .. getMudletHomeDir() .. "\n")
     

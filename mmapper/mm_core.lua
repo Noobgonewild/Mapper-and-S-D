@@ -23,6 +23,16 @@ mm.state = mm.state or {
   debug = false,
 }
 
+-- A partially populated state table can survive package reloads.  Always keep
+-- the live SQLite database name usable instead of resolving whitespace to the
+-- profile directory and producing a misleading "database not found" warning.
+if type(mm.state.map_db) ~= "string" or not mm.state.map_db:match("%S") then
+  mm.state.map_db = "Aardwolf.db"
+end
+if type(mm.state.native_mapper_db) ~= "string" or not mm.state.native_mapper_db:match("%S") then
+  mm.state.native_mapper_db = "mmapper_converted_map.dat"
+end
+
 mm.runtime = mm.runtime or {
   located_once = false,
   cexit_last_rows = {},
@@ -923,170 +933,6 @@ function mm.create_backup(force, quiet_override)
   return true, backupPath
 end
 
-local INIT_DB_FILENAMES = {"Aardwolf.db", "SnDdb.db"}
-local INIT_DB_NAME_LOOKUP = {
-  ["aardwolf.db"] = "Aardwolf.db",
-  ["snddb.db"] = "SnDdb.db",
-}
-
-local function trim_text(value)
-  return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function normalize_fs_path(path)
-  local p = tostring(path or ""):gsub("\\", "/"):gsub("/+", "/")
-  if package.config:sub(1, 1) == "\\" then
-    p = p:lower()
-  end
-  return p:gsub("/$", "")
-end
-
-local function basename(path)
-  return tostring(path or ""):gsub("\\", "/"):match("([^/]+)$") or ""
-end
-
-local function init_file_attrs(path)
-  local ok, lfs = pcall(require, "lfs")
-  if ok and lfs and type(lfs.attributes) == "function" then
-    local attrs = lfs.attributes(path)
-    if attrs then
-      return tonumber(attrs.modification) or 0, tonumber(attrs.size) or 0
-    end
-  end
-
-  local f = io.open(path, "rb")
-  if not f then return 0, 0 end
-  local size = f:seek("end") or 0
-  f:close()
-  return 0, size
-end
-
-local function init_search_command()
-  local is_windows = package.config:sub(1, 1) == "\\"
-  if is_windows then
-    local ps = [[
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
-$ErrorActionPreference = 'SilentlyContinue';
-$names = @('Aardwolf.db', 'SnDdb.db');
-$roots = Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Root };
-foreach ($root in $roots) {
-  Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue |
-    Where-Object { -not $_.PSIsContainer -and $names -contains $_.Name } |
-    ForEach-Object { [Console]::WriteLine($_.FullName) }
-}
-]]
-    ps = ps:gsub("[\r\n]+", " ")
-    return 'powershell -NoProfile -ExecutionPolicy Bypass -Command "' .. ps:gsub('"', '\\"') .. '"'
-  end
-
-  return [[find / -type f \( -name Aardwolf.db -o -name SnDdb.db \) 2>/dev/null]]
-end
-
-local function init_empty_candidate_set()
-  return {
-    ["Aardwolf.db"] = {},
-    ["SnDdb.db"] = {},
-    _seen = {},
-  }
-end
-
-local function init_add_candidate(candidates, path)
-  local cleaned = trim_text(path)
-  if cleaned == "" then return end
-
-  local canonical = INIT_DB_NAME_LOOKUP[basename(cleaned):lower()]
-  if not canonical then return end
-  if not mm.path_exists(cleaned) then return end
-
-  local normalized = normalize_fs_path(cleaned)
-  if candidates._seen[canonical .. "|" .. normalized] then return end
-  candidates._seen[canonical .. "|" .. normalized] = true
-
-  local mtime, size = init_file_attrs(cleaned)
-  table.insert(candidates[canonical], {
-    path = cleaned,
-    mtime = mtime,
-    size = size,
-  })
-end
-
-local function init_discover_candidates()
-  if type(io.popen) ~= "function" then
-    return nil, "filesystem search requires io.popen, which is unavailable in this Mudlet build"
-  end
-
-  local candidates = init_empty_candidate_set()
-  local cmd = init_search_command()
-  local pipe, err = io.popen(cmd, "r")
-  if not pipe then
-    return nil, "unable to start filesystem search: " .. tostring(err)
-  end
-
-  for line in pipe:lines() do
-    init_add_candidate(candidates, line)
-  end
-  pipe:close()
-  return candidates
-end
-
-local function init_format_size(bytes)
-  local n = tonumber(bytes) or 0
-  if n >= 1024 * 1024 * 1024 then
-    return string.format("%.2f GiB (%d bytes)", n / (1024 * 1024 * 1024), n)
-  end
-  if n >= 1024 * 1024 then
-    return string.format("%.2f MiB (%d bytes)", n / (1024 * 1024), n)
-  end
-  if n >= 1024 then
-    return string.format("%.2f KiB (%d bytes)", n / 1024, n)
-  end
-  return tostring(n) .. " bytes"
-end
-
-local function init_report_candidates(filename, rows)
-  rows = rows or {}
-  table.sort(rows, function(a, b)
-    if a.mtime ~= b.mtime then return a.mtime > b.mtime end
-    if a.size ~= b.size then return a.size > b.size end
-    return tostring(a.path) < tostring(b.path)
-  end)
-
-  if #rows == 0 then
-    mm.warn(filename .. ": not found")
-    return false
-  end
-
-  local suffix = (#rows == 1) and "" or "s"
-  mm.note(string.format("%s: found %d location%s", filename, #rows, suffix))
-  for i, row in ipairs(rows) do
-    mm.note(string.format("  %d. %s | size: %s", i, tostring(row.path), init_format_size(row.size)))
-  end
-  return true
-end
-
-function mm.init_start()
-  mm.note("Searching local drives for Aardwolf.db and SnDdb.db. This can take a while.")
-  local candidates, search_err = init_discover_candidates()
-  if not candidates then
-    return false, search_err
-  end
-
-  local found_any = false
-  for _, filename in ipairs(INIT_DB_FILENAMES) do
-    if init_report_candidates(filename, candidates[filename]) then
-      found_any = true
-    end
-  end
-
-  if not found_any then
-    return false, "no Aardwolf.db or SnDdb.db files were found"
-  end
-
-  mm.note("Mapper init search complete. No files were copied or changed.")
-  return true, "mapper init search complete"
-end
-
-
 function mm.read_file_header(path, n)
   local f = io.open(path, "rb")
   if not f then return nil end
@@ -1156,6 +1002,7 @@ function mm.load_native_mapper_db(path)
   if mm.save_settings_persistence then mm.save_settings_persistence() end
   mm.runtime = mm.runtime or {}
   mm.runtime.native_mapper_db_loaded_path = resolved
+  mm.runtime.hybrid_native_unavailable_reason = nil
   mm.runtime.terrain_colors_applied = nil
   mm.note("Loaded native Mudlet mapper DB: " .. resolved)
   if mm.import and mm.import.apply_environment_colors_from_sqlite then
@@ -1527,6 +1374,289 @@ local function open_mapper_db(path)
   return env, conn
 end
 
+local MAPPER_SCHEMA_VERSION = 11
+local MAPPER_CORE_TABLES = { "areas", "environments", "rooms", "exits" }
+local MAPPER_REQUIRED_COLUMNS = {
+  areas = { "uid", "name", "texture", "color", "flags" },
+  environments = { "uid", "name", "color" },
+  rooms = { "uid", "name", "area", "building", "terrain", "info", "notes", "x", "y", "z", "norecall", "noportal", "ignore_exits_mismatch" },
+  -- chaos is intentionally migrated additively after validation for older DBs.
+  exits = { "dir", "fromuid", "touid", "level" },
+}
+local MAPPER_SCHEMA_SQL = {
+  [[CREATE TABLE IF NOT EXISTS areas(
+      uid TEXT NOT NULL,
+      name TEXT,
+      texture TEXT,
+      color TEXT,
+      flags TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY(uid))]],
+  [[CREATE TABLE IF NOT EXISTS environments(
+      uid TEXT NOT NULL,
+      name TEXT,
+      color INTEGER,
+      PRIMARY KEY(uid))]],
+  [[CREATE TABLE IF NOT EXISTS rooms(
+      uid TEXT NOT NULL,
+      name TEXT,
+      area TEXT,
+      building TEXT,
+      terrain TEXT,
+      info TEXT,
+      notes TEXT,
+      x INTEGER,
+      y INTEGER,
+      z INTEGER,
+      norecall INTEGER,
+      noportal INTEGER,
+      ignore_exits_mismatch INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(uid))]],
+  [[CREATE TABLE IF NOT EXISTS exits(
+      dir TEXT NOT NULL,
+      fromuid TEXT NOT NULL,
+      touid TEXT NOT NULL,
+      level STRING NOT NULL DEFAULT '0',
+      chaos TEXT NOT NULL DEFAULT 'no',
+      PRIMARY KEY(fromuid, dir))]],
+  [[CREATE TABLE IF NOT EXISTS bookmarks(
+      uid TEXT NOT NULL,
+      notes TEXT,
+      PRIMARY KEY(uid))]],
+  [[CREATE TABLE IF NOT EXISTS storage(
+      name TEXT NOT NULL,
+      data TEXT NOT NULL,
+      PRIMARY KEY(name))]],
+  [[CREATE TABLE IF NOT EXISTS terrain(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      color INTEGER,
+      date_added DATE,
+      UNIQUE(name))]],
+  [[CREATE TABLE IF NOT EXISTS mapper_area_bookmarks(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      room_uid TEXT NOT NULL UNIQUE,
+      label TEXT,
+      created_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      deleted_at INTEGER)]],
+  [[CREATE VIRTUAL TABLE IF NOT EXISTS rooms_lookup USING FTS3(uid, name)]],
+  [[CREATE INDEX IF NOT EXISTS exits_touid_index ON exits(touid)]],
+  [[CREATE INDEX IF NOT EXISTS rooms_area_index ON rooms(area)]],
+  [[CREATE VIEW IF NOT EXISTS camere AS SELECT * FROM rooms]],
+}
+
+local function trim_db_path(value)
+  return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+function mm.resolve_mapper_db(path)
+  local p = trim_db_path(path ~= nil and path or (mm.state and mm.state.map_db))
+  if p == "" then return nil end
+  if p:sub(1, 1) == "/" or p:match("^%a:[/\\]") then
+    return p
+  end
+  return getMudletHomeDir() .. "/" .. p
+end
+
+local function close_cursor(cursor)
+  if type(cursor) == "userdata" and type(cursor.close) == "function" then
+    pcall(function() cursor:close() end)
+  end
+end
+
+local function execute_statement(conn, sql)
+  local result, err = conn:execute(sql)
+  if not result then return false, tostring(err) end
+  close_cursor(result)
+  return true
+end
+
+local function fetch_scalar(conn, sql)
+  local cursor, err = conn:execute(sql)
+  if not cursor then return nil, tostring(err) end
+  if type(cursor) ~= "userdata" or type(cursor.fetch) ~= "function" then
+    return cursor
+  end
+  local row = cursor:fetch({}, "n")
+  close_cursor(cursor)
+  return row and row[1] or nil
+end
+
+local function mapper_table_set(conn)
+  local cursor, err = conn:execute("SELECT name FROM sqlite_master WHERE type='table'")
+  if not cursor then return nil, tostring(err) end
+  local found = {}
+  local row = cursor:fetch({}, "a")
+  while row do
+    found[tostring(row.name)] = true
+    row = cursor:fetch(row, "a")
+  end
+  close_cursor(cursor)
+  return found
+end
+
+local function mapper_column_set(conn, table_name)
+  local safe_name = tostring(table_name):gsub("'", "''")
+  local cursor, err = conn:execute("PRAGMA table_info('" .. safe_name .. "')")
+  if not cursor then return nil, tostring(err) end
+  local found = {}
+  local row = cursor:fetch({}, "a")
+  while row do
+    found[tostring(row.name)] = true
+    row = cursor:fetch(row, "a")
+  end
+  close_cursor(cursor)
+  return found
+end
+
+function mm.inspect_mapper_database(path)
+  local configured = trim_db_path(path ~= nil and path or (mm.state and mm.state.map_db))
+  local source = mm.resolve_mapper_db(configured)
+  local status = {
+    configured = configured,
+    path = source,
+    exists = source and mm.path_exists(source) or false,
+    expected_schema = MAPPER_SCHEMA_VERSION,
+  }
+  if not status.exists then
+    status.state = "NOT FOUND"
+    return status
+  end
+  if not mm.looks_like_sqlite(source) then
+    status.state = "FOUND BUT INVALID"
+    status.error = "file is not a SQLite database; existing file was left untouched"
+    return status
+  end
+
+  local env, conn, open_err = open_mapper_db(source)
+  if not conn then
+    status.state = "FOUND BUT CANNOT OPEN"
+    status.error = open_err
+    return status
+  end
+
+  local tables, tables_err = mapper_table_set(conn)
+  if not tables then
+    status.state = "FOUND BUT INVALID"
+    status.error = tables_err
+    conn:close(); env:close()
+    return status
+  end
+
+  status.missing_tables = {}
+  for _, name in ipairs(MAPPER_CORE_TABLES) do
+    if not tables[name] then table.insert(status.missing_tables, name) end
+  end
+  status.missing_columns = {}
+  for table_name, required_columns in pairs(MAPPER_REQUIRED_COLUMNS) do
+    if tables[table_name] then
+      local columns, columns_err = mapper_column_set(conn, table_name)
+      if not columns then
+        table.insert(status.missing_columns, table_name .. ".? (" .. tostring(columns_err) .. ")")
+      else
+        for _, column_name in ipairs(required_columns) do
+          if not columns[column_name] then
+            table.insert(status.missing_columns, table_name .. "." .. column_name)
+          end
+        end
+      end
+    end
+  end
+  status.schema_version = tonumber(fetch_scalar(conn, "PRAGMA user_version")) or 0
+  status.integrity = tostring(fetch_scalar(conn, "PRAGMA quick_check") or "unknown")
+  if tables.rooms then status.rooms = tonumber(fetch_scalar(conn, "SELECT COUNT(*) FROM rooms")) or 0 end
+  if tables.exits then status.exits = tonumber(fetch_scalar(conn, "SELECT COUNT(*) FROM exits")) or 0 end
+  conn:close(); env:close()
+
+  if #status.missing_tables > 0 then
+    status.state = "FOUND BUT INVALID"
+    status.error = "missing core tables: " .. table.concat(status.missing_tables, ", ")
+  elseif #status.missing_columns > 0 then
+    status.state = "FOUND BUT INVALID"
+    status.error = "missing core columns: " .. table.concat(status.missing_columns, ", ")
+  elseif status.integrity ~= "ok" then
+    status.state = "FOUND BUT INVALID"
+    status.error = "SQLite quick_check: " .. status.integrity
+  else
+    status.state = "FOUND"
+  end
+  return status
+end
+
+-- Create a complete, empty mapper database only when no file exists.  An
+-- existing file is validated and returned untouched by this function.
+function mm.ensure_mapper_database(path)
+  local source = mm.resolve_mapper_db(path)
+  if not source then return false, "mapper database path is empty" end
+
+  if mm.path_exists(source) then
+    local existing = mm.inspect_mapper_database(path)
+    if existing.state ~= "FOUND" then
+      return false, "existing mapper database was left untouched: " .. tostring(existing.error or existing.state)
+    end
+    return true, existing
+  end
+
+  local env, conn, open_err = open_mapper_db(source)
+  if not conn then
+    return false, "could not create mapper database at " .. source .. ": " .. tostring(open_err)
+  end
+
+  local ok, err = execute_statement(conn, "BEGIN IMMEDIATE")
+  if ok then
+    for _, sql in ipairs(MAPPER_SCHEMA_SQL) do
+      ok, err = execute_statement(conn, sql)
+      if not ok then break end
+    end
+  end
+  if ok then
+    ok, err = execute_statement(conn, "PRAGMA user_version = " .. tostring(MAPPER_SCHEMA_VERSION))
+  end
+  if ok then
+    local committed, commit_err = execute_statement(conn, "COMMIT")
+    if not committed then
+      ok, err = false, commit_err
+      pcall(function() conn:execute("ROLLBACK") end)
+    end
+  else
+    pcall(function() conn:execute("ROLLBACK") end)
+  end
+  conn:close(); env:close()
+
+  if not ok then
+    return false, "new mapper database creation failed at " .. source .. ": " .. tostring(err) ..
+      ". The file was not deleted or replaced."
+  end
+
+  local created = mm.inspect_mapper_database(path)
+  if created.state ~= "FOUND" then
+    return false, "new mapper database did not validate: " .. tostring(created.error or created.state)
+  end
+  created.created = true
+  return true, created
+end
+
+function mm.print_mapper_database_status()
+  local configured = trim_db_path(mm.state and mm.state.map_db)
+  local status = mm.inspect_mapper_database(configured)
+  mm.note("Database required default filename: Aardwolf.db")
+  mm.note("Database configured value: " .. tostring(configured ~= "" and configured or "Aardwolf.db"))
+  mm.note("Database resolved path: " .. tostring(status.path))
+  if status.state ~= "FOUND" then
+    mm.warn("Database status: " .. tostring(status.state) ..
+      (status.error and (" (" .. tostring(status.error) .. ")") or ""))
+    return false, status
+  end
+  mm.note("Database status: FOUND and opened successfully")
+  mm.note(string.format("Database schema: %d (expected %d)", status.schema_version or 0, status.expected_schema or 0))
+  mm.note("Database integrity: " .. tostring(status.integrity))
+  mm.note(string.format("Database contents: %d rooms, %d exits", status.rooms or 0, status.exits or 0))
+  if (status.rooms or 0) == 0 and (status.exits or 0) == 0 then
+    mm.warn("Database classification: EMPTY. Replace it manually with the supplied populated Aardwolf.db if you want preloaded map data.")
+  end
+  return true, status
+end
+
 function mm.sql_escape(value)
   local s = tostring(value or "")
   return "'" .. s:gsub("'", "''") .. "'"
@@ -1540,7 +1670,7 @@ function mm.strip_ansi(text)
 end
 
 function mm.query_mapper_db(sql, db_path)
-  local source = mm.resolve_native_mapper_db(db_path or mm.state.map_db)
+  local source = mm.resolve_mapper_db(db_path ~= nil and db_path or mm.state.map_db)
   if not source or not mm.path_exists(source) then
     return nil, "mapper db not found: " .. tostring(source)
   end
@@ -1571,7 +1701,7 @@ end
 
 
 function mm.exec_mapper_db(sql, db_path)
-  local source = mm.resolve_native_mapper_db(db_path or mm.state.map_db)
+  local source = mm.resolve_mapper_db(db_path ~= nil and db_path or mm.state.map_db)
   if not source or not mm.path_exists(source) then
     return false, "mapper db not found: " .. tostring(source)
   end

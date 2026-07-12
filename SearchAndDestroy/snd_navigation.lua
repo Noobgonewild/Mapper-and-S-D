@@ -5,7 +5,8 @@
     mmapper/mm_navigation.lua and are owned by the mapper package.
 
     This shim keeps legacy S&D entry points working by attaching snd.mapper
-    to mm.nav when available and loading the mapper nav module as fallback.
+    to mm.nav when available. If MMapper was not loaded first, only its exact
+    documented profile path is accepted.
 ]]
 
 snd = snd or {}
@@ -24,51 +25,26 @@ local function file_exists(path)
     return true
 end
 
-local function dirname(path)
-    return (tostring(path or ""):gsub("\\", "/"):match("^(.*)/") or "")
-end
-
-local script_source = debug.getinfo(1, "S").source or ""
-local script_dir = ""
-if script_source:sub(1, 1) == "@" then
-    script_dir = dirname(script_source:sub(2))
-end
-
 local home = getMudletHomeDir()
-local fallback_reason = "module not found in expected paths"
-local candidates = {
-    home .. "/mmapper/mm_navigation.lua",
-    home .. "/packages/mmapper/mm_navigation.lua",
-    home .. "/packages/mmapper/mmapper/mm_navigation.lua",
-    home .. "/../mmapper/mm_navigation.lua",
-    home .. "/../packages/mmapper/mm_navigation.lua",
-    home .. "/../packages/mmapper/mmapper/mm_navigation.lua",
-    home .. "/../../mmapper/mm_navigation.lua",
-    home .. "/../../packages/mmapper/mm_navigation.lua",
-    home .. "/../../packages/mmapper/mmapper/mm_navigation.lua",
-}
+local expected_path = home .. "/mmapper/mm_navigation.lua"
+local fallback_reason
 
-if script_dir ~= "" then
-    table.insert(candidates, script_dir .. "/../mmapper/mm_navigation.lua")
-    table.insert(candidates, script_dir .. "/../packages/mmapper/mm_navigation.lua")
-    table.insert(candidates, script_dir .. "/../packages/mmapper/mmapper/mm_navigation.lua")
-end
-
-for _, path in ipairs(candidates) do
-    if file_exists(path) then
-        local ok, err = pcall(dofile, path)
-        if ok then
-            if mm.nav then
-                snd.mapper = mm.nav
-                return
-            end
-            fallback_reason = "module loaded but mm.nav is unavailable at " .. tostring(path)
-            -- keep searching in case a later candidate has a valid module
-        else
-            cecho("<orange_red>[S&D]<reset> Failed loading mapper navigation module: " .. tostring(err) .. "\n")
-            fallback_reason = "load error at " .. tostring(path)
-        end
+if file_exists(expected_path) then
+    local ok, err = pcall(dofile, expected_path)
+    if ok and mm.nav then
+        snd.mapper = mm.nav
+        return
+    elseif ok then
+        fallback_reason = "module loaded but mm.nav is unavailable at " .. expected_path
+    else
+        fallback_reason = "module error at " .. expected_path .. ": " .. tostring(err)
     end
+else
+    fallback_reason = "required file not found at " .. expected_path
+    cecho("<orange_red>[MMAPPER INSTALLATION WARNING]<reset> Navigation integration is disabled.\n")
+    cecho("<yellow>Required folder name:<reset> mmapper\n")
+    cecho("<yellow>Required folder location:<reset> " .. home .. "/mmapper\n")
+    cecho("Use the exact folder name <cyan>mmapper<reset> (not <red>mapper<reset>) and reload the profile.\n")
 end
 
 local fallback_warned = false

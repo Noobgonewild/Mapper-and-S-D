@@ -10,9 +10,53 @@ end
 _G.mm_loader_in_progress = true
 
 local home = getMudletHomeDir()
-local initPath = home .. "/mmapper/mm_init.lua"
+local expectedFolder = home .. "/mmapper"
+local initPath = expectedFolder .. "/mm_init.lua"
+local requiredFiles = {
+  "mm_init.lua",
+  "mm_core.lua",
+  "mm_area_references.lua",
+  "mm_navigation.lua",
+  "mm_frontier.lua",
+  "mm_bookmarks.lua",
+  "mm_help.lua",
+  "mm_minimap.lua",
+  "mm_commands.lua",
+  "mm_import.lua",
+  "mm_gmcp.lua",
+}
+
+local function file_exists(path)
+  local file = io.open(path, "rb")
+  if not file then return false end
+  file:close()
+  return true
+end
+
+local missing = {}
+for _, filename in ipairs(requiredFiles) do
+  if not file_exists(expectedFolder .. "/" .. filename) then
+    table.insert(missing, filename)
+  end
+end
+
+if #missing > 0 then
+  if not _G.mm_install_warning_shown then
+    cecho("<orange_red>[MMAPPER INSTALLATION WARNING]<reset> MMapper was not loaded.\n")
+    cecho("<yellow>Required folder name:<reset> mmapper\n")
+    cecho("<yellow>Required folder location:<reset> " .. expectedFolder .. "\n")
+    cecho("<yellow>Missing required files:<reset> " .. table.concat(missing, ", ") .. "\n")
+    cecho("Move the complete addon folder into the active profile and name it exactly <cyan>mmapper<reset> (not <red>mapper<reset>).\n")
+    cecho("No MMapper modules were loaded. Reload the profile after correcting the installation.\n")
+    _G.mm_install_warning_shown = true
+  end
+  _G.mm_loader_in_progress = false
+  return
+end
+
+_G.mm_install_warning_shown = nil
 mm = mm or {}
-mm.base_dir = home .. "/mmapper"
+mm.base_dir = expectedFolder
 
 local ok, err = pcall(dofile, initPath)
 _G.mm_loader_in_progress = false

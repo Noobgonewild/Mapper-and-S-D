@@ -199,16 +199,6 @@ local function handle_command_inline(line)
     return true
   end
 
-  if line == "mapper init start" then
-    local ok, err = mm.init_start()
-    if not ok then mm.warn(err) end
-    return true
-  end
-  if line == "mapper init" then
-    mm.warn("Usage: mapper init start")
-    return true
-  end
-
   local help_topic = line:match("^mapper help%s+(.+)$")
   if line == "mapper help" or help_topic then
     mm.show_help(help_topic)
@@ -937,8 +927,6 @@ mm.alias_specs = {
   {"^mapper help(?: (.*))?$", function(m) mm.show_help(m[2]) end},
   {"^mapper stats$", function() mm.show_stats() end},
   {"^mapper stats reset$", function() mm.reset_stats() end},
-  {"^mapper init start$", function() local ok, err = mm.init_start(); if not ok then mm.warn(err) end end},
-  {"^mapper init$", function() mm.warn("Usage: mapper init start") end},
   {"^mapper goto (.+)$", function(m) local ok, err = mm.goto_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper walkto (.+)$", function(m) local ok, err = mm.walkto_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper where%s*(.*)$", function(m) local ok, err = mm.where_room(m[2]); if not ok then mm.warn(err) end end},
@@ -1074,8 +1062,23 @@ mm.alias_specs = {
   {"^mapper portalguard%s*(%S*)$", function(m) handle_portalguard(m[2]) end},
   {"^mapper locate$", function() send("look") end},
   {"^mapper debug(?: (on|off))?$", function(m) if m[2] then mm.state.debug = (m[2] == "on"); mm.note("debug " .. m[2]); if m[2] == "on" then mm.debug("debugging enabled; watch for centerview/map capture lines") end else mm.note("debug " .. ((mm.state and mm.state.debug) and "on" or "off")) end end},
-  {"^mapper database$", function() mm.note("Current mapper database: " .. mm.state.map_db) end},
-  {"^mapper set database (.+)$", function(m) mm.state.map_db = m[2]; mm.note("Mapper database set to " .. m[2]) end},
+  {"^mapper database$", function()
+      if mm.print_mapper_database_status then
+        mm.print_mapper_database_status()
+      else
+        mm.warn("Mapper database status helper is unavailable.")
+      end
+    end},
+  {"^mapper set database (.+)$", function(m)
+      local path = tostring(m[2] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+      if path == "" then
+        mm.warn("Mapper database path cannot be blank. Required default filename: Aardwolf.db")
+        return
+      end
+      mm.state.map_db = path
+      mm.note("Mapper database configured value set to: " .. path)
+      if mm.print_mapper_database_status then mm.print_mapper_database_status() end
+    end},
   {"^mapper native db$", function() mm.note("Native mapper DB: " .. tostring(mm.resolve_native_mapper_db(mm.state.native_mapper_db))) end},
   {"^mapper native db (.+)$", function(m) mm.set_native_mapper_db(m[2]) end},
   {"^mapper native load$", function() local ok, err = mm.load_native_mapper_db(); if not ok then mm.warn(err) end end},

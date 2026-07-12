@@ -806,30 +806,7 @@
             <Alias isActive="yes" name="sndreload">
                 <script><![CDATA[
 -- Manual reload command
-local function resolveProfileDir()
-    local home = getMudletHomeDir()
-    local profile = getProfileName and getProfileName() or ""
-    if profile ~= "" then
-        local candidate = home .. "/profiles/" .. profile
-        if io.exists(candidate) then
-            return candidate
-        end
-    end
-    return home
-end
-
-local profileDir = resolveProfileDir()
-local path = profileDir .. "/SearchAndDestroy/"
-if not io.exists(path .. "snd_main.lua") then
-    path = profileDir .. "/snd/"
-end
-cecho("<orange>[S&D]<reset> <cyan>Attempting manual reload from " .. path .. "<reset>\n")
-
--- Clear existing snd object
-_G.snd = nil
-_G.snd_loader_in_progress = nil
-
--- Load modules in order
+local expectedFolder = getMudletHomeDir() .. "/SearchAndDestroy"
 local modules = {
     "snd_utils.lua",
     "snd_debug.lua",
@@ -846,27 +823,74 @@ local modules = {
     "snd_gui.lua",
 }
 
-local loadedCount = 0
+local triggerGroups = {
+    "SND_Campaign", "SND_Noexp", "SND_GQuest", "SND_Quest",
+    "SND_QuickWhere", "SND_Hunt", "SND_Dinv",
+}
+
+local function setSndTriggers(enabled)
+    local setter = enabled and enableTrigger or disableTrigger
+    if type(setter) ~= "function" then return end
+    for _, name in ipairs(triggerGroups) do pcall(setter, name) end
+end
+
+local function fileExists(filename)
+    local file = io.open(expectedFolder .. "/" .. filename, "rb")
+    if not file then return false end
+    file:close()
+    return true
+end
+
+local missing = {}
 for _, module in ipairs(modules) do
-    local fullPath = path .. module
-    if io.exists(fullPath) then
-        local ok, err = pcall(dofile, fullPath)
-        if ok then
-            loadedCount = loadedCount + 1
-            cecho("<green>[OK]<reset> " .. module .. "\n")
-        else
-            cecho("<red>[FAIL]<reset> " .. module .. ": " .. tostring(err) .. "\n")
-        end
+    if not fileExists(module) then table.insert(missing, module) end
+end
+
+if #missing > 0 then
+    setSndTriggers(false)
+    cecho("<orange_red>[S&D INSTALLATION WARNING]<reset> SearchAndDestroy was not reloaded.\n")
+    cecho("<yellow>Required folder name:<reset> SearchAndDestroy\n")
+    cecho("<yellow>Required folder location:<reset> " .. expectedFolder .. "\n")
+    cecho("<yellow>Missing required files:<reset> " .. table.concat(missing, ", ") .. "\n")
+    cecho("Move the complete addon folder there and name it exactly <cyan>SearchAndDestroy<reset> (not <red>snd<reset>).\n")
+    return
+end
+
+cecho("<orange>[S&D]<reset> <cyan>Attempting manual reload from " .. expectedFolder .. "/<reset>\n")
+setSndTriggers(false)
+
+-- Clear existing S&D state only after the installation passes preflight.
+_G.snd = nil
+_G.snd_loader_in_progress = nil
+
+local loadedCount = 0
+local loadFailed = false
+for _, module in ipairs(modules) do
+    local fullPath = expectedFolder .. "/" .. module
+    local ok, err = pcall(dofile, fullPath)
+    if ok then
+        loadedCount = loadedCount + 1
+        cecho("<green>[OK]<reset> " .. module .. "\n")
     else
-        cecho("<yellow>[SKIP]<reset> " .. module .. " (not found)\n")
+        cecho("<red>[S&D MODULE ERROR]<reset> " .. module .. ": " .. tostring(err) .. "\n")
+        cecho("S&D triggers remain disabled to prevent follow-on errors.\n")
+        loadFailed = true
+        break
     end
 end
 
-if snd and snd.initialize then
-    snd.initialize(false)
+if not loadFailed and snd and snd.initialize then
+    local ok, err = pcall(snd.initialize, false)
+    if not ok then
+        cecho("<red>[S&D INITIALIZATION ERROR]<reset> " .. tostring(err) .. "\n")
+        cecho("S&D triggers remain disabled to prevent follow-on errors.\n")
+        return
+    end
+    setSndTriggers(true)
+    _G.snd_install_warning_shown = nil
     cecho("<green>[S&D]<reset> Reload complete! Loaded " .. loadedCount .. " modules.\n")
 else
-    cecho("<red>[S&D ERROR]<reset> Reload failed - snd object not created\n")
+    cecho("<red>[S&D ERROR]<reset> Reload failed; S&D triggers remain disabled.\n")
 end
 ]]></script>
                 <command></command>
@@ -882,40 +906,38 @@ end
             <!-- sndpath - show expected path -->
             <Alias isActive="yes" name="sndpath">
                 <script><![CDATA[
-local function resolveProfileDir()
-    local home = getMudletHomeDir()
-    local profile = getProfileName and getProfileName() or ""
-    if profile ~= "" then
-        local candidate = home .. "/profiles/" .. profile
-        if io.exists(candidate) then
-            return candidate
-        end
-    end
-    return home
-end
-
 local home = getMudletHomeDir()
-local profileDir = resolveProfileDir()
-local expectedPath = profileDir .. "/SearchAndDestroy/"
-if not io.exists(expectedPath .. "snd_main.lua") then
-    expectedPath = profileDir .. "/snd/"
-end
+local expectedPath = home .. "/SearchAndDestroy/"
+local modules = {
+    "snd_utils.lua", "snd_debug.lua", "snd_data.lua", "snd_main.lua",
+    "snd_gmcp.lua", "snd_database.lua", "snd_campaign.lua", "snd_gquest.lua",
+    "snd_conwin.lua", "snd_triggers.lua", "snd_commands.lua",
+    "snd_navigation.lua", "snd_gui.lua",
+}
 cecho("<orange>[S&D]<reset> <cyan>Mudlet home directory:<reset> " .. home .. "\n")
-cecho("<orange>[S&D]<reset> <cyan>Resolved profile dir:<reset> " .. profileDir .. "\n")
-cecho("<orange>[S&D]<reset> <cyan>Expected module path:<reset> " .. expectedPath .. "\n")
+cecho("<orange>[S&D]<reset> <cyan>Required folder name:<reset> SearchAndDestroy\n")
+cecho("<orange>[S&D]<reset> <cyan>Required module path:<reset> " .. expectedPath .. "\n")
 cecho("<orange>[S&D]<reset> <cyan>snd object exists:<reset> " .. tostring(snd ~= nil) .. "\n")
 if snd then
     cecho("<orange>[S&D]<reset> <cyan>snd.commands exists:<reset> " .. tostring(snd.commands ~= nil) .. "\n")
     cecho("<orange>[S&D]<reset> <cyan>snd.initialized:<reset> " .. tostring(snd.initialized) .. "\n")
 end
 
--- Check if files exist
-local testFile = expectedPath .. "snd_main.lua"
-if io.exists(testFile) then
-    cecho("<green>[S&D]<reset> Module files found at expected location\n")
+local missing = {}
+for _, module in ipairs(modules) do
+    local file = io.open(expectedPath .. module, "rb")
+    if file then
+        file:close()
+    else
+        table.insert(missing, module)
+    end
+end
+if #missing == 0 then
+    cecho("<green>[S&D]<reset> Installation status: CORRECT; all required modules were detected.\n")
 else
-    cecho("<red>[S&D]<reset> Module files NOT found! Copy snd_*.lua files to:\n")
-    cecho("    " .. expectedPath .. "\n")
+    cecho("<red>[S&D]<reset> Installation status: INCORRECT or INCOMPLETE.\n")
+    cecho("<red>[S&D]<reset> Missing required files: " .. table.concat(missing, ", ") .. "\n")
+    cecho("Use the exact folder name <cyan>SearchAndDestroy<reset>; do not rename it to <red>snd<reset>.\n")
 end
 ]]></script>
                 <command></command>
@@ -1166,49 +1188,28 @@ snd.commands.xcmd(matches[2])
             <packageName></packageName>
             <script><![CDATA[
 -- Search and Destroy Mudlet Port
--- Load all modules
+-- Validate the exact installation path before loading any modules.
+
+local triggerGroups = {
+    "SND_Campaign", "SND_Noexp", "SND_GQuest", "SND_Quest",
+    "SND_QuickWhere", "SND_Hunt", "SND_Dinv",
+}
+
+local function setSndTriggers(enabled)
+    local setter = enabled and enableTrigger or disableTrigger
+    if type(setter) ~= "function" then return end
+    for _, name in ipairs(triggerGroups) do pcall(setter, name) end
+end
 
 if _G.snd_loader_in_progress then
     return
 end
 if _G.snd and _G.snd.initialized then
+    setSndTriggers(true)
     return
 end
 _G.snd_loader_in_progress = true
-
-local function findPackagePath()
-    local home = getMudletHomeDir()
-    local profile = getProfileName and getProfileName() or ""
-    local profileDir = home
-
-    if profile ~= "" then
-        local candidate = home .. "/profiles/" .. profile
-        if io.exists(candidate) then
-            profileDir = candidate
-        end
-    end
-
-    local path = profileDir .. "/SearchAndDestroy/"
-    if not io.exists(path .. "snd_main.lua") then
-        path = profileDir .. "/snd/"
-    end
-
-    return path
-end
-
-local packagePath = findPackagePath()
-cecho("<orange>[S&D]<reset> <cyan>Loader starting from " .. packagePath .. "<reset>\n")
-
--- Check if directory exists
-local testFile = packagePath .. "snd_main.lua"
-if not io.exists(testFile) then
-    cecho("<red>[S&D ERROR]<reset> <yellow>Module files not found!<reset>\n")
-    cecho("<red>[S&D ERROR]<reset> <yellow>Expected location: " .. packagePath .. "<reset>\n")
-    cecho("<orange>[S&D]<reset> Please copy all snd_*.lua files to: <cyan>" .. getMudletHomeDir() .. "/SearchAndDestroy/<reset>\n")
-    cecho("<orange>[S&D]<reset> Then type: <green>sndreload<reset>\n")
-    _G.snd_loader_in_progress = false
-    return
-end
+setSndTriggers(false)
 
 -- Load modules in order
 local modules = {
@@ -1227,36 +1228,73 @@ local modules = {
     "snd_gui.lua",
 }
 
-local loadedCount = 0
-local errorCount = 0
-
+local packagePath = getMudletHomeDir() .. "/SearchAndDestroy/"
+local missing = {}
 for _, module in ipairs(modules) do
-    local path = packagePath .. module
-    if io.exists(path) then
-        local ok, err = pcall(dofile, path)
-        if not ok then
-            cecho("<red>[S&D ERROR]<reset> Failed to load " .. module .. ": " .. tostring(err) .. "\n")
-            errorCount = errorCount + 1
-        else
-            loadedCount = loadedCount + 1
-        end
+    local file = io.open(packagePath .. module, "rb")
+    if file then
+        file:close()
+    else
+        table.insert(missing, module)
     end
 end
 
-cecho("<orange>[S&D]<reset> <green>Loaded " .. loadedCount .. " modules<reset>")
-if errorCount > 0 then
-    cecho(" <red>(" .. errorCount .. " errors)<reset>")
+if #missing > 0 then
+    if not _G.snd_install_warning_shown then
+        cecho("<orange_red>[S&D INSTALLATION WARNING]<reset> SearchAndDestroy was not loaded.\n")
+        cecho("<yellow>Required folder name:<reset> SearchAndDestroy\n")
+        cecho("<yellow>Required folder location:<reset> " .. getMudletHomeDir() .. "/SearchAndDestroy\n")
+        cecho("<yellow>Missing required files:<reset> " .. table.concat(missing, ", ") .. "\n")
+        cecho("Move the complete addon folder into the active profile and name it exactly <cyan>SearchAndDestroy<reset> (not <red>snd<reset>).\n")
+        cecho("No S&D modules were loaded, and S&D triggers were disabled to prevent follow-on errors.\n")
+        cecho("After correcting the installation, type <green>sndreload<reset> or reload the profile.\n")
+        _G.snd_install_warning_shown = true
+    end
+    _G.snd_loader_in_progress = false
+    return
 end
-echo("\n")
+
+_G.snd_install_warning_shown = nil
+_G.snd = nil
+cecho("<orange>[S&D]<reset> <cyan>Loader starting from " .. packagePath .. "<reset>\n")
+
+local loadedCount = 0
+local loadFailed = false
+
+for _, module in ipairs(modules) do
+    local path = packagePath .. module
+    local ok, err = pcall(dofile, path)
+    if not ok then
+        cecho("<red>[S&D MODULE ERROR]<reset> " .. module .. ": " .. tostring(err) .. "\n")
+        cecho("S&D triggers remain disabled to prevent follow-on errors.\n")
+        loadFailed = true
+        break
+    else
+        loadedCount = loadedCount + 1
+    end
+end
+
+if loadFailed then
+    _G.snd_loader_in_progress = false
+    return
+end
+
+cecho("<orange>[S&D]<reset> <green>Loaded " .. loadedCount .. " modules from the required folder.<reset>\n")
 
 _G.snd_loader_in_progress = false
 
 -- Initialize
 tempTimer(0.5, function()
     if snd and snd.initialize then
-        snd.initialize(false)
+        local ok, err = pcall(snd.initialize, false)
+        if ok then
+            setSndTriggers(true)
+        else
+            cecho("<red>[S&D INITIALIZATION ERROR]<reset> " .. tostring(err) .. "\n")
+            cecho("S&D triggers remain disabled to prevent follow-on errors.\n")
+        end
     else
-        cecho("<red>[S&D ERROR]<reset> <yellow>snd object not created - modules failed to load<reset>\n")
+        cecho("<red>[S&D ERROR]<reset> <yellow>snd object not created; S&D triggers remain disabled.<reset>\n")
     end
 end)
 ]]></script>

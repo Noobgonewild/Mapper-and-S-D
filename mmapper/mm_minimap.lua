@@ -1457,6 +1457,7 @@ function mm.minimap.set_bigmap_mode(mode)
   mm.runtime.hybrid_navigation_active = nil
   mm.runtime.hybrid_navigation_destination = nil
   mm.runtime.hybrid_bigmap_backend = nil
+  mm.runtime.hybrid_native_unavailable_reason = nil
   opts.bigmap_mode = requested
   if mm.save_settings_persistence then
     mm.save_settings_persistence()
@@ -1477,6 +1478,9 @@ end
 function mm.minimap.activate_bigmap_native()
   if active_bigmap_mode() == "native" then return false end
   mm.runtime = mm.runtime or {}
+  if mm.runtime.hybrid_native_unavailable_reason then
+    return false
+  end
   mm.runtime.hybrid_bigmap_backend = "native"
   activate_current_bigmap_surface("gmcp_continent_room")
   return true
