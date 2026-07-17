@@ -1018,38 +1018,46 @@ function mm.load_native_mapper_db(path)
   return true
 end
 
+-- Convert GMCP/database room info to the mapper's stable TEXT UID convention.
+-- Internal room-name spaces and case are intentionally preserved.
+function mm.canonical_room_uid(info)
+  if type(info) ~= "table" then return nil end
+  local raw_uid = info.num
+  if raw_uid == nil then raw_uid = info.uid end
+  if raw_uid == nil then return nil end
+
+  local uid = mm.strip_ansi(raw_uid):gsub("^%s+", ""):gsub("%s+$", "")
+  if uid == "" then return nil end
+  if uid:match("^nomap_.+") then return uid end
+
+  local numeric = tonumber(uid)
+  if not numeric then return nil end
+  if numeric ~= -1 then return tostring(math.floor(numeric)) end
+
+  local clean_name = mm.strip_ansi(info.name):gsub("^%s+", ""):gsub("%s+$", "")
+  local clean_zone = mm.strip_ansi(info.zone or info.area):gsub("^%s+", ""):gsub("%s+$", "")
+  if clean_name == "" then clean_name = "?" end
+  if clean_zone == "" then clean_zone = "?" end
+  return "nomap_" .. clean_name .. "_" .. clean_zone
+end
+
 function mm.current_room()
-  local function build_nomap_uid(name, zone)
-    local clean_name = mm.strip_ansi(name):gsub("^%s+", ""):gsub("%s+$", "")
-    local clean_zone = mm.strip_ansi(zone):gsub("^%s+", ""):gsub("%s+$", "")
-    if clean_name == "" then clean_name = "?" end
-    if clean_zone == "" then clean_zone = "?" end
-    return "nomap_" .. clean_name .. "_" .. clean_zone
+  local function legacy_room_value(info)
+    local uid = mm.canonical_room_uid(info)
+    if not uid then return nil end
+    return tonumber(uid) or uid
   end
 
   if mm and mm.get_room_info then
-    local info = mm.get_room_info()
-    if info and info.num then
-      local n = tonumber(info.num)
-      if n == -1 then
-        return build_nomap_uid(info.name, info.zone or info.area)
-      end
-      return n
-    end
+    local room = legacy_room_value(mm.get_room_info())
+    if room ~= nil then return room end
   end
-  if gmcp and gmcp.Room and gmcp.Room.Info and gmcp.Room.Info.num then
-    local n = tonumber(gmcp.Room.Info.num)
-    if n == -1 then
-      return build_nomap_uid(gmcp.Room.Info.name, gmcp.Room.Info.zone or gmcp.Room.Info.area)
-    end
-    if n then return n end
+  if gmcp and gmcp.Room and gmcp.Room.Info then
+    local room = legacy_room_value(gmcp.Room.Info)
+    if room ~= nil then return room end
   end
-  if gmcp and gmcp.room and gmcp.room.info and gmcp.room.info.num then
-    local n = tonumber(gmcp.room.info.num)
-    if n == -1 then
-      return build_nomap_uid(gmcp.room.info.name, gmcp.room.info.zone or gmcp.room.info.area)
-    end
-    return n
+  if gmcp and gmcp.room and gmcp.room.info then
+    return legacy_room_value(gmcp.room.info)
   end
   return nil
 end
@@ -1199,6 +1207,136 @@ function mm.resume()
     return false, "no previous mapper target"
   end
   return mm.goto_room(mm.state.last_target)
+end
+
+local room_exit_direction_order = {"n", "s", "e", "w", "u", "d"}
+local room_exit_direction_names = {
+  n = "north", e = "east", s = "south", w = "west", u = "up", d = "down",
+}
+local room_exit_direction_aliases = {
+  n = "n", north = "n",
+  e = "e", east = "e",
+  s = "s", south = "s",
+  w = "w", west = "w",
+  u = "u", up = "u",
+  d = "d", down = "d",
+}
+local room_exit_reverse_direction = {
+  n = "s", e = "w", s = "n", w = "e", u = "d", d = "u",
+}
+local room_exit_cardinal_sql = "'n','north','e','east','s','south','w','west','u','up','d','down'"
+
+function mm.print_room_exits(room, opts)
+  opts = opts or {}
+  room = tonumber(room) or mm.current_room()
+  if not room then return false, "current room unknown" end
+  if type(room) ~= "number" then
+    return false, "mapped exits are not available in unmapped rooms"
+  end
+
+  local room_rows, room_err = mm.query_mapper_db(string.format(
+    "SELECT uid, name, area FROM rooms WHERE uid = %d LIMIT 1",
+    room
+  ))
+  if not room_rows then return false, room_err end
+  if not room_rows[1] then
+    return false, string.format("room %s not found in mapper database", tostring(room))
+  end
+
+  local direct_rows, direct_err = mm.query_mapper_db(string.format([[
+    SELECT lower(trim(exits.dir)) AS dir,
+           exits.touid AS uid,
+           COALESCE(rooms.name, '?') AS name,
+           COALESCE(rooms.area, '') AS area,
+           COALESCE(exits.level, 0) AS level
+    FROM exits
+    LEFT JOIN rooms ON rooms.uid = exits.touid
+    WHERE exits.fromuid = %d
+      AND lower(trim(exits.dir)) IN (%s)
+    ORDER BY exits.dir, exits.touid
+  ]], room, room_exit_cardinal_sql))
+  if not direct_rows then return false, direct_err end
+
+  local inferred_rows, inferred_err = mm.query_mapper_db(string.format([[
+    SELECT lower(trim(exits.dir)) AS dir,
+           exits.fromuid AS uid,
+           COALESCE(rooms.name, '?') AS name,
+           COALESCE(rooms.area, '') AS area
+    FROM exits
+    LEFT JOIN rooms ON rooms.uid = exits.fromuid
+    WHERE exits.touid = %d
+      AND exits.fromuid NOT IN ('*', '**')
+      AND lower(trim(exits.dir)) IN (%s)
+    ORDER BY exits.dir, exits.fromuid
+  ]], room, room_exit_cardinal_sql))
+  if not inferred_rows then return false, inferred_err end
+
+  local exits_by_dir = {}
+  local seen = {}
+  local function add_exit(dir, row, inferred)
+    local uid = tostring(row.uid or "")
+    if uid == "" or uid == "-1" then return end
+    local key = tostring(dir) .. "\001" .. uid
+    if seen[key] then return end
+    seen[key] = true
+    exits_by_dir[dir] = exits_by_dir[dir] or {}
+    table.insert(exits_by_dir[dir], {
+      uid = uid,
+      name = tostring(row.name or "?"),
+      area = tostring(row.area or ""),
+      level = tonumber(row.level) or 0,
+      inferred = inferred == true,
+    })
+  end
+
+  for _, row in ipairs(direct_rows) do
+    local dir = room_exit_direction_aliases[tostring(row.dir or ""):lower()]
+    if dir then add_exit(dir, row, false) end
+  end
+
+  for _, row in ipairs(inferred_rows) do
+    local incoming = room_exit_direction_aliases[tostring(row.dir or ""):lower()]
+    local inferred_dir = incoming and room_exit_reverse_direction[incoming] or nil
+    if inferred_dir and not exits_by_dir[inferred_dir] then
+      add_exit(inferred_dir, row, true)
+    end
+  end
+
+  if opts.show_room ~= false then
+    local info = room_rows[1]
+    local area = tostring(info.area or "")
+    local area_text = area ~= "" and (" / " .. area) or ""
+    mm.note(string.format("Mapped exits from %s (%s)%s:", tostring(info.name or "?"), tostring(room), area_text))
+  else
+    mm.note("Mapped cardinal exits:")
+  end
+
+  for _, dir in ipairs(room_exit_direction_order) do
+    local label = room_exit_direction_names[dir]
+    local entries = exits_by_dir[dir] or {}
+    if #entries == 0 then
+      mm.note(string.format("  %-5s -> no mapped exit", label))
+    else
+      for index, entry in ipairs(entries) do
+        local shown_label = index == 1 and label or ""
+        local suffix = ""
+        if entry.inferred then
+          suffix = " [inferred from reverse exit; may be one-way]"
+        elseif entry.level > 0 then
+          suffix = entry.level >= 999 and " [locked: level 999]" or
+            string.format(" [level %d]", entry.level)
+        end
+        mm.note(string.format(
+          "  %-5s -> %s (%s)%s",
+          shown_label,
+          entry.name,
+          entry.uid,
+          suffix
+        ))
+      end
+    end
+  end
+  return true
 end
 
 function mm.print_room_details(room)
@@ -2181,8 +2319,16 @@ function mm.print_portals(area_arg)
   end
 
   ensure_portal_settings()
-  cecho("\n<deep_sky_blue>Nr  <medium_purple>Type     <medium_purple>Area                      <cornflower_blue>Room name                                  <medium_purple>Portal command                    <deep_sky_blue>Level<reset>\n")
-  cecho("<gray>--------------------------------------------------------------------------------------------------------------------<reset>\n")
+  if mm.portal_usage and mm.portal_usage.prepare_rows then
+    mm.portal_usage.prepare_rows(selected)
+  end
+  local minimum_usage, maximum_usage
+  if mm.portal_usage and mm.portal_usage.count_range then
+    minimum_usage, maximum_usage = mm.portal_usage.count_range(selected)
+  end
+
+  cecho("\n<deep_sky_blue>Nr   <medium_purple>Type     <medium_purple>Area                      <cornflower_blue>Room name                                  <medium_purple>Portal command                    <deep_sky_blue>Level  <cyan>Used<reset>\n")
+  cecho("<gray>----------------------------------------------------------------------------------------------------------------------------<reset>\n")
 
   local function fit(value, width)
     local text = tostring(value or "")
@@ -2197,16 +2343,26 @@ function mm.print_portals(area_arg)
     local is_chaos = mm.is_portal_chaos(p)
     local type_color = is_chaos and "medium_purple" or (is_recall and "light_sky_blue" or "yellow")
     local command_color = is_chaos and "medium_purple" or (is_recall and "light_sky_blue" or "light_slate_blue")
+    if p.usage_trackable and mm.portal_usage and mm.portal_usage.echo_report_link then
+      mm.portal_usage.echo_report_link(p.nr)
+    else
+      cecho(string.format("<deep_sky_blue>[%2s]<reset>", tostring(p.nr or "?")))
+    end
+    local count_color, count_text = "dim_gray", "-"
+    if mm.portal_usage and mm.portal_usage.count_color then
+      count_color, count_text = mm.portal_usage.count_color(p, minimum_usage, maximum_usage)
+    end
     cecho(string.format(
-      "<deep_sky_blue>%-3s <%s>%-8s <light_grey>%-25s <white>%-42s <%s>%-33s <khaki>%5d<reset>",
-      tostring(p.nr or "?"),
+      " <%s>%-8s <light_grey>%-25s <white>%-42s <%s>%-33s <khaki>%5d<reset>  <%s>%4s<reset>",
       type_color,
       is_chaos and "Chaos" or (is_recall and "Recall" or "Portal"),
       fit(p.area or "?", 25),
       fit(p.room_name or "?", 42),
       command_color,
       fit(p.command or "?", 33),
-      tonumber(p.level) or 0
+      tonumber(p.level) or 0,
+      count_color,
+      count_text
     ))
     if mm.portals.settings.bounce_portal_id == tostring(p.portal_id) then
       cecho(" <magenta>[BouncePortal]<reset>")
@@ -2642,6 +2798,13 @@ function mm.normalize_stacked_command(command)
   return normalized
 end
 
+function mm.mapper_walkto_target(command)
+  local normalized = tostring(command or ""):lower()
+    :gsub("^%s+", ""):gsub("%s+$", "")
+  local target = normalized:match("^mapper%s+walkto%s+(%d+)$")
+  return target and tonumber(target) or nil
+end
+
 function mm.set_cexit_wait(seconds)
   local n = tonumber(seconds)
   if not n or n < 2 or n > 40 then
@@ -2700,14 +2863,20 @@ function mm.cexit(command)
   local original_command = tostring(command or ""):gsub("^%s+", ""):gsub("%s+$", "")
   if original_command == "" then return false, "Nothing to do" end
 
-  mm.note(string.format("CEXIT DEBUG: src=%s command='%s'", tostring(src), original_command))
+  mm.debug(string.format("CEXIT DEBUG: src=%s command='%s'", tostring(src), original_command))
   local added_waits = 0
   for wait_secs in string.gmatch(original_command, "wait%((%d*.?%d+)%)") do
     added_waits = added_waits + (tonumber(wait_secs) or 0)
   end
-  mm.note(string.format("CEXIT DEBUG: added_waits=%s", tostring(added_waits)))
+  mm.debug(string.format("CEXIT DEBUG: added_waits=%s", tostring(added_waits)))
   mm.note("CEXIT: WAIT FOR CONFIRMATION BEFORE MOVING.")
-  mm.note(string.format("CEXIT DEBUG: sending='%s'", original_command))
+  mm.debug(string.format("CEXIT DEBUG: sending='%s'", original_command))
+
+  local confirmation_delay = (tonumber(mm.state.temp_cexit_delay) or 2) + added_waits
+  mm.state.temp_cexit_delay = nil
+  mm.runtime = mm.runtime or {}
+  mm.runtime.cexit_execution_serial = (tonumber(mm.runtime.cexit_execution_serial) or 0) + 1
+  local execution_serial = mm.runtime.cexit_execution_serial
 
   local function split_stacked_commands(raw)
     local parts = {}
@@ -2729,40 +2898,96 @@ function mm.cexit(command)
   end
 
   local steps = split_stacked_commands(original_command)
-  local cursor_delay = 0
   local step_gap = 0.05
-  for idx, step in ipairs(steps) do
-    local wait_time = tonumber(step:match("^wait%((%d*.?%d+)%)$"))
-    if wait_time then
-      cursor_delay = cursor_delay + wait_time
-      mm.note(string.format("CEXIT DEBUG: step[%d]='%s' (local wait %.2fs)", idx, step, wait_time))
+
+  local function is_execution_current()
+    return mm.runtime and mm.runtime.cexit_execution_serial == execution_serial
+  end
+
+  local function schedule(delay, callback)
+    if not is_execution_current() then return end
+    if tonumber(delay) and tonumber(delay) > 0 then
+      tempTimer(delay, callback)
     else
-      mm.note(string.format("CEXIT DEBUG: step[%d]='%s' delay=%.2f", idx, step, cursor_delay))
-      if cursor_delay <= 0 then
-        run_cexit_step(step)
-      else
-        tempTimer(cursor_delay, function()
-          run_cexit_step(step)
-        end)
-      end
-      cursor_delay = cursor_delay + step_gap
+      callback()
     end
   end
 
-  local delay = tonumber(mm.state.temp_cexit_delay) or 2
-  delay = delay + added_waits
-  mm.state.temp_cexit_delay = nil
-  tempTimer(delay, function()
-    local dst = mm.current_room()
-    if not dst then mm.warn("CEXIT FAILED: Need to know where we ended up."); return end
-    mm.note(string.format("CEXIT DEBUG: post-delay src=%s dst=%s command='%s'", tostring(src), tostring(dst), original_command))
-    local ok, err = mm.add_full_cexit(original_command, src, dst, 0, false, { preserve_command = true })
-    if not ok then
-      mm.warn("CEXIT FAILED: " .. tostring(err))
-    else
-      mm.note(string.format("CEXIT DEBUG: add_full_cexit persisted command='%s' from=%s to=%s", original_command, tostring(src), tostring(dst)))
+  local function schedule_cexit_confirmation()
+    mm.debug(string.format(
+      "CEXIT DEBUG: confirmation window=%.2fs from cexit start",
+      confirmation_delay
+    ))
+    schedule(confirmation_delay, function()
+      if not is_execution_current() then return end
+      local dst = mm.current_room()
+      if not dst then mm.warn("CEXIT FAILED: Need to know where we ended up."); return end
+      mm.debug(string.format("CEXIT DEBUG: post-delay src=%s dst=%s command='%s'", tostring(src), tostring(dst), original_command))
+      local ok, err = mm.add_full_cexit(original_command, src, dst, 0, false, { preserve_command = true })
+      if not ok then
+        mm.warn("CEXIT FAILED: " .. tostring(err))
+      else
+        mm.debug(string.format("CEXIT DEBUG: add_full_cexit persisted command='%s' from=%s to=%s", original_command, tostring(src), tostring(dst)))
+      end
+    end)
+  end
+
+  local run_from
+  run_from = function(index)
+    if not is_execution_current() then return end
+    local step = steps[index]
+    if not step then
+      mm.debug("CEXIT DEBUG: command sequence fully released")
+      return
     end
-  end)
+
+    local wait_time = tonumber(step:match("^wait%((%d*.?%d+)%)$"))
+    if wait_time then
+      mm.debug(string.format("CEXIT DEBUG: step[%d]='%s' (local wait %.2fs)", index, step, wait_time))
+      schedule(wait_time, function() run_from(index + 1) end)
+      return
+    end
+
+    local walkto_target = mm.mapper_walkto_target(step)
+    if walkto_target then
+      mm.debug(string.format(
+        "CEXIT DEBUG: step[%d]='%s' walkto barrier=%s holding_steps=%d",
+        index,
+        step,
+        tostring(walkto_target),
+        #steps - index
+      ))
+      local ok, err = mm.walkto_room(walkto_target)
+      if not ok then
+        mm.warn(string.format("CEXIT FAILED at step[%d] '%s': %s", index, step, tostring(err)))
+        return
+      end
+
+      local function await_arrival()
+        if not is_execution_current() then return end
+        local current_room = mm.current_room()
+        if tostring(current_room or "") == tostring(walkto_target) then
+          mm.debug(string.format(
+            "CEXIT DEBUG: walkto confirmed room=%s; releasing step[%d]",
+            tostring(walkto_target),
+            index + 1
+          ))
+          schedule(step_gap, function() run_from(index + 1) end)
+          return
+        end
+        schedule(0.1, await_arrival)
+      end
+      await_arrival()
+      return
+    end
+
+    mm.debug(string.format("CEXIT DEBUG: step[%d]='%s' released", index, step))
+    run_cexit_step(step)
+    schedule(step_gap, function() run_from(index + 1) end)
+  end
+
+  schedule_cexit_confirmation()
+  run_from(1)
   return true
 end
 

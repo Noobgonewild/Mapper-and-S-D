@@ -443,6 +443,17 @@ local function handle_command_inline(line)
     if not ok and err then mm.warn(err) end
     return true
   end
+  if line == "mapper portalstats" then
+    local ok, err = mm.portal_usage.show_stats()
+    if not ok then mm.warn(err) end
+    return true
+  end
+  local portalstats_count = line:match("^mapper portalstats recent%s*(%d*)$")
+  if portalstats_count ~= nil then
+    local ok, err = mm.portal_usage.show_stats_recent(portalstats_count ~= "" and portalstats_count or nil)
+    if not ok then mm.warn(err) end
+    return true
+  end
   local portals_filter = line:match("^mapper portals%s+(.+)$")
   if portals_filter then
     local ok, err = mm.print_portals(portals_filter)
@@ -670,6 +681,13 @@ local function handle_command_inline(line)
   if line == "mapper where" then mm.warn("Usage: mapper where <room id>"); return true end
   if where_arg then local ok, err = mm.where_room(where_arg); if not ok then mm.warn(err) end; return true end
 
+  local exits_room = line:match("^mapper exits%s+(%d+)$")
+  if line == "mapper exits" or exits_room then
+    local ok, err = mm.print_room_exits(exits_room)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
   local cexits_area_arg = line:match("^mapper cexits area%s+(.+)$")
   if cexits_area_arg then local ok, err = mm.list_cexits("area " .. cexits_area_arg); if not ok then mm.warn(err) end; return true end
   local cexits_arg = line:match("^mapper cexits%s+(.+)$")
@@ -680,7 +698,7 @@ local function handle_command_inline(line)
 
   local cexit_cmd = line:match("^mapper cexit%s+(.+)$")
   if cexit_cmd then
-    mm.note(string.format("CEXIT DEBUG: parsed='%s' from line='%s'", tostring(cexit_cmd), tostring(line)))
+    mm.debug(string.format("CEXIT DEBUG: parsed='%s' from line='%s'", tostring(cexit_cmd), tostring(line)))
     local ok, err = mm.cexit(cexit_cmd)
     if not ok then mm.warn(err) end
     return true
@@ -930,6 +948,7 @@ mm.alias_specs = {
   {"^mapper goto (.+)$", function(m) local ok, err = mm.goto_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper walkto (.+)$", function(m) local ok, err = mm.walkto_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper where%s*(.*)$", function(m) local ok, err = mm.where_room(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper exits(?:%s+(%d+))?$", function(m) local ok, err = mm.print_room_exits(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper area%s+(.+)$", function(m) local ok, err = mm.search_text("area", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper find%s+(.+)$", function(m) local ok, err = mm.search_text("find", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper list%s+(.+)$", function(m) local ok, err = mm.search_text("list", m[2]); if not ok then mm.warn(err) end end},

@@ -691,6 +691,9 @@ function mm.on_room_info_event()
   local room_area = tostring(info and (info.zone or info.area) or "")
 
   local switched, continent = false, false
+  if mm.portal_usage and mm.portal_usage.on_room_info then
+    mm.portal_usage.on_room_info(info)
+  end
   if mm.minimap and mm.minimap.get_bigmap_mode and mm.minimap.get_bigmap_mode() == "hybrid" then
     switched, continent = mm.sync_hybrid_bigmap_to_room(info)
   end

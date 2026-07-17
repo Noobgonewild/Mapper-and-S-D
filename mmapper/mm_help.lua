@@ -101,6 +101,8 @@ mm.help_table = {
   ['exits'] = {
     header = "Exit Actions",
     rows = {
+      { cmd = "mapper exits", desc = "Show mapped cardinal destinations from the current room, including room names and IDs" },
+      { cmd = "mapper exits <room id>", desc = "Show mapped cardinal destinations from another room" },
       { cmd = "mapper cexits", desc = "List known custom exits" },
       { cmd = "mapper cexits thisroom", desc = "List known custom exits in your current room" },
       { cmd = "mapper cexits here", desc = "List known custom exits in your current area" },
@@ -108,8 +110,8 @@ mm.help_table = {
       { cmd = "mapper deletecexit <number>", desc = "Delete one custom exit by table row number from your last mapper cexits list" },
       { cmd = "mapper deletedcexits", desc = "List recently deleted custom exits (history capped at 20)" },
       { cmd = "mapper restorecexit <number|last>", desc = "Restore one deleted custom exit by row number, or restorecexit last" },
-      { cmd = "mapper cexit <command>", desc = "Follow and link a custom exit (ex: 'mapper cexit ride bucket') To insert a pause during execution of the cexit, use wait(<seconds>) as one or more of the cexit moves To stack commands use ;; as separator (ex: 'mapper cexit open south;;south')" },
-      { cmd = "mapper cexit_wait <seconds>", desc = "Wait this number of seconds instead of the standard 2 when constructing the next cexit (between 2 and 40)" },
+      { cmd = "mapper cexit <command>", desc = "Follow and link a custom exit (ex: 'mapper cexit ride bucket') Stacked mapper walkto commands hold later steps until that room is confirmed. To insert a pause, use wait(<seconds>). To stack commands use ;; as separator (ex: 'mapper cexit open south;;south')" },
+      { cmd = "mapper cexit_wait <seconds>", desc = "Set the next cexit's base confirmation window from cexit start instead of the standard 2 seconds; wait() values extend it (between 2 and 40)" },
       { cmd = "mapper lockedexits", desc = "List locked exits for the current room." },
       { cmd = "mapper lockexit <n|s|e|w|u|d> [level]", desc = "Lock the selected direction and any same-room exits to the same destination by writing exits.level. Without level, sets level 999 (all levels)." },
       { cmd = "mapper lockexit <n|s|e|w|u|d> off", desc = "Remove the lock for the selected direction and any same-room exits to the same destination." },
@@ -119,7 +121,9 @@ mm.help_table = {
   ['portals'] = {
     header = "Portal Actions",
     rows = {
-      { cmd = "mapper portals", desc = "List known hand-held portals" },
+      { cmd = "mapper portals", desc = "List known hand-held portals; click/right-click a bracketed portal row to report it" },
+      { cmd = "mapper portalstats", desc = "Show local usage totals and per-portal attempt statistics for portals with activity" },
+      { cmd = "mapper portalstats recent [count]", desc = "Show the newest portal attempts with confirmation details (default 20, maximum 50)" },
       { cmd = "mapper rebuildportals", desc = "Rebuild portal list from exits with commands starting 'dinv portal use <id>'" },
       { cmd = "mapper portalguard [on|off]", desc = "Guard portal routes unless your level is within 30 of the portal level; xrtforce bypasses it" },
       { cmd = "mapper portals here/<area>", desc = "List known hand-held portals only to this or another area (by area keyword)." },
@@ -197,7 +201,7 @@ mm.help_table = {
   ['exploring'] = {
     header = "Exploring",
     rows = {
-      { cmd = "mapper thisroom", desc = "Show details about the current room" },
+      { cmd = "mapper thisroom", desc = "Show current-room details" },
       { cmd = "mapper showroom <room id>", desc = "Draw the map as if you were standing in a different room" },
       { cmd = "mapper areas", desc = "Show a list of all mapped areas" },
       { cmd = "mapper areas <name>", desc = "Show a list of mapped areas partially matching <name>" },

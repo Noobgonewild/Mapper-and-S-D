@@ -72,6 +72,7 @@ mm.base_dir = base
 load_module(base, "mm_core.lua")
 load_module(base, "mm_area_references.lua")
 load_module(base, "mm_navigation.lua")
+load_module(base, "mm_portal_usage.lua")
 load_module(base, "mm_frontier.lua")
 load_module(base, "mm_bookmarks.lua")
 load_module(base, "mm_help.lua")
@@ -228,6 +229,21 @@ function mm.initialize()
   local configured_mode = mm.minimap and mm.minimap.get_bigmap_mode and mm.minimap.get_bigmap_mode()
   safe_step("register_aliases", function() mm.register_aliases() end)
   safe_step("register_events", function() mm.register_events() end)
+  safe_step("portal_usage.initialize", function()
+    if mm.portal_usage and mm.portal_usage.initialize then
+      local ok, result = mm.portal_usage.initialize()
+      if not ok then
+        mm.warn("Could not initialize portal usage database: " .. tostring(result))
+      elseif result and result.migrated then
+        mm.note("Migrated mmapper_frontiers.db to persistence/mmapper_state.db.")
+      end
+    end
+  end)
+  safe_step("portal_usage.register_events", function()
+    if mm.portal_usage and mm.portal_usage.register_events then
+      mm.portal_usage.register_events()
+    end
+  end)
   safe_step("minimap.init", function() mm.minimap.init() end)
 
   if configured_mode == "native" then

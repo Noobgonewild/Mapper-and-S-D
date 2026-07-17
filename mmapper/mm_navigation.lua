@@ -30,14 +30,8 @@ snd.room = snd.room or { current = { rmid = "-1" } }
 snd.char = snd.char or { level = 201, tier = 0 }
 snd.nav = snd.nav or {}
 
-local function build_nomap_uid(name, zone)
-    local clean_name = (mm and mm.strip_ansi) and mm.strip_ansi(name) or tostring(name or "")
-    local clean_zone = (mm and mm.strip_ansi) and mm.strip_ansi(zone) or tostring(zone or "")
-    clean_name = tostring(clean_name or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    clean_zone = tostring(clean_zone or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    if clean_name == "" then clean_name = "?" end
-    if clean_zone == "" then clean_zone = "?" end
-    return "nomap_" .. clean_name .. "_" .. clean_zone
+if type(mm.canonical_room_uid) ~= "function" then
+    error("MMapper navigation requires mm_core.lua to be loaded first (missing mm.canonical_room_uid).")
 end
 
 if type(snd.utils.infoNote) ~= "function" then
@@ -530,12 +524,7 @@ function snd.mapper.getRoomInfo(roomId)
 end
 
 function snd.mapper.normalizeRoomInfoUid(roomInfo)
-    if not roomInfo or roomInfo.num == nil then return nil end
-    local numeric = tonumber(roomInfo.num)
-    if numeric == -1 then
-        return build_nomap_uid(roomInfo.name, roomInfo.zone or roomInfo.area)
-    end
-    return tostring(roomInfo.num)
+    return mm.canonical_room_uid(roomInfo)
 end
 
 local function room_info_details(roomInfo)
@@ -2460,6 +2449,9 @@ function snd.mapper.onPortalBlocked()
         snd.utils.debugNote("Ignoring portal blocked trigger while in combat.")
         return
     end
+    if mm and mm.portal_usage and mm.portal_usage.mark_blocked then
+        mm.portal_usage.mark_blocked("magic_walls_bounced_portal")
+    end
     snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
     local destination = snd.mapper.goingToRoom or (snd.nav and snd.nav.goingToRoom)
     local pending = snd.mapper.consumeRestrictionMark("portal")
@@ -2539,8 +2531,8 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
     end
 
     local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
-    if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info and gmcp.room.info.num then
-        currentRoom = tostring(gmcp.room.info.num)
+    if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info then
+        currentRoom = mm.canonical_room_uid(gmcp.room.info)
     end
     currentRoom = tostring(currentRoom or "")
     if currentRoom == "" or currentRoom == "-1" then
@@ -3141,14 +3133,19 @@ end
 --- Execute a path (send commands)
 -- Handles cardinal directions with 'run', special exits with ';;', and wait() with tempTimer
 -- @param path Path table from findPath
-function snd.mapper.executePath(path)
+-- @param opts Optional execution controls; preserveExecutionSerial keeps an outer path alive
+function snd.mapper.executePath(path, opts)
     if not path or #path == 0 then
         return
     end
 
+    opts = opts or {}
+
     snd.mapper.notifyBigmapNavigationState("path_started")
 
-    snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
+    if not opts.preserveExecutionSerial then
+        snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
+    end
     local executionSerial = snd.mapper.pathExecutionSerial
 
     local function isExecutionCurrent()
@@ -3189,8 +3186,8 @@ function snd.mapper.executePath(path)
     
     local function getCurrentRoomId()
         local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
-        if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info and gmcp.room.info.num then
-            currentRoom = tostring(gmcp.room.info.num)
+        if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info then
+            currentRoom = mm.canonical_room_uid(gmcp.room.info)
         end
         return tostring(currentRoom or "-1")
     end
@@ -3245,7 +3242,17 @@ function snd.mapper.executePath(path)
         local stepSourceRoom = simulatedRoom
         local isTravelStep = step.travelType == "portal" or step.travelType == "recall"
         local stepHasWait = false
+        local stepHasMapperWalkto = false
         local encounteredWait = false
+
+        for _, token in ipairs(parts) do
+            if tostring(token):match("^%s*wait%((%d+%.?%d*)%)%s*$") then
+                stepHasWait = true
+            end
+            if mm and mm.mapper_walkto_target and mm.mapper_walkto_target(token) then
+                stepHasMapperWalkto = true
+            end
+        end
 
         -- Do not send a jump in the same batch as the walk leading to its
         -- source room. Waiting for GMCP here also makes restriction markers
@@ -3263,12 +3270,22 @@ function snd.mapper.executePath(path)
             }
         end
 
-        for _, token in ipairs(parts) do
-            if tostring(token):match("^%s*wait%((%d+%.?%d*)%)%s*$") then
-                stepHasWait = true
-                break
+        -- A cexit containing mapper walkto must itself wait until the outer
+        -- path reaches the cexit source. Otherwise the nested walk would be
+        -- calculated from the room occupied before the approach run finishes.
+        if stepHasMapperWalkto then
+            flushCardinals()
+            if #currentGroup.commands > 0 then
+                table.insert(groups, currentGroup)
             end
+            currentGroup = {
+                commands = {},
+                delayAfter = 0,
+                waitRoomId = nil,
+                executeRoomId = tostring(stepSourceRoom or "-1"),
+            }
         end
+
         if stepHasWait then
             flushCardinals()
             if #currentGroup.commands > 0 then
@@ -3279,6 +3296,7 @@ function snd.mapper.executePath(path)
 
 		for _, dir in ipairs(parts) do
 			local dirLower = dir:lower()
+			local walktoTarget = mm and mm.mapper_walkto_target and mm.mapper_walkto_target(dir) or nil
 
 			-- Check if this is a wait() command
 			local waitTime = dir:match("^wait%((%d+%.?%d*)%)$")
@@ -3295,6 +3313,24 @@ function snd.mapper.executePath(path)
 			elseif cardinalDirs[dirLower] then
 				-- cardinal movement token (n/s/e/w/u/d)
 				table.insert(cardinalBuffer, dirLower)
+
+                elseif walktoTarget then
+                    -- A nested mapper walk starts its own asynchronous path.
+                    -- End this group at the walk command and hold everything
+                    -- after it until GMCP confirms the requested room.
+					flushCardinals()
+                    walktoTarget = tostring(walktoTarget)
+                    table.insert(currentGroup.commands, {
+                        text = dir,
+                        embeddedWalkTarget = walktoTarget,
+                    })
+                    table.insert(groups, currentGroup)
+                    currentGroup = {
+                        commands = {},
+                        delayAfter = 0,
+                        waitRoomId = nil,
+                        executeRoomId = walktoTarget,
+                    }
 
                 else
                     -- normal command token (e.g. "open d", "kill hidden", "o n", "enter")
@@ -3356,10 +3392,10 @@ function snd.mapper.executePath(path)
         return
     end
 
-    local function sendCommand(cmd, travelType)
+    local function sendCommand(cmd, travelType, embeddedWalkTarget)
         local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
-        if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info and gmcp.room.info.num then
-            currentRoom = tostring(gmcp.room.info.num)
+        if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info then
+            currentRoom = mm.canonical_room_uid(gmcp.room.info)
         end
         if (travelType == "portal" or travelType == "recall") and snd.mapper.isInCombat and snd.mapper.isInCombat() then
             snd.mapper.consumeRestrictionMark("portal")
@@ -3374,6 +3410,23 @@ function snd.mapper.executePath(path)
             snd.mapper.queueRestrictionMark(travelType, currentRoom)
         end
 
+        if travelType == "portal" and mm and mm.portal_usage
+            and mm.portal_usage.note_mapper_portal_command then
+            mm.portal_usage.note_mapper_portal_command(cmd)
+        end
+
+        if embeddedWalkTarget then
+            local ok = snd.mapper.walkTo(tostring(embeddedWalkTarget), {embedded = true})
+            if not ok then
+                snd.utils.infoNote("Stopping path: embedded mapper walkto failed for room " .. tostring(embeddedWalkTarget) .. ".")
+                snd.mapper.goingToRoom = nil
+                snd.nav.goingToRoom = nil
+                snd.mapper.notifyBigmapNavigationState("embedded_walk_failed")
+                return false
+            end
+            return true
+        end
+
         if type(expandAlias) == "function" then
             expandAlias(cmd)
         else
@@ -3384,7 +3437,7 @@ function snd.mapper.executePath(path)
 
     local function sendCommands(commands)
         for _, entry in ipairs(commands) do
-            local ok = sendCommand(entry.text, entry.travelType)
+            local ok = sendCommand(entry.text, entry.travelType, entry.embeddedWalkTarget)
             if ok == false then
                 return false
             end
@@ -3394,6 +3447,7 @@ function snd.mapper.executePath(path)
     
     -- Execute path groups sequentially so wait() never races ahead of queued actions.
     -- If a wait expires while in combat, hold execution until combat clears.
+    local heldGroupNotices = {}
     local function runFrom(startIndex)
         if not isExecutionCurrent() then
             return
@@ -3420,7 +3474,11 @@ function snd.mapper.executePath(path)
             if executeRoomId ~= "" and executeRoomId ~= "-1" then
                 local currentRoomId = getCurrentRoomId()
                 if currentRoomId ~= executeRoomId then
-                    snd.utils.debugNote("Holding group until room " .. executeRoomId .. " (current " .. tostring(currentRoomId) .. ").")
+                    local noticeKey = tostring(index) .. ":" .. executeRoomId
+                    if not heldGroupNotices[noticeKey] then
+                        heldGroupNotices[noticeKey] = true
+                        snd.utils.debugNote("Holding group until room " .. executeRoomId .. " (current " .. tostring(currentRoomId) .. ").")
+                    end
                     tempTimer(0.1, function()
                         if not isExecutionCurrent() then return end
                         runFrom(index)
@@ -3542,14 +3600,9 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     -- Get current room
     local currentRoom = snd.room.current.rmid
     if not currentRoom or currentRoom == "-1" then
-        -- Try to get from GMCP; uid=-1 means a clan/unmapped room.
+        -- Try to get the canonical UID from GMCP, including clan/unmapped rooms.
         if gmcp and gmcp.room and gmcp.room.info then
-            local n = tonumber(gmcp.room.info.num)
-            if n == -1 then
-                currentRoom = build_nomap_uid(gmcp.room.info.name, gmcp.room.info.zone or gmcp.room.info.area)
-            else
-                currentRoom = tostring(gmcp.room.info.num)
-            end
+            currentRoom = mm.canonical_room_uid(gmcp.room.info)
         end
     end
 
@@ -3680,8 +3733,8 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
                             return
                         end
                         local nowRoom = snd.room and snd.room.current and snd.room.current.rmid
-                        if (not nowRoom or nowRoom == "-1") and gmcp and gmcp.room and gmcp.room.info and gmcp.room.info.num then
-                            nowRoom = tostring(gmcp.room.info.num)
+                        if (not nowRoom or nowRoom == "-1") and gmcp and gmcp.room and gmcp.room.info then
+                            nowRoom = mm.canonical_room_uid(gmcp.room.info)
                         end
                         nowRoom = tostring(nowRoom or "")
                         if nowRoom ~= "" and nowRoom ~= "-1" and nowRoom ~= expectedRoom then
@@ -4212,8 +4265,8 @@ function snd.mapper.debugXrtDecision(destInput, resolvedRoom, reason)
     end
 
     local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
-    if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info and gmcp.room.info.num then
-        currentRoom = tostring(gmcp.room.info.num)
+    if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info then
+        currentRoom = mm.canonical_room_uid(gmcp.room.info)
     end
     currentRoom = tostring(currentRoom or "")
 
@@ -4408,13 +4461,16 @@ end
 -- Uses snd.db for area lookup and Aardwolf.db for pathfinding
 -- Does NOT use Mudlet's internal map for navigation
 -- @param dest Destination - room number or area name
-function snd.mapper.walkTo(dest)
+-- @param opts Optional controls; embedded avoids replacing an outer route destination
+function snd.mapper.walkTo(dest, opts)
     if not dest or dest == "" then
         cecho("<yellow>[MMAPPER]<reset> Usage: walkto <roomid|areaname>\n")
         cecho("<dim_gray>Examples: walkto 32418, walkto aylor, walkto farm<reset>\n")
         return false
     end
     
+    opts = opts or {}
+    local embedded = opts.embedded == true
     dest = dest:lower():trim()
     
     -- Get current room
@@ -4424,7 +4480,7 @@ function snd.mapper.walkTo(dest)
     end
     if not currentRoom or currentRoom == "-1" then
         if gmcp and gmcp.room and gmcp.room.info then
-            currentRoom = tostring(gmcp.room.info.num)
+            currentRoom = mm.canonical_room_uid(gmcp.room.info)
         end
     end
     
@@ -4507,9 +4563,11 @@ function snd.mapper.walkTo(dest)
     
     if path and #path > 0 then
         cecho("<dim_gray>[MMAPPER] Found path with " .. #path .. " steps<reset>\n")
-        snd.mapper.goingToRoom = targetRoom
-        snd.nav.goingToRoom = targetRoom
-        snd.mapper.executePath(path)
+        if not embedded then
+            snd.mapper.goingToRoom = targetRoom
+            snd.nav.goingToRoom = targetRoom
+        end
+        snd.mapper.executePath(path, {preserveExecutionSerial = embedded})
         return true
     else
         if snd.mapper.areaGuardEnabled() then

@@ -17,6 +17,7 @@ local requiredFiles = {
   "mm_core.lua",
   "mm_area_references.lua",
   "mm_navigation.lua",
+  "mm_portal_usage.lua",
   "mm_frontier.lua",
   "mm_bookmarks.lua",
   "mm_help.lua",
