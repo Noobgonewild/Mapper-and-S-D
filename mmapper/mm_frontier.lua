@@ -100,6 +100,25 @@ local function active_redirect(targetUid)
   return nil
 end
 
+--- Return the active redirect explicitly saved for a requested room.
+-- Boundary candidates calculated by xrtnear are never stored in this table,
+-- so callers cannot accidentally treat a calculated suggestion as a manual
+-- redirect. Return a copy so external consumers cannot mutate persistence.
+function frontier.get_manual_redirect(targetUid)
+  if not frontier.redirectsLoaded then return nil end
+
+  local redirect = active_redirect(targetUid)
+  if not redirect then return nil end
+
+  return {
+    target_uid = redirect.target_uid,
+    destination_uid = redirect.destination_uid,
+    target_name = redirect.target_name,
+    destination_name = redirect.destination_name,
+    created_at = redirect.created_at,
+  }
+end
+
 local function enforce_single_active_redirects()
   local activeByTarget = {}
   local collapsed = 0
@@ -423,7 +442,7 @@ function frontier.find_boundaries(scope, options)
 end
 
 local function echo_xrt_link(label, uid)
-  local command = string.format([[expandAlias("xrt %d")]], uid)
+  local command = string.format([[mm.goto_room(%d)]], uid)
   echoLink(label, command, "Run xrt " .. tostring(uid), true)
 end
 
@@ -652,7 +671,7 @@ local function print_redirect_rows(rows, deleted)
     if destination then
       echoLink(
         string.format("(%d)", destination),
-        string.format([[expandAlias("xrt %d")]], destination),
+        string.format([[mm.goto_room(%d)]], destination),
         "Run xrt " .. tostring(destination),
         true
       )

@@ -830,7 +830,7 @@ function snd.mapper.echoAreaGuardOverride(destination)
 
     cecho("<yellow>[MMAPPER]<reset> Override: ")
     local label = "[xrtforce " .. dest .. "]"
-    local command = string.format([[expandAlias(%q, false)]], "xrtforce " .. dest)
+    local command = string.format([[snd.mapper.xrtforce(%q)]], dest)
     if type(echoLink) == "function" then
         echoLink(label, command, "Navigate without area, portal, or exit-level guards", true)
     else
@@ -3784,7 +3784,17 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
             snd.utils.debugNote("Area guard route retry found no unguarded route either.")
         end
         snd.utils.infoNote("You couldn't find a path to " .. roomId .. " from here.")
-        snd.utils.infoNote("Try 'xrtnear " .. roomId .. "' to list reachable boundary rooms. The lookup may take a moment.")
+        local offeredManualApproach = false
+        if snd.commands and type(snd.commands.offerManualApproach) == "function" then
+            local ok, offered = pcall(snd.commands.offerManualApproach, roomId)
+            offeredManualApproach = ok and offered == true
+            if not ok then
+                snd.utils.debugNote("Manual approach display failed: " .. tostring(offered))
+            end
+        end
+        if not offeredManualApproach then
+            snd.utils.infoNote("Try 'xrtnear " .. roomId .. "' to list reachable boundary rooms. The lookup may take a moment.")
+        end
         snd.mapper.goingToRoom = nil
         snd.nav.goingToRoom = nil
         snd.mapper.notifyBigmapNavigationState("path_not_found")
@@ -4584,6 +4594,12 @@ function snd.mapper.walkTo(dest, opts)
         end
         cecho("<red>[MMAPPER]<reset> No walking path found to " .. displayName .. "\n")
         cecho("<dim_gray>The destination may not be reachable by walking alone.<reset>\n")
+        if snd.commands and type(snd.commands.offerManualApproach) == "function" then
+            local ok, offered = pcall(snd.commands.offerManualApproach, targetRoom)
+            if not ok then
+                snd.utils.debugNote("Manual approach display failed: " .. tostring(offered))
+            end
+        end
         return false
     end
 end

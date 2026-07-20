@@ -181,6 +181,26 @@ local function handle_portalguard(mode)
   return true
 end
 
+local function handle_autostop(mode)
+  mode = tostring(mode or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+  if mode == "" then
+    mm.note(mm.autostop_status_text())
+    return true
+  end
+  if mode ~= "on" and mode ~= "off" then
+    mm.warn("Usage: mapper autostop [on|off]")
+    return true
+  end
+
+  local ok, err = mm.set_autostop(mode == "on")
+  if not ok then
+    mm.warn("Could not save autostop setting: " .. tostring(err))
+    return true
+  end
+  mm.note(mm.autostop_status_text())
+  return true
+end
+
 local function handle_command_inline(line)
   line = normalize_line(line)
 
@@ -317,6 +337,11 @@ local function handle_command_inline(line)
   local portalguard_mode = line:match("^mapper portalguard%s*(%S*)$")
   if portalguard_mode ~= nil then
     return handle_portalguard(portalguard_mode)
+  end
+
+  local autostop_mode = line:match("^mapper autostop%s*(%S*)$")
+  if autostop_mode ~= nil then
+    return handle_autostop(autostop_mode)
   end
 
   local mapper_portal_raw = line:match("^mapper portal%s+(.+)$")
@@ -1008,7 +1033,6 @@ mm.alias_specs = {
   {"^mapper noportal(.*)$", function(m) local ok, err = mm.set_room_flag("noportal", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper norecall(.*)$", function(m) local ok, err = mm.set_room_flag("norecall", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper resume$", function() local ok, err = mm.resume(); if not ok then mm.warn(err) end end},
-  {"^mapper stop$", function() send("stop") end},
   {"^mapper thisroom$", function() mm.print_room_details() end},
   {"^mapper showroom (.+)$", function(m) mm.print_room_details(m[2]) end},
   {"^mapper saferoom$", function()
@@ -1079,6 +1103,7 @@ mm.alias_specs = {
   {"^mapper autolocate(?: (on|off))?$", function(m) set_native_follow(mm.bool_arg(m[2], not mm.state.auto_locate), "autolocate") end},
   {"^mapper centerlocate(?: (on|off))?$", function(m) set_native_follow(mm.bool_arg(m[2], not mm.state.auto_locate), "centerlocate") end},
   {"^mapper portalguard%s*(%S*)$", function(m) handle_portalguard(m[2]) end},
+  {"^mapper autostop%s*(%S*)$", function(m) handle_autostop(m[2]) end},
   {"^mapper locate$", function() send("look") end},
   {"^mapper debug(?: (on|off))?$", function(m) if m[2] then mm.state.debug = (m[2] == "on"); mm.note("debug " .. m[2]); if m[2] == "on" then mm.debug("debugging enabled; watch for centerview/map capture lines") end else mm.note("debug " .. ((mm.state and mm.state.debug) and "on" or "off")) end end},
   {"^mapper database$", function()

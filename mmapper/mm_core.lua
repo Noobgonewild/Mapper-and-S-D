@@ -20,6 +20,7 @@ mm.state = mm.state or {
   auto_locate = true,
   center_on_locate = true,
   portal_guard_enabled = true,
+  autostop_enabled = true,
   debug = false,
 }
 
@@ -31,6 +32,9 @@ if type(mm.state.map_db) ~= "string" or not mm.state.map_db:match("%S") then
 end
 if type(mm.state.native_mapper_db) ~= "string" or not mm.state.native_mapper_db:match("%S") then
   mm.state.native_mapper_db = "mmapper_converted_map.dat"
+end
+if type(mm.state.autostop_enabled) ~= "boolean" then
+  mm.state.autostop_enabled = true
 end
 
 mm.runtime = mm.runtime or {
@@ -247,6 +251,9 @@ function mm.load_settings_persistence()
   if type(data.portal_guard_enabled) == "boolean" then
     mm.state.portal_guard_enabled = data.portal_guard_enabled
   end
+  if type(data.autostop_enabled) == "boolean" then
+    mm.state.autostop_enabled = data.autostop_enabled
+  end
   if type(data.native_mapper_db) == "string" and data.native_mapper_db ~= "" then
     mm.state.native_mapper_db = data.native_mapper_db
   end
@@ -277,6 +284,7 @@ function mm.save_settings_persistence()
   end
   f:write("return " .. serialize_value({
     portal_guard_enabled = mm.state.portal_guard_enabled ~= false,
+    autostop_enabled = mm.state.autostop_enabled ~= false,
     native_mapper_db = mm.state.native_mapper_db or "mmapper_converted_map.dat",
     auto_locate = mm.state.auto_locate ~= false,
     minimap = {
@@ -298,6 +306,22 @@ end
 
 function mm.set_portal_guard(enabled)
   mm.state.portal_guard_enabled = enabled ~= false
+  local ok, err = mm.save_settings_persistence()
+  if not ok then
+    return false, err
+  end
+  return true
+end
+
+function mm.autostop_status_text()
+  return string.format(
+    "autostop %s: sends the MUD command 'stop' when GMCP enters combat during active mapper navigation.",
+    (mm.state.autostop_enabled ~= false) and "on" or "off"
+  )
+end
+
+function mm.set_autostop(enabled)
+  mm.state.autostop_enabled = enabled ~= false
   local ok, err = mm.save_settings_persistence()
   if not ok then
     return false, err
@@ -1068,11 +1092,15 @@ function mm.goto_room(target)
     return false, "invalid room"
   end
 
-  if type(expandAlias) ~= "function" then
-    return false, "expandAlias is unavailable"
+  local nav = (mm and mm.nav) or (snd and snd.mapper) or nil
+  if not (nav and type(nav.xrt) == "function") then
+    return false, "xrt requires mapper navigation module"
   end
 
-  expandAlias("xrt " .. target)
+  local ok, result = pcall(nav.xrt, tostring(target))
+  if not ok then
+    return false, "xrt failed: " .. tostring(result)
+  end
   mm.state.last_target = target
   return true
 end

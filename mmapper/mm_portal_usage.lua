@@ -449,26 +449,25 @@ local function channel_label(channel)
   return channel:gsub("^%l", string.upper)
 end
 
-function usage.echo_report_link(index)
-  local label = string.format("[%2s]", tostring(index or "?"))
+local function echo_report_link(label, menu_label, reporter, fallback_command)
   local channel = configured_report_channel()
   if type(cechoPopup) == "function" then
     cechoPopup(
       "<deep_sky_blue>" .. label .. "<reset>",
       {
-        function() usage.report_from_link(index, channel) end,
+        function() reporter(channel) end,
         "",
-        function() usage.report_from_link(index, channel) end,
+        function() reporter(channel) end,
         "",
-        function() usage.report_from_link(index, "clan") end,
+        function() reporter("clan") end,
         "",
-        function() usage.report_from_link(index, "say") end,
+        function() reporter("say") end,
         "",
-        function() usage.report_from_link(index, "gtell") end,
+        function() reporter("gtell") end,
       },
       {
         "Left-click: report this portal via " .. channel_label(channel) .. "\nRight-click for other channels",
-        label,
+        menu_label,
         "",
         channel_label(channel),
         "",
@@ -483,7 +482,7 @@ function usage.echo_report_link(index)
   elseif type(cechoLink) == "function" then
     cechoLink(
       "<deep_sky_blue>" .. label .. "<reset>",
-      string.format("mm.portal_usage.report_from_link(%d)", tonumber(index) or 0),
+      fallback_command,
       "Report this portal",
       true
     )
@@ -492,8 +491,39 @@ function usage.echo_report_link(index)
   end
 end
 
+function usage.echo_report_link(index)
+  local label = string.format("[%2s]", tostring(index or "?"))
+  echo_report_link(
+    label,
+    label,
+    function(channel) usage.report_from_link(index, channel) end,
+    string.format("mm.portal_usage.report_from_link(%d)", tonumber(index) or 0)
+  )
+end
+
+function usage.echo_report_id_link(portal_id, display_label)
+  local id = normalized_id(portal_id)
+  local label = tostring(display_label or id or "?")
+  if not id then
+    cecho("<deep_sky_blue>" .. label .. "<reset>")
+    return
+  end
+  echo_report_link(
+    label,
+    id,
+    function(channel) usage.report_id_from_link(id, channel) end,
+    string.format("mm.portal_usage.report_id_from_link(%q)", id)
+  )
+end
+
 function usage.report_from_link(index, channel)
   local ok, err = usage.report(index, channel)
+  if not ok and mm and mm.warn then mm.warn(err) end
+  return ok
+end
+
+function usage.report_id_from_link(portal_id, channel)
+  local ok, err = usage.report_by_id(portal_id, channel)
   if not ok and mm and mm.warn then mm.warn(err) end
   return ok
 end
@@ -583,18 +613,7 @@ local function dispatch_report(channel, payload)
   return false
 end
 
-function usage.report(index, channel)
-  index = tonumber(index)
-  if not index then return false, "Invalid portal report row" end
-  local portal = usage.last_rows[index] or (mm.portals and mm.portals.rebuilt and mm.portals.rebuilt[index])
-  if not portal then
-    return false, "No portal row #" .. tostring(index) .. ". Run 'mapper portals' first."
-  end
-  usage.prepare_rows({portal})
-  if not portal.usage_trackable then
-    return false, "Portal row #" .. tostring(index) .. " is not a DINV handheld portal."
-  end
-
+local function report_portal(portal, channel)
   local selected_channel = trim(channel)
   if selected_channel == "" then selected_channel = configured_report_channel() end
   if selected_channel:lower() == "default" or selected_channel:lower() == "echo" then
@@ -606,6 +625,59 @@ function usage.report(index, channel)
     return false, "Could not report portal row via channel: " .. tostring(selected_channel)
   end
   return true
+end
+
+function usage.report(index, channel)
+  index = tonumber(index)
+  if not index then return false, "Invalid portal report row" end
+  local portal = usage.last_rows[index] or (mm.portals and mm.portals.rebuilt and mm.portals.rebuilt[index])
+  if not portal then
+    return false, "No portal row #" .. tostring(index) .. ". Run 'mapper portals' first."
+  end
+  usage.prepare_rows({portal})
+  if not portal.usage_trackable then
+    return false, "Portal row #" .. tostring(index) .. " is not a DINV handheld portal."
+  end
+  return report_portal(portal, channel)
+end
+
+function usage.report_by_id(portal_id, channel)
+  local id = normalized_id(portal_id)
+  if not id then return false, "Invalid portal ID" end
+
+  local portal = find_mapper_portal(id)
+  if portal then
+    usage.prepare_rows({portal})
+    if not portal.usage_trackable then
+      return false, "Portal ID " .. id .. " is not a DINV handheld portal."
+    end
+    return report_portal(portal, channel)
+  end
+
+  local rows, rows_err = query(string.format([[
+    SELECT portal_id, confirmed_count, last_was_chaos, portal_name,
+           portal_color_name, portal_level, last_landing_room_name,
+           last_landing_area
+    FROM portal_usage
+    WHERE portal_id=%s
+    LIMIT 1
+  ]], sql_quote(id)))
+  if not rows then return false, rows_err end
+  local row = rows[1]
+  if not row then return false, "No portal usage found for ID " .. id .. "." end
+
+  portal = {
+    portal_id = id,
+    portal_name = row.portal_name,
+    portal_color_name = row.portal_color_name,
+    room_name = row.last_landing_room_name,
+    area = row.last_landing_area,
+    level = tonumber(row.portal_level) or 0,
+    usage_count = tonumber(row.confirmed_count) or 0,
+    usage_trackable = true,
+    chaos = tonumber(row.last_was_chaos) == 1 and "yes" or "no",
+  }
+  return report_portal(portal, channel)
 end
 
 local function clean_stat_text(value, fallback)
@@ -725,9 +797,10 @@ function usage.show_stats()
     local lock = details.lock and tostring(details.lock) or "-"
     local used_tried = string.format("%d/%d", tonumber(row.confirmed_count) or 0, tonumber(row.attempt_count) or 0)
     local manual_mapper = string.format("%d/%d", tonumber(row.manual_count) or 0, tonumber(row.mapper_count) or 0)
+    usage.echo_report_id_link(row.portal_id, string.format("%-12s", tostring(row.portal_id or "?")))
     cecho(string.format(
-      "<khaki>%-12s<reset> <%s>%-6s<reset> <white>%5s %11s %9s %5d %5d<reset> <dim_gray>%-10s %-11s<reset>  ",
-      tostring(row.portal_id or "?"), details.chaos and "medium_purple" or "light_grey",
+      " <%s>%-6s<reset> <white>%5s %11s %9s %5d %5d<reset> <dim_gray>%-10s %-11s<reset>  ",
+      details.chaos and "medium_purple" or "light_grey",
       details.chaos and "Chaos" or "Normal", lock, used_tried, manual_mapper,
       tonumber(row.blocked_count) or 0, tonumber(row.unconfirmed_count) or 0,
       stat_date(row.first_used_at), stat_last_time(row.last_used_at)

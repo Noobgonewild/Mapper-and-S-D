@@ -754,6 +754,31 @@ function mm.schedule_auto_layout_rebuild()
   return false
 end
 
+local function current_char_status_state()
+  if not (gmcp and gmcp.char and gmcp.char.status) then return nil end
+  return tonumber(gmcp.char.status.state)
+end
+
+function mm.on_char_status_event()
+  local state = current_char_status_state()
+  if state == nil then return end
+
+  mm.runtime = mm.runtime or {}
+  local previous_state = mm.runtime.autostop_previous_char_state
+  mm.runtime.autostop_previous_char_state = state
+
+  if previous_state == nil or previous_state == 8 or state ~= 8 then return end
+  if not (mm.state and mm.state.autostop_enabled ~= false) then return end
+
+  local navigating = snd and (
+    (snd.nav and snd.nav.goingToRoom ~= nil) or
+    (snd.mapper and snd.mapper.goingToRoom ~= nil)
+  )
+  if not navigating then return end
+
+  send("stop")
+end
+
 local function kill_trigger_field(field)
   local id = mm[field]
   if id and type(killTrigger) == "function" then
@@ -783,7 +808,11 @@ function mm.register_events()
   kill_trigger_field("_rdesc_open_trigger")
   kill_trigger_field("_rdesc_close_trigger")
 
+  mm.runtime = mm.runtime or {}
+  mm.runtime.autostop_previous_char_state = current_char_status_state()
+
   mm._events = {
+    registerAnonymousEventHandler("gmcp.char.status", "mm.on_char_status_event"),
     registerAnonymousEventHandler("gmcp.room.info", "mm.on_room_info_event"),
     registerAnonymousEventHandler("gmcp.Room.Info", "mm.on_room_info_event"),
     registerAnonymousEventHandler("gmcp.room.exits", "mm.on_room_exits_event"),

@@ -92,6 +92,7 @@ mm.help_table = {
       { cmd = "mapper ui visited on/off", desc = "Enable or disable visited-room styling in quick-where cycles" },
       { cmd = "mapper ui chips on/off", desc = "Enable or disable compact status chips in mapper output headers" },
       { cmd = "mapper ui reset", desc = "Reset mapper/S&D UI style toggles to defaults (all on)" },
+      { cmd = "mapper autostop [on|off]", desc = "Send the MUD command 'stop' when GMCP enters combat during active mapper navigation (default is on)" },
       { cmd = "mapper saferoom", desc = "Mark current room safe (appends 'safe' to rooms.info, preserving existing flags)" },
       { cmd = "mapper saferoom on/off", desc = "Toggle the safe flag on the current room" },
       { cmd = "mapper saferoom <roomId>", desc = "Mark the given room id as safe" },
@@ -122,7 +123,7 @@ mm.help_table = {
     header = "Portal Actions",
     rows = {
       { cmd = "mapper portals", desc = "List known hand-held portals; click/right-click a bracketed portal row to report it" },
-      { cmd = "mapper portalstats", desc = "Show local usage totals and per-portal attempt statistics for portals with activity" },
+      { cmd = "mapper portalstats", desc = "Show local usage totals and per-portal attempt statistics; click/right-click a portal ID to report it" },
       { cmd = "mapper portalstats recent [count]", desc = "Show the newest portal attempts with confirmation details (default 20, maximum 50)" },
       { cmd = "mapper rebuildportals", desc = "Rebuild portal list from exits with commands starting 'dinv portal use <id>'" },
       { cmd = "mapper portalguard [on|off]", desc = "Guard portal routes unless your level is within 30 of the portal level; xrtforce bypasses it" },
