@@ -1,4 +1,5 @@
 mm = mm or {}
+mm.initialized = false
 
 local function dirname(path)
   return (path:gsub("\\", "/"):match("^(.*)/") or "")
@@ -311,4 +312,9 @@ function mm.initialize()
   mm.note("MMapper initialized from: " .. tostring(mm.base_dir))
 end
 
-safe_step("initialize", mm.initialize)
+if safe_step("initialize", mm.initialize) then
+  mm.initialized = true
+  if type(raiseEvent) == "function" then
+    raiseEvent("mm.ready")
+  end
+end

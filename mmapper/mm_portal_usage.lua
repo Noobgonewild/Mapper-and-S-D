@@ -9,6 +9,7 @@ local SCHEMA_VERSION = 1
 local CONFIRM_TIMEOUT_SECONDS = 10
 local PORTAL_INTENT_TIMEOUT_SECONDS = 20
 local RECENT_HISTORY_LIMIT = 50
+local DEFAULT_STATS_LIMIT = 20
 local REASON_LABELS = {
   gmcp_destination_mismatch = "GMCP destination mismatch",
   confirmation_timeout = "confirmation timeout",
@@ -750,7 +751,20 @@ local function refresh_stats_metadata()
   return sync_metadata(portals, dinv_portal_items())
 end
 
-function usage.show_stats()
+function usage.show_stats(count)
+  local limit = DEFAULT_STATS_LIMIT
+  if count ~= nil then
+    local requested = trim(count):lower()
+    if requested == "all" then
+      limit = nil
+    else
+      limit = tonumber(requested)
+      if not limit or limit < 1 or limit ~= math.floor(limit) then
+        return false, "Usage: mapper portalstats [count|all]"
+      end
+    end
+  end
+
   refresh_stats_metadata()
   local rows, rows_err = query([[
     SELECT portal_id, confirmed_count, attempt_count, blocked_count, unconfirmed_count,
@@ -760,7 +774,7 @@ function usage.show_stats()
     FROM portal_usage
     WHERE attempt_count > 0 OR confirmed_count > 0
        OR blocked_count > 0 OR unconfirmed_count > 0
-    ORDER BY confirmed_count DESC, last_attempt_at DESC, portal_id
+    ORDER BY attempt_count DESC, confirmed_count DESC, last_attempt_at DESC, portal_id
   ]])
   if not rows then return false, rows_err end
 
@@ -775,7 +789,11 @@ function usage.show_stats()
   end
 
   local mapped = #(mm.portals and mm.portals.rebuilt or {})
-  cecho("\n<white>Mapper Portal Statistics<reset>\n")
+  local display_count = limit and math.min(limit, #rows) or #rows
+  cecho(string.format(
+    "\n<white>Mapper Portal Statistics<reset> <dim_gray>(showing %d of %d, ranked by Used/Tried)<reset>\n",
+    display_count, #rows
+  ))
   cecho(string.format(
     "<dim_gray>Mapped: %d | Active: %d | Used/attempted: %d/%d | Manual/mapper: %d/%d | Blocked: %d | Unconfirmed: %d<reset>\n",
     mapped, #rows, totals.used, totals.tried, totals.manual, totals.mapper,
@@ -792,7 +810,8 @@ function usage.show_stats()
     cecho("<yellow>No portal attempts have been recorded.<reset>\n")
   end
 
-  for _, row in ipairs(rows) do
+  for index = 1, display_count do
+    local row = rows[index]
     local details = current_portal_stats(row)
     local lock = details.lock and tostring(details.lock) or "-"
     local used_tried = string.format("%d/%d", tonumber(row.confirmed_count) or 0, tonumber(row.attempt_count) or 0)

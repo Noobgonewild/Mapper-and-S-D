@@ -123,7 +123,7 @@ mm.help_table = {
     header = "Portal Actions",
     rows = {
       { cmd = "mapper portals", desc = "List known hand-held portals; click/right-click a bracketed portal row to report it" },
-      { cmd = "mapper portalstats", desc = "Show local usage totals and per-portal attempt statistics; click/right-click a portal ID to report it" },
+      { cmd = "mapper portalstats [count|all]", desc = "Show the top portals ranked by used/tried (default 20), or all portal statistics; click/right-click a portal ID to report it" },
       { cmd = "mapper portalstats recent [count]", desc = "Show the newest portal attempts with confirmation details (default 20, maximum 50)" },
       { cmd = "mapper rebuildportals", desc = "Rebuild portal list from exits with commands starting 'dinv portal use <id>'" },
       { cmd = "mapper portalguard [on|off]", desc = "Guard portal routes unless your level is within 30 of the portal level; xrtforce bypasses it" },
@@ -150,10 +150,10 @@ mm.help_table = {
   ['boundaries'] = {
     header = "Boundaries and Redirects",
     rows = {
-      { cmd = "mapper boundaries here", desc = "Show reachable boundary rooms in the current area without moving" },
-      { cmd = "mapper boundaries <area>", desc = "Show reachable boundary rooms in an area name or key" },
-      { cmd = "mapper boundaries <room UID>", desc = "Use the room's area and show its reachable boundary rooms" },
-      { cmd = "xrtnear <room UID>", desc = "Run its stored redirect when present; if the mapper has a route, show it; otherwise show reachable boundary rooms ranked by mapped walk distance when known" },
+      { cmd = "mapper boundaries here", desc = "Show reachable database rooms here with exits to missing or unmapped destinations" },
+      { cmd = "mapper boundaries <area>", desc = "Show reachable database rooms in an area with exits to missing or unmapped destinations" },
+      { cmd = "mapper boundaries <room UID>", desc = "Use the room's area and show its reachable database boundaries" },
+      { cmd = "xrtnear <room UID>", desc = "Run its stored redirect when present; if directly reachable, show its route; otherwise find the nearest reachable edge of the target's mapped graph and rank explicit database boundaries" },
       { cmd = "mapper redirect add <target UID> <destination UID>", desc = "Set or replace the single xrtnear redirect after verifying the destination is currently reachable" },
       { cmd = "mapper redirects [target UID]", desc = "List saved suggestions with clickable destinations, optionally limited to one target" },
       { cmd = "mapper redirect delete <index>", desc = "Delete an entry by index from the last mapper redirects list" },

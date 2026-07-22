@@ -719,6 +719,32 @@ local function find_portal_by_id(id)
   return nil
 end
 
+-- Resolve bounce settings from their persisted portal IDs on demand.  The
+-- navigation table is recreated when MMapper is reloaded, while mm.portals may
+-- survive that reload.  Keeping this resolver in the portal owner prevents a
+-- stale/nil copied setting from silently disabling bounce routing.
+function mm.get_configured_bounce_step(travel_type)
+  ensure_portal_settings()
+  local is_recall = travel_type == "recall"
+  local id = is_recall
+    and mm.portals.settings.bounce_recall_id
+    or mm.portals.settings.bounce_portal_id
+  local portal = find_portal_by_id(id)
+  if not portal then return nil end
+  if is_recall ~= mm.is_portal_recall(portal) then return nil end
+  if mm.is_portal_chaos(portal) then return nil end
+
+  local landing = portal.touid or portal.target_uid
+  if not portal.command or not landing then return nil end
+  return {
+    dir = portal.command,
+    uid = tostring(landing),
+    level = tonumber(portal.level) or 0,
+    travelType = is_recall and "recall" or "portal",
+    portalId = tostring(portal.portal_id),
+  }
+end
+
 function mm.apply_bounce_settings_to_snd()
   local nav = (mm and mm.nav) or (snd and snd.mapper) or nil
   if not (nav and nav.config) then
@@ -727,18 +753,8 @@ function mm.apply_bounce_settings_to_snd()
   ensure_portal_settings()
   local bouncePortal = find_portal_by_id(mm.portals.settings.bounce_portal_id)
   local bounceRecall = find_portal_by_id(mm.portals.settings.bounce_recall_id)
-  nav.config.bouncePortal = bouncePortal and {
-    dir = bouncePortal.command,
-    uid = bouncePortal.touid or bouncePortal.target_uid,
-    level = tonumber(bouncePortal.level) or 0,
-    travelType = "portal",
-  } or nil
-  nav.config.bounceRecall = bounceRecall and {
-    dir = bounceRecall.command,
-    uid = bounceRecall.touid or bounceRecall.target_uid,
-    level = tonumber(bounceRecall.level) or 0,
-    travelType = "recall",
-  } or nil
+  nav.config.bouncePortal = mm.get_configured_bounce_step("portal")
+  nav.config.bounceRecall = mm.get_configured_bounce_step("recall")
   if snd and snd.config then
     snd.config.mapper = snd.config.mapper or {}
     snd.config.mapper.bouncePortalId = bouncePortal and tostring(bouncePortal.portal_id) or nil

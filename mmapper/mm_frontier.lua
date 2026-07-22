@@ -18,21 +18,6 @@ if frontier.dbState then
 end
 frontier.dbState = nil
 
-local directionNames = {
-  [1] = "north",
-  [2] = "northeast",
-  [3] = "east",
-  [4] = "southeast",
-  [5] = "south",
-  [6] = "southwest",
-  [7] = "west",
-  [8] = "northwest",
-  [9] = "up",
-  [10] = "down",
-  [11] = "in",
-  [12] = "out",
-}
-
 local function trim(value)
   return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
 end
@@ -216,47 +201,6 @@ function frontier.initialize()
   return true
 end
 
-local function normalize_stub_direction(value)
-  local numeric = tonumber(value)
-  if numeric and directionNames[numeric] then
-    return directionNames[numeric]
-  end
-  local text = trim(value)
-  return text ~= "" and text or "unknown"
-end
-
-local function get_native_exit_stubs(roomId)
-  local fn = type(getExitStubs1) == "function" and getExitStubs1
-    or (type(getExitStubs) == "function" and getExitStubs)
-    or nil
-  if not fn then return {} end
-
-  local ok, stubs = pcall(fn, roomId)
-  if not ok or type(stubs) ~= "table" then return {} end
-
-  local results = {}
-  local seen = {}
-  local function add(value)
-    local direction = normalize_stub_direction(value)
-    if not seen[direction] then
-      seen[direction] = true
-      table.insert(results, direction)
-    end
-  end
-
-  for key, value in pairs(stubs) do
-    if type(value) == "string" or type(value) == "number" then
-      add(value)
-    elseif value == true then
-      add(key)
-    elseif type(value) == "table" then
-      add(value.direction or value.dir or value.name or key)
-    end
-  end
-  table.sort(results)
-  return results
-end
-
 local function resolve_area(scope)
   local nav = mapper_nav()
   if not (nav and nav.db and type(nav.db.query) == "function") then
@@ -352,6 +296,121 @@ local function target_boundary_distance(nav, target, candidateUid)
   return nil, nil
 end
 
+local function graph_boundary_evidence(edge, candidateUid, towardTargetUid)
+  local direction = trim(edge and edge.dir)
+  if direction == "" then direction = "?" end
+
+  if edge and edge.fromuid == candidateUid and edge.touid == towardTargetUid then
+    return string.format("mapped %s -> %d", direction, towardTargetUid)
+  end
+  if edge and edge.touid == candidateUid and edge.fromuid == towardTargetUid then
+    return string.format("incoming %s from %d", direction, towardTargetUid)
+  end
+  return string.format("mapped adjacency toward %d", towardTargetUid)
+end
+
+-- Walk outward from an unreachable target over the database graph without
+-- assuming exit direction. The first layer containing a room that the real
+-- directed router can reach is the reachability cut nearest to the target.
+-- This lets xrtnear use an incoming one-way edge as proximity evidence while
+-- leaving normal navigation conservative about reverse traversal.
+local function nearest_reachable_graph_boundaries(nav, area, source, target)
+  local edgeRows = nav.db.query(string.format([[
+    SELECT source.uid AS fromuid,
+           source.name AS from_name,
+           source.area AS from_area,
+           destination.uid AS touid,
+           destination.name AS to_name,
+           destination.area AS to_area,
+           exits.dir AS dir
+    FROM exits
+    JOIN rooms AS source ON source.uid = exits.fromuid
+    JOIN rooms AS destination ON destination.uid = exits.touid
+    WHERE exits.fromuid NOT IN ('*', '**')
+      AND lower(source.area) = lower(%s)
+      AND lower(destination.area) = lower(%s)
+    ORDER BY CAST(source.uid AS INTEGER), CAST(destination.uid AS INTEGER), exits.dir
+  ]], nav.db.escape(area), nav.db.escape(area))) or {}
+
+  local adjacency = {}
+  local roomDetails = {}
+  local function remember_room(uid, name, roomArea)
+    if not roomDetails[uid] then
+      roomDetails[uid] = {
+        name = tostring(name or "?"),
+        area = tostring(roomArea or area or ""),
+      }
+    end
+  end
+  local function link(fromUid, toUid, edge)
+    adjacency[fromUid] = adjacency[fromUid] or {}
+    table.insert(adjacency[fromUid], {uid = toUid, edge = edge})
+  end
+
+  for _, row in ipairs(edgeRows) do
+    local fromUid = normalize_uid(row.fromuid)
+    local toUid = normalize_uid(row.touid)
+    if fromUid and toUid and fromUid ~= toUid then
+      local edge = {
+        fromuid = fromUid,
+        touid = toUid,
+        dir = tostring(row.dir or ""),
+      }
+      remember_room(fromUid, row.from_name, row.from_area)
+      remember_room(toUid, row.to_name, row.to_area)
+      link(fromUid, toUid, edge)
+      link(toUid, fromUid, edge)
+    end
+  end
+
+  if not adjacency[target] then return {} end
+
+  local visited = {[target] = true}
+  local layer = {target}
+  local distance = 0
+  local arrival = {}
+
+  while #layer > 0 do
+    if distance > 0 then
+      table.sort(layer)
+      local found = {}
+      for _, uid in ipairs(layer) do
+        local path, depth = path_between(nav, source, uid, nil, nil, true, true)
+        if path then
+          local details = roomDetails[uid] or mapper_room_info(uid) or {}
+          local approach = arrival[uid] or {}
+          table.insert(found, {
+            uid = uid,
+            name = tostring(details.name or "?"),
+            area = tostring(details.area or area or ""),
+            evidence = graph_boundary_evidence(approach.edge, uid, approach.from or target),
+            path = path,
+            depth = tonumber(depth) or #path,
+            targetDistance = distance,
+            targetDepth = distance,
+          })
+        end
+      end
+      if #found > 0 then return found end
+    end
+
+    local nextLayer = {}
+    for _, uid in ipairs(layer) do
+      for _, neighbor in ipairs(adjacency[uid] or {}) do
+        if not visited[neighbor.uid] then
+          visited[neighbor.uid] = true
+          arrival[neighbor.uid] = {from = uid, edge = neighbor.edge}
+          table.insert(nextLayer, neighbor.uid)
+        end
+      end
+    end
+    layer = nextLayer
+    distance = distance + 1
+  end
+
+  return {}
+end
+
 function frontier.find_boundaries(scope, options)
   options = type(options) == "table" and options or {}
   local area, err, targetRoom = resolve_area(scope)
@@ -359,21 +418,7 @@ function frontier.find_boundaries(scope, options)
   local rankTarget = normalize_uid(options.rankTarget or targetRoom)
 
   local nav = mapper_nav()
-  local roomRows = nav.db.query(string.format(
-    "SELECT uid, name, area FROM rooms WHERE lower(area) = lower(%s) ORDER BY CAST(uid AS INTEGER)",
-    nav.db.escape(area)
-  )) or {}
-
   local candidates = {}
-  for _, room in ipairs(roomRows) do
-    local uid = normalize_uid(room.uid)
-    if uid then
-      for _, direction in ipairs(get_native_exit_stubs(uid)) do
-        add_evidence(candidates, uid, room.name, room.area, "stub " .. direction)
-      end
-    end
-  end
-
   local danglingRows = nav.db.query(string.format([[
     SELECT source.uid, source.name, source.area, exits.dir, exits.touid
     FROM exits
@@ -385,6 +430,7 @@ function frontier.find_boundaries(scope, options)
         exits.touid IS NULL
         OR trim(CAST(exits.touid AS TEXT)) = ''
         OR CAST(exits.touid AS TEXT) = '-1'
+        OR substr(lower(CAST(exits.touid AS TEXT)), 1, 6) = 'nomap_'
         OR destination.uid IS NULL
       )
     ORDER BY CAST(source.uid AS INTEGER), exits.dir
@@ -403,10 +449,30 @@ function frontier.find_boundaries(scope, options)
   local source = current_room()
   if not source then return nil, "current room is unknown; try LOOK first" end
 
+  if options.targetAware and rankTarget then
+    for _, boundary in ipairs(nearest_reachable_graph_boundaries(nav, area, source, rankTarget)) do
+      add_evidence(
+        candidates,
+        boundary.uid,
+        boundary.name,
+        boundary.area,
+        boundary.evidence
+      )
+      local candidate = candidates[boundary.uid]
+      candidate.path = boundary.path
+      candidate.depth = boundary.depth
+      candidate.pathKnown = true
+      candidate.targetDistance = boundary.targetDistance
+      candidate.targetDepth = boundary.targetDepth
+    end
+  end
+
   local reachable = {}
   for _, candidate in pairs(candidates) do
     local path, depth
-    if candidate.uid == source then
+    if candidate.pathKnown then
+      path, depth = candidate.path, candidate.depth
+    elseif candidate.uid == source then
       path, depth = {}, 0
     else
       -- Boundary discovery is display-only; use an unguarded route lookup
@@ -417,7 +483,7 @@ function frontier.find_boundaries(scope, options)
       candidate.path = path
       candidate.pathLength = #path
       candidate.depth = tonumber(depth) or #path
-      if options.targetAware and rankTarget then
+      if options.targetAware and rankTarget and candidate.targetDistance == nil then
         candidate.targetDistance, candidate.targetDepth = target_boundary_distance(nav, rankTarget, candidate.uid)
       end
       candidate.evidenceSeen = nil
@@ -438,7 +504,7 @@ function frontier.find_boundaries(scope, options)
     end
     return a.uid < b.uid
   end)
-  return reachable, nil, {area = area, targetRoom = targetRoom, total = #roomRows}
+  return reachable, nil, {area = area, targetRoom = targetRoom}
 end
 
 local function echo_xrt_link(label, uid)

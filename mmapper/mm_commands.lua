@@ -468,14 +468,22 @@ local function handle_command_inline(line)
     if not ok and err then mm.warn(err) end
     return true
   end
-  if line == "mapper portalstats" then
-    local ok, err = mm.portal_usage.show_stats()
-    if not ok then mm.warn(err) end
-    return true
-  end
   local portalstats_count = line:match("^mapper portalstats recent%s*(%d*)$")
   if portalstats_count ~= nil then
     local ok, err = mm.portal_usage.show_stats_recent(portalstats_count ~= "" and portalstats_count or nil)
+    if not ok then mm.warn(err) end
+    return true
+  end
+  local portalstats_arg = line == "mapper portalstats" and ""
+    or line:match("^mapper portalstats%s+(.+)$")
+  if portalstats_arg ~= nil then
+    portalstats_arg = portalstats_arg:lower()
+    if portalstats_arg == "" then portalstats_arg = nil end
+    if portalstats_arg ~= nil and portalstats_arg ~= "all" and not portalstats_arg:match("^%d+$") then
+      mm.warn("Usage: mapper portalstats [count|all]")
+      return true
+    end
+    local ok, err = mm.portal_usage.show_stats(portalstats_arg)
     if not ok then mm.warn(err) end
     return true
   end
@@ -582,7 +590,15 @@ local function handle_command_inline(line)
     if not selected then
       mm.note("bouncerecall is not set.")
     else
-      mm.note("bouncerecall portal_id: " .. tostring(selected))
+      local step = mm.get_configured_bounce_step and mm.get_configured_bounce_step("recall") or nil
+      if step then
+        mm.note(string.format(
+          "bouncerecall portal_id: %s; command: %s; landing room: %s",
+          tostring(selected), tostring(step.dir), tostring(step.uid)
+        ))
+      else
+        mm.warn("bouncerecall portal_id " .. tostring(selected) .. " is set but no longer resolves to a usable recall portal.")
+      end
     end
     return true
   end
@@ -1137,7 +1153,22 @@ mm.alias_specs = {
   {"^mapper portalrecall%s+(%d+)$", function(m) local ok, err = mm.set_portal_recall(tonumber(m[2])); if not ok then mm.warn(err) else mm.note("Toggled recall flag for portal #" .. tostring(m[2])); mm.apply_bounce_settings_to_snd() end end},
   {"^mapper chaosportal%s+(%d+)$", function(m) local ok, err = mm.set_portal_chaos(tonumber(m[2])); if not ok then mm.warn(err) else mm.note("Toggled chaos flag for portal #" .. tostring(m[2])) end end},
   {"^mapper bounceportal$", function() local selected = mm.portals and mm.portals.settings and mm.portals.settings.bounce_portal_id; if not selected then mm.note("bounceportal is not set.") else local cmd = portal_command_for_selected_id(selected); if cmd and tostring(cmd) ~= "" then mm.note("bounceportal: #" .. tostring(selected) .. " -> " .. tostring(cmd)) else mm.note("bounceportal portal_id: " .. tostring(selected)) end end end},
-  {"^mapper bouncerecall$", function() local selected = mm.portals and mm.portals.settings and mm.portals.settings.bounce_recall_id; if not selected then mm.note("bouncerecall is not set.") else mm.note("bouncerecall portal_id: " .. tostring(selected)) end end},
+  {"^mapper bouncerecall$", function()
+    local selected = mm.portals and mm.portals.settings and mm.portals.settings.bounce_recall_id
+    if not selected then
+      mm.note("bouncerecall is not set.")
+      return
+    end
+    local step = mm.get_configured_bounce_step and mm.get_configured_bounce_step("recall") or nil
+    if step then
+      mm.note(string.format(
+        "bouncerecall portal_id: %s; command: %s; landing room: %s",
+        tostring(selected), tostring(step.dir), tostring(step.uid)
+      ))
+    else
+      mm.warn("bouncerecall portal_id " .. tostring(selected) .. " is set but no longer resolves to a usable recall portal.")
+    end
+  end},
   {"^mapper bounceportal clear$", function() local ok, err = mm.clear_bounce_portal(); if not ok then mm.warn(err) else mm.note("bounceportal cleared.") end end},
   {"^mapper bouncerecall clear$", function() local ok, err = mm.clear_bounce_recall(); if not ok then mm.warn(err) else mm.note("bouncerecall cleared.") end end},
   {"^mapper bounceportal%s+(%d+)$", function(m) local ok, portal_or_err = mm.set_bounce_portal(tonumber(m[2])); if not ok then mm.warn(portal_or_err) else mm.note("bounceportal set to #" .. tostring(m[2]) .. ": " .. tostring(portal_or_err.command)) end end},

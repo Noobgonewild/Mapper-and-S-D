@@ -291,6 +291,10 @@ snd.mapper.config = {
 snd.mapper.pendingRestrictionMarks = snd.mapper.pendingRestrictionMarks or {}
 snd.mapper.restrictionTriggerIds = snd.mapper.restrictionTriggerIds or {}
 snd.mapper.pendingBlockedTravel = snd.mapper.pendingBlockedTravel or nil
+-- Discard continuation state left by builds that issued an unconfigured
+-- default recall and waited for GMCP before replanning. Navigation now uses
+-- only mapped recall/home commands and configured bounce recalls.
+snd.mapper.pendingRecallReplan = nil
 
 local mapperDirectionAliases = {
     n = "n", north = "n",
@@ -525,6 +529,44 @@ end
 
 function snd.mapper.normalizeRoomInfoUid(roomInfo)
     return mm.canonical_room_uid(roomInfo)
+end
+
+function snd.mapper.getLiveRoomInfo()
+    if mm and type(mm.get_room_info) == "function" then
+        local ok, info = pcall(mm.get_room_info)
+        if ok and type(info) == "table" then
+            return info
+        end
+    end
+    if gmcp and gmcp.room and type(gmcp.room.info) == "table" then
+        return gmcp.room.info
+    end
+    if gmcp and gmcp.Room and type(gmcp.Room.Info) == "table" then
+        return gmcp.Room.Info
+    end
+    return nil
+end
+
+-- GMCP is the source of truth at the moment a route is planned. A valid-looking
+-- cached nomap UID must not override a newer mapped Room.Info packet.
+function snd.mapper.currentRoomUid(syncCache)
+    local liveInfo = snd.mapper.getLiveRoomInfo()
+    local liveUid = liveInfo and mm.canonical_room_uid(liveInfo) or nil
+    if liveUid ~= nil and tostring(liveUid) ~= "" then
+        liveUid = tostring(liveUid)
+        if syncCache and snd.room and snd.room.current then
+            snd.room.current.rmid = liveUid
+            snd.room.current.arid = liveInfo.zone or liveInfo.area or snd.room.current.arid or ""
+            snd.room.current.name = liveInfo.name or snd.room.current.name or ""
+        end
+        return liveUid
+    end
+
+    local cached = snd.room and snd.room.current and snd.room.current.rmid or nil
+    if cached ~= nil and tostring(cached) ~= "" then
+        return tostring(cached)
+    end
+    return nil
 end
 
 local function room_info_details(roomInfo)
@@ -1932,6 +1974,38 @@ function snd.mapper.setBounceRecall(recallDir, recallDestUid, level)
     snd.utils.infoNote("Bounce recall set: " .. recallDir)
 end
 
+-- Prefer the portal subsystem's persisted ID-based setting.  The config copy
+-- remains as a compatibility fallback for standalone S&D use and tests.
+function snd.mapper.getConfiguredBounce(travelType)
+    if mm and type(mm.get_configured_bounce_step) == "function" then
+        local resolved = mm.get_configured_bounce_step(travelType)
+        if resolved then
+            if travelType == "recall" then
+                snd.mapper.config.bounceRecall = resolved
+            else
+                snd.mapper.config.bouncePortal = resolved
+            end
+            return resolved
+        end
+
+        -- When the portal subsystem owns a settings table, a missing result is
+        -- authoritative (cleared, deleted, or invalid), not a stale config hit.
+        if mm.portals and mm.portals.settings then
+            if travelType == "recall" then
+                snd.mapper.config.bounceRecall = nil
+            else
+                snd.mapper.config.bouncePortal = nil
+            end
+            return nil
+        end
+    end
+
+    if travelType == "recall" then
+        return snd.mapper.config.bounceRecall
+    end
+    return snd.mapper.config.bouncePortal
+end
+
 -------------------------------------------------------------------------------
 -- Pathfinding
 -------------------------------------------------------------------------------
@@ -2126,47 +2200,32 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
             end
         end
 
-        if depthCandidates.src then
+        -- Match the old MUSH mapper: find the globally shortest origin before
+        -- considering the current room's noportal/norecall flags.  At the same
+        -- BFS depth, an available '*' portal wins, then '**' recall/home, then
+        -- the walking source.  A blocked winning jump is repaired only while
+        -- reconstructing the route by prepending the configured opposite
+        -- bounce command; its already-selected suffix is never recalculated
+        -- from the bounce landing room.
+        if depthCandidates.portal then
+            foundFrom = "*"
+        elseif depthCandidates.recall then
+            foundFrom = "**"
+        elseif depthCandidates.src then
             foundFrom = src
+        end
+
+        if foundFrom then
             found = true
             foundDepth = depth
-            snd.utils.debugNote(string.format("findPath connected from source at depth=%d", depth))
-        elseif depthCandidates.portal or depthCandidates.recall then
-            local srcNoPortal = srcRoomInfo and tonumber(srcRoomInfo.noportal) == 1 or false
-            local srcNoRecall = srcRoomInfo and tonumber(srcRoomInfo.norecall) == 1 or false
-
-            local portalAllowed = depthCandidates.portal and not srcNoPortal
-            local recallAllowed = depthCandidates.recall and not srcNoRecall
             snd.utils.debugNote(string.format(
-                "findPath jump candidates depth=%d portal=%s recall=%s srcNoPortal=%s srcNoRecall=%s",
+                "findPath selected shortest origin=%s depth=%d (portal=%s recall=%s source=%s)",
+                tostring(foundFrom),
                 depth,
                 tostring(depthCandidates.portal ~= nil),
                 tostring(depthCandidates.recall ~= nil),
-                tostring(srcNoPortal),
-                tostring(srcNoRecall)
+                tostring(depthCandidates.src == true)
             ))
-
-            if portalAllowed and recallAllowed then
-                if depthCandidates.portal.dirLen < depthCandidates.recall.dirLen then
-                    foundFrom = "*"
-                elseif depthCandidates.recall.dirLen < depthCandidates.portal.dirLen then
-                    foundFrom = "**"
-                elseif depthCandidates.portal.order < depthCandidates.recall.order then
-                    foundFrom = "*"
-                else
-                    foundFrom = "**"
-                end
-            elseif portalAllowed then
-                foundFrom = "*"
-            elseif recallAllowed then
-                foundFrom = "**"
-            end
-
-            if foundFrom then
-                found = true
-                foundDepth = depth
-                snd.utils.debugNote("findPath selected jump origin from '" .. tostring(foundFrom) .. "'")
-            end
         end
         
         if #results == 0 then
@@ -2191,9 +2250,14 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
             local srcNoRecall = tonumber(srcRoom.norecall) == 1
             
             if (foundFrom == "*" and srcNoPortal) or (foundFrom == "**" and srcNoRecall) then
-                -- Need to use bounce portal/recall
-                local bounceRecall = (not srcNoRecall and snd.mapper.config.bounceRecall) or nil
-                local bouncePortal = (not srcNoPortal and snd.mapper.config.bouncePortal) or nil
+                -- Repair the selected jump without replanning its suffix.  A
+                -- bouncerecall is only a command prepended to a blocked '*'
+                -- route; a bounceportal is only prepended to a blocked '**'
+                -- route.
+                local bounceRecall = (foundFrom == "*" and not srcNoRecall
+                    and snd.mapper.getConfiguredBounce("recall")) or nil
+                local bouncePortal = (foundFrom == "**" and not srcNoPortal
+                    and snd.mapper.getConfiguredBounce("portal")) or nil
                 if bounceRecall and not snd.mapper.portalStepAllowed(bounceRecall, ignoreLockedExits) then
                     bounceRecall = nil
                 end
@@ -2202,12 +2266,20 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
                 end
 
                 if bounceRecall then
-                    table.insert(path, bounceRecall)
+                    local bounceStep = {}
+                    for key, value in pairs(bounceRecall) do bounceStep[key] = value end
+                    bounceStep.travelType = "recall"
+                    bounceStep.trustedLanding = bounceStep.uid ~= nil
+                    table.insert(path, bounceStep)
                     if tostring(dst) == tostring(bounceRecall.uid) then
                         return path, foundDepth
                     end
                 elseif bouncePortal then
-                    table.insert(path, bouncePortal)
+                    local bounceStep = {}
+                    for key, value in pairs(bouncePortal) do bounceStep[key] = value end
+                    bounceStep.travelType = "portal"
+                    bounceStep.trustedLanding = bounceStep.uid ~= nil
+                    table.insert(path, bounceStep)
                     if tostring(dst) == tostring(bouncePortal.uid) then
                         return path, foundDepth
                     end
@@ -2248,6 +2320,9 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
         firstStep.travelType = "portal"
     elseif foundFrom == "**" then
         firstStep.travelType = "recall"
+        -- A ** edge exists only because this recall/home command has a recorded
+        -- landing UID. Its suffix can therefore be queued without a GMCP pause.
+        firstStep.trustedLanding = true
     end
     table.insert(path, firstStep)
     
@@ -2319,6 +2394,54 @@ function snd.mapper.markRoomRestriction(roomId, flag)
     return true, true
 end
 
+function snd.mapper.hasActiveNavigation()
+    return (snd.nav and snd.nav.goingToRoom ~= nil)
+        or snd.mapper.goingToRoom ~= nil
+        or snd.mapper.pathExecutionActive == true
+end
+
+-- A definitive server-side route failure must also flush commands already
+-- queued by the MUD. This is deliberately separate from combat autostop,
+-- which preserves navigation state by design.
+function snd.mapper.abortFailedNavigation(reason)
+    if not snd.mapper.hasActiveNavigation() then
+        return false
+    end
+
+    if type(send) == "function" then
+        send("stop", false)
+    end
+    snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
+    snd.mapper.pathExecutionActive = false
+    snd.mapper.pathExecutionHasPendingGroups = false
+    snd.mapper.goingToRoom = nil
+    if snd.nav then
+        snd.nav.goingToRoom = nil
+        snd.nav.pendingManualApproachRequest = nil
+    end
+    snd.mapper.pendingBlockedTravel = nil
+    snd.mapper.pendingRestrictionMarks.portal = nil
+    snd.mapper.pendingRestrictionMarks.recall = nil
+    if snd.scan then
+        snd.scan.pendingNxAction = nil
+    end
+
+    if snd.conwin then
+        if type(snd.conwin.cancelTravel) == "function" then
+            snd.conwin.cancelTravel()
+        else
+            if type(snd.conwin.abortCapture) == "function" then
+                snd.conwin.abortCapture()
+            end
+            snd.conwin.travelActive = false
+        end
+    end
+
+    snd.mapper.notifyBigmapNavigationState(reason or "route_failed")
+    snd.utils.infoNote("Navigation stopped after a definitive route failure.")
+    return true
+end
+
 function snd.mapper.pathStartsWithJump(path, expectedType)
     local travelType = path and path[1] and path[1].travelType
     if expectedType then
@@ -2333,6 +2456,51 @@ function snd.mapper.roomsShareArea(firstRoom, secondRoom)
     local firstArea = firstInfo and snd.utils.trim(firstInfo.area or ""):lower() or ""
     local secondArea = secondInfo and snd.utils.trim(secondInfo.area or ""):lower() or ""
     return firstArea ~= "" and firstArea == secondArea
+end
+
+function snd.mapper.pathCost(path)
+    return path and #path or math.huge
+end
+
+function snd.mapper.pathStartsWithTravel(path)
+    for _, step in ipairs(path or {}) do
+        if step.travelType == "portal" or step.travelType == "recall" then
+            return true
+        end
+    end
+    return false
+end
+
+-- Returns true when the ordinary walking prefix crosses out of sourceArea
+-- before its first recall/portal command. Post-jump rooms are intentionally
+-- ignored: those are not evidence of a panic walk out of the source area.
+function snd.mapper.pathLeavesAreaBeforeJump(path, sourceArea)
+    local wantedArea = snd.utils.trim(sourceArea or ""):lower()
+    if wantedArea == "" then return false end
+
+    for _, step in ipairs(path or {}) do
+        if step.travelType == "portal" or step.travelType == "recall" then
+            return false
+        end
+        local info = step.uid and snd.mapper.getRoomInfo(step.uid) or nil
+        local stepArea = info and snd.utils.trim(info.area or ""):lower() or ""
+        if stepArea ~= "" and stepArea ~= wantedArea then
+            return true
+        end
+    end
+    return false
+end
+
+function snd.mapper.chooseShortestRoute(candidates)
+    local best = nil
+    for _, candidate in ipairs(candidates or {}) do
+        if candidate and candidate.path and #candidate.path > 0 then
+            if not best or #candidate.path < #best.path then
+                best = candidate
+            end
+        end
+    end
+    return best
 end
 
 function snd.mapper.resolveCurrentAreaStartRoom(sourceRoom)
@@ -2395,9 +2563,10 @@ function snd.mapper.resolveCurrentAreaStartRoom(sourceRoom)
     return nil, nil
 end
 
-function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blockedType, ignoreLockedExits)
+function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blockedType, ignoreLockedExits, opts)
     sourceRoom = tostring(sourceRoom or "")
     destination = tostring(destination or "")
+    opts = opts or {}
     local areaKey, startRoom = snd.mapper.resolveCurrentAreaStartRoom(sourceRoom)
     if not areaKey or not startRoom or startRoom == destination then
         return nil
@@ -2408,6 +2577,13 @@ function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blocked
         walkPath = snd.mapper.findPath(sourceRoom, startRoom, true, true, ignoreLockedExits)
         if not walkPath then
             snd.utils.debugNote("area-start fallback: no walk-only route to " .. tostring(areaKey) .. " start room " .. tostring(startRoom) .. ".")
+            return nil
+        end
+
+        local sourceInfo = snd.mapper.getRoomInfo(sourceRoom)
+        local sourceArea = sourceInfo and sourceInfo.area or areaKey
+        if snd.mapper.pathLeavesAreaBeforeJump(walkPath, sourceArea) then
+            snd.utils.debugNote("area-start fallback rejected a walk that leaves " .. tostring(areaKey) .. " before reaching start room " .. tostring(startRoom) .. ".")
             return nil
         end
     end
@@ -2422,13 +2598,40 @@ function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blocked
     local jumpLeg = nil
     local jumpType = nil
     for _, candidateType in ipairs(jumpOrder) do
-        local noPortals = candidateType == "recall"
-        local noRecalls = candidateType == "portal"
-        local candidate = snd.mapper.findPath(startRoom, destination, noPortals, noRecalls, ignoreLockedExits)
-        if candidate and candidate[1] and candidate[1].travelType == candidateType then
-            jumpLeg = candidate
-            jumpType = candidateType
-            break
+        local allowed = (candidateType == "portal" and opts.allowPortals ~= false)
+            or (candidateType == "recall" and opts.allowRecalls ~= false)
+        if allowed then
+            local noPortals = candidateType == "recall"
+            local noRecalls = candidateType == "portal"
+            local candidate = snd.mapper.findPath(startRoom, destination, noPortals, noRecalls, ignoreLockedExits)
+            if candidate and candidate[1] and candidate[1].travelType == candidateType then
+                jumpLeg = candidate
+                jumpType = candidateType
+                break
+            end
+        end
+    end
+
+    -- If the designated start has learned that both jump methods are blocked,
+    -- leave from the start toward its nearest usable room and try there. This
+    -- still forms one costed area-start candidate; it is never executed ahead
+    -- of a shorter direct walk.
+    if not jumpLeg and type(snd.mapper.buildOutwardJumpRoute) == "function" then
+        local outwardLeg, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(
+            startRoom,
+            destination,
+            ignoreLockedExits
+        )
+        local outwardAllowed = (outwardType == "portal" and opts.allowPortals ~= false)
+            or (outwardType == "recall" and opts.allowRecalls ~= false)
+        if outwardLeg and #outwardLeg > 0 and outwardAllowed then
+            jumpLeg = outwardLeg
+            jumpType = outwardType
+            snd.utils.debugNote(string.format(
+                "area-start fallback: start room %s is restricted; continuing to jump room %s.",
+                tostring(startRoom),
+                tostring(outwardRoom or "?")
+            ))
         end
     end
 
@@ -2530,10 +2733,7 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
         return
     end
 
-    local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
-    if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info then
-        currentRoom = mm.canonical_room_uid(gmcp.room.info)
-    end
+    local currentRoom = snd.mapper.currentRoomUid(true)
     currentRoom = tostring(currentRoom or "")
     if currentRoom == "" or currentRoom == "-1" then
         return
@@ -2556,106 +2756,124 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
         tostring(currentNoRecall)
     ))
 
-    -- If both flags are set, first try the closest room with a usable jump.
+    -- Re-run the same global src/'*'/'**' search after persisting the newly
+    -- discovered restriction.  findPath itself applies the old mapper's bounce
+    -- reconstruction, so no separately planned bounce route belongs here.
+    local preferredPath = snd.mapper.findPath(
+        currentRoom,
+        destination,
+        false,
+        false,
+        ignoreLockedExits
+    )
+    if preferredPath and #preferredPath > 0 then
+        snd.utils.debugNote(string.format(
+            "blocked travel selected rebuilt shortest route (%d steps).",
+            #preferredPath
+        ))
+        snd.mapper.executePath(preferredPath)
+        return true
+    end
+
+    local routeCandidates = {}
+    local function addCandidate(kind, candidatePath, details)
+        if candidatePath and #candidatePath > 0 then
+            local candidate = details or {}
+            candidate.kind = kind
+            candidate.path = candidatePath
+            table.insert(routeCandidates, candidate)
+        end
+    end
+
+    -- A complete walking route is always legal. It is deliberately inserted
+    -- first so it wins ties, but it is not executed until nearby and area-start
+    -- jump routes have also been costed.
+    local walkingPath = snd.mapper.findPath(currentRoom, destination, true, true, ignoreLockedExits)
+    addCandidate("walk", walkingPath)
+
+    -- If both flags are set, expand outward breadth-first until the closest
+    -- usable jump room is found. Mapper area boundaries are not barriers.
     if currentNoPortal and currentNoRecall then
-        snd.utils.debugNote("current room is both norecall/noportal; trying outward jump-room expansion first.")
-        local combined, chosenType, closestRoom = snd.mapper.buildOutwardJumpRoute(currentRoom, destination, ignoreLockedExits)
-        if combined and #combined > 0 then
-            snd.utils.infoNote("Rerouting via closest viable room " .. tostring(closestRoom) .. " using " .. tostring(chosenType) .. ".")
-            snd.mapper.executePath(combined)
-            return true
-        end
-        snd.utils.debugNote("outward jump-room expansion failed from room " .. currentRoom .. "; trying broader fallbacks.")
+        snd.utils.debugNote("current room is both norecall/noportal; costing outward jump-room expansion.")
+        local combined, chosenType, closestRoom = snd.mapper.buildOutwardJumpRoute(
+            currentRoom,
+            destination,
+            ignoreLockedExits
+        )
+        addCandidate("nearby_" .. tostring(chosenType or "jump"), combined, {
+            viaRoom = closestRoom,
+        })
     end
 
-    local bounceStep = nil
-    if blockedType == "recall" then
-        local roomInfo = snd.mapper.getRoomInfo(currentRoom)
-        local blockedPortal = roomInfo and tonumber(roomInfo.noportal) == 1 or false
-        if not blockedPortal then
-            bounceStep = snd.mapper.config.bouncePortal
-        end
-    elseif blockedType == "portal" then
-        local roomInfo = snd.mapper.getRoomInfo(currentRoom)
-        local blockedRecall = roomInfo and tonumber(roomInfo.norecall) == 1 or false
-        if not blockedRecall then
-            bounceStep = snd.mapper.config.bounceRecall
-        end
+    local forceNoPortals = (blockedType == "portal")
+    local forceNoRecalls = (blockedType == "recall")
+    local expectedType = (blockedType == "portal") and "recall" or "portal"
+    local alternatePath = snd.mapper.findPath(
+        currentRoom,
+        destination,
+        forceNoPortals,
+        forceNoRecalls,
+        ignoreLockedExits
+    )
+    if alternatePath
+        and (snd.mapper.pathStartsWithJump(alternatePath, expectedType)
+            or snd.mapper.roomsShareArea(currentRoom, destination))
+    then
+        addCandidate("direct_" .. expectedType, alternatePath)
+    elseif alternatePath then
+        snd.utils.debugNote("blocked travel deferred a cross-area walk-only alternate until area-start fallback is costed.")
     end
 
-    local reroutePath = nil
-    if bounceStep and not snd.mapper.portalStepAllowed(bounceStep, ignoreLockedExits) then
-        bounceStep = nil
-    end
-    if bounceStep and bounceStep.dir and bounceStep.uid then
-        local nextLeg = nil
-        if tostring(bounceStep.uid) ~= destination then
-            nextLeg = snd.mapper.findPath(tostring(bounceStep.uid), destination, nil, nil, ignoreLockedExits)
-        else
-            nextLeg = {}
-        end
+    local nearbyPath, nearbyRoom = snd.mapper.findNearestAlternateRoute(
+        currentRoom,
+        destination,
+        blockedType,
+        ignoreLockedExits,
+        false
+    )
+    addCandidate("nearby_" .. expectedType, nearbyPath, {viaRoom = nearbyRoom})
 
-        if nextLeg then
-            reroutePath = {
-                {
-                    dir = bounceStep.dir,
-                    uid = bounceStep.uid,
-                    level = tonumber(bounceStep.level) or 0,
-                    travelType = (blockedType == "recall") and "portal" or "recall",
-                }
-            }
-            for _, step in ipairs(nextLeg) do
-                table.insert(reroutePath, step)
-            end
-            snd.utils.debugNote("Blocked " .. blockedType .. " - rerouting via configured bounce " .. ((blockedType == "recall") and "portal" or "recall") .. ".")
-        end
-    end
+    -- The start-room option is always evaluated before a cross-area walk can be
+    -- selected. It still loses normally when walking has the lower full cost.
+    local areaRoute, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(
+        currentRoom,
+        destination,
+        blockedType,
+        ignoreLockedExits,
+        {
+            allowPortals = snd.mapper.config.usePortals ~= false,
+            allowRecalls = snd.mapper.config.useRecall ~= false,
+        }
+    )
+    addCandidate("area_start_" .. tostring(jumpType or "jump"), areaRoute, {
+        areaKey = areaKey,
+        startRoom = startRoom,
+    })
 
-    if not reroutePath then
-        local forceNoPortals = (blockedType == "portal")
-        local forceNoRecalls = (blockedType == "recall")
-        local expectedType = (blockedType == "portal") and "recall" or "portal"
-        local candidate = snd.mapper.findPath(currentRoom, destination, forceNoPortals, forceNoRecalls, ignoreLockedExits)
-        if candidate and (snd.mapper.pathStartsWithJump(candidate, expectedType) or snd.mapper.roomsShareArea(currentRoom, destination)) then
-            reroutePath = candidate
-        elseif candidate then
-            snd.utils.debugNote("blocked travel deferred a cross-area walk-only route until area-start fallback is tried.")
-        end
-    end
-
-    if not reroutePath then
-        local reroute, viaRoom = snd.mapper.findNearestAlternateRoute(currentRoom, destination, blockedType, ignoreLockedExits, false)
-        if reroute and #reroute > 0 then
-            reroutePath = reroute
-            snd.utils.infoNote("Rerouting via nearby room " .. tostring(viaRoom) .. " to use " .. ((blockedType == "recall") and "portal" or "recall") .. ".")
-        end
-    end
-
-    if not reroutePath then
-        local areaRoute, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(currentRoom, destination, blockedType, ignoreLockedExits)
-        if areaRoute and #areaRoute > 0 then
-            reroutePath = areaRoute
+    local selected = snd.mapper.chooseShortestRoute(routeCandidates)
+    if selected then
+        if selected.kind and selected.kind:match("^nearby_") then
             snd.utils.infoNote(string.format(
-                "Nearby jump options exhausted. Rerouting through %s start room %s, then trying %s.",
-                tostring(areaKey),
-                tostring(startRoom),
-                tostring(jumpType)
+                "Rerouting via nearby room %s (%d steps).",
+                tostring(selected.viaRoom or "?"),
+                #selected.path
+            ))
+        elseif selected.kind and selected.kind:match("^area_start_") then
+            snd.utils.infoNote(string.format(
+                "Rerouting through %s start room %s (%d steps).",
+                tostring(selected.areaKey or "area"),
+                tostring(selected.startRoom or "?"),
+                #selected.path
+            ))
+        else
+            snd.utils.debugNote(string.format(
+                "blocked travel route comparison selected %s (%d steps).",
+                tostring(selected.kind or "route"),
+                #selected.path
             ))
         end
-    end
 
-    if not reroutePath then
-        local candidate = snd.mapper.findPath(currentRoom, destination, nil, nil, ignoreLockedExits)
-        if candidate and (snd.mapper.pathStartsWithJump(candidate) or snd.mapper.roomsShareArea(currentRoom, destination)) then
-            reroutePath = candidate
-        elseif candidate then
-            snd.utils.infoNote("Blocked " .. blockedType .. "; refusing a walk-only route across areas from room " .. currentRoom .. ".")
-            snd.utils.debugNote("cross-area walk-only fallback rejected after nearby and area-start jump options were exhausted.")
-        end
-    end
-
-    if reroutePath and #reroutePath > 0 then
-        snd.mapper.executePath(reroutePath)
+        snd.mapper.executePath(selected.path)
         return true
     else
         snd.utils.infoNote("You couldn't find a path to " .. destination .. " from here.")
@@ -2972,10 +3190,10 @@ function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
             for _, ex in ipairs(exits) do
                 local nextRoom = tostring(ex.touid or "")
                 if nextRoom ~= "" and nextRoom ~= "-1" and not visited[nextRoom] then
+                    local roomInfo = snd.mapper.getRoomInfo(nextRoom)
                     visited[nextRoom] = true
                     parents[nextRoom] = {prev = node.room, dir = ex.dir}
 
-                    local roomInfo = snd.mapper.getRoomInfo(nextRoom)
                     local nextNoPortal = roomInfo and tonumber(roomInfo.noportal) == 1 or false
                     local nextNoRecall = roomInfo and tonumber(roomInfo.norecall) == 1 or false
                     if not (nextNoPortal and nextNoRecall) then
@@ -3147,6 +3365,11 @@ function snd.mapper.executePath(path, opts)
         snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
     end
     local executionSerial = snd.mapper.pathExecutionSerial
+    snd.mapper.pathExecutionActive = true
+    snd.mapper.pathExecutionHasPendingGroups = true
+    if snd.conwin and type(snd.conwin.onTravelStarted) == "function" then
+        snd.conwin.onTravelStarted("mapper-path-started")
+    end
 
     local function isExecutionCurrent()
         return snd.mapper.pathExecutionSerial == executionSerial
@@ -3185,10 +3408,7 @@ function snd.mapper.executePath(path, opts)
     end
     
     local function getCurrentRoomId()
-        local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
-        if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info then
-            currentRoom = mm.canonical_room_uid(gmcp.room.info)
-        end
+        local currentRoom = snd.mapper.currentRoomUid(false)
         return tostring(currentRoom or "-1")
     end
 
@@ -3205,7 +3425,7 @@ function snd.mapper.executePath(path, opts)
     -- Build command groups (separated by waits)
     -- Each group is {commands = {{text="cmd1", travelType=nil}, ...}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil}
     local groups = {}
-    local currentGroup = {commands = {}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil}
+    local currentGroup = {commands = {}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil, trustedSource = false}
     local cardinalBuffer = {}
     local simulatedRoom = getCurrentRoomId()
     
@@ -3254,19 +3474,25 @@ function snd.mapper.executePath(path, opts)
             end
         end
 
-        -- Do not send a jump in the same batch as the walk leading to its
-        -- source room. Waiting for GMCP here also makes restriction markers
-        -- identify the room where recall/portal was actually attempted.
+        -- Keep jumps in their own command groups, but do not impose a GMCP
+        -- barrier when the preceding mapped edge already declares its room ID.
+        -- Restriction markers use the simulated mapped source room in that case.
         if isTravelStep then
             flushCardinals()
             if #currentGroup.commands > 0 then
                 table.insert(groups, currentGroup)
             end
+            local sourceIsTrusted = currentGroup.trustedSource == true
+            local sourceExecuteRoom = tostring(stepSourceRoom or "-1")
+            if sourceIsTrusted then
+                sourceExecuteRoom = nil
+            end
             currentGroup = {
                 commands = {},
                 delayAfter = 0,
                 waitRoomId = nil,
-                executeRoomId = tostring(stepSourceRoom or "-1"),
+                executeRoomId = sourceExecuteRoom,
+                trustedSource = sourceIsTrusted,
             }
         end
 
@@ -3290,7 +3516,7 @@ function snd.mapper.executePath(path, opts)
             flushCardinals()
             if #currentGroup.commands > 0 then
                 table.insert(groups, currentGroup)
-                currentGroup = {commands = {}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil}
+                currentGroup = {commands = {}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil, trustedSource = false}
             end
         end
 
@@ -3307,7 +3533,7 @@ function snd.mapper.executePath(path, opts)
                     currentGroup.waitRoomId = tostring(stepSourceRoom or "-1")
                 end
 					table.insert(groups, currentGroup)
-					currentGroup = {commands = {}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil}
+					currentGroup = {commands = {}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil, trustedSource = false}
                     encounteredWait = true
 
 			elseif cardinalDirs[dirLower] then
@@ -3330,6 +3556,7 @@ function snd.mapper.executePath(path, opts)
                         delayAfter = 0,
                         waitRoomId = nil,
                         executeRoomId = walktoTarget,
+                        trustedSource = false,
                     }
 
                 else
@@ -3354,25 +3581,43 @@ function snd.mapper.executePath(path, opts)
                 table.insert(currentGroup.commands, {
                     text = dir,
                     travelType = step.travelType,
+                    sourceRoom = stepSourceRoom,
                 })
 			end
         end
-        if step.uid then
+        local hasKnownLanding = step.uid ~= nil
+            and tostring(step.uid) ~= ""
+            and tostring(step.uid) ~= "-1"
+        if hasKnownLanding then
             simulatedRoom = tostring(step.uid)
         end
 
-        -- Commands after a jump must likewise wait until its destination is
-        -- confirmed instead of racing into the server command queue.
+        -- A mapped cardinal/cexit is a trusted graph edge. The next command can
+        -- be queued against its recorded destination without waiting for GMCP.
+        -- Nested mapper walkto remains asynchronous and keeps its explicit room
+        -- barrier.
+        if hasKnownLanding and not isTravelStep and not stepHasMapperWalkto then
+            currentGroup.trustedSource = true
+        end
+
+        -- Registered recall/portal edges also carry a known destination UID.
+        -- Only an unknown landing needs a GMCP destination barrier.
         if isTravelStep then
             flushCardinals()
             if #currentGroup.commands > 0 then
                 table.insert(groups, currentGroup)
             end
+            local landingIsTrusted = step.trustedLanding == true or hasKnownLanding
+            local destinationExecuteRoom = tostring(simulatedRoom or "-1")
+            if landingIsTrusted then
+                destinationExecuteRoom = nil
+            end
             currentGroup = {
                 commands = {},
                 delayAfter = 0,
                 waitRoomId = nil,
-                executeRoomId = tostring(simulatedRoom or "-1"),
+                executeRoomId = destinationExecuteRoom,
+                trustedSource = landingIsTrusted,
             }
         end
 	end
@@ -3386,17 +3631,16 @@ function snd.mapper.executePath(path, opts)
     
     -- Execute groups with proper timing
     if #groups == 0 then
+        snd.mapper.pathExecutionActive = false
+        snd.mapper.pathExecutionHasPendingGroups = false
         snd.mapper.goingToRoom = nil
         snd.nav.goingToRoom = nil
         snd.mapper.notifyBigmapNavigationState("empty_path")
         return
     end
 
-    local function sendCommand(cmd, travelType, embeddedWalkTarget)
-        local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
-        if (not currentRoom or currentRoom == "-1") and gmcp and gmcp.room and gmcp.room.info then
-            currentRoom = mm.canonical_room_uid(gmcp.room.info)
-        end
+    local function sendCommand(cmd, travelType, embeddedWalkTarget, plannedSourceRoom)
+        local currentRoom = snd.mapper.currentRoomUid(true)
         if (travelType == "portal" or travelType == "recall") and snd.mapper.isInCombat and snd.mapper.isInCombat() then
             snd.mapper.consumeRestrictionMark("portal")
             snd.mapper.consumeRestrictionMark("recall")
@@ -3406,8 +3650,9 @@ function snd.mapper.executePath(path, opts)
             snd.mapper.notifyBigmapNavigationState("combat_abort")
             return false
         end
-        if travelType and currentRoom and currentRoom ~= "-1" then
-            snd.mapper.queueRestrictionMark(travelType, currentRoom)
+        local restrictionRoom = plannedSourceRoom or currentRoom
+        if travelType and restrictionRoom and tostring(restrictionRoom) ~= "-1" then
+            snd.mapper.queueRestrictionMark(travelType, restrictionRoom)
         end
 
         if travelType == "portal" and mm and mm.portal_usage
@@ -3437,7 +3682,7 @@ function snd.mapper.executePath(path, opts)
 
     local function sendCommands(commands)
         for _, entry in ipairs(commands) do
-            local ok = sendCommand(entry.text, entry.travelType, entry.embeddedWalkTarget)
+            local ok = sendCommand(entry.text, entry.travelType, entry.embeddedWalkTarget, entry.sourceRoom)
             if ok == false then
                 return false
             end
@@ -3459,8 +3704,13 @@ function snd.mapper.executePath(path, opts)
             end
             local grp = groups[index]
             if not grp then
+                snd.mapper.pathExecutionHasPendingGroups = false
                 return
             end
+
+            -- True means another client-side command group still has to be
+            -- released. State 3 between groups is not a genuine travel stop.
+            snd.mapper.pathExecutionHasPendingGroups = index < #groups
 
             if snd.mapper.canSendCommands and not snd.mapper.canSendCommands() then
                 tempTimer(0.25, function()
@@ -3598,13 +3848,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     iterativeMode = (iterativeMode == true)
 
     -- Get current room
-    local currentRoom = snd.room.current.rmid
-    if not currentRoom or currentRoom == "-1" then
-        -- Try to get the canonical UID from GMCP, including clan/unmapped rooms.
-        if gmcp and gmcp.room and gmcp.room.info then
-            currentRoom = mm.canonical_room_uid(gmcp.room.info)
-        end
-    end
+    local currentRoom = snd.mapper.currentRoomUid(true)
 
     if not currentRoom or currentRoom == "-1" then
         snd.utils.infoNote("Current room unknown. Try 'look' first.")
@@ -3677,29 +3921,94 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     local noPortals = not usePortals or not snd.mapper.config.usePortals
     local noRecalls = not snd.mapper.config.useRecall
 
-    -- Clan rooms (nomap_ prefix) cannot use portals or recalls; walk-only via mapped cexits.
-    if currentRoom and currentRoom:match("^nomap_") then
-        noPortals = true
-        noRecalls = true
+    -- A nomap UID is not itself proof that recall/portal must be disabled.
+    -- Failed attempts persist the corresponding flags just like mapped rooms.
+
+    local path, depth = snd.mapper.findPath(currentRoom, roomId, noPortals, noRecalls, ignoreLockedExits)
+    local routeCandidates = {}
+    if path and #path > 0 then
+        table.insert(routeCandidates, {
+            kind = "normal",
+            path = path,
+            depth = depth,
+        })
     end
 
+    -- A room marked both norecall and noportal expands outward breadth-first to
+    -- the closest room with either jump method. Area boundaries do not stop it.
     if usePortals then
-        local outwardPath, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(currentRoom, roomId, ignoreLockedExits)
+        local outwardPath, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(
+            currentRoom,
+            roomId,
+            ignoreLockedExits
+        )
         if outwardPath and #outwardPath > 0 then
-            snd.utils.debugNote(string.format(
-                "gotoRoom using outward expansion first: via room=%s mode=%s steps=%d",
-                tostring(outwardRoom or "?"),
-                tostring(outwardType or "?"),
-                #outwardPath
-            ))
-            snd.mapper.goingToRoom = roomId
-            snd.nav.goingToRoom = roomId
-            snd.mapper.executePath(outwardPath)
-            return true
+            table.insert(routeCandidates, {
+                kind = "nearby_" .. tostring(outwardType or "jump"),
+                path = outwardPath,
+                viaRoom = outwardRoom,
+            })
         end
     end
 
-    local path, depth = snd.mapper.findPath(currentRoom, roomId, noPortals, noRecalls, ignoreLockedExits)
+    local sourceInfo = snd.mapper.getRoomInfo(currentRoom)
+    local destinationInfo = snd.mapper.getRoomInfo(roomId)
+    local sourceAreaValue = sourceInfo and sourceInfo.area
+        or (snd.room and snd.room.current and snd.room.current.arid)
+        or ""
+    local sourceArea = snd.utils.trim(sourceAreaValue):lower()
+    local destinationArea = destinationInfo and snd.utils.trim(destinationInfo.area or ""):lower() or ""
+    local crossingAreas = sourceArea ~= "" and destinationArea ~= "" and sourceArea ~= destinationArea
+    local normalBypassesStart = path and snd.mapper.pathLeavesAreaBeforeJump(path, sourceArea) or false
+
+    -- Before accepting a walking prefix that leaves the source area, explicitly
+    -- cost the route through that area's designated start room. Walking remains a
+    -- valid candidate and wins whenever its complete path is shorter.
+    if usePortals and crossingAreas and (not path or normalBypassesStart) then
+        local areaPath, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(
+            currentRoom,
+            roomId,
+            nil,
+            ignoreLockedExits,
+            {
+                allowPortals = not noPortals,
+                allowRecalls = not noRecalls,
+            }
+        )
+        if areaPath and #areaPath > 0 then
+            table.insert(routeCandidates, {
+                kind = "area_start_" .. tostring(jumpType or "jump"),
+                path = areaPath,
+                areaKey = areaKey,
+                startRoom = startRoom,
+            })
+        end
+    end
+
+    local selectedRoute = snd.mapper.chooseShortestRoute(routeCandidates)
+    if selectedRoute then
+        path = selectedRoute.path
+        depth = selectedRoute.depth or #path
+        if selectedRoute.kind == "normal" then
+            snd.utils.debugNote("Route comparison selected normal path with " .. #path .. " steps.")
+        elseif selectedRoute.kind and selectedRoute.kind:match("^nearby_") then
+            snd.utils.debugNote(string.format(
+                "Route comparison selected nearby jump room %s (%s, %d steps).",
+                tostring(selectedRoute.viaRoom or "?"),
+                tostring(selectedRoute.kind),
+                #path
+            ))
+        else
+            snd.utils.debugNote(string.format(
+                "Route comparison selected %s start room %s (%d steps).",
+                tostring(selectedRoute.areaKey or sourceArea or "area"),
+                tostring(selectedRoute.startRoom or "?"),
+                #path
+            ))
+        end
+    else
+        path = nil
+    end
 
     if path and #path > 0 then
         snd.utils.debugNote("Found path with " .. #path .. " steps (depth " .. depth .. ")")
@@ -3707,7 +4016,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
         -- Store destination for arrival detection
         snd.mapper.goingToRoom = roomId
         snd.nav.goingToRoom = roomId
-        
+
         -- Execute full path or one adaptive step (xrt iterative mode)
         if iterativeMode then
             local closestPortalRoom, portalWalk = snd.mapper.findNearestRoomWithoutFlag(currentRoom, "noportal", ignoreLockedExits)
@@ -3732,10 +4041,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
                         if tostring(snd.mapper.goingToRoom or "") ~= roomId then
                             return
                         end
-                        local nowRoom = snd.room and snd.room.current and snd.room.current.rmid
-                        if (not nowRoom or nowRoom == "-1") and gmcp and gmcp.room and gmcp.room.info then
-                            nowRoom = mm.canonical_room_uid(gmcp.room.info)
-                        end
+                        local nowRoom = snd.mapper.currentRoomUid(true)
                         nowRoom = tostring(nowRoom or "")
                         if nowRoom ~= "" and nowRoom ~= "-1" and nowRoom ~= expectedRoom then
                             snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, true, guardDestination)
@@ -3783,6 +4089,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
             end
             snd.utils.debugNote("Area guard route retry found no unguarded route either.")
         end
+
         snd.utils.infoNote("You couldn't find a path to " .. roomId .. " from here.")
         local offeredManualApproach = false
         if snd.commands and type(snd.commands.offerManualApproach) == "function" then
@@ -4629,6 +4936,27 @@ snd.mapper.restrictionTriggerIds = {
         snd.mapper.onRecallBlocked()
     end),
 }
+
+for _, triggerId in ipairs(snd.mapper.routeFailureTriggerIds or {}) do
+    killTrigger(triggerId)
+end
+snd.mapper.routeFailureTriggerIds = {
+    tempRegexTrigger("^Too many run errors\\. Aborting speedwalk\\.$", function()
+        snd.mapper.abortFailedNavigation("speedwalk_aborted")
+    end),
+    tempRegexTrigger("^Magical wards around .+ bounce you back\\.$", function()
+        snd.mapper.abortFailedNavigation("ward_bounced")
+    end),
+}
+
+for _, eventId in ipairs(snd.mapper.recallResumeEventIds or {}) do
+    if type(killAnonymousEventHandler) == "function" then
+        killAnonymousEventHandler(eventId)
+    end
+end
+-- Older builds registered GMCP handlers for blind-recall continuation. Kill
+-- those handlers during an upgrade, but do not register replacements.
+snd.mapper.recallResumeEventIds = {}
 
 if snd.mapper.xrtForceAlias then
     killAlias(snd.mapper.xrtForceAlias)
