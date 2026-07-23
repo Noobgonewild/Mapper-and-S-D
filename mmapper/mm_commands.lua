@@ -745,8 +745,46 @@ local function handle_command_inline(line)
     return true
   end
 
-  local fx_cmd, fx_src, fx_dst, fx_lvl, fx_quiet = line:match("^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)(%s+quiet)?$")
-  if fx_cmd then local ok, err = mm.add_full_cexit(fx_cmd, fx_src, fx_dst, fx_lvl, fx_quiet ~= nil); if not ok then mm.warn(err) end; return true end
+  local random_cexits_area_arg = line:match("^mapper randomcexits area%s+(.+)$")
+  if random_cexits_area_arg then
+    local ok, err = mm.list_random_cexits("area " .. random_cexits_area_arg)
+    if not ok then mm.warn(err) end
+    return true
+  end
+  local random_cexits_arg = line:match("^mapper randomcexits%s+(.+)$")
+  if line == "mapper randomcexits" or random_cexits_arg then
+    local ok, err = mm.list_random_cexits(random_cexits_arg)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  local delete_random_cexit_idx = line:match("^mapper deleterandomcexit%s+(%d+)$")
+  if delete_random_cexit_idx then
+    local ok, err = mm.delete_random_cexit(delete_random_cexit_idx)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
+  local random_cmd, random_src, random_destinations, random_level = line:match(
+    "^mapper randomcexit%s+{(.+)}%s+(%S+)%s+{([^}]+)}%s+(%d+)$"
+  )
+  if random_cmd then
+    local ok, err = mm.add_random_cexit(random_cmd, random_src, random_destinations, random_level, false)
+    if not ok then mm.warn(err) end
+    return true
+  end
+  if line:find("^mapper randomcexit") then
+    mm.warn("Usage: mapper randomcexit {<command>} <source> {<destination1>,<destination2>[,...]} <level>")
+    return true
+  end
+
+  local fx_cmd, fx_src, fx_dst, fx_lvl = line:match("^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)$")
+  local fx_quiet = false
+  if not fx_cmd then
+    fx_cmd, fx_src, fx_dst, fx_lvl = line:match("^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)%s+quiet$")
+    fx_quiet = fx_cmd ~= nil
+  end
+  if fx_cmd then local ok, err = mm.add_full_cexit(fx_cmd, fx_src, fx_dst, fx_lvl, fx_quiet); if not ok then mm.warn(err) end; return true end
 
   local delete_cexit_idx = line:match("^mapper deletecexit%s+(%d+)$")
   if delete_cexit_idx then local ok, err = mm.delete_cexit(delete_cexit_idx); if not ok then mm.warn(err) end; return true end
@@ -1020,7 +1058,13 @@ mm.alias_specs = {
   {"^mapper cexits(?:%s+(.+))?$", function(m) local ok, err = mm.list_cexits(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexit_wait%s+(.+)$", function(m) local ok, err = mm.set_cexit_wait(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexit%s+(.+)$", function(m) local ok, err = mm.cexit(m[2]); if not ok then mm.warn(err) end end},
-  {"^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)(%s+quiet)?$", function(m) local ok, err = mm.add_full_cexit(m[2], m[3], m[4], m[5], m[6] ~= nil); if not ok then mm.warn(err) end end},
+  {"^mapper randomcexits area%s+(.+)$", function(m) local ok, err = mm.list_random_cexits("area " .. m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper randomcexits%s+(.+)$", function(m) local ok, err = mm.list_random_cexits(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper randomcexits$", function() local ok, err = mm.list_random_cexits(); if not ok then mm.warn(err) end end},
+  {"^mapper deleterandomcexit%s+(%d+)$", function(m) local ok, err = mm.delete_random_cexit(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper randomcexit%s+{(.+)}%s+(%S+)%s+{([^}]+)}%s+(%d+)$", function(m) local ok, err = mm.add_random_cexit(m[2], m[3], m[4], m[5], false); if not ok then mm.warn(err) end end},
+  {"^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)%s+quiet$", function(m) local ok, err = mm.add_full_cexit(m[2], m[3], m[4], m[5], true); if not ok then mm.warn(err) end end},
+  {"^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)$", function(m) local ok, err = mm.add_full_cexit(m[2], m[3], m[4], m[5], false); if not ok then mm.warn(err) end end},
   {"^mapper deletecexit%s+(%d+)$", function(m) local ok, err = mm.delete_cexit(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper deletedcexits$", function() local ok, err = mm.list_deleted_cexits(); if not ok then mm.warn(err) end end},
   {"^mapper restorecexit%s+(.+)$", function(m) local ok, err = mm.restore_cexit(m[2]); if not ok then mm.warn(err) end end},

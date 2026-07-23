@@ -2064,6 +2064,24 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
         ignoreLockedExits,
         ignoreAreaGuard
     )
+    local randomAreaFromWhere = snd.mapper.areaGuardRoomSql(
+        "random_cexits.fromuid",
+        src,
+        ignoreLockedExits,
+        ignoreAreaGuard
+    )
+    local randomAreaToWhere = snd.mapper.areaGuardRoomSql(
+        "random_cexits.touid",
+        src,
+        ignoreLockedExits,
+        ignoreAreaGuard
+    )
+    local randomLevelWhere = ignoreLockedExits and "1=1" or string.format("level <= %d", myLevel)
+    local randomCexits = snd.mapper.db.query(string.format([[
+        SELECT fromuid, touid, dir, level, 1 AS random_cexit
+        FROM random_cexits
+        WHERE %s AND %s AND %s
+    ]], randomLevelWhere, randomAreaFromWhere, randomAreaToWhere)) or {}
     if blockedAreaCount > 0 then
         snd.utils.debugNote(string.format(
             "Area guard route filter active: level=%d allowance=%d blockedAreas=%d source=%s",
@@ -2075,7 +2093,9 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
     end
     
     -- Check for direct one-room path first
-    local directPath = snd.mapper.checkDirectPath(src, dst, myLevel, ignoreLockedExits, ignoreAreaGuard)
+    local directPath = snd.mapper.checkDirectPath(
+        src, dst, myLevel, ignoreLockedExits, ignoreAreaGuard, randomCexits
+    )
     if directPath then
         snd.utils.debugNote("findPath direct one-room path found.")
         return directPath, 1
@@ -2086,7 +2106,9 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
     local maxDepth = snd.mapper.config.maxSearchDepth
     local roomSets = {}
     local roomsList = {snd.mapper.db.escape(dst)}
+    local frontierSet = {[dst] = true}
     local visited = ""
+    local visitedSet = {}
     local found = false
     local foundDepth = 0
     local foundFrom = nil
@@ -2096,13 +2118,16 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
     local visitedList = {}
     if noPortals then
         table.insert(visitedList, snd.mapper.db.escape("*"))
+        visitedSet["*"] = true
     end
     if noRecalls then
         table.insert(visitedList, snd.mapper.db.escape("**"))
+        visitedSet["**"] = true
     end
     for _, room in ipairs(roomsList) do
         table.insert(visitedList, room)
     end
+    visitedSet[dst] = true
     visited = table.concat(visitedList, ",")
     
     while not found and depth < maxDepth do
@@ -2111,8 +2136,10 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
         if depth > 1 then
             local prevSet = roomSets[depth - 1] or {}
             roomsList = {}
+            frontierSet = {}
             for _, v in pairs(prevSet) do
                 table.insert(roomsList, snd.mapper.db.escape(v.fromuid))
+                frontierSet[tostring(v.fromuid)] = true
             end
         end
         
@@ -2129,6 +2156,7 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
                 visited = visited .. "," .. newVisited
             end
         end
+        for roomId in pairs(frontierSet) do visitedSet[roomId] = true end
         
         -- Query exits leading to rooms in our current set
         local sql = string.format([[
@@ -2153,6 +2181,11 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
         )
         
         local results = snd.mapper.db.query(sql) or {}
+        for _, row in ipairs(randomCexits) do
+            if frontierSet[tostring(row.touid)] and not visitedSet[tostring(row.fromuid)] then
+                table.insert(results, row)
+            end
+        end
         roomSets[depth] = {}
         snd.utils.debugNote(string.format(
             "findPath depth=%d frontier=%d results=%d",
@@ -2174,7 +2207,8 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
                 roomSets[depth][row.fromuid] = {
                     fromuid = row.fromuid,
                     touid = row.touid,
-                    dir = row.dir
+                    dir = row.dir,
+                    randomCexit = tonumber(row.random_cexit) == 1,
                 }
             end
 
@@ -2315,7 +2349,11 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
     end
     
     -- Build path from found room to destination
-    local firstStep = {dir = currentRoom.dir, uid = currentRoom.touid}
+    local firstStep = {
+        dir = currentRoom.dir,
+        uid = currentRoom.touid,
+        randomCexit = currentRoom.randomCexit == true,
+    }
     if foundFrom == "*" then
         firstStep.travelType = "portal"
     elseif foundFrom == "**" then
@@ -2332,7 +2370,11 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
         currentRoom = roomSets[foundDepth][nextRoom]
         if currentRoom then
             nextRoom = currentRoom.touid
-            table.insert(path, {dir = currentRoom.dir, uid = currentRoom.touid})
+            table.insert(path, {
+                dir = currentRoom.dir,
+                uid = currentRoom.touid,
+                randomCexit = currentRoom.randomCexit == true,
+            })
         end
     end
     snd.utils.debugNote(string.format("findPath success steps=%d searchDepth=%d", #path, depth))
@@ -2883,7 +2925,7 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
 end
 
 --- Check for direct one-room path
-function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits, ignoreAreaGuard)
+function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits, ignoreAreaGuard, randomCexits)
     local where = ignoreLockedExits and "" or string.format(" AND level <= %d", level)
     local areaFromWhere = snd.mapper.areaGuardRoomSql("exits.fromuid", src, ignoreLockedExits, ignoreAreaGuard)
     local areaToWhere = snd.mapper.areaGuardRoomSql("exits.touid", src, ignoreLockedExits, ignoreAreaGuard)
@@ -2902,9 +2944,23 @@ function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits, ignoreAr
         snd.mapper.exitPreferenceOrderSql("dir")
     )
     
-    local results = snd.mapper.db.query(sql)
-    if results and #results > 0 then
-        return {{dir = results[1].dir, uid = dst}}
+    local results = snd.mapper.db.query(sql) or {}
+
+    local chosen = results[1]
+    for _, randomCandidate in ipairs(randomCexits or {}) do
+        if tostring(randomCandidate.fromuid) == tostring(src)
+            and tostring(randomCandidate.touid) == tostring(dst)
+            and snd.mapper.shouldPreferExitDir(randomCandidate.dir, chosen and chosen.dir or nil)
+        then
+            chosen = randomCandidate
+        end
+    end
+    if chosen then
+        return {{
+            dir = chosen.dir,
+            uid = dst,
+            randomCexit = tonumber(chosen.random_cexit) == 1,
+        }}
     end
     return nil
 end
@@ -3359,6 +3415,17 @@ function snd.mapper.executePath(path, opts)
 
     opts = opts or {}
 
+    -- A random cexit is always terminal for this invocation. Its recorded
+    -- destination is only a pathfinding possibility, never a landing promise.
+    -- Drop the suffix before command groups are built so nothing can be queued
+    -- after the random command.
+    local terminalPath = {}
+    for _, step in ipairs(path) do
+        table.insert(terminalPath, step)
+        if step.randomCexit == true then break end
+    end
+    path = terminalPath
+
     snd.mapper.notifyBigmapNavigationState("path_started")
 
     if not opts.preserveExecutionSerial then
@@ -3461,6 +3528,7 @@ function snd.mapper.executePath(path, opts)
 		local parts = raw:find(";", 1, true) and splitSemis(raw) or { raw }
         local stepSourceRoom = simulatedRoom
         local isTravelStep = step.travelType == "portal" or step.travelType == "recall"
+        local isRandomCexit = step.randomCexit == true
         local stepHasWait = false
         local stepHasMapperWalkto = false
         local encounteredWait = false
@@ -3472,6 +3540,23 @@ function snd.mapper.executePath(path, opts)
             if mm and mm.mapper_walkto_target and mm.mapper_walkto_target(token) then
                 stepHasMapperWalkto = true
             end
+        end
+
+        -- Unlike regular mapped cexits, never queue a random command behind a
+        -- trusted prefix. Hold it until GMCP confirms its recorded source room.
+        if isRandomCexit then
+            flushCardinals()
+            if #currentGroup.commands > 0 then
+                table.insert(groups, currentGroup)
+            end
+            currentGroup = {
+                commands = {},
+                delayAfter = 0,
+                waitRoomId = nil,
+                executeRoomId = tostring(stepSourceRoom or "-1"),
+                trustedSource = false,
+                terminalRandomCexit = true,
+            }
         end
 
         -- Keep jumps in their own command groups, but do not impose a GMCP
@@ -3690,6 +3775,18 @@ function snd.mapper.executePath(path, opts)
     -- Execute path groups sequentially so wait() never races ahead of queued actions.
     -- If a wait expires while in combat, hold execution until combat clears.
     local heldGroupNotices = {}
+    local function finishRandomCexit()
+        snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or executionSerial) + 1
+        snd.mapper.pathExecutionActive = false
+        snd.mapper.pathExecutionHasPendingGroups = false
+        snd.mapper.goingToRoom = nil
+        snd.nav.goingToRoom = nil
+        if snd.conwin and type(snd.conwin.cancelTravel) == "function" then
+            snd.conwin.cancelTravel()
+        end
+        snd.mapper.notifyBigmapNavigationState("random_cexit_terminal")
+    end
+
     local function runFrom(startIndex)
         if not isExecutionCurrent() then
             return
@@ -3745,6 +3842,11 @@ function snd.mapper.executePath(path, opts)
                 if ok == false then
                     return
                 end
+            end
+
+            if grp.terminalRandomCexit then
+                finishRandomCexit()
+                return
             end
 
             if grp.delayAfter > 0 then

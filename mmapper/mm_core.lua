@@ -1600,6 +1600,12 @@ local MAPPER_SCHEMA_SQL = {
       level STRING NOT NULL DEFAULT '0',
       chaos TEXT NOT NULL DEFAULT 'no',
       PRIMARY KEY(fromuid, dir))]],
+  [[CREATE TABLE IF NOT EXISTS random_cexits(
+      dir TEXT NOT NULL,
+      fromuid TEXT NOT NULL,
+      touid TEXT NOT NULL,
+      level STRING NOT NULL DEFAULT '0',
+      PRIMARY KEY(fromuid, dir, touid))]],
   [[CREATE TABLE IF NOT EXISTS bookmarks(
       uid TEXT NOT NULL,
       notes TEXT,
@@ -1623,6 +1629,7 @@ local MAPPER_SCHEMA_SQL = {
       deleted_at INTEGER)]],
   [[CREATE VIRTUAL TABLE IF NOT EXISTS rooms_lookup USING FTS3(uid, name)]],
   [[CREATE INDEX IF NOT EXISTS exits_touid_index ON exits(touid)]],
+  [[CREATE INDEX IF NOT EXISTS random_cexits_touid_index ON random_cexits(touid)]],
   [[CREATE INDEX IF NOT EXISTS rooms_area_index ON rooms(area)]],
   [[CREATE VIEW IF NOT EXISTS camere AS SELECT * FROM rooms]],
 }
@@ -1924,6 +1931,22 @@ function mm.ensure_exits_chaos_column()
     return false, upd_err
   end
   return true
+end
+
+function mm.ensure_random_cexits_table()
+  local ok, err = mm.exec_mapper_db([[
+    CREATE TABLE IF NOT EXISTS random_cexits(
+      dir TEXT NOT NULL,
+      fromuid TEXT NOT NULL,
+      touid TEXT NOT NULL,
+      level STRING NOT NULL DEFAULT '0',
+      PRIMARY KEY(fromuid, dir, touid))
+  ]])
+  if not ok then return false, err end
+
+  return mm.exec_mapper_db(
+    "CREATE INDEX IF NOT EXISTS random_cexits_touid_index ON random_cexits(touid)"
+  )
 end
 
 local function trim(value)
@@ -2880,6 +2903,20 @@ function mm.add_full_cexit(command, src, dst, level, quiet, opts)
   end
   if src == dst then return false, "start room and destination room should be different" end
 
+  local random_ready, random_err = mm.ensure_random_cexits_table()
+  if not random_ready then return false, random_err end
+  local random_conflicts, conflict_err = mm.query_mapper_db(string.format(
+    "SELECT touid FROM random_cexits WHERE fromuid=%s AND dir=%s LIMIT 1",
+    mm.sql_escape(src), mm.sql_escape(command)
+  ))
+  if not random_conflicts then return false, conflict_err end
+  if random_conflicts[1] then
+    return false, string.format(
+      "a random cexit already uses '%s' from room %s; delete it before creating a regular cexit",
+      command, tostring(src)
+    )
+  end
+
   local ok, err = mm.exec_mapper_db(string.format(
     "INSERT OR REPLACE INTO exits (dir, fromuid, touid, level) VALUES (%s, %s, %s, %s)",
     mm.sql_escape(command), mm.sql_escape(src), mm.sql_escape(dst), mm.sql_escape(level)
@@ -2897,6 +2934,108 @@ function mm.add_full_cexit(command, src, dst, level, quiet, opts)
 
   if not quiet then
     mm.note(string.format("Custom Exit CONFIRMED: %s (%s) -> %s [lock level %d]", tostring(src), command, tostring(dst), level))
+  end
+  return true
+end
+
+local function normalize_random_cexit_destinations(destinations)
+  local values = {}
+  if type(destinations) == "table" then
+    for _, value in ipairs(destinations) do table.insert(values, value) end
+  else
+    for value in tostring(destinations or ""):gmatch("([^,]+)") do
+      table.insert(values, value)
+    end
+  end
+
+  local normalized, seen = {}, {}
+  for _, value in ipairs(values) do
+    local uid = mm.strip_ansi(value):gsub("^%s+", ""):gsub("%s+$", "")
+    if uid ~= "" and not seen[uid] then
+      seen[uid] = true
+      table.insert(normalized, uid)
+    end
+  end
+  table.sort(normalized, function(a, b)
+    local an, bn = tonumber(a), tonumber(b)
+    if an and bn then return an < bn end
+    return tostring(a) < tostring(b)
+  end)
+  return normalized
+end
+
+function mm.add_random_cexit(command, src, destinations, level, quiet)
+  command = mm.normalize_stacked_command(command)
+  src = mm.strip_ansi(src):gsub("^%s+", ""):gsub("%s+$", "")
+  level = tonumber(level) or 0
+  local outcomes = normalize_random_cexit_destinations(destinations)
+
+  if command == "" then return false, "random cexit command is required" end
+  if command:find(";", 1, true) then
+    return false, "random cexit must be a single command without stacked separators"
+  end
+  if mm.mapper_walkto_target(command) or command:match("^wait%(") then
+    return false, "random cexit must be a single MUD command"
+  end
+  if src == "" then return false, "random cexit source room id is required" end
+  if #outcomes < 2 then return false, "random cexit requires at least two destination room ids" end
+  for _, destination in ipairs(outcomes) do
+    if destination == src then
+      return false, "random cexit destinations must be different from the source room"
+    end
+  end
+
+  local ensured, ensure_err = mm.ensure_random_cexits_table()
+  if not ensured then return false, ensure_err end
+
+  local conflicts, conflict_err = mm.query_mapper_db(string.format(
+    "SELECT touid FROM exits WHERE fromuid=%s AND dir=%s LIMIT 1",
+    mm.sql_escape(src), mm.sql_escape(command)
+  ))
+  if not conflicts then return false, conflict_err end
+  if conflicts[1] then
+    return false, string.format(
+      "a regular cexit already uses '%s' from room %s; delete it before creating the random cexit",
+      command, src
+    )
+  end
+
+  local source = mm.resolve_mapper_db(mm.state and mm.state.map_db)
+  if not source or not mm.path_exists(source) then
+    return false, "mapper db not found: " .. tostring(source)
+  end
+  local env, conn, open_err = open_mapper_db(source)
+  if not conn then return false, open_err end
+
+  local ok, err = execute_statement(conn, "BEGIN IMMEDIATE")
+  if ok then
+    ok, err = execute_statement(conn, string.format(
+      "DELETE FROM random_cexits WHERE fromuid=%s AND dir=%s",
+      mm.sql_escape(src), mm.sql_escape(command)
+    ))
+  end
+  if ok then
+    for _, destination in ipairs(outcomes) do
+      ok, err = execute_statement(conn, string.format(
+        "INSERT INTO random_cexits (dir, fromuid, touid, level) VALUES (%s, %s, %s, %s)",
+        mm.sql_escape(command), mm.sql_escape(src), mm.sql_escape(destination), mm.sql_escape(level)
+      ))
+      if not ok then break end
+    end
+  end
+  if ok then
+    ok, err = execute_statement(conn, "COMMIT")
+  end
+  if not ok then pcall(function() conn:execute("ROLLBACK") end) end
+  conn:close()
+  env:close()
+  if not ok then return false, err end
+
+  if not quiet then
+    mm.note(string.format(
+      "Random Exit CONFIRMED: %s (%s) -> {%s} [lock level %d]",
+      src, command, table.concat(outcomes, ", "), level
+    ))
   end
   return true
 end
@@ -3104,6 +3243,119 @@ function mm.list_cexits(scope_arg)
   if #rows == 0 then mm.note("Found 0 custom exits."); return true end
   print_cexits_table(rows)
   mm.note(string.format("Found %d custom exits.", #rows))
+  return true
+end
+
+local function random_cexit_where_for_scope(scope_arg)
+  local arg = tostring(scope_arg or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  local lower = arg:lower()
+  local where = "1=1"
+  local intro = "The following rooms have random custom exits:"
+  if lower == "thisroom" then
+    local room = mm.current_room()
+    if not room then return nil, nil, "RANDOM CEXITS THISROOM ERROR: unknown current room; try LOOK" end
+    where = "random_cexits.fromuid = " .. mm.sql_escape(room)
+    intro = "The following random custom exits are in this room:"
+  elseif lower == "here" then
+    local area = current_area_name()
+    if area == "" then return nil, nil, "RANDOM CEXITS HERE ERROR: unknown current area; try LOOK" end
+    where = "lower(rooms.area) = " .. mm.sql_escape(area:lower())
+    intro = "The following rooms in the current area have random custom exits:"
+  elseif lower:match("^area%s+") then
+    local area_name = arg:sub(6):gsub("^%s+", ""):gsub("%s+$", "")
+    if area_name == "" then return nil, nil, "Usage: mapper randomcexits area <area name>" end
+    where = "lower(rooms.area) LIKE " .. mm.sql_escape("%" .. area_name:lower() .. "%")
+    intro = string.format("The following rooms in areas partially matching '%s' have random custom exits:", area_name)
+  elseif lower ~= "" then
+    where = "lower(rooms.area) LIKE " .. mm.sql_escape("%" .. lower .. "%")
+    intro = string.format("The following rooms in areas partially matching '%s' have random custom exits:", arg)
+  end
+  return where, intro, nil
+end
+
+local function print_random_cexits_table(rows)
+  cecho("<gray>#   From     Area         Name                           Command                 Possible destinations<reset>\n")
+  cecho("<gray>-------------------------------------------------------------------------------------------------------------<reset>\n")
+  for i, row in ipairs(rows) do
+    local from = tonumber(row.fromuid) or -1
+    cecho(string.format("<light_grey>%-3d<reset> ", i))
+    if from > 0 then
+      echoLink(string.format("(%d)", from), [[mm.goto_room(]] .. from .. [[)]], "Go to source room", true)
+    else
+      echo("(?)")
+    end
+    cecho(string.format(
+      "  <light_grey>%-10.10s %-30.30s %-23.23s {%s}<reset>\n",
+      tostring(row.area or ""),
+      tostring(row.name or ""),
+      tostring(row.dir or ""),
+      table.concat(row.destinations or {}, ", ")
+    ))
+    if i >= 200 then break end
+  end
+end
+
+function mm.list_random_cexits(scope_arg)
+  local ensured, ensure_err = mm.ensure_random_cexits_table()
+  if not ensured then return false, ensure_err end
+
+  local where, intro, err = random_cexit_where_for_scope(scope_arg)
+  if not where then return false, err end
+  local rows, qerr = mm.query_mapper_db(
+    "SELECT random_cexits.fromuid, COALESCE(rooms.name, random_cexits.fromuid) AS name, " ..
+    "COALESCE(rooms.area, '') AS area, random_cexits.dir, random_cexits.touid, random_cexits.level " ..
+    "FROM random_cexits LEFT JOIN rooms ON rooms.uid = random_cexits.fromuid WHERE " .. where ..
+    " ORDER BY area, random_cexits.fromuid, random_cexits.dir, random_cexits.touid"
+  )
+  if not rows then return false, qerr end
+
+  local grouped, by_key = {}, {}
+  for _, row in ipairs(rows) do
+    local key = tostring(row.fromuid) .. "\0" .. tostring(row.dir)
+    local entry = by_key[key]
+    if not entry then
+      entry = {
+        fromuid = tostring(row.fromuid or ""),
+        area = tostring(row.area or ""),
+        name = tostring(row.name or ""),
+        dir = tostring(row.dir or ""),
+        level = tonumber(row.level) or 0,
+        destinations = {},
+      }
+      by_key[key] = entry
+      table.insert(grouped, entry)
+    end
+    table.insert(entry.destinations, tostring(row.touid or ""))
+  end
+
+  mm.runtime.random_cexit_last_rows = grouped
+  mm.note(intro)
+  if #grouped == 0 then mm.note("Found 0 random custom exits."); return true end
+  print_random_cexits_table(grouped)
+  mm.note(string.format("Found %d random custom exits.", #grouped))
+  return true
+end
+
+function mm.delete_random_cexit(index)
+  local n = tonumber(index)
+  if not n then return false, "Usage: mapper deleterandomcexit <number>" end
+  local rows = mm.runtime.random_cexit_last_rows or {}
+  local row = rows[n]
+  if not row then
+    return false, "DELETE RANDOM CEXIT ERROR: index out of range for last shown randomcexits table"
+  end
+
+  local ok, err = mm.exec_mapper_db(string.format(
+    "DELETE FROM random_cexits WHERE fromuid=%s AND dir=%s",
+    mm.sql_escape(row.fromuid), mm.sql_escape(row.dir)
+  ))
+  if not ok then return false, err end
+  table.remove(rows, n)
+  mm.runtime.random_cexit_last_rows = rows
+  mm.note(string.format(
+    "Deleted random cexit: from (%s) dir '%s' to {%s}.",
+    tostring(row.fromuid), tostring(row.dir), table.concat(row.destinations or {}, ", ")
+  ))
   return true
 end
 

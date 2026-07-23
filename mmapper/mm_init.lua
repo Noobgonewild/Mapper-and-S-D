@@ -263,6 +263,14 @@ function mm.initialize()
         end
       end
     end)
+    safe_step("ensure_random_cexits_table", function()
+      if mm.ensure_random_cexits_table then
+        local ok, ensure_err = mm.ensure_random_cexits_table()
+        if not ok then
+          mm.warn("Could not initialize random custom exits: " .. tostring(ensure_err))
+        end
+      end
+    end)
   end
 
   safe_step("frontier.initialize", function()
