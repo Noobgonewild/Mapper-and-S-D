@@ -2385,21 +2385,6 @@ function snd.commands.xkill()
     local currentTarget = snd.targets.current
     local keyword = ""
 
-    if currentTarget then
-        local targetAlive
-        if snd.scan and type(snd.scan.targetIsAlive) == "function" then
-            targetAlive = snd.scan.targetIsAlive(currentTarget)
-        else
-            local status = tostring(currentTarget.status or ""):lower()
-            targetAlive = not currentTarget.dead and not currentTarget.killed
-                and status ~= "dead" and status ~= "killed"
-        end
-        if not targetAlive then
-            snd.utils.infoNote("Selected target is already dead.")
-            return false
-        end
-    end
-
     -- xkill should always prioritize the selected current target and only
     -- consider quest fallback when no current target exists.
     if currentTarget then
