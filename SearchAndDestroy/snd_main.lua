@@ -974,7 +974,7 @@ function snd.tryAutoOpenWindow()
     end
 
     if not isVisible then
-        expandAlias("snd window", false)
+        snd.commands.showWindow()
     end
 end
 
@@ -1309,7 +1309,11 @@ end
 
 --- Clear the current target
 function snd.clearTarget()
+    local activity = snd.targets.current and snd.targets.current.activity or nil
     snd.targets.current = nil
+    if activity and snd.targets.scoped then
+        snd.targets.scoped[activity] = nil
+    end
     if snd.gui and snd.gui.refresh then
         snd.gui.refresh()
     end
@@ -1459,6 +1463,8 @@ function snd.onRoomChange()
     -- Check if we arrived at destination
     local destination = snd.nav.goingToRoom or snd.mapper.goingToRoom
     if destination and tostring(snd.room.current.rmid) == tostring(destination) then
+        snd.mapper.pathExecutionActive = false
+        snd.mapper.pathExecutionHasPendingGroups = false
         if snd.mapper and snd.mapper.flushPendingPersists then
             snd.mapper.flushPendingPersists()
         end

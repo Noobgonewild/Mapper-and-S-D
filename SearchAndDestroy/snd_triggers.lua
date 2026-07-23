@@ -165,6 +165,9 @@ end
 
 --- Campaign mob killed trigger
 function snd.triggers.cpMobKilled()
+    if snd.conwin and snd.conwin.confirmPendingCombatDeath then
+        snd.conwin.confirmPendingCombatDeath("campaign-kill-message")
+    end
     snd.cp.onMobKilled()
 end
 
@@ -456,6 +459,9 @@ end
 
 --- GQ mob killed trigger
 function snd.triggers.gqMobKilled()
+    if snd.conwin and snd.conwin.confirmPendingCombatDeath then
+        snd.conwin.confirmPendingCombatDeath("gquest-kill-message")
+    end
     snd.gq.onMobKilled()
 end
 
@@ -765,10 +771,20 @@ end
 function snd.triggers.roomCharsStart()
     snd.roomChars = snd.roomChars or {}
     snd.roomChars.active = true
+    -- Clean up a line-capture trigger left by an older plugin version. ConWin
+    -- must only consume consider output, never the broad RoomChars stream.
+    if snd.roomChars.lineCaptureId then
+        pcall(killTrigger, snd.roomChars.lineCaptureId)
+        snd.roomChars.lineCaptureId = nil
+    end
 end
 
 function snd.triggers.roomCharsEnd()
     snd.roomChars = snd.roomChars or {}
+    if snd.roomChars.lineCaptureId then
+        pcall(killTrigger, snd.roomChars.lineCaptureId)
+        snd.roomChars.lineCaptureId = nil
+    end
     snd.roomChars.active = false
     if snd.conwin and snd.conwin.onRoomcharsEnd then
         snd.conwin.onRoomcharsEnd()

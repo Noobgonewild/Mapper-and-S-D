@@ -196,9 +196,25 @@ function mm.minimap.is_navigation_active()
 end
 
 local function set_window_title(which, title)
+  title = title or ""
+  mm.minimap.window_titles = mm.minimap.window_titles or {}
+  mm.minimap.window_titles[which] = title
+
   local w = mm.minimap.windows and mm.minimap.windows[which]
-  if not (w and w.dragbar and w.dragbar.echo) then return end
-  w.dragbar:echo(title or "")
+  if not w then return end
+
+  if w.container and type(w.container.setTitle) == "function" then
+    w.container:setTitle(title, "#A0FFFF", "l")
+  elseif w.dragbar and type(w.dragbar.echo) == "function" then
+    w.dragbar:echo(title)
+  end
+end
+
+local function restore_window_title(which)
+  local titles = mm.minimap.window_titles
+  if titles and titles[which] ~= nil then
+    set_window_title(which, titles[which])
+  end
 end
 
 function mm.minimap.set_room_title(room_name, room_id, area_name)
@@ -206,13 +222,13 @@ function mm.minimap.set_room_title(room_name, room_id, area_name)
   if room_label == "" then return end
 
   local area_label = tostring(area_name or "")
-  set_window_title("minimap", room_label)
+  set_window_title("minimap", "")
   local big_label = room_label
   if room_id ~= nil and tostring(room_id) ~= "" then
     big_label = string.format("%s (%s)", big_label, tostring(room_id))
   end
   if area_label ~= "" then
-    big_label = string.format("%s - %s", big_label, area_label)
+    big_label = string.format("%s / %s", area_label, big_label)
   end
   set_window_title("bigmap", big_label)
 end
@@ -477,6 +493,7 @@ local function create_miniconsole(which)
     adjustable = shell and true or false,
   }
 
+  restore_window_title(which)
   apply_font_size(which)
   if mm.minimap.windows[which].dragbar and not mm.minimap.windows[which].adjustable then
     bind_dragbar(which, mm.minimap.windows[which].dragbar)
@@ -550,6 +567,7 @@ local function create_local_map_canvas()
     adjustable = shell and true or false,
   }
 
+  restore_window_title("bigmap")
   if dragbar and not mm.minimap.windows.bigmap.adjustable then
     bind_dragbar("bigmap", dragbar)
   end
@@ -635,6 +653,7 @@ local function create_bigmap_mapper()
     adjustable = shell and true or false,
   }
 
+  restore_window_title("bigmap")
   if dragbar and not mm.minimap.windows.bigmap.adjustable then
     bind_dragbar("bigmap", dragbar)
   end

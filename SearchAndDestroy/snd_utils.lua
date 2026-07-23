@@ -993,6 +993,13 @@ function snd.utils.reportCampaignCompletion(rewards, durationSeconds)
     if pracs > 0 then table.insert(channelParts, string.format("@GPracs: %d@W", pracs)) end
     if durationText ~= "" then table.insert(channelParts, string.format("@CDuration: %s@W", durationText)) end
     local payload = string.format("@GCampaign complete!@W %s", table.concat(channelParts, ", "))
+
+    -- Custom channel aliases can echo immediately while the campaign-complete
+    -- server line is still open, so finish that line before expanding the alias.
+    if not snd.utils.isMudReportChannel(channel) then
+        cecho("\n")
+    end
+
     return snd.utils.dispatchReportChannel(channel, payload)
 end
 

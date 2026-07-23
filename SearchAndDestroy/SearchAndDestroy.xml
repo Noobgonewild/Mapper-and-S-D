@@ -860,6 +860,11 @@ cecho("<orange>[S&D]<reset> <cyan>Attempting manual reload from " .. expectedFol
 setSndTriggers(false)
 
 -- Clear existing S&D state only after the installation passes preflight.
+if _G.snd_loader_initialization_timer and type(killTimer) == "function" then
+    pcall(killTimer, _G.snd_loader_initialization_timer)
+end
+_G.snd_loader_initialization_timer = nil
+_G.snd_loader_initialization_pending = nil
 _G.snd = nil
 _G.snd_loader_in_progress = nil
 
@@ -1201,9 +1206,46 @@ local function setSndTriggers(enabled)
     for _, name in ipairs(triggerGroups) do pcall(setter, name) end
 end
 
-if _G.snd_loader_in_progress then
+if _G.snd_loader_in_progress or _G.snd_loader_initialization_pending then
     return
 end
+
+local function mapperReady()
+    return type(_G.mm) == "table"
+        and type(_G.mm.canonical_room_uid) == "function"
+        and type(_G.mm.nav) == "table"
+end
+
+-- Mudlet does not guarantee package event-handler order. If S&D receives
+-- sysLoadEvent before MMapper, wait for mm.ready and also poll briefly for
+-- compatibility with older MMapper package loaders that do not raise it.
+if not mapperReady() then
+    setSndTriggers(false)
+    _G.snd_mapper_wait_attempts = (tonumber(_G.snd_mapper_wait_attempts) or 0) + 1
+
+    if not _G.snd_mapper_wait_timer
+        and _G.snd_mapper_wait_attempts <= 100
+        and type(tempTimer) == "function"
+        and type(raiseEvent) == "function" then
+        _G.snd_mapper_wait_timer = tempTimer(0.1, function()
+            _G.snd_mapper_wait_timer = nil
+            raiseEvent("snd.mapper.retry")
+        end)
+    elseif _G.snd_mapper_wait_attempts > 100 and not _G.snd_mapper_wait_warning_shown then
+        cecho("<orange_red>[S&D DEPENDENCY ERROR]<reset> MMapper did not become ready; S&D remains disabled.\n")
+        cecho("Install or enable MMapper, then reload the profile.\n")
+        _G.snd_mapper_wait_warning_shown = true
+    end
+    return
+end
+
+if _G.snd_mapper_wait_timer and type(killTimer) == "function" then
+    pcall(killTimer, _G.snd_mapper_wait_timer)
+end
+_G.snd_mapper_wait_timer = nil
+_G.snd_mapper_wait_attempts = nil
+_G.snd_mapper_wait_warning_shown = nil
+
 if _G.snd and _G.snd.initialized then
     setSndTriggers(true)
     return
@@ -1284,7 +1326,10 @@ cecho("<orange>[S&D]<reset> <green>Loaded " .. loadedCount .. " modules from the
 _G.snd_loader_in_progress = false
 
 -- Initialize
-tempTimer(0.5, function()
+_G.snd_loader_initialization_pending = true
+_G.snd_loader_initialization_timer = tempTimer(0.5, function()
+    _G.snd_loader_initialization_timer = nil
+    _G.snd_loader_initialization_pending = nil
     if snd and snd.initialize then
         local ok, err = pcall(snd.initialize, false)
         if ok then
@@ -1301,6 +1346,8 @@ end)
             <eventHandlerList>
                 <string>sysLoadEvent</string>
                 <string>sysInstall</string>
+                <string>mm.ready</string>
+                <string>snd.mapper.retry</string>
             </eventHandlerList>
         </Script>
     </ScriptPackage>

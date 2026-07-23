@@ -156,6 +156,14 @@ local function canStartQuickWhere()
     return true
 end
 
+local function canStartNx()
+    if getCharacterState() == "8" then
+        snd.utils.infoNote("Next room skipped while in combat.")
+        return false
+    end
+    return true
+end
+
 local xcpModeDescriptions = {
     db = "db - use stored DB/mapped rooms only",
     qw = "qw - live where, exact-match selected target",
@@ -299,21 +307,128 @@ function snd.commands.sendGameCommand(cmd, echo)
     return false
 end
 
--- Route all movement through command aliases so S&D stays mapper-independent.
-function snd.commands.gotoRoomViaAlias(roomId)
+--- Dispatch an S&D command through its Lua API instead of re-entering Mudlet's alias engine.
+-- @param command string S&D command line
+-- @return boolean true when the command was recognized and dispatched
+function snd.commands.dispatchLocalCommand(command)
+    local line = snd.utils.trim(command or "")
+    if line == "" then return false end
+
+    local args = line:match("^snd%s*(.*)$")
+    if args ~= nil then snd.commands.snd(args); return true end
+
+    args = line:match("^xhelp%s*(.*)$")
+    if args ~= nil then snd.commands.xhelp(args); return true end
+
+    args = line:match("^xcp%s*(.*)$")
+    if args ~= nil then snd.commands.xcp(args); return true end
+
+    args = line:match("^qwx%s*(.*)$")
+    if args ~= nil then snd.commands.qwx(args); return true end
+
+    args = line:match("^qw%s*(.*)$")
+    if args ~= nil then snd.commands.qw(args); return true end
+
+    if line == "nx" then snd.commands.nx(); return true end
+    if line == "xkill" then snd.commands.xkill(); return true end
+    if line == "qref" then snd.commands.qref(); return true end
+    if line == "aha" or line == "ah0" then snd.commands.stopAutoHunt(); return true end
+
+    args = line:match("^xcmd%s*(.*)$")
+    if args ~= nil then snd.commands.xcmd(args); return true end
+
+    args = line:match("^ht%s*(.*)$")
+    if args ~= nil then snd.commands.ht(args); return true end
+
+    args = line:match("^ah%s*(.*)$")
+    if args ~= nil then snd.commands.ah(args); return true end
+
+    args = line:match("^xset%s*(.*)$")
+    if args ~= nil then snd.commands.xset(args); return true end
+
+    args = line:match("^go%s*(.*)$")
+    if args ~= nil then snd.commands.goToIndex(args); return true end
+
+    if line == "qs" and snd.gui and snd.gui.quickScan then
+        snd.gui.quickScan()
+        return true
+    end
+
+    return false
+end
+
+-- Route movement through the mapper's Lua API. MMapper is a required dependency.
+function snd.commands.gotoRoomViaAlias(roomId, options)
     roomId = tonumber(roomId)
     if not roomId or roomId <= 0 then
         return false
     end
 
-    local travelAlias = (snd.config and snd.config.speed == "walk") and "walkto" or "xrt"
-    local cmd = travelAlias .. " " .. tostring(roomId)
-    if type(extendedAlias) == "function" then
-        extendedAlias(cmd)
-    elseif type(expandAlias) == "function" then
-        expandAlias(cmd)
-    else
-        send(cmd, false)
+    local opts = type(options) == "table" and options or {}
+    local walkOnly = snd.config and snd.config.speed == "walk"
+    local request = nil
+    local current = snd.targets and snd.targets.current or nil
+    local isTargetRoom = current and tonumber(current.roomId) == roomId
+    if not isTargetRoom and current and snd.nav and snd.nav.quickWhere and snd.nav.quickWhere.rooms then
+        for _, candidate in ipairs(snd.nav.quickWhere.rooms) do
+            if tonumber(candidate) == roomId then
+                isTargetRoom = true
+                break
+            end
+        end
+    end
+    if not isTargetRoom and current and snd.nav and snd.nav.gotoList then
+        for _, entry in pairs(snd.nav.gotoList) do
+            if entry and entry.type == "room" and tonumber(entry.id) == roomId then
+                isTargetRoom = true
+                break
+            end
+        end
+    end
+
+    if opts.allowManualApproach ~= false and isTargetRoom then
+        request = {
+            requestedRoom = roomId,
+            source = tostring(opts.source or "snd"),
+            targetName = current and tostring(current.name or current.mob or "") or "",
+            targetKey = snd.commands.buildQuickWhereTargetKeyFromCurrent
+                and snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
+                or "",
+        }
+        snd.nav = snd.nav or {}
+        snd.nav.pendingManualApproachRequest = request
+    end
+
+    local travelApi = nil
+    if snd.mapper then
+        if walkOnly then
+            travelApi = snd.mapper.walkTo
+        else
+            travelApi = snd.mapper.xrt
+        end
+    end
+    if type(travelApi) ~= "function" then
+        if request and snd.nav and snd.nav.pendingManualApproachRequest == request then
+            snd.nav.pendingManualApproachRequest = nil
+        end
+        snd.utils.errorNote("Mapper navigation API is unavailable.")
+        return false
+    end
+
+    local dispatched, dispatchError = pcall(travelApi, tostring(roomId))
+    if not dispatched then
+        if request and snd.nav and snd.nav.pendingManualApproachRequest == request then
+            snd.nav.pendingManualApproachRequest = nil
+        end
+        snd.utils.errorNote("Mapper navigation failed: " .. tostring(dispatchError))
+        return false
+    end
+
+    -- Mapper API dispatch is synchronous. A failed route consumes this
+    -- request while building its manual-approach list; successful routes leave
+    -- no fallback state behind.
+    if request and snd.nav and snd.nav.pendingManualApproachRequest == request then
+        snd.nav.pendingManualApproachRequest = nil
     end
     return true
 end
@@ -504,6 +619,30 @@ end
 -- xcp - Select Target
 -------------------------------------------------------------------------------
 
+--- Select the first living target shown by the active activity tab.
+-- This deliberately resolves the target from the live list instead of reusing
+-- snd.targets.scoped, which may still describe a target killed moments ago.
+function snd.commands.selectFirstTarget(activity)
+    local scopedActivity = tostring(activity or getScopedActivity() or ""):lower()
+    local success = false
+
+    if scopedActivity == "quest" then
+        success = snd.commands.selectQuestTarget() == true
+    elseif scopedActivity == "cp" and snd.campaign.active then
+        success = snd.cp.selectTarget(1) == true
+    elseif scopedActivity == "gq" and snd.gquest.active then
+        success = snd.gq.selectTarget(1) == true
+    end
+
+    if success then
+        clearNxOverride()
+        return true
+    end
+
+    snd.utils.infoNote("No living target available on the " .. (scopedActivity ~= "" and scopedActivity or "active") .. " tab")
+    return false
+end
+
 function snd.commands.xcp(args)
     args = snd.utils.trim(args or "")
 
@@ -664,6 +803,168 @@ function snd.commands.buildQuickWhereTargetKeyFromCurrent(target)
     }, "|")
 end
 
+
+local function manualApproachMatchesCurrent(approach)
+    if type(approach) ~= "table" or approach.active ~= true then
+        return false
+    end
+
+    local storedKey = tostring(approach.targetKey or "")
+    if storedKey == "" then
+        return true
+    end
+
+    local current = snd.targets and snd.targets.current or nil
+    local currentKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
+    return currentKey ~= "" and currentKey == storedKey
+end
+
+local function manualApproachRoomName(roomId, fallback)
+    local name = snd.utils.trim(tostring(fallback or ""))
+    if name == "" and snd.mapper and type(snd.mapper.getRoomInfo) == "function" then
+        local ok, info = pcall(snd.mapper.getRoomInfo, roomId)
+        if ok and type(info) == "table" then
+            name = snd.utils.trim(tostring(info.name or ""))
+        end
+    end
+    if name == "" then
+        name = "room"
+    end
+    return snd.utils.stripColors(name)
+end
+
+local function manualApproachEllipsify(text, maxLength)
+    text = tostring(text or "")
+    if #text <= maxLength then return text end
+    if maxLength <= 3 then return text:sub(1, maxLength) end
+    return text:sub(1, maxLength - 3) .. "..."
+end
+
+--- Offer an explicit, saved mapper redirect after an S&D room request fails.
+-- This deliberately does not modify quickWhere.rooms or the selected target's
+-- roomId: the redirect is an approach room, not evidence of the mob's location.
+function snd.commands.offerManualApproach(requestedRoom)
+    local requestedId = tonumber(requestedRoom)
+    local pending = snd.nav and snd.nav.pendingManualApproachRequest or nil
+    if not requestedId or not pending or tonumber(pending.requestedRoom) ~= requestedId then
+        return false
+    end
+
+    snd.nav.pendingManualApproachRequest = nil
+
+    local current = snd.targets and snd.targets.current or nil
+    local currentKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
+    local pendingKey = tostring(pending.targetKey or "")
+    if pendingKey ~= "" and currentKey ~= "" and pendingKey ~= currentKey then
+        return false
+    end
+
+    local frontier = mm and mm.frontier or nil
+    if not frontier or type(frontier.get_manual_redirect) ~= "function" then
+        return false
+    end
+
+    local redirect = frontier.get_manual_redirect(requestedId)
+    local destinationId = redirect and tonumber(redirect.destination_uid) or nil
+    if not destinationId or destinationId <= 0 or destinationId == requestedId then
+        return false
+    end
+
+    local requestedName = manualApproachRoomName(requestedId, redirect.target_name)
+    local destinationName = manualApproachRoomName(destinationId, redirect.destination_name)
+    local targetName = snd.utils.trim(tostring(pending.targetName or (current and current.name) or ""))
+    if targetName == "" then targetName = "selected target" end
+
+    local approach = {
+        active = true,
+        requestedRoom = requestedId,
+        requestedName = requestedName,
+        destinationRoom = destinationId,
+        destinationName = destinationName,
+        targetKey = currentKey ~= "" and currentKey or pendingKey,
+        targetName = targetName,
+    }
+    snd.nav.manualApproach = approach
+    snd.nav.gotoArea = -1
+    snd.nav.gotoIndex = 1
+    snd.nav.nextRoom = destinationId
+    snd.nav.gotoList = {
+        [1] = {
+            type = "manual_redirect",
+            id = destinationId,
+            requestedRoom = requestedId,
+            requestedName = requestedName,
+            targetKey = approach.targetKey,
+        },
+    }
+    snd.nav.gotoListTargetKey = approach.targetKey
+
+    snd.utils.infoNote("Manual approach available for this target:")
+
+    local tableWidth = math.max(72, tonumber(snd.config and snd.config.tableWidth) or 80)
+    local linksEnabled = not (snd.config and snd.config.mapperUI and snd.config.mapperUI.links == false)
+    cecho(string.format("\n<gray>XCP  %-38s  %-9s  Notes<reset>\n", "Navigation option", "(uid)"))
+    cecho(string.format(
+        "<dim_gray>[QW]<reset> <white>%s<reset> <dim_gray>- target room: %s (%d)<reset>\n",
+        targetName,
+        requestedName,
+        requestedId
+    ))
+    cecho("<gray>" .. string.rep("-", tableWidth) .. "<reset>\n")
+
+    local rowName = manualApproachEllipsify(destinationName, 38)
+    local rowText = string.format("%3d  %-38s  (%-7d)  ", 1, rowName, destinationId)
+    cecho("<white>")
+    if linksEnabled and type(echoLink) == "function" then
+        echoLink(
+            rowText,
+            [[snd.commands.goToIndex(1)]],
+            string.format(
+                "Travel to manual approach %s (%d); target remains %s (%d)",
+                destinationName,
+                destinationId,
+                requestedName,
+                requestedId
+            ),
+            true
+        )
+    else
+        cecho(rowText)
+    end
+    cecho("<reset>Manual redirect\n")
+    cecho("<gray>" .. string.rep("-", tableWidth) .. "<reset>\n")
+    cecho("<gray>Type 'go 1' or click the room to travel there. 'nx' selects this option.<reset>\n")
+    return true
+end
+
+function snd.commands.takeManualApproach(entry)
+    local approach = snd.nav and snd.nav.manualApproach or nil
+    local destinationId = tonumber(entry and entry.id) or tonumber(approach and approach.destinationRoom)
+    local requestedId = tonumber(entry and entry.requestedRoom) or tonumber(approach and approach.requestedRoom)
+    if not destinationId or destinationId <= 0 or not requestedId then
+        return false
+    end
+
+    if approach and not manualApproachMatchesCurrent(approach) then
+        approach.active = false
+        return false
+    end
+    if approach then
+        approach.active = false
+    end
+
+    snd.utils.infoNote(string.format(
+        "Going to manual approach room %d (target room %d)",
+        destinationId,
+        requestedId
+    ))
+    return snd.commands.gotoRoomViaAlias(destinationId, {
+        allowManualApproach = false,
+        source = "manual_redirect",
+    })
+end
+
+
 local function targetMatchesCurrent(entry, current)
     if not entry or not current then return false end
     if entry.activity ~= current.activity then return false end
@@ -714,6 +1015,10 @@ local function selectTargetEntry(target)
 end
 
 function snd.commands.nx()
+    if not canStartNx() then
+        return
+    end
+
     local current = snd.targets.current
     local nxOverride = snd.nav and snd.nav.nxOverride or nil
     local useAdhocQuickWhere = nxOverride and nxOverride.mode == "adhoc_qw"
@@ -741,6 +1046,15 @@ function snd.commands.nx()
     if not current then
         snd.utils.infoNote("No target selected. Use xcp to select a target first")
         return
+    end
+
+    local manualApproach = snd.nav and snd.nav.manualApproach or nil
+    if manualApproach and manualApproach.active == true then
+        if manualApproachMatchesCurrent(manualApproach) then
+            snd.commands.takeManualApproach()
+            return
+        end
+        manualApproach.active = false
     end
 
     local function currentQuickWhereList()
@@ -2375,6 +2689,10 @@ function snd.commands.goToIndex(args)
     elseif entry.type == "room" then
         snd.utils.infoNote("Going to room " .. entry.id)
         snd.commands.gotoRoomViaAlias(entry.id)
+    elseif entry.type == "manual_redirect" then
+        if not snd.commands.takeManualApproach(entry) then
+            snd.utils.infoNote("That manual approach is no longer available")
+        end
     else
         snd.utils.infoNote("Invalid target entry at index " .. index)
     end
@@ -2800,35 +3118,8 @@ local function emitHelpCommandLink(commandText, commandToSend, hint)
             return
         end
 
-        -- Keep S&D help links local when possible; don't send addon commands to
-        -- the game when we can call the command API directly.
-        if trimmed == "snd" and snd and snd.commands and snd.commands.snd then
-            snd.commands.snd("")
-            return
-        end
-        if trimmed:match("^snd%s+") and snd and snd.commands and snd.commands.snd then
-            snd.commands.snd(trimmed:gsub("^snd%s+", "", 1))
-            return
-        end
-        if trimmed == "xhelp" and snd and snd.commands and snd.commands.xhelp then
-            snd.commands.xhelp("")
-            return
-        end
-        local xhelpArgs = trimmed:match("^xhelp%s+(.+)$")
-        if xhelpArgs and snd and snd.commands and snd.commands.xhelp then
-            snd.commands.xhelp(xhelpArgs)
-            return
-        end
-
-        if type(expandAlias) == "function" then
-            local ok = pcall(expandAlias, trimmed, false)
-            if ok then return end
-            pcall(expandAlias, trimmed)
-            return
-        end
-
-        if type(send) == "function" then
-            send(trimmed, false)
+        if not snd.commands.dispatchLocalCommand(trimmed) then
+            snd.utils.errorNote("Help link command is not registered: " .. trimmed)
         end
     end
     -- Use classic Mudlet links (stable rendering across consoles / logs).

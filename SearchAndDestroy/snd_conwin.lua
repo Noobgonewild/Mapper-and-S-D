@@ -29,6 +29,68 @@ CW.lastTrackedMobId = CW.lastTrackedMobId or nil
 CW.lastKilledMobName = CW.lastKilledMobName or ""
 CW.lastKilledAt = CW.lastKilledAt or 0
 CW.lastRawEnemy = CW.lastRawEnemy or ""
+CW.travelGeneration = tonumber(CW.travelGeneration) or 0
+CW.travelActive = CW.travelActive == true
+CW.travelClearedGeneration = tonumber(CW.travelClearedGeneration) or -1
+CW.lastAutomaticRefreshKey = CW.lastAutomaticRefreshKey or nil
+CW.latestRoomId = CW.latestRoomId or CW.lastRoomId
+CW.lastPlayerState = CW.lastPlayerState or nil
+CW.ROOM_REFRESH_DELAY = 0.20
+CW.roomRefreshSerial = tonumber(CW.roomRefreshSerial) or 0
+CW.captureSerial = tonumber(CW.captureSerial) or 0
+CW.captureInFlight = nil -- A reload invalidates any marker from the old code.
+CW.suppressConsiderLines = false
+CW.refreshDirty = CW.refreshDirty == true
+CW.pendingRefreshReason = CW.pendingRefreshReason or nil
+CW.forceRefreshRevision = tonumber(CW.forceRefreshRevision) or 0
+CW.forceRefreshPending = CW.forceRefreshPending == true
+CW.lastServedForceRevision = tonumber(CW.lastServedForceRevision) or 0
+CW.lastSuccessfulAutomaticKey = CW.lastSuccessfulAutomaticKey or nil
+CW.combatSessionActive = CW.combatSessionActive == true
+CW.combatRefreshQueued = CW.combatRefreshQueued == true
+CW.COMBAT_END_DELAY = 0.20
+CW.ATTACK_INTENT_TTL = 2.0
+CW.ESCAPE_INTENT_TTL = 2.0
+CW.SAME_NAME_RESET_MIN_JUMP = 20
+CW.SAME_NAME_RESET_MAX_LOW = 50
+-- Combat observations are session-local; a script reload invalidates their
+-- ordering relative to future CP/GQ kill messages.
+CW.deathEvents = {}
+CW.deathEventSerial = tonumber(CW.deathEventSerial) or 0
+CW.lastReturnedDeathSerial = nil
+CW.lastKilledMobName = ""
+CW.lastKilledAt = 0
+CW.pendingAttackIntent = nil
+CW.pendingEscapeIntent = nil
+CW.combat = CW.combat or {}
+if CW.combat.pendingEndTimer and type(killTimer) == "function" then
+    pcall(killTimer, CW.combat.pendingEndTimer)
+end
+CW.combat = {
+    activeRowId = nil,
+    activeName = "",
+    lastHp = nil,
+    minimumHp = nil,
+    roomId = "",
+    generation = tonumber(CW.combat.generation) or 0,
+    pendingEndTimer = nil,
+    pendingEndSerial = tonumber(CW.combat.pendingEndSerial) or 0,
+}
+-- RoomChars includes players and every visible inhabitant. Retire the old
+-- provisional integration so only parsed consider output can populate ConWin.
+CW.provisionalLines = nil
+CW.provisionalRoomId = nil
+CW.onRoomcharsStart = nil
+CW.onRoomcharsLine = nil
+
+-- Retire any callback created by an older copy of this file. The new timer is
+-- only a quiet-room debounce; GMCP state and the single-flight marker remain
+-- the source of truth.
+if CW.roomRefreshTimer and type(killTimer) == "function" then
+    pcall(killTimer, CW.roomRefreshTimer)
+end
+CW.roomRefreshTimer = nil
+CW.roomRefreshSerial = CW.roomRefreshSerial + 1
 
 local consider_map = {
     {[[^(\(.+\) ?)?(.+) looks a little worried about the idea\.$]], "chartreuse", "-2 to -4"},
@@ -79,11 +141,44 @@ local function gmcp_get(path)
 end
 
 local function currentRoomId()
+    -- Read the live GMCP packet first. Anonymous handlers for the same event do
+    -- not have a guaranteed execution order, so snd.room.current may still be
+    -- the room we just left when ConWin's room.info handler runs.
+    local roomInfo = gmcp_get("room.info")
+    if type(roomInfo) == "table" and type(mm) == "table" and type(mm.canonical_room_uid) == "function" then
+        local ok, roomId = pcall(mm.canonical_room_uid, roomInfo)
+        if ok and roomId ~= nil and tostring(roomId) ~= "" then
+            return tostring(roomId)
+        end
+    end
     local roomId = snd and snd.room and snd.room.current and snd.room.current.rmid or nil
     if roomId ~= nil and tostring(roomId) ~= "" then
         return tostring(roomId)
     end
     return tostring(gmcp_get("room.info.num") or "")
+end
+
+local function currentPlayerState()
+    local state = gmcp_get("char.status.state")
+    if state == nil and snd and snd.char then
+        state = snd.char.state
+    end
+    return state ~= nil and tostring(state) or ""
+end
+
+local function mapperHasPendingTravel(roomId)
+    if snd and snd.mapper and snd.mapper.pathExecutionHasPendingGroups == true then
+        return true
+    end
+
+    local destination = snd and (
+        (snd.nav and snd.nav.goingToRoom) or
+        (snd.mapper and snd.mapper.goingToRoom)
+    ) or nil
+    if destination ~= nil and tostring(destination) ~= "" then
+        return tostring(destination) ~= tostring(roomId or "")
+    end
+    return false
 end
 
 local function trim(s) return (tostring(s or ""):gsub("^%s+",""):gsub("%s+$","")) end
@@ -207,13 +302,319 @@ function CW.resolveCurrentRoomTargetForNxAction()
     end
 end
 
-function CW.clear(_reason)
-    CW.mobs = {}
-    CW.killsSinceRefresh = 0
+local function automaticRefreshKey(roomId)
+    return tostring(CW.travelGeneration or 0) .. ":" .. tostring(roomId or "")
+end
+
+function CW.cancelPendingCombatEnd()
+    local combat = CW.combat or {}
+    combat.pendingEndSerial = (tonumber(combat.pendingEndSerial) or 0) + 1
+    if combat.pendingEndTimer and type(killTimer) == "function" then
+        pcall(killTimer, combat.pendingEndTimer)
+    end
+    combat.pendingEndTimer = nil
+    CW.combat = combat
+end
+
+function CW.releaseCombatBinding()
+    CW.cancelPendingCombatEnd()
+    local combat = CW.combat
+    combat.activeRowId = nil
+    combat.activeName = ""
+    combat.lastHp = nil
+    combat.minimumHp = nil
+    combat.roomId = ""
     CW.currentEnemyMobId = nil
     CW.lastKnownEnemyPct = nil
     CW.lastTrackedMobId = nil
+end
+
+function CW.resetCombatTracking()
+    CW.releaseCombatBinding()
+    CW.pendingAttackIntent = nil
+    CW.pendingEscapeIntent = nil
+    CW.lastEnemy = ""
+    CW.lastRawEnemy = ""
+end
+
+function CW.resetConsideredMobs(resetKills)
+    CW.mobs = {}
+    if resetKills then
+        CW.killsSinceRefresh = 0
+    end
+    CW.resetCombatTracking()
+end
+
+function CW.clear(_reason)
+    CW.resetConsideredMobs(true)
     CW.render()
+end
+
+function CW.abortCapture()
+    if CW.doneTimer then
+        if type(killTimer) == "function" then
+            pcall(killTimer, CW.doneTimer)
+        end
+        CW.doneTimer = nil
+    end
+    CW.awaiting = false
+end
+
+function CW.cancelRoomRefreshTimer()
+    CW.roomRefreshSerial = (tonumber(CW.roomRefreshSerial) or 0) + 1
+    if CW.roomRefreshTimer and type(killTimer) == "function" then
+        pcall(killTimer, CW.roomRefreshTimer)
+    end
+    CW.roomRefreshTimer = nil
+end
+
+function CW.hasPendingRefresh()
+    local roomId = tostring(CW.latestRoomId or currentRoomId() or "")
+    local automaticPending = CW.travelActive
+        and roomId ~= ""
+        and CW.lastSuccessfulAutomaticKey ~= automaticRefreshKey(roomId)
+    return CW.refreshDirty == true or automaticPending or CW.forceRefreshPending == true
+end
+
+function CW.isRefreshEligible(roomId)
+    if currentPlayerState() ~= "3" then return false end
+    if trim(gmcp_get("char.status.enemy") or "") ~= "" then return false end
+    if snd and snd.mapper and snd.mapper.pathExecutionHasPendingGroups == true then
+        return false
+    end
+
+    -- A combat-issued MUD stop can leave the old mapper destination in place
+    -- even though no client-side groups remain. That is a genuine ConWin stop.
+    if not CW.combatRefreshQueued and mapperHasPendingTravel(roomId) then
+        return false
+    end
+    return true
+end
+
+function CW.armRoomRefresh(delay)
+    if CW.captureInFlight then return false end
+    CW.cancelRoomRefreshTimer()
+    local serial = CW.roomRefreshSerial
+    CW.roomRefreshTimer = tempTimer(tonumber(delay) or CW.ROOM_REFRESH_DELAY, function()
+        if serial ~= CW.roomRefreshSerial then return end
+        CW.roomRefreshTimer = nil
+        CW.tryStartRefresh()
+    end)
+    return true
+end
+
+function CW.requestRefresh(reason, force, delay)
+    local roomId = currentRoomId()
+    if roomId == "" then return false end
+    CW.latestRoomId = roomId
+    CW.pendingRefreshReason = tostring(reason or "automatic")
+    CW.refreshDirty = true
+    if force and not CW.forceRefreshPending then
+        CW.forceRefreshRevision = (tonumber(CW.forceRefreshRevision) or 0) + 1
+        CW.forceRefreshPending = true
+    end
+    if not CW.captureInFlight then
+        CW.armRoomRefresh(delay)
+    end
+    return true
+end
+
+function CW.startSerializedCapture(roomId)
+    if CW.captureInFlight then return false end
+    CW.suppressConsiderLines = false
+    CW.captureSerial = (tonumber(CW.captureSerial) or 0) + 1
+    local serial = CW.captureSerial
+    CW.captureInFlight = {
+        serial = serial,
+        requestRoom = tostring(roomId or currentRoomId()),
+        generation = tonumber(CW.travelGeneration) or 0,
+        forceRevision = CW.forceRefreshPending and CW.forceRefreshRevision or CW.lastServedForceRevision,
+        combatRefresh = CW.combatRefreshQueued == true,
+        reason = CW.pendingRefreshReason or "automatic",
+        failed = false,
+        cancelled = false,
+        observedRoom = nil,
+        mobs = {},
+    }
+    CW.awaiting = true
+    CW.mobDetectDispatched = false
+    send("consider all", false)
+    send("echo " .. CW.MARKER .. ":" .. tostring(serial), false)
+    return true
+end
+
+function CW.tryStartRefresh()
+    if CW.captureInFlight or not CW.hasPendingRefresh() then return false end
+
+    local roomId = currentRoomId()
+    if roomId == "" then return false end
+    CW.latestRoomId = roomId
+
+    if not cfg().enabled or tostring(cfg().mode or "consider"):lower() ~= "consider" then
+        CW.refreshDirty = false
+        CW.travelActive = false
+        return false
+    end
+    if not CW.isRefreshEligible(roomId) then return false end
+
+    if CW.isCurrentRoomSafe() then
+        CW.clear("safe")
+        CW.lastSuccessfulAutomaticKey = automaticRefreshKey(roomId)
+        CW.lastServedForceRevision = CW.forceRefreshRevision
+        CW.forceRefreshPending = false
+        CW.refreshDirty = false
+        CW.travelActive = false
+        CW.combatSessionActive = false
+        CW.combatRefreshQueued = false
+        return true
+    end
+
+    return CW.startSerializedCapture(roomId)
+end
+
+function CW.noteCaptureRoom()
+    local flight = CW.captureInFlight
+    if not flight or flight.failed or flight.cancelled then return end
+    local roomId = currentRoomId()
+    if roomId == "" then return end
+    if flight.observedRoom and flight.observedRoom ~= roomId then
+        flight.failed = true
+        return
+    end
+    flight.observedRoom = roomId
+end
+
+function CW.onConsiderRejected()
+    local flight = CW.captureInFlight
+    if not flight then return false end
+    flight.failed = true
+    CW.awaiting = false
+    CW.refreshDirty = true
+    CW.combatSessionActive = true
+    return true
+end
+
+function CW.onCaptureMarker(serial)
+    serial = tonumber(serial)
+    local flight = CW.captureInFlight
+    if not flight or serial ~= tonumber(flight.serial) then return false end
+
+    if CW.doneTimer then
+        if type(killTimer) == "function" then pcall(killTimer, CW.doneTimer) end
+        CW.doneTimer = nil
+    end
+    CW.awaiting = false
+    CW.captureInFlight = nil
+
+    if currentPlayerState() == "8" or trim(gmcp_get("char.status.enemy") or "") ~= "" then
+        flight.failed = true
+    end
+    local completedRoom = currentRoomId()
+    if flight.observedRoom and flight.observedRoom ~= completedRoom then
+        flight.failed = true
+    end
+
+    if flight.cancelled then
+        return false
+    end
+
+    if flight.failed then
+        CW.refreshDirty = true
+        if currentPlayerState() == "3" and trim(gmcp_get("char.status.enemy") or "") == "" then
+            CW.armRoomRefresh()
+        end
+        return false
+    end
+
+    -- Keep the previous rows visible while the server produces consider output,
+    -- then replace the list immediately before the completed result is rendered.
+    CW.resetConsideredMobs(false)
+    CW.mobs = flight.mobs or {}
+    CW.killsSinceRefresh = 0
+    CW.lastSuccessfulAutomaticKey = automaticRefreshKey(completedRoom)
+    CW.lastAutoRoomId = completedRoom
+    CW.lastAutoConsiderAt = os.time()
+    CW.lastServedForceRevision = math.max(
+        tonumber(CW.lastServedForceRevision) or 0,
+        tonumber(flight.forceRevision) or 0
+    )
+    if CW.lastServedForceRevision >= (tonumber(CW.forceRefreshRevision) or 0) then
+        CW.forceRefreshPending = false
+    end
+
+    -- The consider and marker are sent adjacently, so live GMCP at marker time
+    -- identifies the room whose output we just captured. It supersedes the
+    -- Room.Info packet that originally requested this flight.
+    CW.latestRoomId = completedRoom
+    CW.lastRoomId = completedRoom
+    CW.refreshDirty = false
+    CW.travelActive = false
+
+    if flight.combatRefresh and not CW.forceRefreshPending then
+        CW.combatSessionActive = false
+        CW.combatRefreshQueued = false
+    end
+
+    CW.render()
+    CW.resolveCurrentRoomTargetForNxAction()
+    if CW.hasPendingRefresh() then
+        CW.armRoomRefresh()
+    end
+    return true
+end
+
+function CW.onTravelStarted(reason)
+    if CW.travelActive then return false end
+
+    CW.travelGeneration = (tonumber(CW.travelGeneration) or 0) + 1
+    CW.travelActive = true
+    CW.latestRoomId = currentRoomId()
+    CW.refreshDirty = true
+    if CW.awaiting and not CW.captureInFlight then
+        CW.abortCapture()
+    end
+
+    if CW.travelClearedGeneration ~= CW.travelGeneration then
+        CW.travelClearedGeneration = CW.travelGeneration
+        CW.clear(reason or "travel-started")
+    end
+    return true
+end
+
+function CW.maybeRefreshStoppedRoom(reason)
+    if not CW.hasPendingRefresh() then return false end
+    if currentPlayerState() ~= "3" then return false end
+
+    local roomId = currentRoomId()
+    if roomId == "" then
+        return false
+    end
+    if not CW.combatRefreshQueued and mapperHasPendingTravel(roomId) then
+        return false
+    end
+
+    CW.latestRoomId = roomId
+    CW.lastRoomId = roomId
+    return CW.requestRefresh(reason or "travel-stopped", false)
+end
+
+function CW.onNavigationStopped(reason)
+    return CW.maybeRefreshStoppedRoom(reason or "navigation-stopped")
+end
+
+function CW.cancelTravel()
+    CW.cancelRoomRefreshTimer()
+    if CW.captureInFlight then
+        CW.captureSerial = (tonumber(CW.captureSerial) or 0) + 1
+        CW.captureInFlight = nil
+        CW.suppressConsiderLines = true
+    end
+    CW.abortCapture()
+    CW.travelActive = false
+    CW.refreshDirty = false
+    CW.forceRefreshPending = false
+    CW.combatSessionActive = false
+    CW.combatRefreshQueued = false
 end
 
 function CW.isCurrentRoomSafe()
@@ -360,12 +761,35 @@ function CW.killCommandFor(index)
     return string.format("%s %s", base, kw)
 end
 
+function CW.noteAttackIntent(mob, source)
+    if type(mob) ~= "table" then return nil end
+    local name = normalizeMobName(mob.name)
+    if name == "" then return nil end
+    CW.pendingAttackIntent = {
+        rowId = mob.id,
+        name = name,
+        roomId = currentRoomId(),
+        createdAt = os.clock(),
+        source = tostring(source or "attack"),
+    }
+    return CW.pendingAttackIntent
+end
+
+function CW.noteEscapeIntent(command)
+    CW.pendingEscapeIntent = {
+        command = tostring(command or ""),
+        roomId = currentRoomId(),
+        createdAt = os.clock(),
+    }
+end
+
 function CW.attack(index)
     local cmd = CW.killCommandFor(tonumber(index))
     if not cmd then return end
     local m = CW.mobs[tonumber(index)]
     if m then
         CW.currentEnemyMobId = m.id
+        CW.noteAttackIntent(m, "conwin")
     end
     send(cmd, false)
 end
@@ -410,14 +834,21 @@ function CW.noteAttackByKeyword(keyword, dupIndex)
     local m = CW.selectMobForKeyword(keyword, dupIndex)
     if m then
         CW.currentEnemyMobId = m.id
+        CW.noteAttackIntent(m, "outgoing-command")
         CW.render()
     end
+    return m
 end
 
 function CW.trackAttackCommand(command)
     local raw = trim(command)
     if raw == "" then return end
     local lowered = raw:lower()
+    local verb = lowered:match("^(%S+)") or ""
+    if verb == "flee" or verb == "retreat" then
+        CW.noteEscapeIntent(raw)
+        return
+    end
 
     if lowered == "xkill" then
         local t = snd.targets and snd.targets.current
@@ -476,12 +907,14 @@ function CW.onDataSendRequest(...)
     for i = 1, argc do
         local arg = select(i, ...)
         if type(arg) == "string" then
+            if trim(arg):lower() == "consider all" then CW.suppressConsiderLines = false end
             CW.trackAttackCommand(arg)
             return
         end
         if type(arg) == "table" then
             local maybeCmd = arg.command or arg.cmd or arg.line
             if type(maybeCmd) == "string" then
+                if trim(maybeCmd):lower() == "consider all" then CW.suppressConsiderLines = false end
                 CW.trackAttackCommand(maybeCmd)
                 return
             end
@@ -520,13 +953,23 @@ function CW.render()
     local c = CW.ui.console
     c:clear()
     c:setFontSize(cfg().fontSize)
+    local rawActiveEnemy = trim(CW.getActiveEnemyName())
+    local activeEnemy = normalizeMobName(rawActiveEnemy)
+    local liveCombat = currentPlayerState() == "8" and activeEnemy ~= ""
+    local enemyPct = clamp(gmcp_get("char.status.enemypct") or 100, 0, 100)
     if #CW.mobs == 0 then
-        c:cecho("<dim_gray>(no mobs)\n")
+        if liveCombat then
+            c:cecho(string.format(
+                "<white>[combat] %s %3d%%<reset>\n",
+                rawActiveEnemy ~= "" and rawActiveEnemy or activeEnemy,
+                enemyPct
+            ))
+        else
+            c:cecho("<dim_gray>(no mobs)\n")
+        end
         return
     end
     CW.reindexDuplicates()
-    local activeEnemy = normalizeMobName(CW.getActiveEnemyName())
-    local enemyPct = clamp(gmcp_get("char.status.enemypct") or 100, 0, 100)
     local strictFocus = cfg().strictFocusIdOnly and true or false
     local matchingEnemyCount = 0
     if activeEnemy ~= "" then
@@ -540,6 +983,14 @@ function CW.render()
         end
     end
     local hideAmbiguousEnemy = strictFocus and activeEnemy ~= "" and matchingEnemyCount > 1 and not CW.currentEnemyMobId
+
+    if liveCombat and matchingEnemyCount == 0 then
+        c:cecho(string.format(
+            "<white>[combat] %s %3d%% <dim_gray>(not in considered list)<reset>\n",
+            rawActiveEnemy ~= "" and rawActiveEnemy or activeEnemy,
+            enemyPct
+        ))
+    end
 
     for i, m in ipairs(CW.mobs) do
         local marker = CW.activityMarkersForMob(m.name)
@@ -605,12 +1056,14 @@ end
 
 function CW.startCapture()
     CW.awaiting = true
-    CW.clear("start")
+    CW.resetConsideredMobs(false)
+    CW.render()
 end
 
 function CW.finishCapture()
     CW.awaiting = false
     if CW.doneTimer then killTimer(CW.doneTimer) CW.doneTimer = nil end
+    CW.killsSinceRefresh = 0
     CW.render()
     CW.resolveCurrentRoomTargetForNxAction()
 end
@@ -644,16 +1097,36 @@ function CW.considerLine(name, color, range, prefixHint)
         return text, tag
     end
 
-    if not CW.awaiting then
+    local flight = CW.captureInFlight
+    if CW.suppressConsiderLines and not flight then return end
+    if flight and (flight.failed or flight.cancelled) then return end
+    if flight then
+        CW.noteCaptureRoom()
+        CW.awaiting = true
+    elseif not CW.awaiting then
         CW.startCapture()
     end
     local mobName, alignTag = splitPrefixAndName(name)
     if not alignTag then
         alignTag = parseAlignTag(prefixHint)
     end
-    CW.addMob(mobName, color, range)
-    if #CW.mobs > 0 and alignTag then
-        CW.mobs[#CW.mobs].alignTag = alignTag
+    if flight then
+        if mobName ~= "" then
+            CW.nextMobId = CW.nextMobId + 1
+            flight.mobs[#flight.mobs + 1] = {
+                id = CW.nextMobId,
+                name = mobName,
+                color = color or "white",
+                range = range or "?",
+                dead = false,
+                alignTag = alignTag,
+            }
+        end
+    else
+        CW.addMob(mobName, color, range)
+        if #CW.mobs > 0 and alignTag then
+            CW.mobs[#CW.mobs].alignTag = alignTag
+        end
     end
     if mobName ~= "" and snd.db and snd.room and snd.room.current and snd.room.current.rmid then
         snd.db.recordMobSeen(
@@ -663,29 +1136,285 @@ function CW.considerLine(name, color, range, prefixHint)
             snd.room.current.arid
         )
     end
-    CW.deferFinish()
+    if not flight then
+        CW.deferFinish()
+    end
 end
 
 function CW.refresh(source)
     if not cfg().enabled then return end
-    if CW.awaiting then return end
-    if CW.shouldClearForSafeRoom() then
-        CW.clear("safe")
-        return
-    end
     source = tostring(source or "manual")
-    if source == "auto" then
+    local delay = source == "manual" and 0 or CW.ROOM_REFRESH_DELAY
+    return CW.requestRefresh(source, true, delay)
+end
+
+local function requestRepopulateRefresh()
+    local requested = CW.refresh("repopulate")
+    if requested then
+        -- A combat-issued stop may leave a stale mapper destination. Only the
+        -- threshold-approved refresh should bypass that stale destination.
+        CW.combatSessionActive = true
+        CW.combatRefreshQueued = true
+    end
+    return requested
+end
+
+local function aliveRowsByName(name)
+    local needle = normalizeMobName(name)
+    local rows = {}
+    if needle == "" then return rows end
+    for _, mob in ipairs(CW.mobs or {}) do
+        if not mob.dead and normalizeMobName(mob.name) == needle then
+            rows[#rows + 1] = mob
+        end
+    end
+    return rows
+end
+
+local function aliveRowById(rowId, expectedName)
+    if rowId == nil then return nil end
+    local needle = normalizeMobName(expectedName)
+    for _, mob in ipairs(CW.mobs or {}) do
+        if tostring(mob.id) == tostring(rowId) and not mob.dead
+                and (needle == "" or normalizeMobName(mob.name) == needle) then
+            return mob
+        end
+    end
+    return nil
+end
+
+function CW.getRecentAttackIntent(enemyName)
+    local intent = CW.pendingAttackIntent
+    if type(intent) ~= "table" then return nil end
+    local age = os.clock() - (tonumber(intent.createdAt) or 0)
+    if age < 0 or age > CW.ATTACK_INTENT_TTL then
+        CW.pendingAttackIntent = nil
+        return nil
+    end
+    if intent.roomId ~= "" and tostring(intent.roomId) ~= currentRoomId() then
+        CW.pendingAttackIntent = nil
+        return nil
+    end
+    if normalizeMobName(intent.name) ~= normalizeMobName(enemyName) then
+        return nil
+    end
+    return intent
+end
+
+function CW.hasRecentEscapeIntent()
+    local intent = CW.pendingEscapeIntent
+    if type(intent) ~= "table" then return false end
+    local age = os.clock() - (tonumber(intent.createdAt) or 0)
+    if age < 0 or age > CW.ESCAPE_INTENT_TTL then
+        CW.pendingEscapeIntent = nil
+        return false
+    end
+    if intent.roomId ~= "" and tostring(intent.roomId) ~= currentRoomId() then
+        return false
+    end
+    return true
+end
+
+function CW.bindCombatEnemy(enemyName, enemyPct, preferredRowId)
+    local normalizedName = normalizeMobName(enemyName)
+    if normalizedName == "" then return nil end
+
+    local row = aliveRowById(preferredRowId, normalizedName)
+    local candidates = aliveRowsByName(normalizedName)
+    if not row and (#candidates == 1 or not cfg().strictFocusIdOnly) then
+        row = candidates[1]
+    end
+
+    local hp = tonumber(enemyPct)
+    if hp ~= nil then hp = clamp(hp, 0, 100) end
+    local combat = CW.combat
+    combat.generation = (tonumber(combat.generation) or 0) + 1
+    combat.activeRowId = row and row.id or nil
+    combat.activeName = normalizedName
+    combat.lastHp = hp
+    combat.minimumHp = hp
+    combat.roomId = currentRoomId()
+    CW.currentEnemyMobId = combat.activeRowId
+    CW.lastTrackedMobId = combat.activeRowId
+    CW.lastKnownEnemyPct = hp
+    return row
+end
+
+function CW.recordDeathEvent(name, rowId, cause, hpBefore)
+    local normalizedName = normalizeMobName(name)
+    if normalizedName == "" then return nil end
+    CW.deathEventSerial = (tonumber(CW.deathEventSerial) or 0) + 1
+    local event = {
+        serial = CW.deathEventSerial,
+        name = normalizedName,
+        rowId = rowId,
+        cause = tostring(cause or "combat-transition"),
+        hpBefore = tonumber(hpBefore),
+        roomId = currentRoomId(),
+        at = os.time(),
+        clock = os.clock(),
+    }
+    CW.deathEvents[#CW.deathEvents + 1] = event
+    while #CW.deathEvents > 16 do
+        table.remove(CW.deathEvents, 1)
+    end
+    CW.lastKilledMobName = normalizedName
+    CW.lastKilledAt = event.at
+    return event
+end
+
+function CW.markCombatEnemyDead(rowId, enemyName, cause, hpBefore)
+    local normalizedName = normalizeMobName(enemyName)
+    if normalizedName == "" then return false end
+
+    local row = aliveRowById(rowId, normalizedName)
+    local candidates = aliveRowsByName(normalizedName)
+    if not row and (#candidates == 1 or not cfg().strictFocusIdOnly) then
+        row = candidates[1]
+    end
+    if row and row.dead then return false end
+
+    local recordedName = row and trim(row.name) or normalizedName
+    if row then row.dead = true end
+    CW.killsSinceRefresh = (tonumber(CW.killsSinceRefresh) or 0) + 1
+    CW.recordDeathEvent(recordedName, row and row.id or nil, cause, hpBefore)
+
+    if recordedName ~= "" and snd.db and snd.room and snd.room.current and snd.room.current.rmid then
+        snd.db.recordMobKill(
+            recordedName,
+            snd.room.current.rmid,
+            snd.room.current.name,
+            snd.room.current.arid
+        )
+    end
+
+    CW.render()
+    local threshold = math.max(0, math.floor(tonumber(cfg().repopulate) or 0))
+    if threshold > 0 and CW.killsSinceRefresh >= threshold
+            and cfg().enabled and tostring(cfg().mode or "consider"):lower() == "consider" then
+        requestRepopulateRefresh()
+    end
+    return true
+end
+
+function CW.scheduleCombatEnd()
+    local combat = CW.combat
+    if combat.activeName == "" or combat.pendingEndTimer then return false end
+
+    combat.pendingEndSerial = (tonumber(combat.pendingEndSerial) or 0) + 1
+    local serial = combat.pendingEndSerial
+    local pending = {
+        rowId = combat.activeRowId,
+        name = combat.activeName,
+        hp = combat.lastHp,
+        roomId = combat.roomId ~= "" and combat.roomId or currentRoomId(),
+    }
+    combat.pendingEndTimer = tempTimer(CW.COMBAT_END_DELAY, function()
+        if serial ~= tonumber(CW.combat.pendingEndSerial) then return end
+        CW.combat.pendingEndTimer = nil
+
         local roomId = currentRoomId()
-        local now = os.time()
-        if roomId ~= "" and CW.lastAutoRoomId == roomId and (now - (CW.lastAutoConsiderAt or 0)) < 15 then
+        if roomId == "" or tostring(roomId) ~= tostring(pending.roomId) then
+            CW.clear("combat-ended-after-movement")
             return
         end
-        CW.lastAutoRoomId = roomId
-        CW.lastAutoConsiderAt = now
+
+        local state = currentPlayerState()
+        local activeEnemy = normalizeMobName(CW.getActiveEnemyName())
+        if state == "8" and activeEnemy ~= "" then
+            local hp = tonumber(gmcp_get("char.status.enemypct"))
+            CW.observeCombatStatus(state, activeEnemy, hp)
+            return
+        end
+
+        if CW.hasRecentEscapeIntent() then
+            CW.releaseCombatBinding()
+            CW.render()
+            return
+        end
+
+        if state == "3" and activeEnemy == "" then
+            CW.markCombatEnemyDead(pending.rowId, pending.name, "combat-ended", pending.hp)
+        end
+        CW.releaseCombatBinding()
+        CW.render()
+    end)
+    return true
+end
+
+function CW.confirmPendingCombatDeath(cause)
+    local combat = CW.combat
+    if not combat.pendingEndTimer or combat.activeName == "" then return "" end
+    local rowId = combat.activeRowId
+    local name = combat.activeName
+    local hp = combat.lastHp
+    CW.cancelPendingCombatEnd()
+    CW.markCombatEnemyDead(rowId, name, cause or "kill-message", hp)
+    CW.releaseCombatBinding()
+    CW.render()
+    return name
+end
+
+function CW.observeCombatStatus(playerState, enemyName, enemyPct)
+    local state = tostring(playerState or "")
+    local normalizedName = normalizeMobName(enemyName)
+    local combatNow = state == "8" and normalizedName ~= ""
+    local combat = CW.combat
+
+    if not combatNow then
+        if combat.activeName ~= "" then
+            CW.scheduleCombatEnd()
+        end
+        return false
     end
-    CW.startCapture()
-    send("consider all", false)
-    send("echo " .. CW.MARKER, false)
+
+    CW.cancelPendingCombatEnd()
+    local hp = tonumber(enemyPct)
+    if hp ~= nil then hp = clamp(hp, 0, 100) end
+    local intent = CW.getRecentAttackIntent(normalizedName)
+
+    if combat.activeName == "" then
+        CW.bindCombatEnemy(normalizedName, hp, intent and intent.rowId or nil)
+    elseif combat.activeName ~= normalizedName then
+        local previousRowId = combat.activeRowId
+        local previousName = combat.activeName
+        local previousHp = combat.lastHp
+        if not intent then
+            CW.markCombatEnemyDead(previousRowId, previousName, "target-changed", previousHp)
+        end
+        CW.bindCombatEnemy(normalizedName, hp, intent and intent.rowId or nil)
+    else
+        local manualSameNameSwitch = intent and intent.rowId ~= nil
+            and tostring(intent.rowId) ~= tostring(combat.activeRowId)
+        if manualSameNameSwitch then
+            CW.bindCombatEnemy(normalizedName, hp, intent.rowId)
+        else
+            local lastHp = tonumber(combat.lastHp)
+            local minimumHp = tonumber(combat.minimumHp)
+            local hasAnotherCopy = combat.activeRowId ~= nil
+                and countAliveByNormalizedName(normalizedName) > 1
+            local resetDetected = hp ~= nil and lastHp ~= nil and minimumHp ~= nil
+                and hasAnotherCopy
+                and minimumHp <= CW.SAME_NAME_RESET_MAX_LOW
+                and (hp - lastHp) >= CW.SAME_NAME_RESET_MIN_JUMP
+            if resetDetected then
+                local previousRowId = combat.activeRowId
+                CW.markCombatEnemyDead(previousRowId, normalizedName, "same-name-hp-reset", lastHp)
+                CW.bindCombatEnemy(normalizedName, hp, nil)
+            else
+                if hp ~= nil then
+                    combat.lastHp = hp
+                    combat.minimumHp = minimumHp and math.min(minimumHp, hp) or hp
+                    CW.lastKnownEnemyPct = hp
+                end
+            end
+        end
+    end
+
+    if intent then CW.pendingAttackIntent = nil end
+    CW.pendingEscapeIntent = nil
+    CW.render()
+    return true
 end
 
 function CW.onRoomInfo()
@@ -693,31 +1422,38 @@ function CW.onRoomInfo()
     local moved = false
     if roomId ~= "" and CW.lastRoomId and roomId ~= CW.lastRoomId then
         moved = true
-        CW.clear("room-changed")
     end
     if roomId ~= "" then
         if not CW.lastRoomId then moved = true end
         CW.lastRoomId = roomId
     end
 
-    if not moved or not cfg().enabled then return end
-    local mode = tostring(cfg().mode or "consider"):lower()
-    if mode ~= "consider" then return end
-
-    if CW.isCurrentRoomSafe() then
-        CW.clear("safe-room")
-        return
+    if moved then
+        CW.latestRoomId = roomId
+        CW.onTravelStarted("room-changed")
+        -- Debounce rapid Room.Info bursts. The callback still requires GMCP
+        -- state 3 and no mapper continuation before it may send anything.
+        CW.requestRefresh("room-arrived", false)
     end
-
-    CW.refresh("auto")
 end
 
 function CW.onRoomcharsEnd()
     if not cfg().clearOnEmptyRoomchars then return end
-    -- If roomchars stream ended and no mobs were parsed for this room, clear stale entries.
+    -- RoomChars may clear stale considered rows, but never contributes rows.
     if CW.awaiting and #CW.mobs == 0 then
         CW.clear("empty-roomchars")
     end
+end
+
+function CW.onEmptyConsiderResult()
+    if CW.suppressConsiderLines and not CW.captureInFlight then return end
+    if CW.captureInFlight then
+        if CW.captureInFlight.failed or CW.captureInFlight.cancelled then return end
+        CW.noteCaptureRoom()
+        CW.captureInFlight.mobs = {}
+        return
+    end
+    CW.clear("empty")
 end
 
 function CW.createWindow()
@@ -756,134 +1492,69 @@ function CW.createWindow()
 end
 
 function CW.onCharStatus()
-    local prevEnemy = normalizeMobName(CW.lastEnemy or "")
-    local prevRawEnemy = trim(CW.lastRawEnemy or "")
+    local playerState = currentPlayerState()
+    local previousPlayerState = CW.lastPlayerState
     local rawEnemyNow = CW.getActiveEnemyName()
     local enemyNow = normalizeMobName(rawEnemyNow)
-    local hadEnemy = prevEnemy ~= ""
-    local hasEnemy = enemyNow ~= ""
+    local combatNow = playerState == "8" or enemyNow ~= ""
+    CW.lastPlayerState = playerState
 
-    if hadEnemy and not hasEnemy then
-        local prevKnownEnemyPct = CW.lastKnownEnemyPct
-        local matched = false
-        local killedMobName = ""
-        local strictFocus = cfg().strictFocusIdOnly and true or false
-        local ambiguousPrevEnemy = strictFocus and not CW.currentEnemyMobId and countAliveByNormalizedName(prevEnemy) > 1
-        if CW.currentEnemyMobId then
-            for _, m in ipairs(CW.mobs) do
-                if m.id == CW.currentEnemyMobId and not m.dead then
-                    m.dead = true
-                    killedMobName = m.name or ""
-                    matched = true
-                    break
-                end
+    if combatNow then
+        if not CW.combatSessionActive then
+            CW.combatSessionActive = true
+            CW.combatRefreshQueued = false
+        end
+        CW.cancelRoomRefreshTimer()
+        if CW.captureInFlight then
+            CW.captureInFlight.failed = true
+        end
+    elseif playerState == "12" then
+        CW.onTravelStarted("running")
+    elseif playerState == "3" then
+        if CW.combatSessionActive and CW.combatRefreshQueued then
+            -- The timer may have fired while combat still made the refresh
+            -- ineligible, or a later combat packet may have cancelled it.
+            if not CW.captureInFlight and not CW.roomRefreshTimer and CW.hasPendingRefresh() then
+                CW.armRoomRefresh()
             end
-        end
-        if not matched and not ambiguousPrevEnemy then
-            for _, m in ipairs(CW.mobs) do
-                if not m.dead and normalizeMobName(m.name) == prevEnemy then
-                    m.dead = true
-                    killedMobName = m.name or ""
-                    matched = true
-                    break
-                end
-            end
-        end
-        CW.currentEnemyMobId = nil
-        CW.lastKnownEnemyPct = nil
-        if matched then
-            CW.lastKilledMobName = normalizeMobName(killedMobName)
-            CW.lastKilledAt = os.time()
-            CW.killsSinceRefresh = (tonumber(CW.killsSinceRefresh) or 0) + 1
-        end
-
-        if matched then
-            local mobToRecord = trim(killedMobName)
-            if mobToRecord == "" then
-                mobToRecord = trim(CW.lastEnemy or "")
-            end
-            if mobToRecord ~= "" and snd.db and snd.room and snd.room.current and snd.room.current.rmid then
-                snd.db.recordMobKill(
-                    mobToRecord,
-                    snd.room.current.rmid,
-                    snd.room.current.name,
-                    snd.room.current.arid
-                )
-            end
-        end
-
-        if not matched and #CW.mobs == 0 and prevRawEnemy ~= ""
-                and prevKnownEnemyPct == 0 then
-            CW.lastKilledMobName = prevRawEnemy
-            CW.lastKilledAt = os.time()
-        end
-
-        local threshold = math.max(0, math.floor(tonumber(cfg().repopulate) or 0))
-        if matched and threshold > 0 and CW.killsSinceRefresh >= threshold and cfg().enabled and tostring(cfg().mode or "consider"):lower() == "consider" then
-            CW.refresh("auto")
+        elseif CW.combatSessionActive and CW.hasPendingRefresh() then
+            CW.combatRefreshQueued = CW.requestRefresh("post-combat-retry", false) == true
         else
-            CW.render()
-        end
-    else
-        local phantomKill = false
-        if CW.currentEnemyMobId ~= CW.lastTrackedMobId then
-            CW.lastKnownEnemyPct = nil
-        end
-        if hasEnemy then
-            local enemyPct = clamp(gmcp_get("char.status.enemypct") or 100, 0, 100)
-            if CW.currentEnemyMobId and prevEnemy == enemyNow
-                    and CW.lastKnownEnemyPct and CW.lastKnownEnemyPct < 30
-                    and enemyPct > CW.lastKnownEnemyPct + 50
-                    and countAliveByNormalizedName(enemyNow) > 1 then
-                for _, m in ipairs(CW.mobs) do
-                    if m.id == CW.currentEnemyMobId and not m.dead and normalizeMobName(m.name) == enemyNow then
-                        m.dead = true
-                        CW.killsSinceRefresh = (tonumber(CW.killsSinceRefresh) or 0) + 1
-                        phantomKill = true
-                        local killedName = trim(m.name or "")
-                        if killedName ~= "" and snd.db and snd.room and snd.room.current and snd.room.current.rmid then
-                            snd.db.recordMobKill(killedName, snd.room.current.rmid, snd.room.current.name, snd.room.current.arid)
-                        end
-                        break
-                    end
-                end
-                if phantomKill then
-                    CW.currentEnemyMobId = nil
-                end
-            end
-            CW.lastKnownEnemyPct = enemyPct
-            if not CW.currentEnemyMobId then
-                local strictFocus = cfg().strictFocusIdOnly and true or false
-                local aliveMatches = countAliveByNormalizedName(enemyNow)
-                if not (strictFocus and aliveMatches > 1) then
-                    for _, m in ipairs(CW.mobs) do
-                        if not m.dead and normalizeMobName(m.name) == enemyNow then
-                            CW.currentEnemyMobId = m.id
-                            break
-                        end
-                    end
-                end
-            end
-        else
-            CW.lastKnownEnemyPct = nil
-        end
-        local threshold = math.max(0, math.floor(tonumber(cfg().repopulate) or 0))
-        if phantomKill and threshold > 0 and CW.killsSinceRefresh >= threshold and cfg().enabled and tostring(cfg().mode or "consider"):lower() == "consider" then
-            CW.refresh("auto")
-        else
-            CW.render()
+            -- Ordinary combat completion is handled by the kill counter below.
+            -- Do not refresh here or the configured repopulate threshold is bypassed.
+            CW.combatSessionActive = false
+            CW.combatRefreshQueued = false
+            CW.maybeRefreshStoppedRoom(previousPlayerState == "8" and "post-combat-ready" or "player-ready")
         end
     end
+
+    local enemyPct = tonumber(gmcp_get("char.status.enemypct"))
+    CW.observeCombatStatus(playerState, rawEnemyNow, enemyPct)
     CW.lastEnemy = enemyNow
     CW.lastRawEnemy = rawEnemyNow
     CW.lastTrackedMobId = CW.currentEnemyMobId
 end
 
 function CW.getRecentKilledMobName(maxAgeSeconds)
-    local killedName = trim(CW.lastKilledMobName or "")
-    if killedName == "" then return "" end
     local ttl = tonumber(maxAgeSeconds) or 3
     if ttl < 0 then ttl = 0 end
+
+    local nowClock = os.clock()
+    for i = #CW.deathEvents, 1, -1 do
+        local event = CW.deathEvents[i]
+        local age = nowClock - (tonumber(event.clock) or nowClock)
+        if age < 0 or age > ttl then
+            table.remove(CW.deathEvents, i)
+        end
+    end
+    local event = CW.deathEvents[1]
+    if event then
+        CW.lastReturnedDeathSerial = event.serial
+        return trim(event.name or "")
+    end
+
+    local killedName = trim(CW.lastKilledMobName or "")
+    if killedName == "" then return "" end
     local killedAt = tonumber(CW.lastKilledAt) or 0
     if killedAt <= 0 then return "" end
     if (os.time() - killedAt) > ttl then return "" end
@@ -891,17 +1562,33 @@ function CW.getRecentKilledMobName(maxAgeSeconds)
 end
 
 function CW.clearRecentKilledMobName()
-    CW.lastKilledMobName = ""
-    CW.lastKilledAt = 0
+    local returnedSerial = CW.lastReturnedDeathSerial
+    if returnedSerial ~= nil then
+        for i, event in ipairs(CW.deathEvents) do
+            if tostring(event.serial) == tostring(returnedSerial) then
+                table.remove(CW.deathEvents, i)
+                break
+            end
+        end
+    end
+    CW.lastReturnedDeathSerial = nil
+
+    local newest = CW.deathEvents[#CW.deathEvents]
+    if newest then
+        CW.lastKilledMobName = newest.name or ""
+        CW.lastKilledAt = newest.at or 0
+    else
+        CW.lastKilledMobName = ""
+        CW.lastKilledAt = 0
+    end
 end
 
 function CW.getCurrentCombatMobName()
-    -- Require live GMCP enemy name in all paths: currentEnemyMobId is only set when nil
-    -- (see onCharStatus), so it can be stale if the player switched targets without a kill.
-    -- Gating on activeEnemy ensures we never return a mob that disagrees with GMCP.
+    -- A target is authoritative only while GMCP also says the player is fighting.
+    if currentPlayerState() ~= "8" then return "" end
     local activeEnemy = normalizeMobName(CW.getActiveEnemyName())
     if activeEnemy == "" then return "" end
-    -- ID match is preferred for precision, but only when ID mob name agrees with GMCP
+    -- ID match is preferred for precision, but only when it agrees with GMCP.
     if CW.currentEnemyMobId then
         for _, m in ipairs(CW.mobs) do
             if m.id == CW.currentEnemyMobId and not m.dead and normalizeMobName(m.name) == activeEnemy then
@@ -915,10 +1602,9 @@ function CW.getCurrentCombatMobName()
             return activeEnemy
         end
     end
-    if #CW.mobs == 0 then
-        return activeEnemy
-    end
-    return ""
+    -- GMCP remains authoritative even when an aggressive joiner was not part
+    -- of the last consider snapshot; the UI shows it as a combat-only row.
+    return activeEnemy
 end
 
 function CW.onPrompt()
@@ -1052,9 +1738,16 @@ function CW.install()
         end)
     end
 
-    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^" .. CW.MARKER .. "$", function() deleteLine(); CW.finishCapture() end)
-    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^nhm$", function() deleteLine(); CW.finishCapture() end)
-    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^You see no one here but yourself!$", function() CW.clear("empty") end)
+    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^" .. CW.MARKER .. ":(\\d+)$", function()
+        deleteLine()
+        CW.onCaptureMarker(matches[2])
+    end)
+    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^nhm$", function()
+        deleteLine()
+        if not CW.captureInFlight then CW.finishCapture() end
+    end)
+    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^You see no one here but yourself!$", "snd.conwin.onEmptyConsiderResult")
+    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^Not while you are fighting!$", "snd.conwin.onConsiderRejected")
     -- TODO: do repop/sense life in the future.
 
     for _, id in ipairs(CW.ids.events) do pcall(killAnonymousEventHandler, id) end

@@ -2320,8 +2320,8 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
         firstStep.travelType = "portal"
     elseif foundFrom == "**" then
         firstStep.travelType = "recall"
-        -- A ** edge exists only because this recall/home command has a recorded
-        -- landing UID. Its suffix can therefore be queued without a GMCP pause.
+        -- Preserve the recorded landing metadata used by configured routes.
+        -- Execution still requires live GMCP confirmation before the suffix.
         firstStep.trustedLanding = true
     end
     table.insert(path, firstStep)
@@ -3600,24 +3600,21 @@ function snd.mapper.executePath(path, opts)
             currentGroup.trustedSource = true
         end
 
-        -- Registered recall/portal edges also carry a known destination UID.
-        -- Only an unknown landing needs a GMCP destination barrier.
+        -- A registered recall/portal edge tells us where the jump should land,
+        -- not whether the MUD accepted it. Hold every suffix until live GMCP
+        -- confirms the expected room; a blocked-travel trigger invalidates the
+        -- execution serial and prevents that suffix from ever being released.
         if isTravelStep then
             flushCardinals()
             if #currentGroup.commands > 0 then
                 table.insert(groups, currentGroup)
             end
-            local landingIsTrusted = step.trustedLanding == true or hasKnownLanding
-            local destinationExecuteRoom = tostring(simulatedRoom or "-1")
-            if landingIsTrusted then
-                destinationExecuteRoom = nil
-            end
             currentGroup = {
                 commands = {},
                 delayAfter = 0,
                 waitRoomId = nil,
-                executeRoomId = destinationExecuteRoom,
-                trustedSource = landingIsTrusted,
+                executeRoomId = tostring(simulatedRoom or "-1"),
+                trustedSource = false,
             }
         end
 	end

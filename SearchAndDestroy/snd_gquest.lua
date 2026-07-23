@@ -553,6 +553,9 @@ function snd.gq.onMobKilled()
             t.remaining = math.max(0, (t.remaining or 1) - 1)
             if t.remaining == 0 then
                 t.dead = true
+                if t.mob == snd.targets.current.name then
+                    snd.clearTarget()
+                end
             end
         end
     end

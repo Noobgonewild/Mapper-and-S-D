@@ -71,6 +71,30 @@ function mm.get_room_area_info()
   return nil
 end
 
+function mm.get_area_display_name(info)
+  info = type(info) == "table" and info or (mm.get_room_info() or {})
+  local area_id = tostring(info.zone or info.area or "")
+  local area_info = mm.get_room_area_info()
+
+  if type(area_info) == "table" then
+    local packet_id = tostring(area_info.id or area_info.uid or "")
+    local packet_name = tostring(area_info.name or area_info.title or "")
+    if packet_name ~= "" and
+        (area_id == "" or packet_id == "" or packet_id == area_id) then
+      return packet_name
+    end
+  end
+
+  if mm.area_references and type(mm.area_references.get) == "function" then
+    local reference = mm.area_references.get(area_id)
+    if reference and tostring(reference.name or "") ~= "" then
+      return tostring(reference.name)
+    end
+  end
+
+  return area_id
+end
+
 function mm.get_room_sectors_packet()
   local packet = mm.get_room_packet()
   if packet and type(packet.sectors) == "table" then
@@ -445,7 +469,7 @@ function mm.on_room_info()
   local center_room = native_mode and
     (tonumber(mm.runtime and mm.runtime.last_player_room) or tonumber(info.num)) or room_id
   local room_name = tostring(info.name or "")
-  local area_name = tostring(info.zone or info.area or "")
+  local area_name = mm.get_area_display_name(info)
   if mm.minimap and mm.minimap.set_room_title then
     mm.minimap.set_room_title(room_name, room_id, area_name)
   end
@@ -598,7 +622,7 @@ function mm.on_map_end()
     local info = mm.get_room_info() or {}
     mm.runtime.last_ascii_room_num = tostring(info.num or "")
     if mm.minimap and mm.minimap.set_room_title then
-      mm.minimap.set_room_title(room_name, info.num, info.zone or info.area)
+      mm.minimap.set_room_title(room_name, info.num, mm.get_area_display_name(info))
     end
     if local_bigmap_active() and mm.minimap and mm.minimap.update_local_map then
       mm.minimap.update_local_map(info.num)
@@ -615,7 +639,7 @@ function mm.on_room_vnum_line()
   if not vnum then return end
 
   if mm.minimap and mm.minimap.set_room_title and rname ~= "" then
-    mm.minimap.set_room_title(rname, vnum, mm.runtime and mm.runtime.last_zone)
+    mm.minimap.set_room_title(rname, vnum, mm.get_area_display_name())
   end
 
   if local_bigmap_active() then
@@ -725,6 +749,12 @@ function mm.on_room_area_event()
     if not ok then
       mm.debug("gmcp.room.area persist skipped/failed: " .. tostring(err))
     end
+  end
+
+  local info = mm.get_room_info() or {}
+  local room_name = tostring(info.name or (mm.runtime and mm.runtime.last_room_name) or "")
+  if room_name ~= "" and mm.minimap and mm.minimap.set_room_title then
+    mm.minimap.set_room_title(room_name, info.num, mm.get_area_display_name(info))
   end
 end
 

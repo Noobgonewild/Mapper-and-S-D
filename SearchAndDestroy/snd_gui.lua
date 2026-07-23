@@ -1440,8 +1440,16 @@ function snd.gui.onButtonClick(btnId, _, button)
         if snd.commands and snd.commands.xkill then
             snd.commands.xkill()
         end
+    elseif cmd == "xcp" then
+        if snd.commands and snd.commands.selectFirstTarget then
+            local activeTab = snd.getActiveTab and snd.getActiveTab() or nil
+            snd.commands.selectFirstTarget(activeTab)
+        end
     else
-        expandAlias(cmd, false)
+        if not (snd.commands and snd.commands.dispatchLocalCommand
+            and snd.commands.dispatchLocalCommand(cmd)) then
+            snd.utils.errorNote("Unhandled S&D button command: " .. tostring(cmd))
+        end
     end
 end
 
@@ -1660,7 +1668,7 @@ function snd.gui.showContextMenu()
         cecho(string.format("\n<green>Debug mode: %s\n", snd.config.debugMode and "ON" or "OFF"))
     end, "Toggle debug mode", true)
     cecho("  ")
-    cechoLink("<cyan> [Help]", function() expandAlias("xhelp", false) end, "Show help", true)
+    cechoLink("<cyan> [Help]", function() snd.commands.xhelp("") end, "Show help", true)
     cecho("\n")
 
     cecho("<DimGray>" .. divider .. "\n")
