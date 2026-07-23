@@ -605,7 +605,14 @@ end
 function snd.scan.targetIsAlive(target)
     if not target then return false end
     if target.dead or target.killed then return false end
-    if tostring(target.status or ""):lower() == "dead" then return false end
+    local status = tostring(target.status or ""):lower()
+    if status == "dead" or status == "killed" then return false end
+    if tostring(target.activity or ""):lower() == "quest" then
+        local questStatus = tostring(
+            snd.quest and snd.quest.target and snd.quest.target.status or ""
+        ):lower()
+        if questStatus == "dead" or questStatus == "killed" then return false end
+    end
     if target.remaining ~= nil and tonumber(target.remaining) == 0 then return false end
     return true
 end

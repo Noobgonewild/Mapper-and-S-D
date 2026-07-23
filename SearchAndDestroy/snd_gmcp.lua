@@ -515,6 +515,44 @@ function snd.gmcp.removeQuestFromTargetList()
     end
 end
 
+--- Mark every cached representation of the current quest target as killed.
+-- Current/scoped targets are copies of the list row, so updating only the list
+-- can leave mobdetect and xkill holding an apparently live quest target.
+function snd.gmcp.markQuestTargetKilled()
+    local canonical = snd.quest and snd.quest.target or nil
+    if canonical then
+        canonical.dead = true
+        canonical.killed = true
+        canonical.status = "killed"
+        canonical.remaining = 0
+    end
+
+    for _, target in ipairs(snd.targets.list) do
+        if target.activity == "quest" then
+            target.dead = true
+            target.killed = true
+            target.status = "killed"
+            target.remaining = 0
+        end
+    end
+
+    local current = snd.targets.current
+    if current and current.activity == "quest" then
+        current.dead = true
+        current.killed = true
+        current.status = "killed"
+        current.remaining = 0
+    end
+
+    local scoped = snd.targets.scoped and snd.targets.scoped.quest or nil
+    if scoped then
+        scoped.dead = true
+        scoped.killed = true
+        scoped.status = "killed"
+        scoped.remaining = 0
+    end
+end
+
 --- Quest target killed
 function snd.gmcp.onQuestKilled(q)
     snd.quest.available = false
@@ -522,12 +560,7 @@ function snd.gmcp.onQuestKilled(q)
     snd.quest.target.status = "killed"
     snd.quest.timer = tonumber(q.time) or 0
     
-    -- Mark quest target as dead in target list
-    for _, target in ipairs(snd.targets.list) do
-        if target.activity == "quest" then
-            target.dead = true
-        end
-    end
+    snd.gmcp.markQuestTargetKilled()
     
     snd.utils.infoNote("Quest target killed!")
 
@@ -811,12 +844,7 @@ function snd.gmcp.onQuestStatus(q)
         snd.quest.target.status = "killed"
         snd.quest.timer = tonumber(q.time) or 0
         snd.quest.setCooldown(0)
-        -- Mark as dead in list
-        for _, target in ipairs(snd.targets.list) do
-            if target.activity == "quest" then
-                target.dead = true
-            end
-        end
+        snd.gmcp.markQuestTargetKilled()
     elseif q.targ then
         -- Currently on a quest
         snd.quest.active = true

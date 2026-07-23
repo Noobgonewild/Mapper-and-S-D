@@ -244,6 +244,8 @@ local function activeActivityLabel(target)
     elseif activity == "gq" and snd and snd.gquest and snd.gquest.active then
         return "GQ"
     elseif activity == "quest" and snd and snd.quest and snd.quest.active then
+        local questStatus = tostring(snd.quest.target and snd.quest.target.status or ""):lower()
+        if questStatus == "dead" or questStatus == "killed" then return nil end
         return "quest"
     end
     return nil
