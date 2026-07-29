@@ -97,9 +97,6 @@ function mm.import.inspect_sqlite(source_path)
       exit_count = tonumber(exitCount and exitCount[1] and exitCount[1].cnt) or 0,
     }
 
-    -- rooms.x/y/z are Aardwolf continent coordinates, not Mudlet area-layout
-    -- coordinates.  A native map can be rebuilt without those columns because
-    -- local room positions are derived from cardinal exits below.
     local required_rooms = { "uid", "name", "area" }
     local required_exits = { "fromuid", "touid", "dir" }
 
@@ -976,6 +973,11 @@ function mm.import.layout_cache_matches_room(room_info)
     return false
   end
 
+  local incoming_terrain = tostring(room_info.terrain or "")
+  if incoming_terrain ~= "" and tostring(cached_room.terrain or "") ~= incoming_terrain then
+    return false
+  end
+
   if type(room_info.exits) ~= "table" then return true end
   local cached_exits = snapshot.graph.actual_exit_index
     and snapshot.graph.actual_exit_index[rid]
@@ -986,10 +988,12 @@ function mm.import.layout_cache_matches_room(room_info)
     end
   end
 
+  local incoming_exits = {}
   for raw_dir, raw_target in pairs(room_info.exits) do
     local dir = normalize_cardinal(raw_dir)
     if dir then
       local target = tonumber(raw_target)
+      if target and (target > 0 or target == -1) then incoming_exits[dir] = target end
       local cached = cached_exits[dir]
       if not cached then return false end
       if target and target > 0 then
@@ -997,6 +1001,11 @@ function mm.import.layout_cache_matches_room(room_info)
       elseif tonumber(cached.to) ~= -1 then
         return false
       end
+    end
+  end
+  for dir in pairs(cached_exits) do
+    if normalize_cardinal(dir) and incoming_exits[normalize_cardinal(dir)] == nil then
+      return false
     end
   end
   return true
@@ -2048,6 +2057,9 @@ local function start_all_area_job(mode, source_path, target_path)
       if type(_G[api]) ~= "function" then return false, "Mudlet map API unavailable: " .. api .. "()" end
     end
   end
+  if mm.request_sector_metadata then
+    mm.request_sector_metadata(mode == "rebuild" and "mapper rebuild map" or "mapper calccoords")
+  end
   local graph, graph_err = load_layout_graph(source_path)
   if not graph then return false, graph_err end
   if #graph.room_order == 0 then return false, "mapper database contains no numeric rooms to rebuild" end
@@ -2275,6 +2287,9 @@ function mm.import.rebuild_layout_from(start_room, opts)
     if type(_G[api]) ~= "function" then
       return false, "Mudlet map API unavailable: " .. api .. "()"
     end
+  end
+  if mm.request_sector_metadata then
+    mm.request_sector_metadata("mapper rebuild layout")
   end
   local start = tonumber(start_room)
   if not start then return false, "start room must be a number" end

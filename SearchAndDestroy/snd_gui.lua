@@ -131,7 +131,7 @@ local actionButtons = {
     {id = "qs",  text = "qs",  cmd = "snd_qs",     rcmd = "snd_qs",   tip = "Quick-scan for current target"},
     {id = "qw",  text = "qw",  cmd = "qw",         rcmd = "qw",       tip = "L: quick-where | R: quick-where"},
     {id = "ht",  text = "ht",  cmd = "ht",         rcmd = "ht cancel", tip = "L: hunt trick | R: cancel hunt"},
-    {id = "ref", text = "ref", cmd = "snd_rel",    rcmd = "snd_ref",  tip = "Refresh by active tab (Quest=quest info, CP=cp check, GQ=gq check)"},
+    {id = "ref", text = "ref", cmd = "snd_ref",    rcmd = "snd_rel",  tip = "L: refresh status | R: force target/location reload"},
 }
 
 -------------------------------------------------------------------------------
@@ -472,6 +472,9 @@ function snd.gui.createWindow()
     -----------------------------------------------------------------------
     snd.gui.initialized = true
     snd.gui.minimized = false
+    if snd.gui.bindNoexpCallbacks then
+        snd.gui.bindNoexpCallbacks()
+    end
 
     if cfg.enabled == false then
         snd.gui.hide()
@@ -760,8 +763,10 @@ function snd.gui.reloadTargets()
     if activeTab == "gq" then
         send("gq info", false)
     elseif activeTab == "cp" then
-        if snd.cp and snd.cp.requestCheck then
-            snd.cp.requestCheck(0, "gui.reloadTargets:tab-cp")
+        if snd.cp and snd.cp.requestResolveCheck then
+            snd.cp.requestResolveCheck(0, "gui.reloadTargets:tab-cp")
+        elseif snd.cp and snd.cp.requestCheck then
+            snd.cp.requestCheck(0, "gui.reloadTargets:tab-cp", true)
         else
             send("cp check", false)
         end
@@ -1226,9 +1231,9 @@ function snd.gui.updateTargetList()
                     prefix = TC.unlikelyTag .. "(Unlikely) "
                 end
 
-                local suffix = ""
+                local expressGutter = "   "
                 if snd.gui.isExpressTarget and snd.gui.isExpressTarget(v) then
-                    suffix = "  " .. TC.express .. "(Express)"
+                    expressGutter = " " .. TC.express .. "E "
                 end
 
                 local displayIndex = nil
@@ -1243,7 +1248,7 @@ function snd.gui.updateTargetList()
                     displayIndex = gqDisplayIndex
                 end
 
-                local displayLabel = displayIndex and string.format("%2d", displayIndex) or "--"
+                local displayLabel = displayIndex and tostring(displayIndex) or "--"
                 local isFighting = isFightingTarget(v.mob) and not v.dead
                 local numberColor = color
                 if isTargeted or isFighting then
@@ -1256,10 +1261,11 @@ function snd.gui.updateTargetList()
                     numberColor = TC.cpTab
                 end
                 local indexVisual = displayLabel .. ")"
-                local okPrefix = writeTargetText(string.format("%s%s%s %s%s",
-                    prefix, numberColor, indexVisual, dupStr, qtyStr))
+                local okPrefix = writeTargetText(string.format("%s%s%s%s %s%s",
+                    expressGutter, prefix, numberColor, indexVisual, dupStr, qtyStr))
                 if not okPrefix then
-                    writeTargetText(string.format("%s%s %s%s", numberColor, indexVisual, dupStr, qtyStr))
+                    writeTargetText(string.format("%s%s%s %s%s",
+                        expressGutter, numberColor, indexVisual, dupStr, qtyStr))
                 end
 
                 if displayIndex then
@@ -1281,7 +1287,7 @@ function snd.gui.updateTargetList()
                    and not v.lowConfidence and not v.unlikely then
                     bandColor = areaColorMap[arid]
                 end
-                writeTargetText(string.format(" - %s%s%s%s\n", bandColor, location, suffix, TC.reset))
+                writeTargetText(string.format(" - %s%s%s\n", bandColor, location, TC.reset))
 
                 lineCount = lineCount + 1
             end
@@ -1364,8 +1370,7 @@ end
 
 function snd.gui.isExpressTarget(target)
     if not snd.config.express or not snd.config.express.enabled then return false end
-    if not target.killCount then return false end
-    return target.killCount >= (snd.config.express.minKillCount or 2)
+    return type(target) == "table" and target.express == true
 end
 
 -------------------------------------------------------------------------------
@@ -1460,30 +1465,46 @@ end
 
 --- Noexp click handler
 function snd.gui.onNoexpClick()
-    if snd.config.anex and snd.config.anex.automatic then
-        snd.config.anex.tnlCutoff = (snd.config.anex.tnlCutoff or 0) + 100
-        if snd.config.anex.tnlCutoff > 9900 then
-            snd.config.anex.tnlCutoff = 9900
-        end
-        if snd.gmcp and snd.gmcp.checkAutoNoexp then
-            snd.gmcp.checkAutoNoexp()
-        end
-        snd.gui.updateNoexp()
+    local anex = snd.config and snd.config.anex
+    if not anex then
+        return
     end
+
+    -- Clicking the cutoff control exits manual mode and enables auto-noexp.
+    anex.automatic = true
+    anex.tnlCutoff = (tonumber(anex.tnlCutoff) or 0) + 100
+    if anex.tnlCutoff > 9900 then
+        anex.tnlCutoff = 9900
+    end
+    if snd.gmcp and snd.gmcp.checkAutoNoexp then
+        snd.gmcp.checkAutoNoexp()
+    end
+    if snd.saveState then
+        snd.saveState()
+    end
+    snd.gui.updateNoexp()
 end
 
 --- Noexp right-click handler
 function snd.gui.onNoexpRightClick()
-    if snd.config.anex and snd.config.anex.automatic then
-        snd.config.anex.tnlCutoff = (snd.config.anex.tnlCutoff or 0) - 100
-        if snd.config.anex.tnlCutoff < 0 then
-            snd.config.anex.tnlCutoff = 0
-        end
-        if snd.gmcp and snd.gmcp.checkAutoNoexp then
-            snd.gmcp.checkAutoNoexp()
-        end
-        snd.gui.updateNoexp()
+    local anex = snd.config and snd.config.anex
+    if not anex then
+        return
     end
+
+    -- The control must remain usable while it displays "off"/manual mode.
+    anex.automatic = true
+    anex.tnlCutoff = (tonumber(anex.tnlCutoff) or 0) - 100
+    if anex.tnlCutoff < 0 then
+        anex.tnlCutoff = 0
+    end
+    if snd.gmcp and snd.gmcp.checkAutoNoexp then
+        snd.gmcp.checkAutoNoexp()
+    end
+    if snd.saveState then
+        snd.saveState()
+    end
+    snd.gui.updateNoexp()
 end
 
 --- Unified noexp mouse handler (works even if right-click callback is unavailable)

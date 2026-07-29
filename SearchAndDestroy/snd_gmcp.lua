@@ -232,17 +232,21 @@ function snd.gmcp.onRoomInfo()
     local roomChanged = snd.room.current.rmid ~= snd.room.previous.rmid
 
     if snd.mapper then
-        local navigating = (snd.nav.goingToRoom or snd.mapper.goingToRoom) ~= nil
+        local navigating = snd.mapper.persistenceNavigationActive
+            and snd.mapper.persistenceNavigationActive()
         if navigating then
             if snd.mapper.bufferRoomPersist then
                 snd.mapper.bufferRoomPersist(ri)
             end
         else
-            -- Not navigating: flush any orphaned buffer then persist immediately.
-            if snd.mapper.flushPendingPersists then
-                snd.mapper.flushPendingPersists()
-            end
-            if snd.mapper.persistDiscoveredRoom then
+            -- A manual arrival is still persisted immediately, but joins any
+            -- orphaned navigation buffer so there is one commit/notification.
+            if snd.mapper.bufferRoomPersist and snd.mapper.flushPendingPersists then
+                local hadOrphanedBuffer = snd.mapper.hasPendingPersistence
+                    and snd.mapper.hasPendingPersistence()
+                snd.mapper.bufferRoomPersist(ri)
+                snd.mapper.flushPendingPersists({ bulk_compare = hadOrphanedBuffer == true })
+            elseif snd.mapper.persistDiscoveredRoom then
                 snd.mapper.persistDiscoveredRoom(ri)
             end
         end
@@ -458,6 +462,9 @@ function snd.gmcp.addQuestToTargetList()
         dead = (snd.quest.target.status == "killed"),
         remaining = 1,
     }
+    if snd.express and snd.express.classifyTarget then
+        snd.express.classifyTarget(target)
+    end
     
     -- Find insertion position: after GQ targets, before CP targets
     -- Priority: GQ > Quest > CP
@@ -474,6 +481,9 @@ function snd.gmcp.addQuestToTargetList()
     
     -- Auto-select quest target (unless GQ is active)
     if not snd.gquest.active then
+        if snd.nav and snd.nav.invalidateQuickWhereForTarget then
+            snd.nav.invalidateQuickWhereForTarget(target)
+        end
         snd.targets.current = target
     end
     
@@ -954,8 +964,22 @@ end
 -- Auto Noexp Check
 -------------------------------------------------------------------------------
 
+--- Return whether S&D is currently allowed to manage noexp.
+-- A cutoff of 0 (shown as "off" in the window) leaves the player's manual
+-- noexp setting untouched.
+function snd.gmcp.isAutoNoexpEnabled()
+    local anex = snd.config and snd.config.anex
+    return anex ~= nil
+        and anex.automatic == true
+        and (tonumber(anex.tnlCutoff) or 0) > 0
+end
+
 function snd.gmcp.setNoexp(enabled, message, managed)
     if not snd.char then
+        return false
+    end
+
+    if not snd.gmcp.isAutoNoexpEnabled() then
         return false
     end
 
@@ -983,7 +1007,7 @@ function snd.gmcp.setNoexp(enabled, message, managed)
 end
 
 function snd.gmcp.checkAutoNoexp()
-    if not snd.config.anex.automatic then
+    if not snd.gmcp.isAutoNoexpEnabled() then
         return
     end
 
@@ -997,15 +1021,17 @@ function snd.gmcp.checkAutoNoexp()
         campaignStatus = "unknown"
     end
 
-    -- Levels 200+ should always have noexp off (mirrors original behavior).
-    if level >= 200 then
-        snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (you have reached level " .. level .. ")", false)
+    -- Joining a global quest intentionally enables noexp. Character-status
+    -- updates continue during the GQ, so do not let the normal TNL cutoff
+    -- immediately undo that setting.
+    if snd.gquest and snd.gquest.active then
+        snd.gmcp.setNoexp(true, "Search and Destroy: Turning noexp ON (global quest active)", true)
         return
     end
 
-    -- Cutoff 0 means automatic noexp is disabled.
-    if cutoff <= 0 then
-        snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (auto noexp is disabled)", false)
+    -- While auto-noexp is enabled, levels 200+ should have noexp off.
+    if level >= 200 then
+        snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (you have reached level " .. level .. ")", false)
         return
     end
 

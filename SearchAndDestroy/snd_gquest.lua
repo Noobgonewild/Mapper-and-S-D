@@ -334,6 +334,9 @@ function snd.gq.buildMainTargetList()
         if entry.priority_room and tonumber(entry.priority_room) and tonumber(entry.priority_room) > 0 then
             entry.rmid = tonumber(entry.priority_room)
         end
+        if snd.express and snd.express.classifyTarget then
+            snd.express.classifyTarget(entry)
+        end
         if snd.debug and snd.debug.mobTag and (entry.priority_room or entry.nowhere or entry.nohunt) then
             snd.debug.mobTag(string.format(
                 "GQ build mob='%s' area=%s loc='%s' rmid=%s nowhere=%s nohunt=%s priority_room=%s",
@@ -725,7 +728,8 @@ end
 
 --- Select a gquest target by index
 -- @param index Target index (1-based)
-function snd.gq.selectTarget(index)
+function snd.gq.selectTarget(index, options)
+    local opts = type(options) == "table" and options or {}
     index = tonumber(index)
     if not index then return false end
     
@@ -771,16 +775,22 @@ function snd.gq.selectTarget(index)
         areaName = target.loc or "",
         index = index,
         activity = "gq",
+        express = target.express == true,
+        expressRoomId = target.expressRoomId,
+        expressKillCount = target.expressKillCount,
+        expressRoomCount = target.expressRoomCount,
     })
-    if snd.gquest.targetType == "room" and target.roomName and target.roomName ~= "" then
-        snd.mapper.searchRoomsExact(target.roomName, target.arid, target.mob, {
-            activity = "gq",
-            levelTaken = snd.gquest.effectiveLevel,
-        })
-    else
-        local results = snd.mapper.searchMobLocations(target.mob, target.arid)
-        if not results or #results == 0 then
-            snd.commands.qw("")
+    if not opts.skipLookup then
+        if snd.gquest.targetType == "room" and target.roomName and target.roomName ~= "" then
+            snd.mapper.searchRoomsExact(target.roomName, target.arid, target.mob, {
+                activity = "gq",
+                levelTaken = snd.gquest.effectiveLevel,
+            })
+        else
+            local results = snd.mapper.searchMobLocations(target.mob, target.arid)
+            if not results or #results == 0 then
+                snd.commands.qw("")
+            end
         end
     end
     

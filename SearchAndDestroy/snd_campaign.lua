@@ -31,6 +31,7 @@ snd.cp.parsing = {
 }
 snd.cp.pendingResetClose = snd.cp.pendingResetClose or nil
 snd.cp.pendingResetCloseTimer = snd.cp.pendingResetCloseTimer or nil
+snd.cp.forceResolveNextCheck = snd.cp.forceResolveNextCheck or false
 
 local CP_COMPLETION_BONUS_WAIT = 0.5
 
@@ -64,6 +65,12 @@ function snd.cp.requestCheck(delay, reason, force)
         send("cp check", false)
     end)
     return true
+end
+
+--- Request a CP check whose response must rebuild location resolution.
+function snd.cp.requestResolveCheck(delay, reason)
+    snd.cp.forceResolveNextCheck = true
+    return snd.cp.requestCheck(delay, reason or "forced CP resolution", true)
 end
 
 -------------------------------------------------------------------------------
@@ -554,9 +561,23 @@ function snd.cp.endCpCheck()
     snd.campaign.lastCheck = os.clock()
     local wasActive = snd.campaign.active
     
+    local forceResolve = snd.cp.forceResolveNextCheck == true
+    snd.cp.forceResolveNextCheck = false
     if #snd.campaign.checkList > 0 then
-        snd.utils.debugNote("Building target list from cp check results")
-        snd.cp.buildTargetListFromCheck()
+        local statusOnlyApplied = false
+        if snd.campaign.resolved and not forceResolve and snd.cp.applyCheckStatusOnly then
+            local ok, reason = snd.cp.applyCheckStatusOnly()
+            statusOnlyApplied = ok == true
+            if not statusOnlyApplied then
+                snd.utils.debugNote("CP status-only refresh fell back to full resolution: " .. tostring(reason or "unknown"))
+            end
+        end
+        if not statusOnlyApplied then
+            snd.utils.debugNote(forceResolve and "Force rebuilding CP target resolution" or "Building target list from cp check results")
+            snd.cp.buildTargetListFromCheck()
+        else
+            snd.utils.debugNote("Updated CP target status without rebuilding location resolution")
+        end
     end
 
     if snd.campaign.active and not wasActive and snd.db then
@@ -574,35 +595,6 @@ end
 
 --- Build target list from cp check results (when cp info wasn't run first)
 function snd.cp.buildTargetListFromCheck()
-    -- Preserve player-killed flag across rebuilds. cp check can report a
-    -- mob's location differently when alive vs dead (e.g. a room name while
-    -- alive, an area name while dead), so a strict (mob, loc) match would
-    -- drop killed=true after the rebuild. Use a two-tier match: exact
-    -- (mob, loc) first, mob-only as fallback, with consumption counts so
-    -- multiple campaign entries sharing a mob name don't all inherit the
-    -- same killed flag.
-    local killedExact = {}
-    local killedByMob = {}
-    for _, t in ipairs(snd.campaign.targets or {}) do
-        if t.killed then
-            local mob = t.mob or ""
-            local key = mob .. "|" .. (t.loc or "")
-            killedExact[key] = (killedExact[key] or 0) + 1
-            killedByMob[mob] = (killedByMob[mob] or 0) + 1
-        end
-    end
-
-    -- Identify mob names that have any alive entry in the new check. The
-    -- mob-only fallback below is unsafe for these: the prior kill might be
-    -- the now-alive (respawned) entry, and applying its leftover token to a
-    -- different dead same-name duplicate would misattribute ownership.
-    local aliveMobs = {}
-    for _, check in ipairs(snd.campaign.checkList) do
-        if not check.dead then
-            aliveMobs[check.mob or ""] = true
-        end
-    end
-
     snd.campaign.targets = {}
 
     for i, check in ipairs(snd.campaign.checkList) do
@@ -611,36 +603,17 @@ function snd.cp.buildTargetListFromCheck()
             areaKey = snd.db.getAreaKeyFromName(check.loc) or ""
         end
 
-        local mob = check.mob or ""
-        local key = mob .. "|" .. (check.loc or "")
-
-        -- Always consume an exact (mob, loc) token if one exists, regardless
-        -- of the new dead state. If the mob respawned (check.dead == false),
-        -- burning the token here keeps it from leaking into the fallback for
-        -- a different same-name duplicate.
-        local exactMatched = false
-        if (killedExact[key] or 0) > 0 then
-            killedExact[key] = killedExact[key] - 1
-            killedByMob[mob] = (killedByMob[mob] or 1) - 1
-            exactMatched = true
-        end
-
-        local killed = false
-        if check.dead then
-            if exactMatched then
-                killed = true
-            elseif (killedByMob[mob] or 0) > 0 and not aliveMobs[mob] then
-                killedByMob[mob] = killedByMob[mob] - 1
-                killed = true
-            end
-        end
-
         table.insert(snd.campaign.targets, {
             mob = check.mob,
             loc = check.loc,
+            resolutionLoc = check.loc,
+            lastCheckLoc = check.loc,
             arid = areaKey,
             dead = check.dead or false,
-            killed = killed,
+            -- cp check lists only targets that are still required. Any local
+            -- kill marker for a reported row was stale or not campaign credit.
+            killed = false,
+            campaignIndex = i,
             keyword = snd.gmcp.guessMobKeyword(check.mob, areaKey),
         })
     end
@@ -652,6 +625,9 @@ function snd.cp.buildTargetListFromCheck()
         snd.targets.type = snd.campaign.targetType
         snd.targets.activity = "cp"
         snd.cp.buildMainTargetList()
+        snd.campaign.resolved = true
+    else
+        snd.campaign.resolved = false
     end
     
     snd.utils.debugNote("Built " .. #snd.campaign.targets .. " targets from cp check")
@@ -692,7 +668,99 @@ function snd.cp.determineTargetType(targets)
     return "area"
 end
 
-function snd.cp.resolveZonesForTarget(target, playerLevel)
+local function newResolutionContext()
+    return {
+        mobEvidence = {},
+        areaByZone = {},
+    }
+end
+
+local function resolutionMobKey(mobName)
+    return snd.utils.trim(tostring(mobName or "")):lower()
+end
+
+local function getResolutionArea(context, zone)
+    zone = tostring(zone or "")
+    if zone == "" then return nil end
+    context.areaByZone = context.areaByZone or {}
+    if context.areaByZone[zone] == nil then
+        context.areaByZone[zone] = (snd.db and snd.db.getArea and snd.db.getArea(zone)) or false
+    end
+    return context.areaByZone[zone] or nil
+end
+
+local function getMobEvidence(context, mobName)
+    local key = resolutionMobKey(mobName)
+    if key == "" then return {}, mobName end
+    context.mobEvidence = context.mobEvidence or {}
+    if context.mobEvidence[key] == nil then
+        local rows, matchedName = {}, mobName
+        if snd.db and snd.db.getMobLocations then
+            rows, matchedName = snd.db.getMobLocations(mobName, "", { legacy = true })
+            rows = rows or {}
+        end
+        local byZone = {}
+        for _, row in ipairs(rows) do
+            local zone = tostring(row.zone or row.arid or ""):lower()
+            if zone ~= "" then
+                byZone[zone] = byZone[zone] or {}
+                table.insert(byZone[zone], row)
+            end
+        end
+        context.mobEvidence[key] = {
+            rows = rows,
+            byZone = byZone,
+            matchedName = matchedName or mobName,
+        }
+    end
+    local evidence = context.mobEvidence[key]
+    return evidence.rows or {}, evidence.matchedName or mobName
+end
+
+local function getMobZoneEvidence(context, mobName, zone)
+    getMobEvidence(context, mobName)
+    local evidence = context.mobEvidence and context.mobEvidence[resolutionMobKey(mobName)] or nil
+    if not evidence then return {} end
+    return evidence.byZone and evidence.byZone[tostring(zone or ""):lower()] or {}
+end
+
+local function rowMatchesPriority(row)
+    if not row then return false end
+    local priorityRoom = tonumber(row.priority_room)
+    local roomId = tonumber(row.roomid or row.rmid)
+    return tonumber(row.priority_match) == 1
+        or (priorityRoom ~= nil and roomId ~= nil and priorityRoom == roomId)
+end
+
+local function rowRanksBefore(a, b)
+    if not b then return true end
+    local aPriority = rowMatchesPriority(a)
+    local bPriority = rowMatchesPriority(b)
+    if aPriority ~= bPriority then return aPriority end
+    local aSeen = tonumber(a and a.seen_count) or 0
+    local bSeen = tonumber(b and b.seen_count) or 0
+    if aSeen ~= bSeen then return aSeen > bSeen end
+    local aKills = tonumber(a and a.kill_count) or 0
+    local bKills = tonumber(b and b.kill_count) or 0
+    if aKills ~= bKills then return aKills > bKills end
+    return (tonumber(a and (a.roomid or a.rmid)) or 0) < (tonumber(b and (b.roomid or b.rmid)) or 0)
+end
+
+local function tagsFromEvidenceRow(row)
+    if not row then return nil end
+    local priorityRoom = tonumber(row.priority_room)
+    local nowhere = row.nowhere == true or tonumber(row.nowhere) == 1
+    local nohunt = row.nohunt == true or tonumber(row.nohunt) == 1
+    if not priorityRoom and not nowhere and not nohunt then return nil end
+    return {
+        priority_room = priorityRoom,
+        nowhere = nowhere,
+        nohunt = nohunt,
+    }
+end
+
+function snd.cp.resolveZonesForTarget(target, playerLevel, resolutionContext)
+    local context = resolutionContext or newResolutionContext()
     local hint = tostring(target.loc or "")
     local fallback = {
         {
@@ -705,13 +773,6 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
     }
 
     local levelKnown = playerLevel and playerLevel > 0
-    local areaCache = {}
-    local function getAreaCached(zone)
-        if areaCache[zone] == nil then
-            areaCache[zone] = (snd.db.getArea and snd.db.getArea(zone)) or false
-        end
-        return areaCache[zone] or nil
-    end
     local function levelOk(area)
         local minLvl = tonumber(area and area.minlvl) or 0
         local maxLvl = tonumber(area and area.maxlvl) or 0
@@ -719,14 +780,6 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
         if minLvl == 0 and maxLvl == 0 then return true end
         return playerLevel >= minLvl and playerLevel <= (maxLvl + 25)
     end
-    local function rowMatchesPriority(row)
-        if not row then return false end
-        local priorityRoom = tonumber(row.priority_room)
-        local roomId = tonumber(row.roomid)
-        return tonumber(row.priority_match) == 1
-            or (priorityRoom ~= nil and roomId ~= nil and priorityRoom == roomId)
-    end
-
     local function tryMapperFallback()
         if hint == "" then return nil end
         if not (snd.mapper and snd.mapper.searchRoomsExact) then return nil end
@@ -737,7 +790,7 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
         for _, row in ipairs(rows) do
             local zone = tostring(row.arid or row.area or "")
             if zone ~= "" and not seenZone[zone] then
-                local area = getAreaCached(zone)
+                local area = getResolutionArea(context, zone)
                 if levelOk(area) then
                     seenZone[zone] = true
                     table.insert(results, {
@@ -748,6 +801,7 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
                         seenCount = 0,
                         fromDb = false,
                         fromMapper = true,
+                        tags = tagsFromEvidenceRow(row),
                     })
                 end
             end
@@ -756,41 +810,49 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
         return results
     end
 
-    if not snd.db or not snd.db.getMobLocations or not target.mob or target.mob == "" then
-        return tryMapperFallback() or fallback
+    if not target.mob or target.mob == "" then
+        return tryMapperFallback() or fallback, {}
     end
 
-    local rows = snd.db.getMobLocations(
-        target.mob,
-        "",
-        (hint ~= "" and { roomHint = hint } or nil)
-    ) or {}
-    if #rows == 0 and hint ~= "" then
-        rows = snd.db.getMobLocations(target.mob, "") or {}
-    end
+    -- Fetch every S&D sighting for a unique mob once. Exact room-name matching,
+    -- zone selection, tags, and Express classification all consume this snapshot.
+    local rows = getMobEvidence(context, target.mob)
     if #rows == 0 then
-        return tryMapperFallback() or fallback
+        return tryMapperFallback() or fallback, rows
     end
 
     if hint ~= "" then
         local hintLower = hint:lower()
-        local primary = {}
+        local exactByZone = {}
+        local exactZoneOrder = {}
         for _, row in ipairs(rows) do
             local zone = tostring(row.zone or "")
             if zone ~= "" and row.room and tostring(row.room):lower() == hintLower then
-                local area = getAreaCached(zone)
+                local area = getResolutionArea(context, zone)
                 if levelOk(area) then
-                    table.insert(primary, {
-                        arid = zone,
-                        areaName = (area and area.name) or hint,
-                        roomName = row.room,
-                        roomId = tonumber(row.roomid),
-                        seenCount = tonumber(row.seen_count) or 0,
-                        priorityMatch = rowMatchesPriority(row),
-                        fromDb = true,
-                    })
+                    if exactByZone[zone] == nil then
+                        table.insert(exactZoneOrder, zone)
+                    end
+                    if rowRanksBefore(row, exactByZone[zone]) then
+                        exactByZone[zone] = row
+                    end
                 end
             end
+        end
+        local primary = {}
+        for _, zone in ipairs(exactZoneOrder) do
+            local row = exactByZone[zone]
+            local area = getResolutionArea(context, zone)
+            table.insert(primary, {
+                arid = zone,
+                areaName = (area and area.name) or hint,
+                roomName = row.room,
+                roomId = tonumber(row.roomid),
+                seenCount = tonumber(row.seen_count) or 0,
+                priorityMatch = rowMatchesPriority(row),
+                fromDb = true,
+                tags = tagsFromEvidenceRow(row),
+            })
         end
         if #primary > 0 then
             table.sort(primary, function(a, b)
@@ -799,7 +861,7 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
                 end
                 return (a.seenCount or 0) > (b.seenCount or 0)
             end)
-            return primary
+            return primary, rows
         end
     end
 
@@ -823,19 +885,12 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
     end
 
     if #zoneOrder == 0 then
-        return fallback
+        return fallback, rows
     end
 
     for _, zone in ipairs(zoneOrder) do
         local agg = byZone[zone]
-        table.sort(agg.rooms, function(a, b)
-            local aPriority = rowMatchesPriority(a)
-            local bPriority = rowMatchesPriority(b)
-            if aPriority ~= bPriority then
-                return aPriority
-            end
-            return (tonumber(a.seen_count) or 0) > (tonumber(b.seen_count) or 0)
-        end)
+        table.sort(agg.rooms, rowRanksBefore)
         agg.bestRow = agg.rooms[1]
     end
 
@@ -850,7 +905,7 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
 
     local kept = {}
     for _, zone in ipairs(zoneOrder) do
-        local area = getAreaCached(zone)
+        local area = getResolutionArea(context, zone)
         if levelOk(area) then
             local agg = byZone[zone]
             local row = agg.bestRow
@@ -862,6 +917,7 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
                 seenCount = agg.totalSeen,
                 priorityMatch = agg.priorityMatch == true,
                 fromDb = true,
+                tags = tagsFromEvidenceRow(row),
             })
         end
     end
@@ -871,20 +927,20 @@ function snd.cp.resolveZonesForTarget(target, playerLevel)
             "CP filter: dropped '%s' — no zone fits level %d (mob in %d zone(s) total)",
             tostring(target.mob), playerLevel, #zoneOrder
         ))
-        return tryMapperFallback() or fallback
+        return tryMapperFallback() or fallback, rows
     end
 
     if hint ~= "" and #kept > 1 then
         local hintLower = hint:lower()
         for _, z in ipairs(kept) do
             if z.areaName and z.areaName:lower() == hintLower then
-                return { z }
+                return { z }, rows
             end
         end
     end
 
 
-    return kept
+    return kept, rows
 end
 
 --- Keep scoped/current CP target aligned with the rebuilt CP target list.
@@ -942,6 +998,9 @@ function snd.cp.reconcileSelectionAfterRebuild()
 
     if snd.targets and snd.targets.current and snd.targets.current.activity == "cp"
         and not selectionStillValid(snd.targets.current) then
+        if snd.nav and snd.nav.invalidateQuickWhereForTarget then
+            snd.nav.invalidateQuickWhereForTarget(nil)
+        end
         snd.targets.current = nil
         clearedCurrent = true
     end
@@ -958,6 +1017,68 @@ local function entryHasMobPriority(entry)
     return priorityRoom ~= nil and priorityRoom > 0
 end
 
+local function sortAndIndexCpEntries(cpEntries)
+    local currentArid = (snd.room and snd.room.current and tostring(snd.room.current.arid or "")) or ""
+    local currentAreaHasAlive = false
+    if currentArid ~= "" then
+        for _, entry in ipairs(cpEntries) do
+            if tostring(entry.arid or "") == currentArid and not entry.dead then
+                currentAreaHasAlive = true
+                break
+            end
+        end
+    end
+
+    local areaGroupSeen = {}
+    local areaGroupCount = 0
+    if currentAreaHasAlive then
+        areaGroupSeen[currentArid] = 0
+    end
+    for _, entry in ipairs(cpEntries) do
+        local arid = tostring(entry.arid or "")
+        if areaGroupSeen[arid] == nil then
+            areaGroupCount = areaGroupCount + 1
+            areaGroupSeen[arid] = areaGroupCount
+        end
+        entry._areaGroup = areaGroupSeen[arid]
+    end
+
+    table.sort(cpEntries, function(a, b)
+        if a.dead ~= b.dead then
+            return not a.dead
+        end
+        local aPriority = entryHasMobPriority(a)
+        local bPriority = entryHasMobPriority(b)
+        if aPriority ~= bPriority then
+            return aPriority
+        end
+        local aLow = a.lowConfidence == true
+        local bLow = b.lowConfidence == true
+        if aLow ~= bLow then
+            return not aLow
+        end
+        if (a._areaGroup or 0) ~= (b._areaGroup or 0) then
+            return (a._areaGroup or 0) < (b._areaGroup or 0)
+        end
+        if (a.campaignIndex or 0) ~= (b.campaignIndex or 0) then
+            return (a.campaignIndex or 0) < (b.campaignIndex or 0)
+        end
+        return (a.dupIndex or 0) < (b.dupIndex or 0)
+    end)
+
+    local displayIndex = 0
+    for listIndex, entry in ipairs(cpEntries) do
+        entry._areaGroup = nil
+        entry.cpListIndex = listIndex
+        if not entry.dead then
+            displayIndex = displayIndex + 1
+            entry.displayIndex = displayIndex
+        else
+            entry.displayIndex = nil
+        end
+    end
+end
+
 --- Build the main target list from campaign targets
 function snd.cp.buildMainTargetList()
     -- Remove existing CP targets but preserve GQ and Quest targets
@@ -970,12 +1091,13 @@ function snd.cp.buildMainTargetList()
     snd.targets.list = newList
 
     local playerLevel = tonumber(snd.char and snd.char.level) or 0
+    local resolutionContext = newResolutionContext()
     local emittedAnyRoomTarget = false
     local highEntries = {}
     local lowEntries = {}
 
     for i, target in ipairs(snd.campaign.targets) do
-        local resolved = snd.cp.resolveZonesForTarget(target, playerLevel)
+        local resolved = snd.cp.resolveZonesForTarget(target, playerLevel, resolutionContext)
         if type(resolved) ~= "table" or #resolved == 0 then
             resolved = {
                 {
@@ -991,9 +1113,6 @@ function snd.cp.buildMainTargetList()
         end
         local visible = {}
         for _, zone in ipairs(resolved) do
-            local arid = zone.arid or ""
-            local tags = snd.db and snd.db.getMobTags and snd.db.getMobTags(target.mob, arid) or nil
-            zone.tags = tags
             table.insert(visible, zone)
         end
         local total = #visible
@@ -1039,6 +1158,10 @@ function snd.cp.buildMainTargetList()
                 entry.rmid = zone.roomId
             end
 
+            if snd.express and snd.express.classifyTarget then
+                snd.express.classifyTarget(entry, getMobZoneEvidence(resolutionContext, target.mob, arid))
+            end
+
             if snd.debug and snd.debug.mobTag and (entry.priority_room or entry.nowhere or entry.nohunt) then
                 snd.debug.mobTag(string.format(
                     "CP build mob='%s' area=%s roomName='%s' rmid=%s nowhere=%s nohunt=%s priority_room=%s sourceRoomId=%s seen=%s",
@@ -1069,69 +1192,8 @@ function snd.cp.buildMainTargetList()
     for _, entry in ipairs(lowEntries) do
         table.insert(cpEntries, entry)
     end
-    local currentArid = (snd.room and snd.room.current and tostring(snd.room.current.arid or "")) or ""
-    local currentAreaHasAlive = false
-    if currentArid ~= "" then
-        for _, entry in ipairs(cpEntries) do
-            if tostring(entry.arid or "") == currentArid and not entry.dead then
-                currentAreaHasAlive = true
-                break
-            end
-        end
-    end
-
-    local areaGroupSeen = {}
-    local areaGroupCount = 0
-    if currentAreaHasAlive then
-        areaGroupSeen[currentArid] = 0
-    end
+    sortAndIndexCpEntries(cpEntries)
     for _, entry in ipairs(cpEntries) do
-        local arid = tostring(entry.arid or "")
-        if not areaGroupSeen[arid] then
-            areaGroupCount = areaGroupCount + 1
-            areaGroupSeen[arid] = areaGroupCount
-        end
-        entry._areaGroup = areaGroupSeen[arid]
-    end
-
-    table.sort(cpEntries, function(a, b)
-        if a.dead ~= b.dead then
-            return not a.dead
-        end
-        local aPriority = entryHasMobPriority(a)
-        local bPriority = entryHasMobPriority(b)
-        if aPriority ~= bPriority then
-            return aPriority
-        end
-        local aLow = a.lowConfidence == true
-        local bLow = b.lowConfidence == true
-        if aLow ~= bLow then
-            return not aLow
-        end
-        if (a._areaGroup or 0) ~= (b._areaGroup or 0) then
-            return (a._areaGroup or 0) < (b._areaGroup or 0)
-        end
-        if (a.campaignIndex or 0) ~= (b.campaignIndex or 0) then
-            return (a.campaignIndex or 0) < (b.campaignIndex or 0)
-        end
-        return (a.dupIndex or 0) < (b.dupIndex or 0)
-    end)
-
-    for _, entry in ipairs(cpEntries) do
-        entry._areaGroup = nil
-    end
-
-    local cpDisplayIndex = 0
-    local cpListIndex = 0
-    for _, entry in ipairs(cpEntries) do
-        cpListIndex = cpListIndex + 1
-        entry.cpListIndex = cpListIndex
-        if not entry.dead then
-            cpDisplayIndex = cpDisplayIndex + 1
-            entry.displayIndex = cpDisplayIndex
-        else
-            entry.displayIndex = nil
-        end
         table.insert(snd.targets.list, entry)
     end
 
@@ -1144,150 +1206,116 @@ function snd.cp.buildMainTargetList()
     snd.cp.reconcileSelectionAfterRebuild()
 end
 
---- Update target status from cp check results
+--- Propagate canonical campaign status to every already-resolved CP entry.
+-- One canonical target may have several zone choices; all choices share status.
 function snd.cp.updateTargetStatus()
-    -- Mark all as potentially alive first
-    -- Then mark as dead based on check list
-
-    local cpCampaignIndex = 0
-    for _, campaignTarget in ipairs(snd.campaign.targets or {}) do
-        cpCampaignIndex = cpCampaignIndex + 1
-        local wasDead = campaignTarget.dead == true
-        local wasKilled = campaignTarget.killed == true
-        campaignTarget.dead = true
-        for _, check in ipairs(snd.campaign.checkList) do
-            if campaignTarget.mob == check.mob and (campaignTarget.loc or "") == (check.loc or "") then
-                campaignTarget.dead = check.dead or wasDead
-                break
-            end
-        end
-        -- Preserve player-killed flag only while the mob is still dead in our state.
-        -- If the mob is now alive (respawned or never died), clear the killed flag.
-        campaignTarget.killed = (campaignTarget.dead and wasKilled) and true or false
+    local canonicalByIndex = {}
+    for i, campaignTarget in ipairs(snd.campaign.targets or {}) do
+        campaignTarget.campaignIndex = tonumber(campaignTarget.campaignIndex) or i
+        canonicalByIndex[campaignTarget.campaignIndex] = campaignTarget
     end
 
     local cpList = {}
     local nonCpList = {}
-    local consumedChecks = {}
-    for _, target in ipairs(snd.targets.list) do
+    for _, target in ipairs(snd.targets.list or {}) do
         if target.activity == "cp" then
-            local wasDead = target.dead == true
-            local wasKilled = target.killed == true
-            target.dead = false
-            target.killed = false
-
-            local found = false
-            for idx, check in ipairs(snd.campaign.checkList) do
-                if not consumedChecks[idx]
-                    and target.mob == check.mob
-                    and (target.loc or "") == (check.loc or "") then
-                    found = true
-                    consumedChecks[idx] = true
-                    target.dead = check.dead or wasDead
-                    break
-                end
+            local canonical = canonicalByIndex[tonumber(target.campaignIndex)]
+            if canonical then
+                target.dead = canonical.dead == true
+                target.killed = canonical.dead == true and canonical.killed == true
+                table.insert(cpList, target)
             end
-            if not found then
-                for idx, check in ipairs(snd.campaign.checkList) do
-                    if not consumedChecks[idx] and target.mob == check.mob then
-                        found = true
-                        consumedChecks[idx] = true
-                        target.dead = check.dead or wasDead
-                        break
-                    end
-                end
-            end
-
-            -- If not in check list, mark the entry dead (matches the original
-            -- behavior). Don't infer killed=true here: this branch also fires
-            -- for duplicate zones whose sibling already consumed the matching
-            -- check-list row, and those are not player kills. Real kills mark
-            -- killed=true on the specific entry in onMobKilled, so preserving
-            -- wasKilled is sufficient.
-            if not found then
-                target.dead = true
-                target.killed = wasKilled
-            else
-                target.killed = (target.dead and wasKilled) and true or false
-            end
-            table.insert(cpList, target)
         else
             table.insert(nonCpList, target)
         end
     end
 
-    local currentArid = (snd.room and snd.room.current and tostring(snd.room.current.arid or "")) or ""
-    local currentAreaHasAlive = false
-    if currentArid ~= "" then
-        for _, entry in ipairs(cpList) do
-            if tostring(entry.arid or "") == currentArid and not entry.dead then
-                currentAreaHasAlive = true
+    sortAndIndexCpEntries(cpList)
+    snd.targets.list = nonCpList
+    for _, target in ipairs(cpList) do
+        table.insert(snd.targets.list, target)
+    end
+    snd.cp.reconcileSelectionAfterRebuild()
+end
+
+--- Apply a parsed CP check to the canonical target roster without re-resolving.
+-- Returns false only when the response contains a target that cannot belong to
+-- the current roster, in which case the caller safely falls back to a full build.
+function snd.cp.applyCheckStatusOnly()
+    local targets = snd.campaign.targets or {}
+    if not snd.campaign.resolved or #targets == 0 then
+        return false, "no resolved campaign snapshot"
+    end
+
+    local matchedTargets = {}
+    local assignments = {}
+
+    local function targetLocationMatches(target, check)
+        local checkLoc = tostring(check.loc or ""):lower()
+        if checkLoc == "" then return false end
+        return tostring(target.resolutionLoc or target.loc or ""):lower() == checkLoc
+            or tostring(target.lastCheckLoc or ""):lower() == checkLoc
+    end
+
+    -- Prefer exact mob+location identity so duplicate mob names retain ownership.
+    for checkIndex, check in ipairs(snd.campaign.checkList or {}) do
+        for targetIndex, target in ipairs(targets) do
+            if not matchedTargets[targetIndex]
+                and tostring(target.mob or ""):lower() == tostring(check.mob or ""):lower()
+                and targetLocationMatches(target, check) then
+                matchedTargets[targetIndex] = true
+                assignments[checkIndex] = targetIndex
                 break
             end
         end
     end
 
-    local areaGroupSeen = {}
-    local areaGroupCount = 0
-    if currentAreaHasAlive then
-        areaGroupSeen[currentArid] = 0
-    end
-    for _, entry in ipairs(cpList) do
-        local arid = tostring(entry.arid or "")
-        if not areaGroupSeen[arid] then
-            areaGroupCount = areaGroupCount + 1
-            areaGroupSeen[arid] = areaGroupCount
+    -- A dead line can present a different location. Consume a same-name target
+    -- by stable campaign order, while still rejecting genuinely new mob names.
+    for checkIndex, check in ipairs(snd.campaign.checkList or {}) do
+        if not assignments[checkIndex] then
+            for targetIndex, target in ipairs(targets) do
+                if not matchedTargets[targetIndex]
+                    and tostring(target.mob or ""):lower() == tostring(check.mob or ""):lower() then
+                    matchedTargets[targetIndex] = true
+                    assignments[checkIndex] = targetIndex
+                    break
+                end
+            end
         end
-        entry._areaGroup = areaGroupSeen[arid]
-    end
-
-    table.sort(cpList, function(a, b)
-        if a.dead ~= b.dead then
-            return not a.dead
-        end
-        local aPriority = entryHasMobPriority(a)
-        local bPriority = entryHasMobPriority(b)
-        if aPriority ~= bPriority then
-            return aPriority
-        end
-        local aLow = a.lowConfidence == true
-        local bLow = b.lowConfidence == true
-        if aLow ~= bLow then
-            return not aLow
-        end
-        if (a._areaGroup or 0) ~= (b._areaGroup or 0) then
-            return (a._areaGroup or 0) < (b._areaGroup or 0)
-        end
-        if (a.campaignIndex or 0) ~= (b.campaignIndex or 0) then
-            return (a.campaignIndex or 0) < (b.campaignIndex or 0)
-        end
-        return (a.dupIndex or 0) < (b.dupIndex or 0)
-    end)
-
-    for _, entry in ipairs(cpList) do
-        entry._areaGroup = nil
-    end
-
-    local cpIndex = 0
-    local cpListIndex = 0
-    for _, target in ipairs(cpList) do
-        cpListIndex = cpListIndex + 1
-        target.cpListIndex = cpListIndex
-        if not target.dead then
-            cpIndex = cpIndex + 1
-            target.displayIndex = cpIndex
-        else
-            target.displayIndex = nil
+        if not assignments[checkIndex] then
+            return false, "CP roster changed near '" .. tostring(check.mob or "") .. "'"
         end
     end
 
-    snd.targets.list = {}
-    for _, target in ipairs(nonCpList) do
-        table.insert(snd.targets.list, target)
+    -- The response is the authoritative roster of targets still required.
+    -- Omitted targets were completed, so remove their canonical records and
+    -- every expanded location row. Explicit - Dead rows remain because they
+    -- are still required after they respawn.
+    local retainedTargets = {}
+    local newIndexByOldCampaignIndex = {}
+    for checkIndex, check in ipairs(snd.campaign.checkList or {}) do
+        local targetIndex = assignments[checkIndex]
+        local target = targets[targetIndex]
+        local oldCampaignIndex = tonumber(target.campaignIndex) or targetIndex
+        local newCampaignIndex = #retainedTargets + 1
+        target.lastCheckLoc = check.loc
+        target.dead = check.dead == true
+        target.killed = false
+        target.campaignIndex = newCampaignIndex
+        retainedTargets[newCampaignIndex] = target
+        newIndexByOldCampaignIndex[oldCampaignIndex] = newCampaignIndex
     end
-    for _, target in ipairs(cpList) do
-        table.insert(snd.targets.list, target)
+
+    snd.campaign.targets = retainedTargets
+    for _, target in ipairs(snd.targets.list or {}) do
+        if target.activity == "cp" then
+            target.campaignIndex = newIndexByOldCampaignIndex[tonumber(target.campaignIndex)]
+        end
     end
+
+    snd.cp.updateTargetStatus()
+    return true
 end
 
 -------------------------------------------------------------------------------
@@ -1299,8 +1327,8 @@ function snd.cp.onMobKilled()
     snd.utils.debugNote("Campaign mob killed!")
     local shouldSyncAfterKill = true
     local killedTargetsBefore = 0
-    for _, target in ipairs(snd.targets.list or {}) do
-        if target.activity == "cp" and target.killed then
+    for _, target in ipairs(snd.campaign.targets or {}) do
+        if target.killed then
             killedTargetsBefore = killedTargetsBefore + 1
         end
     end
@@ -1357,11 +1385,8 @@ function snd.cp.onMobKilled()
             local killedEntry = snd.targets.list[bestIndex]
             killedEntry.dead = true
             killedEntry.killed = true
-            -- Mirror the killed flag onto snd.campaign.targets so it survives
-            -- the next buildTargetListFromCheck rebuild. Match by campaignIndex
-            -- rather than (mob, loc): buildMainTargetList rewrites entry.loc to
-            -- zone.areaName, which won't equal the campaign target's original
-            -- check-list location for room-based campaigns.
+            -- Mirror the local kill onto the canonical target until cp check
+            -- returns the authoritative remaining-target roster.
             local campaignIdx = tonumber(killedEntry.campaignIndex)
             local ct = campaignIdx and snd.campaign.targets and snd.campaign.targets[campaignIdx]
             if ct and ct.mob == killedEntry.mob then
@@ -1385,8 +1410,8 @@ function snd.cp.onMobKilled()
             -- mobs would stay in the list as [Killed] forever because no future cp
             -- check would ever fire to clear them.
             local killedPendingCount = 0
-            for _, t in ipairs(snd.targets.list) do
-                if t.activity == "cp" and t.killed then
+            for _, t in ipairs(snd.campaign.targets or {}) do
+                if t.killed then
                     killedPendingCount = killedPendingCount + 1
                 end
             end
@@ -1401,8 +1426,8 @@ function snd.cp.onMobKilled()
     end
     
     local killedTargetsAfter = 0
-    for _, target in ipairs(snd.targets.list or {}) do
-        if target.activity == "cp" and target.killed then
+    for _, target in ipairs(snd.campaign.targets or {}) do
+        if target.killed then
             killedTargetsAfter = killedTargetsAfter + 1
         end
     end
@@ -1605,6 +1630,8 @@ end
 function snd.cp.onCampaignAccepted()
     snd.campaign.canGetNew = false
     snd.campaign.acceptedAt = os.time()
+    snd.campaign.resolved = false
+    snd.cp.forceResolveNextCheck = false
 
     if snd.gmcp and snd.gmcp.setCampaignActiveForAutoNoexp then
         snd.gmcp.setCampaignActiveForAutoNoexp()
@@ -1619,6 +1646,8 @@ function snd.cp.clearCampaign()
     snd.campaign.acceptedAt = 0
     snd.campaign.targets = {}
     snd.campaign.checkList = {}
+    snd.campaign.resolved = false
+    snd.cp.forceResolveNextCheck = false
     snd.campaign.qpReward = 0
     snd.campaign.goldReward = 0
     snd.campaign.tpReward = 0
@@ -1735,7 +1764,8 @@ end
 
 --- Select a campaign target by index
 -- @param index Target index (1-based)
-function snd.cp.selectTarget(index)
+function snd.cp.selectTarget(index, options)
+    local opts = type(options) == "table" and options or {}
     index = tonumber(index)
     if not index then return false end
     
@@ -1797,16 +1827,22 @@ function snd.cp.selectTarget(index)
         areaName = target.loc or "",    -- Area display name
         index = index,
         activity = "cp",
+        express = target.express == true,
+        expressRoomId = target.expressRoomId,
+        expressKillCount = target.expressKillCount,
+        expressRoomCount = target.expressRoomCount,
     })
-    if snd.campaign.targetType == "room" and target.roomName and target.roomName ~= "" then
-        snd.mapper.searchRoomsExact(target.roomName, target.arid, target.mob, {
-            activity = "cp",
-            levelTaken = snd.campaign.levelTaken,
-        })
-    else
-        local results = snd.mapper.searchMobLocations(target.mob, target.arid)
-        if not results or #results == 0 then
-            snd.commands.qw("")
+    if not opts.skipLookup then
+        if snd.campaign.targetType == "room" and target.roomName and target.roomName ~= "" then
+            snd.mapper.searchRoomsExact(target.roomName, target.arid, target.mob, {
+                activity = "cp",
+                levelTaken = snd.campaign.levelTaken,
+            })
+        else
+            local results = snd.mapper.searchMobLocations(target.mob, target.arid)
+            if not results or #results == 0 then
+                snd.commands.qw("")
+            end
         end
     end
     

@@ -25,6 +25,9 @@ local luasql = require "luasql.sqlite3"
 snd.db.env = nil
 snd.db.conn = nil
 snd.db.isOpen = false
+snd.db.schemaReady = false
+snd.db.mobTagsBaseReady = false
+snd.db.areaCache = nil
 snd.db.seenCache = snd.db.seenCache or {}
 snd.db.seenCacheLastPrune = snd.db.seenCacheLastPrune or 0
 snd.db.seenCooldownSeconds = 300       -- 5 minutes
@@ -309,6 +312,9 @@ function snd.db.close()
         snd.db.env = nil
     end
     snd.db.isOpen = false
+    snd.db.schemaReady = false
+    snd.db.mobTagsBaseReady = false
+    snd.db.areaCache = nil
 end
 
 --- Clear in-memory seen update cooldown cache.
@@ -373,27 +379,38 @@ end
 
 --- Ensure mob tag table exists.
 function snd.db.ensureMobTagsTable()
+    if snd.db.schemaReady then
+        return true
+    end
     if not snd.db.isOpen then
         if not snd.db.open() then
             return false
         end
     end
 
-    local ok = snd.db.execute([[
-        CREATE TABLE IF NOT EXISTS mob_tags (
-            id INTEGER PRIMARY KEY,
-            mob TEXT NOT NULL COLLATE NOCASE,
-            zone TEXT NOT NULL COLLATE NOCASE,
-            nowhere INTEGER NOT NULL DEFAULT 0,
-            nohunt INTEGER NOT NULL DEFAULT 0,
-            priority_room INTEGER DEFAULT NULL,
-            UNIQUE(mob, zone)
-        )
-    ]])
-    if not ok then return false end
-    snd.db.execute("CREATE INDEX IF NOT EXISTS idx_mob_tags_zone ON mob_tags(zone)")
-    snd.db.execute("CREATE INDEX IF NOT EXISTS idx_mob_tags_mob ON mob_tags(mob)")
-    snd.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mob_tags_key_nocase ON mob_tags(lower(mob), lower(zone))")
+    if not snd.db.mobTagsBaseReady then
+        local ok = snd.db.execute([[
+            CREATE TABLE IF NOT EXISTS mob_tags (
+                id INTEGER PRIMARY KEY,
+                mob TEXT NOT NULL COLLATE NOCASE,
+                zone TEXT NOT NULL COLLATE NOCASE,
+                nowhere INTEGER NOT NULL DEFAULT 0,
+                nohunt INTEGER NOT NULL DEFAULT 0,
+                priority_room INTEGER DEFAULT NULL,
+                UNIQUE(mob, zone)
+            )
+        ]])
+        if not ok then return false end
+        local zoneIndexOk = snd.db.execute("CREATE INDEX IF NOT EXISTS idx_mob_tags_zone ON mob_tags(zone)")
+        local mobIndexOk = snd.db.execute("CREATE INDEX IF NOT EXISTS idx_mob_tags_mob ON mob_tags(mob)")
+        snd.db.mobTagsBaseReady = zoneIndexOk and mobIndexOk
+    end
+    if not snd.db.mobTagsBaseReady then return false end
+
+    -- This can fail on an older database until normalizeMobTagRows removes
+    -- case-only duplicates. Base readiness still allows that normalization.
+    local keyIndexOk = snd.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mob_tags_key_nocase ON mob_tags(lower(mob), lower(zone))")
+    snd.db.schemaReady = keyIndexOk == true
     return true
 end
 
@@ -418,7 +435,10 @@ function snd.db.initialize(silent)
     snd.db.ensureCampaignIdentityTable()
     snd.db.ensureMobTagsTable()
     snd.db.normalizeMobTagRows()
-    snd.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mob_tags_key_nocase ON mob_tags(lower(mob), lower(zone))")
+    snd.db.ensureMobTagsTable()
+    if snd.db.loadAreaCache then
+        snd.db.loadAreaCache()
+    end
     
     -- Get stats
     local stats = snd.db.getStats()
@@ -888,9 +908,9 @@ function snd.db.getMobLocations(mobName, zone, opts)
                                CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match
                         FROM mobs m
                         LEFT JOIN mob_tags mt
-                          ON lower(mt.mob) = lower(m.mob)
-                         AND lower(mt.zone) = lower(m.zone)
-                        WHERE lower(m.mob) = lower(%s) AND lower(m.zone) = lower(%s)
+                          ON mt.mob = m.mob
+                         AND mt.zone = m.zone
+                        WHERE m.mob = %s AND m.zone = %s
                         ORDER BY priority_match DESC, m.seen_count DESC, m.kill_count DESC, m.roomid ASC
                     ]],
                     snd.db.escape(name),
@@ -905,8 +925,8 @@ function snd.db.getMobLocations(mobName, zone, opts)
                                    mt.nowhere,
                                    mt.nohunt,
                                    CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match,
-                                   ROW_NUMBER() OVER (
-                                        PARTITION BY lower(m.mob), lower(m.zone)
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY m.mob, m.zone
                                         ORDER BY
                                             CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END DESC,
                                             m.seen_count DESC,
@@ -915,11 +935,11 @@ function snd.db.getMobLocations(mobName, zone, opts)
                                     ) AS rn
                             FROM mobs m
                             LEFT JOIN mob_tags mt
-                              ON lower(mt.mob) = lower(m.mob)
-                             AND lower(mt.zone) = lower(m.zone)
-                            WHERE lower(m.mob) = lower(%s)
-                              AND lower(m.zone) = lower(%s)
-                              AND lower(m.room) = lower(%s)
+                              ON mt.mob = m.mob
+                             AND mt.zone = m.zone
+                            WHERE m.mob = %s
+                              AND m.zone = %s
+                              AND m.room = %s
                         ) ranked
                         WHERE rn = 1
                         ORDER BY priority_match DESC, seen_count DESC, kill_count DESC, roomid ASC
@@ -943,8 +963,8 @@ function snd.db.getMobLocations(mobName, zone, opts)
                                    mt.nowhere,
                                    mt.nohunt,
                                    CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match,
-                                   ROW_NUMBER() OVER (
-                                        PARTITION BY lower(m.mob), lower(m.zone)
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY m.mob, m.zone
                                         ORDER BY
                                             CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END DESC,
                                             m.seen_count DESC,
@@ -953,9 +973,9 @@ function snd.db.getMobLocations(mobName, zone, opts)
                                     ) AS rn
                             FROM mobs m
                             LEFT JOIN mob_tags mt
-                              ON lower(mt.mob) = lower(m.mob)
-                             AND lower(mt.zone) = lower(m.zone)
-                            WHERE lower(m.mob) = lower(%s) AND lower(m.zone) = lower(%s)
+                              ON mt.mob = m.mob
+                             AND mt.zone = m.zone
+                            WHERE m.mob = %s AND m.zone = %s
                         ) ranked
                         WHERE rn = 1
                         ORDER BY priority_match DESC, seen_count DESC, kill_count DESC, roomid ASC
@@ -976,9 +996,9 @@ function snd.db.getMobLocations(mobName, zone, opts)
                                CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match
                         FROM mobs m
                         LEFT JOIN mob_tags mt
-                          ON lower(mt.mob) = lower(m.mob)
-                         AND lower(mt.zone) = lower(m.zone)
-                        WHERE lower(m.mob) = lower(%s)
+                          ON mt.mob = m.mob
+                         AND mt.zone = m.zone
+                        WHERE m.mob = %s
                         ORDER BY priority_match DESC, m.seen_count DESC, m.kill_count DESC, m.roomid ASC
                     ]],
                     snd.db.escape(name)
@@ -992,8 +1012,8 @@ function snd.db.getMobLocations(mobName, zone, opts)
                                    mt.nowhere,
                                    mt.nohunt,
                                    CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match,
-                                   ROW_NUMBER() OVER (
-                                        PARTITION BY lower(m.mob), lower(m.zone)
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY m.mob, m.zone
                                         ORDER BY
                                             CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END DESC,
                                             m.seen_count DESC,
@@ -1002,10 +1022,10 @@ function snd.db.getMobLocations(mobName, zone, opts)
                                     ) AS rn
                             FROM mobs m
                             LEFT JOIN mob_tags mt
-                              ON lower(mt.mob) = lower(m.mob)
-                             AND lower(mt.zone) = lower(m.zone)
-                            WHERE lower(m.mob) = lower(%s)
-                              AND lower(m.room) = lower(%s)
+                              ON mt.mob = m.mob
+                             AND mt.zone = m.zone
+                            WHERE m.mob = %s
+                              AND m.room = %s
                         ) ranked
                         WHERE rn = 1
                         ORDER BY priority_match DESC, seen_count DESC, kill_count DESC, roomid ASC
@@ -1027,8 +1047,8 @@ function snd.db.getMobLocations(mobName, zone, opts)
                                    mt.nowhere,
                                    mt.nohunt,
                                    CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match,
-                                   ROW_NUMBER() OVER (
-                                        PARTITION BY lower(m.mob), lower(m.zone)
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY m.mob, m.zone
                                         ORDER BY
                                             CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END DESC,
                                             m.seen_count DESC,
@@ -1037,9 +1057,9 @@ function snd.db.getMobLocations(mobName, zone, opts)
                                     ) AS rn
                             FROM mobs m
                             LEFT JOIN mob_tags mt
-                              ON lower(mt.mob) = lower(m.mob)
-                             AND lower(mt.zone) = lower(m.zone)
-                            WHERE lower(m.mob) = lower(%s)
+                              ON mt.mob = m.mob
+                             AND mt.zone = m.zone
+                            WHERE m.mob = %s
                         ) ranked
                         WHERE rn = 1
                         ORDER BY priority_match DESC, seen_count DESC, kill_count DESC, roomid ASC
@@ -1111,23 +1131,56 @@ end
 -- Area Functions
 -------------------------------------------------------------------------------
 
+local function normalize_area_lookup(value)
+    return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function normalize_area_loose(value)
+    return normalize_area_lookup(value):gsub("[^%w]", "")
+end
+
+function snd.db.invalidateAreaCache()
+    snd.db.areaCache = nil
+end
+
+function snd.db.loadAreaCache()
+    local rows = snd.db.query("SELECT * FROM area ORDER BY key") or {}
+    local cache = {
+        rows = rows,
+        byKey = {},
+        byName = {},
+        byLooseName = {},
+    }
+    for _, row in ipairs(rows) do
+        local key = normalize_area_lookup(row.key)
+        local name = normalize_area_lookup(row.name)
+        local looseName = normalize_area_loose(row.name)
+        if key ~= "" then cache.byKey[key] = row end
+        if name ~= "" and not cache.byName[name] then cache.byName[name] = row end
+        if looseName ~= "" and not cache.byLooseName[looseName] then
+            cache.byLooseName[looseName] = row
+        end
+    end
+    snd.db.areaCache = cache
+    return cache
+end
+
+local function get_area_cache()
+    return snd.db.areaCache or snd.db.loadAreaCache()
+end
+
+local function get_stored_area(areaKey)
+    local cache = get_area_cache()
+    return cache and cache.byKey[normalize_area_lookup(areaKey)] or nil
+end
+
 --- Get area info by key
 -- @param areaKey Area keyword
 -- @return Area record or nil
 function snd.db.getArea(areaKey)
     if not areaKey or areaKey == "" then return nil end
-    
-    local sql = string.format(
-        "SELECT * FROM area WHERE key = %s",
-        snd.db.escape(areaKey)
-    )
-    
-    local results = snd.db.query(sql)
-    if results and #results > 0 then
-        return results[1]
-    end
-    
-    return nil
+
+    return get_stored_area(areaKey)
 end
 
 --- Get area key from area name
@@ -1137,43 +1190,26 @@ function snd.db.getAreaKeyFromName(areaName)
     if not areaName or areaName == "" then return nil end
 
     local trimmed = snd.utils and snd.utils.trim and snd.utils.trim(areaName) or tostring(areaName)
-    local sql = string.format(
-        "SELECT key FROM area WHERE lower(name) = lower(%s)",
-        snd.db.escape(trimmed)
-    )
-
-    local results = snd.db.query(sql)
-    if results and #results > 0 then
-        return results[1].key
-    end
+    local cache = get_area_cache()
+    local exact = cache and cache.byName[normalize_area_lookup(trimmed)] or nil
+    if exact then return exact.key end
 
     -- Tolerate punctuation/spacing drift between campaign output and area table,
     -- e.g. "Necromancers' Guild" vs "Necromancer's Guild".
-    local normalized = tostring(trimmed):lower():gsub("[^%w]", "")
-    if normalized ~= "" then
-        sql = string.format(
-            "SELECT key FROM area " ..
-            "WHERE lower(replace(replace(replace(replace(name, '''', ''), ' ', ''), '-', ''), '_', '')) = %s " ..
-            "LIMIT 1",
-            snd.db.escape(normalized)
-        )
-        results = snd.db.query(sql)
-        if results and #results > 0 then
-            return results[1].key
+    local loose = normalize_area_loose(trimmed)
+    local normalizedMatch = loose ~= "" and cache and cache.byLooseName[loose] or nil
+    if normalizedMatch then return normalizedMatch.key end
+
+    -- Preserve the original final substring fallback without another SQL scan.
+    local needle = normalize_area_lookup(trimmed)
+    if needle ~= "" and cache then
+        for _, row in ipairs(cache.rows) do
+            if normalize_area_lookup(row.name):find(needle, 1, true) then
+                return row.key
+            end
         end
     end
 
-    -- Try partial match if exact match fails
-    sql = string.format(
-        "SELECT key FROM area WHERE lower(name) LIKE lower(%s)",
-        snd.db.escape("%" .. trimmed .. "%")
-    )
-
-    results = snd.db.query(sql)
-    if results and #results > 0 then
-        return results[1].key
-    end
-    
     return nil
 end
 
@@ -1182,7 +1218,7 @@ end
 -- @param areaName Full area name
 -- @return Area record
 function snd.db.getOrCreateArea(areaKey, areaName)
-    local existing = snd.db.getArea(areaKey)
+    local existing = get_stored_area(areaKey)
     if existing then
         return existing
     end
@@ -1202,7 +1238,7 @@ function snd.db.getOrCreateArea(areaKey, areaName)
         snd.db.escape(areaKey)
     )
     snd.db.execute(sql)
-    
+    snd.db.invalidateAreaCache()
     return snd.db.getArea(areaKey)
 end
 
@@ -1215,7 +1251,7 @@ function snd.db.setAreaStartRoom(areaKey, roomId)
     roomId = tonumber(roomId) or -1
     
     -- Check if area exists
-    local existing = snd.db.getArea(areaKey)
+    local existing = get_stored_area(areaKey)
     if existing then
         local sql = string.format(
             "UPDATE area SET startRoom = %d WHERE key = %s",
@@ -1223,6 +1259,7 @@ function snd.db.setAreaStartRoom(areaKey, roomId)
             snd.db.escape(areaKey)
         )
         snd.db.execute(sql)
+        snd.db.invalidateAreaCache()
         snd.utils.infoNote("Updated start room for " .. areaKey .. " to " .. roomId)
     else
         -- Create new area record

@@ -123,6 +123,25 @@ local function normalize_line(line)
     :gsub("%s+$", "")
 end
 
+local BOOKMARK_COMMAND_ALIASES = {"mapper bookmark", "bookmarks", "bookmark"}
+
+local function normalize_bookmark_command(line)
+  if line == "bookmarkwin" or line:find("^bookmarkwin ") then
+    return "mapper " .. line
+  end
+
+  for _, alias in ipairs(BOOKMARK_COMMAND_ALIASES) do
+    if line == alias then
+      return "mapper bookmarks"
+    end
+    if line:sub(1, #alias + 1) == alias .. " " then
+      return "mapper bookmarks" .. line:sub(#alias + 1)
+    end
+  end
+
+  return line
+end
+
 local function parse_command_with_optional_level(raw)
   local cleaned = tostring(raw or ""):gsub("^%s+", ""):gsub("%s+$", "")
   if mm.normalize_stacked_command then
@@ -530,6 +549,16 @@ local function handle_command_inline(line)
     if not ok then mm.warn(err) end
     return true
   end
+
+  if line == "mapper refresh terrain" or line == "mapper refresh sectors" then
+    if mm.request_sector_metadata then
+      local ok, err = mm.request_sector_metadata("manual terrain refresh")
+      if ok then mm.note("Requested fresh terrain/sector metadata.") else mm.warn(err) end
+    else
+      mm.warn("GMCP sector metadata requests are unavailable.")
+    end
+    return true
+  end
   if line == "mapper calccoords" then
     mm.note("This refreshes classified cardinal links/stubs, recalculates every area layout, and saves the native map. Maze/teleport exits remain navigation routes but are excluded from coordinates. Confirm with: mapper calccoords confirm")
     return true
@@ -717,6 +746,14 @@ local function handle_command_inline(line)
 
   local next_arg = line:match("^mapper next%s+(%d+)$")
   if line == "mapper next" or next_arg then local ok, err = mm.next_result(next_arg); if not ok then mm.warn(err) end; return true end
+
+  local guarded_arg = line:match("^mapper guarded%s+(.+)$")
+    or line:match("^mapper areaguard%s+(.+)$")
+  if line == "mapper guarded" or line == "mapper areaguard" then
+    mm.warn("Usage: mapper guarded <room id>")
+    return true
+  end
+  if guarded_arg then local ok, err = mm.guarded_room(guarded_arg); if not ok then mm.warn(err) end; return true end
 
   local where_arg = line:match("^mapper where%s+(.+)$")
   if line == "mapper where" then mm.warn("Usage: mapper where <room id>"); return true end
@@ -1026,19 +1063,27 @@ mm.alias_specs = {
   {"^mapper stats reset$", function() mm.reset_stats() end},
   {"^mapper goto (.+)$", function(m) local ok, err = mm.goto_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper walkto (.+)$", function(m) local ok, err = mm.walkto_room(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper guarded%s*(.*)$", function(m) local ok, err = mm.guarded_room(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper areaguard%s*(.*)$", function(m) local ok, err = mm.guarded_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper where%s*(.*)$", function(m) local ok, err = mm.where_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper exits(?:%s+(%d+))?$", function(m) local ok, err = mm.print_room_exits(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper area%s+(.+)$", function(m) local ok, err = mm.search_text("area", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper find%s+(.+)$", function(m) local ok, err = mm.search_text("find", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper list%s+(.+)$", function(m) local ok, err = mm.search_text("list", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper notes(?:%s+(.+))?$", function(m) local ok, err = mm.search_notes(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarkwin%s*(.*)$", function(m) local ok, err = mm.bookmark_window.command(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper bookmarks$", function() local ok, err = mm.bookmarks.list(); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks list$", function() local ok, err = mm.bookmarks.list_all(); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks search$", function() local ok, err = mm.bookmarks.search(); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks search%s+(.+)$", function(m) local ok, err = mm.bookmarks.search(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper bookmarks add$", function() local ok, err = mm.bookmarks.add(); if not ok then mm.warn(err) end end},
   {"^mapper bookmarks add%s+(.+)$", function(m) local ok, err = mm.bookmarks.add(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper bookmarks go%s+#(%d+)$", function(m) local ok, err = mm.bookmarks.go_index(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper bookmarks delete%s+#(%d+)$", function(m) local ok, err = mm.bookmarks.delete_index(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper bookmarks delete%s+(%d+)$", function(m) local ok, err = mm.bookmarks.delete_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper bookmarks rename%s+#(%d+)%s+(.+)$", function(m) local ok, err = mm.bookmarks.rename_index(m[2], m[3]); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks pin%s*(.*)$", function(m) local ok, err = mm.bookmarks.pin(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper bookmarks unpin%s*(.*)$", function(m) local ok, err = mm.bookmarks.unpin(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper bookmarks listdeleted$", function() local ok, err = mm.bookmarks.list_deleted(); if not ok then mm.warn(err) end end},
   {"^mapper bookmarks restore%s+#(%d+)$", function(m) local ok, err = mm.bookmarks.restore_index(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper bookmarks%s+(.+)$", function(m) local ok, err = mm.bookmarks.list(m[2]); if not ok then mm.warn(err) end end},
@@ -1221,6 +1266,14 @@ mm.alias_specs = {
   {"^mapper import rooms$", function() local ok, err = mm.import.convert_sqlite_to_mudlet(mm.state.map_db); if not ok then mm.warn(err) end end},
   {"^mapper rebuild lookup$", function() rebuild_rooms_lookup() end},
   {"^mapper rebuild rooms_lookup$", function() rebuild_rooms_lookup() end},
+  {"^mapper refresh (terrain|sectors)$", function()
+    if mm.request_sector_metadata then
+      local ok, err = mm.request_sector_metadata("manual terrain refresh")
+      if ok then mm.note("Requested fresh terrain/sector metadata.") else mm.warn(err) end
+    else
+      mm.warn("GMCP sector metadata requests are unavailable.")
+    end
+  end},
   {"^mapper recolor map$", function() local ok, err = mm.apply_terrain_colors(); if not ok then mm.warn(err) end end},
   {"^mapper updatecolors$", function() local ok, info = mm.import.update_room_colors_from_sqlite(mm.state.map_db); if not ok then mm.warn(info) else mm.note(string.format("DB room colors updated: env=%d, env-colors=%d, rooms=%d, skipped=%d", info.env_rows or 0, info.colors_applied or 0, info.rooms_updated or 0, info.rooms_skipped or 0)) end end},
   {"^mapper updatecolors (.+)$", function(m) local ok, info = mm.import.update_room_colors_from_sqlite(m[2]); if not ok then mm.warn(info) else mm.note(string.format("DB room colors updated from %s: env=%d, env-colors=%d, rooms=%d, skipped=%d", tostring(info.source), info.env_rows or 0, info.colors_applied or 0, info.rooms_updated or 0, info.rooms_skipped or 0)) end end},
@@ -1250,7 +1303,7 @@ mm.stubbed = {
 }
 
 function mm.handle_command(line)
-  line = normalize_line(line)
+  line = normalize_bookmark_command(normalize_line(line))
   mm.debug("handle_command received: " .. tostring(line))
   if handle_command_inline(line) then return true end
 
@@ -1281,7 +1334,7 @@ function mm.register_aliases()
     pcall(killAlias, mm._alias)
     mm._alias = nil
   end
-  mm._alias = tempAlias("^(mapper|mapper .+|maptype .+|mapshow .+|updatecolors(?: .+)?|resetaard|recon?)$", function()
+  mm._alias = tempAlias("^(mapper|mapper .+|bookmarks?(?: .+)?|bookmarkwin(?: .+)?|maptype .+|mapshow .+|updatecolors(?: .+)?|resetaard|recon?)$", function()
     -- Prefer Mudlet's raw command text when available so stacked separators
     -- like ";;" are preserved for downstream mapper parsing/persistence.
     local line = command or matches[2] or matches[1]

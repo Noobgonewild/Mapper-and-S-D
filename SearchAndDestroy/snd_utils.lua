@@ -125,7 +125,10 @@ end
 -- @return Plain string without color codes
 function snd.utils.stripColors(str)
     if not str then return "" end
-    
+
+    str = tostring(str)
+    str = str:gsub("\27%[[0-9;]*m", "")
+    str = str:gsub("[%z\1-\8\11\12\14-\31]", "")
     str = str:gsub("@@", "\001")
     str = str:gsub("@%-", "~")
     str = str:gsub("@x%d?%d?%d?", "")

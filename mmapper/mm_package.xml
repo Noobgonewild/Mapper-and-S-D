@@ -20,6 +20,7 @@ local requiredFiles = {
   "mm_portal_usage.lua",
   "mm_frontier.lua",
   "mm_bookmarks.lua",
+  "mm_bookmark_window.lua",
   "mm_help.lua",
   "mm_minimap.lua",
   "mm_commands.lua",

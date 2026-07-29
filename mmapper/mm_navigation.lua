@@ -197,6 +197,11 @@ function snd.mapper.db.close()
         snd.mapper.db.env = nil
     end
     snd.mapper.db.isOpen = false
+    snd.mapper.db.columnCache = nil
+    snd.mapper.db.roomsLookupReady = nil
+    snd.mapper.committedSectorFingerprint = nil
+    snd.mapper.clanAreaCache = nil
+    snd.mapper.clanAreaList = nil
 end
 
 --- Execute a query and return results
@@ -576,24 +581,6 @@ local function room_info_details(roomInfo)
     return nil
 end
 
-local function valid_room_coords(roomInfo)
-    if not roomInfo then return {} end
-    local coord = roomInfo.coord or {}
-    local x = tonumber(coord.x or roomInfo.x)
-    local y = tonumber(coord.y or roomInfo.y)
-    local z = tonumber(coord.z or roomInfo.z)
-    local coordId = tonumber(coord.id)
-    if coordId == -1 or (x == -1 and y == -1) then
-        return {}
-    end
-
-    local out = {}
-    if x ~= nil then out.x = x end
-    if y ~= nil then out.y = y end
-    if z ~= nil then out.z = z end
-    return out
-end
-
 function snd.mapper.refreshRoomLookup(roomId, roomName)
     if not roomId or tostring(roomId) == "" then return false, "missing room id" end
     if not snd.mapper.db.open() then return false, "cannot open mapper database" end
@@ -651,7 +638,8 @@ function snd.mapper.rebuildRoomsLookup()
     return false, err
 end
 
-function snd.mapper.persistAreaInfo(areaInfo)
+function snd.mapper.persistAreaInfo(areaInfo, opts)
+    opts = opts or {}
     if type(areaInfo) ~= "table" then return false, "missing area info" end
     if not snd.mapper.db.open() then return false, "cannot open mapper database" end
 
@@ -670,20 +658,22 @@ function snd.mapper.persistAreaInfo(areaInfo)
         snd.mapper.db.escape(color),
         snd.mapper.db.escape(flags)
     ))
-    if mm and mm.bump_stats then
+    if not opts.defer_stats and mm and mm.bump_stats then
         mm.bump_stats(ok and "areas_updated" or "failed")
+    end
+    if ok then
+        snd.mapper.clanAreaCache = nil
+        snd.mapper.clanAreaList = nil
     end
     return ok, err
 end
 
-function snd.mapper.persistSectors(sectorsPacket)
-    if not snd.mapper.db.open() then return false, "cannot open mapper database" end
-
+local function sector_rows(sectorsPacket)
     local sectors = sectorsPacket
     if type(sectorsPacket) == "table" and type(sectorsPacket.sectors) == "table" then
         sectors = sectorsPacket.sectors
     end
-    if type(sectors) ~= "table" then return false, "missing sectors list" end
+    if type(sectors) ~= "table" then return nil, "missing sectors list" end
 
     local rows = {}
     for _, sector in pairs(sectors) do
@@ -695,10 +685,72 @@ function snd.mapper.persistSectors(sectorsPacket)
             })
         end
     end
-    if #rows == 0 then return false, "sectors list has no usable entries" end
+    if #rows == 0 then return nil, "sectors list has no usable entries" end
+    return rows
+end
 
-    local ok, err = snd.mapper.db.execute("BEGIN")
-    if not ok then return false, err end
+local function sector_fingerprint(rows)
+    local normalized = {}
+    for _, row in ipairs(rows or {}) do
+        table.insert(normalized, {
+            id = tostring(row.id or row.uid or ""),
+            name = tostring(row.name or ""),
+            color = tonumber(row.color) or 0,
+        })
+    end
+    table.sort(normalized, function(a, b)
+        local aid, bid = tonumber(a.id), tonumber(b.id)
+        if aid and bid and aid ~= bid then return aid < bid end
+        if a.id ~= b.id then return a.id < b.id end
+        if a.name ~= b.name then return a.name < b.name end
+        return a.color < b.color
+    end)
+    local parts = {}
+    for _, row in ipairs(normalized) do
+        table.insert(parts, table.concat({ row.id, row.name, tostring(row.color) }, "\31"))
+    end
+    return table.concat(parts, "\30")
+end
+
+function snd.mapper.sectorPacketFingerprint(sectorsPacket)
+    local rows, err = sector_rows(sectorsPacket)
+    if not rows then return nil, err end
+    return sector_fingerprint(rows), rows
+end
+
+function snd.mapper.loadCommittedSectorFingerprint()
+    if snd.mapper.committedSectorFingerprint ~= nil then
+        return snd.mapper.committedSectorFingerprint
+    end
+    if not snd.mapper.db.open() then return nil, "cannot open mapper database" end
+    local rows = snd.mapper.db.query("SELECT uid, name, color FROM environments")
+    if rows == nil then return nil, "cannot read environment metadata" end
+    snd.mapper.committedSectorFingerprint = sector_fingerprint(rows)
+    return snd.mapper.committedSectorFingerprint
+end
+
+function snd.mapper.persistSectors(sectorsPacket, opts)
+    opts = opts or {}
+    if not snd.mapper.db.open() then return false, "cannot open mapper database" end
+
+    local rows, rows_err = sector_rows(sectorsPacket)
+    if not rows then return false, rows_err end
+
+    local incoming_fingerprint = sector_fingerprint(rows)
+    local committed_fingerprint = opts.committed_fingerprint
+    if committed_fingerprint == nil and opts.compare ~= false then
+        committed_fingerprint = snd.mapper.loadCommittedSectorFingerprint()
+    end
+    if committed_fingerprint ~= nil and committed_fingerprint == incoming_fingerprint then
+        return true, 0, false, incoming_fingerprint
+    end
+
+    local owns_transaction = opts.in_transaction ~= true
+    local ok, err = true, nil
+    if owns_transaction then
+        ok, err = snd.mapper.db.execute("BEGIN")
+        if not ok then return false, err end
+    end
     ok, err = snd.mapper.db.execute("DELETE FROM environments")
     if ok then
         for _, row in ipairs(rows) do
@@ -713,48 +765,36 @@ function snd.mapper.persistSectors(sectorsPacket)
     end
 
     if ok then
-        snd.mapper.db.execute("COMMIT")
-        if mm and mm.bump_stats then
+        if owns_transaction then
+            local commit_ok, commit_err = snd.mapper.db.execute("COMMIT")
+            if not commit_ok then
+                pcall(snd.mapper.db.execute, "ROLLBACK")
+                return false, commit_err
+            end
+            if not opts.defer_notify and snd.mapper.notifyMapperDbUpdated then
+                local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
+                snd.mapper.notifyMapperDbUpdated(currentRoom, true)
+            end
+            snd.mapper.committedSectorFingerprint = incoming_fingerprint
+        end
+        if not opts.defer_stats and mm and mm.bump_stats then
             mm.bump_stats("env_rows_updated", #rows)
         end
-        return true, #rows
+        return true, #rows, true, incoming_fingerprint
     end
 
-    snd.mapper.db.execute("ROLLBACK")
-    if mm and mm.bump_stats then
+    if owns_transaction then snd.mapper.db.execute("ROLLBACK") end
+    if not opts.defer_stats and mm and mm.bump_stats then
         mm.bump_stats("failed")
     end
     return false, err
 end
 
+-- Retained as a compatibility surface for older callers.  Live Room.Info is
+-- not a metadata-discovery trigger: area and sector packets are consumed when
+-- they arrive, while explicit map build/repair workflows own any requests.
 function snd.mapper.requestMetadataForRoom(roomInfo)
-    if type(sendGMCP) ~= "function" or type(roomInfo) ~= "table" then return false end
-    if not snd.mapper.db.open() then return false end
-
-    local requested = false
-    local areaKey = tostring(roomInfo.zone or roomInfo.area or "")
-    if areaKey ~= "" and snd.mapper.lastAreaMetadataRequest ~= areaKey then
-        local rows = snd.mapper.db.query(
-            "SELECT uid FROM areas WHERE uid = " .. snd.mapper.db.escape(areaKey) .. " LIMIT 1"
-        ) or {}
-        if #rows == 0 then
-            snd.mapper.lastAreaMetadataRequest = areaKey
-            sendGMCP("request area")
-            requested = true
-        end
-    end
-
-    if not snd.mapper.sectorsMetadataRequested then
-        local rows = snd.mapper.db.query("SELECT COUNT(*) AS cnt FROM environments") or {}
-        local count = tonumber(rows[1] and rows[1].cnt) or 0
-        if count == 0 then
-            snd.mapper.sectorsMetadataRequested = true
-            sendGMCP("request sectors")
-            requested = true
-        end
-    end
-
-    return requested
+    return false
 end
 
 -------------------------------------------------------------------------------
@@ -766,6 +806,48 @@ local PORTAL_GUARD_ALLOWANCE = 30
 
 local function normalizeAreaKey(value)
     return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+-- Clan membership is area metadata. Load it once so route validation does not
+-- issue a room/area join for every step in every candidate path.
+function snd.mapper.loadClanAreaCache()
+    if type(snd.mapper.clanAreaCache) == "table"
+        and type(snd.mapper.clanAreaList) == "table"
+    then
+        return snd.mapper.clanAreaCache, snd.mapper.clanAreaList
+    end
+
+    local cache = {}
+    local list = {}
+    local rows = snd.mapper.db.query([[
+        SELECT uid
+        FROM areas
+        WHERE LOWER(COALESCE(flags, '')) LIKE '%clanarea%'
+        ORDER BY uid
+    ]]) or {}
+    for _, row in ipairs(rows) do
+        local key = normalizeAreaKey(row.uid)
+        if key ~= "" and not cache[key] then
+            cache[key] = true
+            table.insert(list, key)
+        end
+    end
+
+    snd.mapper.clanAreaCache = cache
+    snd.mapper.clanAreaList = list
+    return cache, list
+end
+
+function snd.mapper.isClanArea(areaKey)
+    local key = normalizeAreaKey(areaKey)
+    if key == "" then return false end
+    local cache = snd.mapper.loadClanAreaCache()
+    return cache[key] == true
+end
+
+function snd.mapper.isClanRoom(roomId, roomInfo)
+    local info = roomInfo or snd.mapper.getRoomInfo(roomId)
+    return info ~= nil and snd.mapper.isClanArea(info.area)
 end
 
 function snd.mapper.portalGuardEnabled()
@@ -809,7 +891,32 @@ function snd.mapper.areaGuardConfig()
 end
 
 function snd.mapper.areaGuardEnabled()
-    return snd.mapper.areaGuardConfig().enabled == true
+    return (tonumber(snd.mapper.areaGuardForceDepth) or 0) > 0
+        or snd.mapper.areaGuardConfig().enabled == true
+end
+
+-- Temporarily force AreaGuard on for synchronous, read-only route planning.
+-- The persisted setting is never changed, and the previous runtime depth is
+-- restored even if the callback raises an error.
+function snd.mapper.withAreaGuardForced(callback)
+    if type(callback) ~= "function" then
+        error("withAreaGuardForced expects a function", 2)
+    end
+
+    local previousDepth = tonumber(snd.mapper.areaGuardForceDepth) or 0
+    snd.mapper.areaGuardForceDepth = previousDepth + 1
+    local function packResults(...)
+        return {count = select("#", ...), ...}
+    end
+    local results = packResults(pcall(callback))
+    snd.mapper.areaGuardForceDepth = previousDepth
+
+    if not results[1] then
+        error(results[2], 0)
+    end
+
+    local unpackResults = table.unpack or unpack
+    return unpackResults(results, 2, results.count)
 end
 
 function snd.mapper.areaGuardAllowance()
@@ -917,6 +1024,14 @@ function snd.mapper.checkAreaGuardDestination(currentRoom, destinationRoom, over
     end
 
     local result = snd.mapper.evaluateRoomAreaGuard(destinationRoom)
+    if snd.mapper.isClanArea(result.mapperArea) then
+        snd.utils.debugNote(string.format(
+            "Area guard destination allowed: room=%s area='%s' is a clan area.",
+            tostring(destinationRoom),
+            tostring(result.mapperArea or "?")
+        ))
+        return true
+    end
     if not result.known then
         snd.utils.debugNote(string.format(
             "Area guard destination allowed: room=%s area='%s' has no reference metadata.",
@@ -985,23 +1100,130 @@ function snd.mapper.areaGuardRoomSql(roomExpression, sourceRoom, ignoreLockedExi
         return "1=1", 0
     end
 
+    local _, clanAreas = snd.mapper.loadClanAreaCache()
+    local clanAreaSql = {}
+    for _, areaKey in ipairs(clanAreas or {}) do
+        table.insert(clanAreaSql, snd.mapper.db.escape(areaKey))
+    end
+    local nonClanWhere = #clanAreaSql > 0
+        and " AND LOWER(area_guard_room.area) NOT IN (" .. table.concat(clanAreaSql, ",") .. ")"
+        or ""
+
     local sql = string.format(
         "NOT EXISTS (SELECT 1 FROM rooms AS area_guard_room " ..
-        "WHERE area_guard_room.uid = %s AND LOWER(area_guard_room.area) IN (%s))",
+        "WHERE area_guard_room.uid = %s AND LOWER(area_guard_room.area) IN (%s)%s)",
         roomExpression,
-        table.concat(blocked, ",")
+        table.concat(blocked, ","),
+        nonClanWhere
     )
     return sql, blockedCount
 end
 
+-- Validate a concrete route against the ordinary area policy. Clan rooms are
+-- locally exempt, but that exemption never carries into the next non-clan
+-- room. Thus a clan cexit landing in a dangerous area is still rejected.
+-- The current source area remains escapable and unknown areas fail open,
+-- matching areaGuardRoomSql.
+function snd.mapper.pathMeetsAreaGuard(sourceRoom, path)
+    if not snd.mapper.areaGuardEnabled() then return true, nil, false end
+
+    local sourceInfo = snd.mapper.getRoomInfo(sourceRoom)
+    local sourceArea = normalizeAreaKey(sourceInfo and sourceInfo.area or "")
+    local usedClanExemption = false
+
+    for _, step in ipairs(path or {}) do
+        local roomId = tostring(step.uid or "")
+        if roomId ~= "" and roomId ~= "-1" then
+            local result = snd.mapper.evaluateRoomAreaGuard(roomId)
+            local stepArea = normalizeAreaKey(result and result.mapperArea or "")
+            local isSourceArea = sourceArea ~= "" and stepArea == sourceArea
+            if snd.mapper.isClanArea(stepArea) then
+                usedClanExemption = true
+            elseif result and result.known and not result.allowed and not isSourceArea then
+                return false, result, usedClanExemption
+            end
+        end
+    end
+
+    return true, nil, usedClanExemption
+end
+
+-- Inspect the ordinary shortest route with AreaGuard excluded from route
+-- selection. Clan rooms are exempt only for their own room checks; they never
+-- authorize earlier or later non-clan rooms. If this candidate is rejected,
+-- gotoRoom performs the usual guarded search for the shortest valid fallback.
+-- Since acceptance is now a room-local property, that filtered search is
+-- equivalent to rejecting unsafe candidates in cost order; no clan-biased
+-- pathfinder or Aylor anchor is required.
+function snd.mapper.planAreaGuardRoute(
+    currentRoom,
+    destination,
+    noPortals,
+    noRecalls,
+    ignoreLockedExits
+)
+    if snd.mapper.areaGuardBypassed(ignoreLockedExits, false) then
+        return {active = false, directSafe = false}
+    end
+
+    local source = tostring(currentRoom or "")
+    local target = tostring(destination or "")
+    local directPath, directDepth = snd.mapper.findPath(
+        source,
+        target,
+        noPortals,
+        noRecalls,
+        ignoreLockedExits,
+        true
+    )
+
+    local directSafe = false
+    local usedClanExemption = false
+    local blockedDirect = nil
+    if directPath and #directPath > 0 then
+        directSafe, blockedDirect, usedClanExemption = snd.mapper.pathMeetsAreaGuard(source, directPath)
+        if directSafe then
+            local directCandidate = {
+                kind = usedClanExemption and "direct_clan_exempt" or "direct_area_safe",
+                path = directPath,
+                depth = directDepth or #directPath,
+            }
+            snd.utils.debugNote(usedClanExemption
+                and "Area guard: true shortest route is safe with a local clan-room exemption."
+                or "Area guard: true shortest route already passes every safety check.")
+            return {
+                active = true,
+                directSafe = true,
+                directPath = directPath,
+                candidate = directCandidate,
+                candidates = {directCandidate},
+            }
+        else
+            snd.utils.debugNote(string.format(
+                "Area guard: true shortest route is blocked at room %s (%s).",
+                tostring(blockedDirect and blockedDirect.roomId or "?"),
+                tostring(blockedDirect and (blockedDirect.keyword or blockedDirect.mapperArea) or "unknown area")
+            ))
+        end
+    end
+
+    return {
+        active = true,
+        directSafe = false,
+        directPath = directPath,
+        blocked = blockedDirect,
+        candidate = nil,
+        candidates = {},
+    }
+end
+
 --- Persist a discovered room + exits from GMCP room.info into Aardwolf.db
 -- @param roomInfo GMCP room.info table
-local PERSIST_STATS_FIELDS = { "rooms_updated", "coords_stored", "exits_updated", "failed" }
+local PERSIST_STATS_FIELDS = { "rooms_updated", "exits_updated", "failed" }
 
 local function new_persist_stats()
     return {
         rooms_updated = 0,
-        coords_stored = 0,
         exits_updated = 0,
         failed = 0,
         layout_changed = false,
@@ -1026,13 +1248,20 @@ local function publish_persist_stats(stats)
     end
 end
 
-local function notify_mapper_db_updated(room_id, invalidate_layout)
+function snd.mapper.notifyMapperDbUpdated(room_id, invalidate_layout)
     if invalidate_layout and mm and mm.import and mm.import.invalidate_layout_cache then
         mm.import.invalidate_layout_cache()
     end
     local local_mode = not (mm and mm.minimap and mm.minimap.is_local_mode) or
         mm.minimap.is_local_mode()
-    if local_mode and mm and mm.minimap and mm.minimap.update_local_map then
+    local room_already_rendered = mm and mm.runtime and
+        tostring(mm.runtime.last_room_num or "") == tostring(room_id or "")
+    -- Mudlet can invoke the S&D and MMapper Room.Info handlers in either order.
+    -- If the normal render is still coming, invalidating the cache is enough;
+    -- that render will consume the committed data. If it already ran, rebuild
+    -- only when committed geometry made the active local view stale.
+    if invalidate_layout and local_mode and room_already_rendered and
+        mm and mm.minimap and mm.minimap.update_local_map then
         mm.minimap.update_local_map(room_id)
     end
     if type(raiseEvent) == "function" then
@@ -1041,13 +1270,14 @@ local function notify_mapper_db_updated(room_id, invalidate_layout)
 end
 
 function snd.mapper.persistDiscoveredRoom(roomInfo, opts)
+    opts = opts or {}
     local statDelta = new_persist_stats()
     if not roomInfo or not roomInfo.num then
         return false, statDelta
     end
     if not snd.mapper.db.open() then
         statDelta.failed = statDelta.failed + 1
-        if not (opts and opts.defer_stats) then publish_persist_stats(statDelta) end
+        if not opts.defer_stats then publish_persist_stats(statDelta) end
         return false, statDelta
     end
 
@@ -1055,7 +1285,9 @@ function snd.mapper.persistDiscoveredRoom(roomInfo, opts)
     if not roomId or roomId == "" then
         return false, statDelta
     end
-    if mm and mm.import and mm.import.layout_cache_matches_room then
+    if opts.layout_changed ~= nil then
+        statDelta.layout_changed = opts.layout_changed == true
+    elseif mm and mm.import and mm.import.layout_cache_matches_room then
         statDelta.layout_changed = not mm.import.layout_cache_matches_room(roomInfo)
     else
         statDelta.layout_changed = true
@@ -1064,88 +1296,95 @@ function snd.mapper.persistDiscoveredRoom(roomInfo, opts)
     local roomName = (mm and mm.strip_ansi) and mm.strip_ansi(roomInfo.name) or tostring(roomInfo.name or "")
     local terrain = tostring(roomInfo.terrain or "")
     local details = room_info_details(roomInfo)
-    local coords = valid_room_coords(roomInfo)
-    local roomCols = snd.mapper.db.tableColumns("rooms")
+    local writeRoom = opts.write_room ~= false
+    local writeLookup = opts.write_lookup ~= false
+    local writeExits = opts.write_exits ~= false
+    local roomCols = writeRoom and snd.mapper.db.tableColumns("rooms") or {}
 
-    local insertCols = { "uid", "name", "area", "terrain" }
-    local insertVals = {
-        snd.mapper.db.escape(roomId),
-        snd.mapper.db.escape(roomName),
-        snd.mapper.db.escape(areaKey),
-        snd.mapper.db.escape(terrain),
-    }
-    if roomCols.info and details ~= nil then
-        table.insert(insertCols, "info")
-        table.insert(insertVals, snd.mapper.db.escape(details))
-    end
-    for _, col in ipairs({ "x", "y", "z" }) do
-        if roomCols[col] and coords[col] ~= nil then
-            table.insert(insertCols, col)
-            table.insert(insertVals, tostring(math.floor(coords[col])))
+    if writeRoom then
+        local insertCols = { "uid", "name", "area", "terrain" }
+        local insertVals = {
+            snd.mapper.db.escape(roomId),
+            snd.mapper.db.escape(roomName),
+            snd.mapper.db.escape(areaKey),
+            snd.mapper.db.escape(terrain),
+        }
+        if roomCols.info and details ~= nil then
+            table.insert(insertCols, "info")
+            table.insert(insertVals, snd.mapper.db.escape(details))
+        end
+        if roomCols.norecall then
+            table.insert(insertCols, "norecall")
+            table.insert(insertVals, "0")
+        end
+        if roomCols.noportal then
+            table.insert(insertCols, "noportal")
+            table.insert(insertVals, "0")
+        end
+
+        local insertRoomSql = string.format(
+            "INSERT OR IGNORE INTO rooms (%s) VALUES (%s)",
+            table.concat(insertCols, ", "),
+            table.concat(insertVals, ", ")
+        )
+        local insertRoomOk = snd.mapper.db.conn:execute(insertRoomSql)
+
+        local updates = {
+            "name = " .. snd.mapper.db.escape(roomName),
+            "area = " .. snd.mapper.db.escape(areaKey),
+            "terrain = " .. snd.mapper.db.escape(terrain),
+        }
+        if roomCols.info and details ~= nil then
+            table.insert(updates, "info = " .. snd.mapper.db.escape(details))
+        end
+        local updateRoomSql = string.format(
+            "UPDATE rooms SET %s WHERE uid = %s",
+            table.concat(updates, ", "),
+            snd.mapper.db.escape(roomId)
+        )
+        local updateRoomOk = snd.mapper.db.conn:execute(updateRoomSql)
+        if insertRoomOk and updateRoomOk then
+            statDelta.rooms_updated = statDelta.rooms_updated + 1
+        else
+            statDelta.failed = statDelta.failed + 1
         end
     end
-    if roomCols.norecall then
-        table.insert(insertCols, "norecall")
-        table.insert(insertVals, "0")
-    end
-    if roomCols.noportal then
-        table.insert(insertCols, "noportal")
-        table.insert(insertVals, "0")
-    end
 
-    local insertRoomSql = string.format(
-        "INSERT OR IGNORE INTO rooms (%s) VALUES (%s)",
-        table.concat(insertCols, ", "),
-        table.concat(insertVals, ", ")
-    )
-    local insertRoomOk = snd.mapper.db.conn:execute(insertRoomSql)
-
-    local updates = {
-        "name = " .. snd.mapper.db.escape(roomName),
-        "area = " .. snd.mapper.db.escape(areaKey),
-        "terrain = " .. snd.mapper.db.escape(terrain),
-    }
-    if roomCols.info and details ~= nil then
-        table.insert(updates, "info = " .. snd.mapper.db.escape(details))
-    end
-    for _, col in ipairs({ "x", "y", "z" }) do
-        if roomCols[col] and coords[col] ~= nil then
-            table.insert(updates, col .. " = " .. tostring(math.floor(coords[col])))
+    if writeLookup then
+        local lookupOk, lookupErr = snd.mapper.refreshRoomLookup(roomId, roomName)
+        if not lookupOk then
+            snd.utils.debugNote("rooms_lookup refresh failed for " .. tostring(roomId) .. ": " .. tostring(lookupErr))
+            statDelta.failed = statDelta.failed + 1
         end
-    end
-
-    local updateRoomSql = string.format(
-        "UPDATE rooms SET %s WHERE uid = %s",
-        table.concat(updates, ", "),
-        snd.mapper.db.escape(roomId)
-    )
-    local updateRoomOk = snd.mapper.db.conn:execute(updateRoomSql)
-    if insertRoomOk and updateRoomOk then
-        statDelta.rooms_updated = statDelta.rooms_updated + 1
-        if coords.x ~= nil or coords.y ~= nil or coords.z ~= nil then
-            statDelta.coords_stored = statDelta.coords_stored + 1
-        end
-    else
-        statDelta.failed = statDelta.failed + 1
-    end
-
-    local lookupOk, lookupErr = snd.mapper.refreshRoomLookup(roomId, roomName)
-    if not lookupOk then
-        snd.utils.debugNote("rooms_lookup refresh failed for " .. tostring(roomId) .. ": " .. tostring(lookupErr))
     end
 
     local exits = roomInfo.exits
-    if type(exits) == "table" then
+    if writeExits and type(exits) == "table" then
         local exitsUpdated = 0
         local exitFailures = 0
+        -- Room.Info is authoritative for cardinal exits. Clear the old
+        -- cardinal set once, then insert the normalized live set; custom exits,
+        -- recall edges, and portal edges remain untouched.
+        local deleteOk, deleteResult = snd.mapper.db.execute(string.format(
+            "DELETE FROM exits WHERE fromuid = %s AND LOWER(dir) IN (%s)",
+            snd.mapper.db.escape(roomId),
+            mapperCardinalDirectionsSql
+        ))
+        if deleteOk then
+            exitsUpdated = exitsUpdated + (tonumber(deleteResult) or 0)
+        else
+            exitFailures = exitFailures + 1
+        end
         for dir, toUid in pairs(exits) do
             local toRoom = tonumber(toUid)
-            if toRoom and (toRoom > 0 or toRoom == -1) then
+            local normalizedDir = snd.mapper.normalizeDirection(dir)
+            if normalizedDir and toRoom and (toRoom > 0 or toRoom == -1) then
+                local storedDir = normalizedDir
                 -- Preserve direction-only maze exits as -1 so map renderers can
                 -- draw arrows even though navigation has no destination room.
                 local insertExitSql = string.format(
                     "INSERT OR IGNORE INTO exits (dir, fromuid, touid, level) VALUES (%s, %s, %s, 0)",
-                    snd.mapper.db.escape(tostring(dir)),
+                    snd.mapper.db.escape(storedDir),
                     snd.mapper.db.escape(roomId),
                     snd.mapper.db.escape(tostring(toRoom))
                 )
@@ -1155,7 +1394,7 @@ function snd.mapper.persistDiscoveredRoom(roomInfo, opts)
                     "UPDATE exits SET touid = %s WHERE fromuid = %s AND dir = %s",
                     snd.mapper.db.escape(tostring(toRoom)),
                     snd.mapper.db.escape(roomId),
-                    snd.mapper.db.escape(tostring(dir))
+                    snd.mapper.db.escape(storedDir)
                 )
                 local updateExitOk = snd.mapper.db.conn:execute(updateExitSql)
                 if insertExitOk and updateExitOk then
@@ -1165,53 +1404,340 @@ function snd.mapper.persistDiscoveredRoom(roomInfo, opts)
                 end
             end
         end
+
         statDelta.exits_updated = statDelta.exits_updated + exitsUpdated
         statDelta.failed = statDelta.failed + exitFailures
     end
 
-    if not (opts and opts.defer_stats) then
+    if not opts.defer_stats then
         publish_persist_stats(statDelta)
     end
-    if not (opts and opts.defer_notify) then
-        notify_mapper_db_updated(roomId, statDelta.layout_changed)
+    if not opts.defer_notify then
+        snd.mapper.notifyMapperDbUpdated(roomId, statDelta.layout_changed)
     end
-    return true, statDelta
+    return statDelta.failed == 0, statDelta
+end
+
+local function pending_room_ids(pendingRooms)
+    local ids = {}
+    for _, roomInfo in pairs(pendingRooms or {}) do
+        local uid = snd.mapper.normalizeRoomInfoUid(roomInfo)
+        if uid and uid ~= "" then table.insert(ids, tostring(uid)) end
+    end
+    table.sort(ids)
+    return ids
+end
+
+local function query_pending_chunks(ids, build_sql)
+    local rows = {}
+    local chunk_size = 400
+    for first = 1, #ids, chunk_size do
+        local escaped = {}
+        for index = first, math.min(#ids, first + chunk_size - 1) do
+            table.insert(escaped, snd.mapper.db.escape(ids[index]))
+        end
+        local result = snd.mapper.db.query(build_sql(table.concat(escaped, ", ")))
+        if result == nil then return nil end
+        for _, row in ipairs(result) do table.insert(rows, row) end
+    end
+    return rows
+end
+
+function snd.mapper.loadPendingRoomDbState(pendingRooms)
+    local ids = pending_room_ids(pendingRooms)
+    local state = {
+        rooms = {},
+        exits = {},
+        exit_counts = {},
+        room_columns = {},
+    }
+    if #ids == 0 then return state end
+    state.room_columns = snd.mapper.db.tableColumns("rooms")
+
+    local select_columns = { "uid", "name", "area", "terrain" }
+    if state.room_columns.info then table.insert(select_columns, "info") end
+    local room_rows = query_pending_chunks(ids, function(in_clause)
+        return "SELECT " .. table.concat(select_columns, ", ") ..
+            " FROM rooms WHERE uid IN (" .. in_clause .. ")"
+    end)
+    if room_rows == nil then return nil, "cannot load buffered room rows" end
+    for _, row in ipairs(room_rows) do
+        state.rooms[tostring(row.uid)] = row
+    end
+
+    local exit_rows = query_pending_chunks(ids, function(in_clause)
+        return "SELECT fromuid, dir, touid FROM exits WHERE fromuid IN (" .. in_clause ..
+            ") AND LOWER(dir) IN (" .. mapperCardinalDirectionsSql .. ")"
+    end)
+    if exit_rows == nil then return nil, "cannot load buffered cardinal exits" end
+    for _, row in ipairs(exit_rows) do
+        local uid = tostring(row.fromuid or "")
+        local dir = snd.mapper.normalizeDirection(row.dir)
+        local target = tonumber(row.touid)
+        if uid ~= "" and dir and target and (target > 0 or target == -1) then
+            state.exits[uid] = state.exits[uid] or {}
+            state.exit_counts[uid] = state.exit_counts[uid] or {}
+            state.exits[uid][dir] = target
+            state.exit_counts[uid][dir] = (state.exit_counts[uid][dir] or 0) + 1
+        end
+    end
+    return state
+end
+
+local function normalized_live_cardinal_exits(roomInfo)
+    if type(roomInfo and roomInfo.exits) ~= "table" then return nil end
+    local exits = {}
+    for raw_dir, raw_target in pairs(roomInfo.exits) do
+        local dir = snd.mapper.normalizeDirection(raw_dir)
+        local target = tonumber(raw_target)
+        if dir and target and (target > 0 or target == -1) then exits[dir] = target end
+    end
+    return exits
+end
+
+local function cardinal_exit_sets_match(live, stored, stored_counts)
+    if live == nil then return true end
+    stored = stored or {}
+    stored_counts = stored_counts or {}
+    for dir, target in pairs(live) do
+        if tonumber(stored[dir]) ~= tonumber(target) then return false end
+        if tonumber(stored_counts[dir]) and tonumber(stored_counts[dir]) > 1 then return false end
+    end
+    for dir in pairs(stored) do
+        if live[dir] == nil then return false end
+    end
+    return true
+end
+
+function snd.mapper.planRoomPersist(roomInfo, dbState)
+    local uid = snd.mapper.normalizeRoomInfoUid(roomInfo)
+    local stored = uid and dbState and dbState.rooms[tostring(uid)] or nil
+    local columns = dbState and dbState.room_columns or {}
+    local roomName = (mm and mm.strip_ansi) and mm.strip_ansi(roomInfo.name) or tostring(roomInfo.name or "")
+    local areaKey = tostring(roomInfo.zone or roomInfo.area or "")
+    local terrain = tostring(roomInfo.terrain or "")
+    local details = room_info_details(roomInfo)
+    local isNew = stored == nil
+
+    local nameChanged = isNew or tostring(stored.name or "") ~= roomName
+    local areaChanged = isNew or tostring(stored.area or "") ~= areaKey
+    local terrainChanged = isNew or tostring(stored.terrain or "") ~= terrain
+    local detailsChanged = false
+    if columns.info and details ~= nil then
+        detailsChanged = isNew or tostring(stored.info or "") ~= tostring(details)
+    end
+    local liveExits = normalized_live_cardinal_exits(roomInfo)
+    local exitsChanged = liveExits ~= nil and (isNew or not cardinal_exit_sets_match(
+        liveExits,
+        dbState and dbState.exits[tostring(uid)] or nil,
+        dbState and dbState.exit_counts[tostring(uid)] or nil
+    ))
+    local roomChanged = isNew or nameChanged or areaChanged or terrainChanged or detailsChanged
+
+    return {
+        is_new = isNew,
+        write_room = roomChanged,
+        write_lookup = nameChanged,
+        write_exits = exitsChanged,
+        layout_changed = isNew or areaChanged or terrainChanged or exitsChanged,
+        changed = roomChanged or exitsChanged,
+    }
 end
 
 snd.mapper.pendingPersists = snd.mapper.pendingPersists or {}
+snd.mapper.pendingAreaPersists = snd.mapper.pendingAreaPersists or {}
+snd.mapper.pendingSectorsPersist = snd.mapper.pendingSectorsPersist or nil
 
-function snd.mapper.bufferRoomPersist(ri)
-    if not ri or not ri.num then return end
-    local key = snd.mapper.normalizeRoomInfoUid(ri) or tostring(ri.num)
-    snd.mapper.pendingPersists[tostring(key)] = ri
+local function persistence_snapshot(value, seen)
+    if type(value) ~= "table" then return value end
+    seen = seen or {}
+    if seen[value] then return seen[value] end
+    local copy = {}
+    seen[value] = copy
+    for key, item in pairs(value) do
+        copy[persistence_snapshot(key, seen)] = persistence_snapshot(item, seen)
+    end
+    return copy
 end
 
-function snd.mapper.flushPendingPersists()
-    local pending = snd.mapper.pendingPersists
-    if not pending or next(pending) == nil then return end
-    if not snd.mapper.db.open() then return end
+function snd.mapper.persistenceNavigationActive()
+    return (snd.nav and snd.nav.goingToRoom ~= nil)
+        or snd.mapper.goingToRoom ~= nil
+        or snd.mapper.pathExecutionActive == true
+        or snd.mapper.persistenceArrivalSettling == true
+end
+
+function snd.mapper.bufferRoomPersist(ri)
+    if not ri or not ri.num then return false end
+    local key = snd.mapper.normalizeRoomInfoUid(ri) or tostring(ri.num)
+    snd.mapper.pendingPersists[tostring(key)] = persistence_snapshot(ri)
+    return true
+end
+
+function snd.mapper.bufferAreaPersist(areaInfo)
+    if type(areaInfo) ~= "table" then return false end
+    local uid = areaInfo.id or areaInfo.uid
+    if uid == nil or tostring(uid) == "" then return false end
+    snd.mapper.pendingAreaPersists[tostring(uid)] = persistence_snapshot(areaInfo)
+    return true
+end
+
+function snd.mapper.bufferSectorsPersist(sectorsPacket)
+    if type(sectorsPacket) ~= "table" then return false end
+    snd.mapper.pendingSectorsPersist = persistence_snapshot(sectorsPacket)
+    return true
+end
+
+local function has_pending_persistence()
+    return next(snd.mapper.pendingPersists or {}) ~= nil
+        or next(snd.mapper.pendingAreaPersists or {}) ~= nil
+        or snd.mapper.pendingSectorsPersist ~= nil
+end
+
+function snd.mapper.hasPendingPersistence()
+    return has_pending_persistence()
+end
+
+function snd.mapper.flushPendingPersists(opts)
+    opts = opts or {}
+    snd.mapper.persistenceFlushSerial = (tonumber(snd.mapper.persistenceFlushSerial) or 0) + 1
+    snd.mapper.persistenceArrivalSettling = false
+    if not has_pending_persistence() then return true, new_persist_stats() end
+    if not snd.mapper.db.open() then return false, "cannot open mapper database" end
 
     local totals = new_persist_stats()
-    snd.mapper.db.conn:execute("BEGIN")
+    local pendingRooms = snd.mapper.pendingPersists or {}
+    local pendingAreas = snd.mapper.pendingAreaPersists or {}
+    local pendingSectors = snd.mapper.pendingSectorsPersist
+    local areaCount = 0
+    local sectorCount = 0
+    local sectorFingerprint = nil
     local redrawRoom = nil
-    for _, ri in pairs(pending) do
-        redrawRoom = snd.mapper.normalizeRoomInfoUid(ri) or redrawRoom
-        local ok, delta = snd.mapper.persistDiscoveredRoom(ri, { defer_stats = true, defer_notify = true })
-        add_persist_stats(totals, delta)
-        if not ok and type(delta) ~= "table" then
-            totals.failed = totals.failed + 1
+    local databaseChanged = false
+
+    local beginOk, beginErr = snd.mapper.db.execute("BEGIN")
+    if not beginOk then return false, beginErr end
+
+    local flushOk = true
+    local flushErr = nil
+    local dbState = nil
+    if opts.bulk_compare ~= false then
+        local stateErr
+        dbState, stateErr = snd.mapper.loadPendingRoomDbState(pendingRooms)
+        if not dbState then
+            flushOk = false
+            flushErr = stateErr
         end
     end
-    local commitOk = snd.mapper.db.conn:execute("COMMIT")
-    if commitOk then
-        publish_persist_stats(totals)
-        local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
-        notify_mapper_db_updated(currentRoom or redrawRoom, totals.layout_changed)
-    elseif mm and mm.bump_stats then
-        mm.bump_stats("failed")
+    if flushOk then
+        for roomKey, ri in pairs(pendingRooms) do
+            redrawRoom = snd.mapper.normalizeRoomInfoUid(ri) or redrawRoom
+            local persistPlan = dbState and snd.mapper.planRoomPersist(ri, dbState) or nil
+            if persistPlan then
+                totals.layout_changed = totals.layout_changed or persistPlan.layout_changed
+            end
+            if not persistPlan or persistPlan.changed then
+                databaseChanged = true
+                local persistOpts = {
+                    defer_stats = true,
+                    defer_notify = true,
+                }
+                if persistPlan then
+                    persistOpts.write_room = persistPlan.write_room
+                    persistOpts.write_lookup = persistPlan.write_lookup
+                    persistOpts.write_exits = persistPlan.write_exits
+                    persistOpts.layout_changed = persistPlan.layout_changed
+                end
+                local ok, delta = snd.mapper.persistDiscoveredRoom(ri, persistOpts)
+                add_persist_stats(totals, delta)
+                if not ok then
+                    flushOk = false
+                    flushErr = "failed to persist room " .. tostring(roomKey)
+                    break
+                end
+            end
+        end
     end
 
+    if flushOk then
+        for areaKey, areaInfo in pairs(pendingAreas) do
+            local ok, err = snd.mapper.persistAreaInfo(areaInfo, { defer_stats = true })
+            if not ok then
+                flushOk = false
+                flushErr = "failed to persist area " .. tostring(areaKey) .. ": " .. tostring(err)
+                break
+            end
+            areaCount = areaCount + 1
+            databaseChanged = true
+        end
+    end
+
+    if flushOk and pendingSectors then
+        local ok, result, changed, fingerprint = snd.mapper.persistSectors(pendingSectors, {
+            in_transaction = true,
+            defer_stats = true,
+        })
+        if not ok then
+            flushOk = false
+            flushErr = "failed to persist sectors: " .. tostring(result)
+        else
+            sectorCount = tonumber(result) or 0
+            sectorFingerprint = fingerprint
+            databaseChanged = databaseChanged or changed == true
+            -- Environment colors are visual, but an identical packet does not
+            -- invalidate or redraw the local graph.
+            totals.layout_changed = totals.layout_changed or changed == true
+        end
+    end
+
+    if not flushOk then
+        snd.mapper.db.execute("ROLLBACK")
+        if mm and mm.bump_stats then mm.bump_stats("failed") end
+        return false, flushErr
+    end
+
+    local commitOk, commitErr = snd.mapper.db.execute("COMMIT")
+    if not commitOk then
+        pcall(snd.mapper.db.execute, "ROLLBACK")
+        if mm and mm.bump_stats then mm.bump_stats("failed") end
+        return false, commitErr
+    end
+
+    -- Clear only after a successful commit so interrupted/failed routes can be
+    -- retried by the existing orphan-buffer path.
     snd.mapper.pendingPersists = {}
+    snd.mapper.pendingAreaPersists = {}
+    snd.mapper.pendingSectorsPersist = nil
+    if sectorFingerprint ~= nil then
+        snd.mapper.committedSectorFingerprint = sectorFingerprint
+    end
+
+    publish_persist_stats(totals)
+    if mm and mm.bump_stats then
+        if areaCount > 0 then mm.bump_stats("areas_updated", areaCount) end
+        if sectorCount > 0 then mm.bump_stats("env_rows_updated", sectorCount) end
+    end
+    local currentRoom = snd.room and snd.room.current and snd.room.current.rmid
+    if databaseChanged then
+        snd.mapper.notifyMapperDbUpdated(currentRoom or redrawRoom, totals.layout_changed)
+    end
+    return true, totals
+end
+
+function snd.mapper.schedulePendingPersistFlush()
+    snd.mapper.persistenceFlushSerial = (tonumber(snd.mapper.persistenceFlushSerial) or 0) + 1
+    local serial = snd.mapper.persistenceFlushSerial
+    snd.mapper.persistenceArrivalSettling = true
+    if type(tempTimer) ~= "function" then
+        snd.mapper.persistenceArrivalSettling = false
+        return snd.mapper.flushPendingPersists()
+    end
+    tempTimer(0, function()
+        if serial ~= snd.mapper.persistenceFlushSerial then return end
+        snd.mapper.persistenceArrivalSettling = false
+        snd.mapper.flushPendingPersists()
+    end)
+    return true
 end
 
 local function tokenizeInfo(info)
@@ -1601,9 +2127,9 @@ function snd.mapper.searchRoomsRows(rows, mobName, options)
                            CASE WHEN mt.priority_room IS NOT NULL AND mt.priority_room = m.roomid THEN 1 ELSE 0 END AS priority_match
                     FROM mobs m
                     LEFT JOIN mob_tags mt
-                      ON lower(mt.mob) = lower(m.mob)
-                     AND lower(mt.zone) = lower(m.zone)
-                    WHERE lower(m.mob) = lower(%s) AND m.roomid in (%s);
+                      ON mt.mob = m.mob
+                     AND mt.zone = m.zone
+                    WHERE m.mob = %s AND m.roomid in (%s);
                 ]],
                 snd.db.escape(name),
                 table.concat(roomidList, ",")
@@ -1738,13 +2264,16 @@ function snd.mapper.searchRoomsResults(results, context)
     local linksEnabled = ui.links ~= false
     local chipsEnabled = ui.chips ~= false
 
-    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    local isQuickWhereList = false
     local qwTargetLabel = ""
-    if quickWhere then
-        qwTargetLabel = snd.utils and snd.utils.trim and snd.utils.trim(quickWhere.requestedKeyword or quickWhere.lookupKeyword or "")
-            or tostring(quickWhere.requestedKeyword or quickWhere.lookupKeyword or "")
+    if snd.commands and type(snd.commands.quickWhereListDisplay) == "function" then
+        isQuickWhereList, qwTargetLabel = snd.commands.quickWhereListDisplay(context)
+    elseif type(context) == "table" and context.quickWhere == true then
+        isQuickWhereList = true
+        qwTargetLabel = snd.utils and snd.utils.trim and snd.utils.trim(context.quickWhereLabel or "")
+            or tostring(context.quickWhereLabel or "")
     end
-    if qwTargetLabel == "" and snd.targets and snd.targets.current and snd.targets.current.name then
+    if isQuickWhereList and qwTargetLabel == "" and snd.targets and snd.targets.current and snd.targets.current.name then
         qwTargetLabel = snd.targets.current.name
     end
 
@@ -1755,13 +2284,7 @@ function snd.mapper.searchRoomsResults(results, context)
     end
     cecho("  Notes<reset>\n")
     if chipsEnabled then
-        local showQuickWhereChip = false
-        if quickWhere then
-            showQuickWhereChip = (quickWhere.active == true)
-                or (type(quickWhere.rooms) == "table" and #quickWhere.rooms > 0)
-                or (qwTargetLabel ~= "")
-        end
-        if showQuickWhereChip then
+        if isQuickWhereList then
             if qwTargetLabel ~= "" then
                 cecho(string.format("<dim_gray>[QW]<reset> <white>%s<reset>\n", qwTargetLabel))
             else
@@ -2017,8 +2540,19 @@ end
 -- @param noRecalls If true, don't use recall
 -- @param ignoreLockedExits If true, ignore exit-level locks
 -- @param ignoreAreaGuard If true, ignore only the area guard
+-- @param ignoreTravelRestrictions If true, ignore source noportal/norecall flags
+-- @param searchDepthLimit Optional per-call BFS depth cap
 -- @return Path table, depth, or nil if no path
-function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, ignoreAreaGuard)
+function snd.mapper.findPath(
+    src,
+    dst,
+    noPortals,
+    noRecalls,
+    ignoreLockedExits,
+    ignoreAreaGuard,
+    ignoreTravelRestrictions,
+    searchDepthLimit
+)
     if not snd.mapper.db.open() then
         return nil
     end
@@ -2026,13 +2560,14 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
     src = tostring(src)
     dst = tostring(dst)
     snd.utils.debugNote(string.format(
-        "findPath start src=%s dst=%s noPortals=%s noRecalls=%s ignoreLocked=%s ignoreAreaGuard=%s",
+        "findPath start src=%s dst=%s noPortals=%s noRecalls=%s ignoreLocked=%s ignoreAreaGuard=%s depthLimit=%s",
         src,
         dst,
         tostring(noPortals == true),
         tostring(noRecalls == true),
         tostring(ignoreLockedExits == true),
-        tostring(ignoreAreaGuard == true)
+        tostring(ignoreAreaGuard == true),
+        tostring(searchDepthLimit or "default")
     ))
     
     if src == dst then
@@ -2051,7 +2586,9 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
         myLevel + (myTier * 10)
     )
     local portalGuardWhere = snd.mapper.portalGuardSql("fromuid", "level", myLevel, ignoreLockedExits)
-    local chaosWhere = gqActive and "(fromuid <> '*' OR ifnull(chaos, 'no') <> 'yes')" or "1=1"
+    local chaosWhere = (gqActive and not ignoreTravelRestrictions)
+        and "(fromuid <> '*' OR ifnull(chaos, 'no') <> 'yes')"
+        or "1=1"
     local areaFromWhere, blockedAreaCount = snd.mapper.areaGuardRoomSql(
         "exits.fromuid",
         src,
@@ -2103,7 +2640,11 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
     
     -- BFS pathfinding (backwards from destination)
     local depth = 0
-    local maxDepth = snd.mapper.config.maxSearchDepth
+    local maxDepth = tonumber(snd.mapper.config.maxSearchDepth) or 100
+    local requestedDepth = tonumber(searchDepthLimit)
+    if requestedDepth then
+        maxDepth = math.max(0, math.min(maxDepth, math.floor(requestedDepth)))
+    end
     local roomSets = {}
     local roomsList = {snd.mapper.db.escape(dst)}
     local frontierSet = {[dst] = true}
@@ -2283,7 +2824,9 @@ function snd.mapper.findPath(src, dst, noPortals, noRecalls, ignoreLockedExits, 
             local srcNoPortal = tonumber(srcRoom.noportal) == 1
             local srcNoRecall = tonumber(srcRoom.norecall) == 1
             
-            if (foundFrom == "*" and srcNoPortal) or (foundFrom == "**" and srcNoRecall) then
+            if not ignoreTravelRestrictions
+                and ((foundFrom == "*" and srcNoPortal) or (foundFrom == "**" and srcNoRecall))
+            then
                 -- Repair the selected jump without replanning its suffix.  A
                 -- bouncerecall is only a command prepended to a blocked '*'
                 -- route; a bounceportal is only prepended to a blocked '**'
@@ -2500,8 +3043,49 @@ function snd.mapper.roomsShareArea(firstRoom, secondRoom)
     return firstArea ~= "" and firstArea == secondArea
 end
 
-function snd.mapper.pathCost(path)
-    return path and #path or math.huge
+local function dinv_portal_id(command)
+    return tostring(command or ""):lower():match("^%s*dinv%s+portal%s+use%s+([%w_%-]+)")
+end
+
+function snd.mapper.routeCostContext()
+    local wornPortalId = nil
+    local usage = mm and mm.portal_usage or nil
+    if usage and type(usage.currently_worn_portal_id) == "function" then
+        local ok, result = pcall(usage.currently_worn_portal_id)
+        if ok and result ~= nil and tostring(result) ~= "" then
+            wornPortalId = tostring(result):lower()
+        end
+    end
+    return {wornPortalId = wornPortalId}
+end
+
+function snd.mapper.pathPortalCount(path)
+    local count = 0
+    for _, step in ipairs(path or {}) do
+        if step.travelType == "portal" then count = count + 1 end
+    end
+    return count
+end
+
+-- Operational xrt cost. Ordinary edges, recalls, non-DINV jumps, and an
+-- already-worn DINV portal cost one. A DINV portal that must be fetched/worn
+-- (or whose live equipment state is unavailable) costs two.
+function snd.mapper.pathCost(path, costContext)
+    if not path then return math.huge end
+    local context = costContext or snd.mapper.routeCostContext()
+    local wornPortalId = context.wornPortalId and tostring(context.wornPortalId):lower() or nil
+    local cost = 0
+    for _, step in ipairs(path) do
+        local stepCost = 1
+        if step.travelType == "portal" then
+            local portalId = dinv_portal_id(step.dir)
+            if portalId and portalId ~= wornPortalId then
+                stepCost = 2
+            end
+        end
+        cost = cost + stepCost
+    end
+    return cost
 end
 
 function snd.mapper.pathStartsWithTravel(path)
@@ -2533,12 +3117,34 @@ function snd.mapper.pathLeavesAreaBeforeJump(path, sourceArea)
     return false
 end
 
-function snd.mapper.chooseShortestRoute(candidates)
+function snd.mapper.chooseShortestRoute(candidates, opts)
+    opts = opts or {}
+    local distanceOnly = opts.mode == "distance"
+    local costContext = opts.costContext
+    if not distanceOnly and not costContext then
+        costContext = snd.mapper.routeCostContext()
+    end
+
     local best = nil
+    local bestCost = math.huge
+    local bestPortalCount = math.huge
+    local bestSteps = math.huge
     for _, candidate in ipairs(candidates or {}) do
         if candidate and candidate.path and #candidate.path > 0 then
-            if not best or #candidate.path < #best.path then
+            local candidateCost = distanceOnly and #candidate.path
+                or snd.mapper.pathCost(candidate.path, costContext)
+            local candidatePortalCount = snd.mapper.pathPortalCount(candidate.path)
+            local candidateSteps = #candidate.path
+            if not best
+                or candidateCost < bestCost
+                or (candidateCost == bestCost and candidatePortalCount < bestPortalCount)
+                or (candidateCost == bestCost and candidatePortalCount == bestPortalCount
+                    and candidateSteps < bestSteps)
+            then
                 best = candidate
+                bestCost = candidateCost
+                bestPortalCount = candidatePortalCount
+                bestSteps = candidateSteps
             end
         end
     end
@@ -2639,6 +3245,7 @@ function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blocked
 
     local jumpLeg = nil
     local jumpType = nil
+    local jumpCandidates = {}
     for _, candidateType in ipairs(jumpOrder) do
         local allowed = (candidateType == "portal" and opts.allowPortals ~= false)
             or (candidateType == "recall" and opts.allowRecalls ~= false)
@@ -2647,11 +3254,23 @@ function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blocked
             local noRecalls = candidateType == "portal"
             local candidate = snd.mapper.findPath(startRoom, destination, noPortals, noRecalls, ignoreLockedExits)
             if candidate and candidate[1] and candidate[1].travelType == candidateType then
-                jumpLeg = candidate
-                jumpType = candidateType
-                break
+                local combinedCandidate = {}
+                for _, step in ipairs(walkPath) do table.insert(combinedCandidate, step) end
+                for _, step in ipairs(candidate) do table.insert(combinedCandidate, step) end
+                table.insert(jumpCandidates, {
+                    kind = candidateType,
+                    path = combinedCandidate,
+                    leg = candidate,
+                })
             end
         end
+    end
+    local selectedJump = snd.mapper.chooseShortestRoute(jumpCandidates, {
+        costContext = opts.costContext,
+    })
+    if selectedJump then
+        jumpLeg = selectedJump.leg
+        jumpType = selectedJump.kind
     end
 
     -- If the designated start has learned that both jump methods are blocked,
@@ -2662,7 +3281,8 @@ function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blocked
         local outwardLeg, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(
             startRoom,
             destination,
-            ignoreLockedExits
+            ignoreLockedExits,
+            opts.costContext
         )
         local outwardAllowed = (outwardType == "portal" and opts.allowPortals ~= false)
             or (outwardType == "recall" and opts.allowRecalls ~= false)
@@ -2798,26 +3418,8 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
         tostring(currentNoRecall)
     ))
 
-    -- Re-run the same global src/'*'/'**' search after persisting the newly
-    -- discovered restriction.  findPath itself applies the old mapper's bounce
-    -- reconstruction, so no separately planned bounce route belongs here.
-    local preferredPath = snd.mapper.findPath(
-        currentRoom,
-        destination,
-        false,
-        false,
-        ignoreLockedExits
-    )
-    if preferredPath and #preferredPath > 0 then
-        snd.utils.debugNote(string.format(
-            "blocked travel selected rebuilt shortest route (%d steps).",
-            #preferredPath
-        ))
-        snd.mapper.executePath(preferredPath)
-        return true
-    end
-
     local routeCandidates = {}
+    local costContext = snd.mapper.routeCostContext()
     local function addCandidate(kind, candidatePath, details)
         if candidatePath and #candidatePath > 0 then
             local candidate = details or {}
@@ -2826,6 +3428,18 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
             table.insert(routeCandidates, candidate)
         end
     end
+
+    -- Re-run the same global src/'*'/'**' search after persisting the newly
+    -- discovered restriction. Keep it as a candidate so the walking and
+    -- alternate-jump routes are still compared with operational portal cost.
+    local preferredPath = snd.mapper.findPath(
+        currentRoom,
+        destination,
+        false,
+        false,
+        ignoreLockedExits
+    )
+    addCandidate("preferred", preferredPath)
 
     -- A complete walking route is always legal. It is deliberately inserted
     -- first so it wins ties, but it is not executed until nearby and area-start
@@ -2840,7 +3454,8 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
         local combined, chosenType, closestRoom = snd.mapper.buildOutwardJumpRoute(
             currentRoom,
             destination,
-            ignoreLockedExits
+            ignoreLockedExits,
+            costContext
         )
         addCandidate("nearby_" .. tostring(chosenType or "jump"), combined, {
             viaRoom = closestRoom,
@@ -2885,6 +3500,7 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
         {
             allowPortals = snd.mapper.config.usePortals ~= false,
             allowRecalls = snd.mapper.config.useRecall ~= false,
+            costContext = costContext,
         }
     )
     addCandidate("area_start_" .. tostring(jumpType or "jump"), areaRoute, {
@@ -2892,7 +3508,7 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
         startRoom = startRoom,
     })
 
-    local selected = snd.mapper.chooseShortestRoute(routeCandidates)
+    local selected = snd.mapper.chooseShortestRoute(routeCandidates, {costContext = costContext})
     if selected then
         if selected.kind and selected.kind:match("^nearby_") then
             snd.utils.infoNote(string.format(
@@ -2965,7 +3581,7 @@ function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits, ignoreAr
     return nil
 end
 
-function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedExits)
+function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedExits, costContext)
     sourceRoom = tostring(sourceRoom or "")
     destination = tostring(destination or "")
     if sourceRoom == "" or sourceRoom == "-1" or destination == "" then
@@ -3015,10 +3631,22 @@ function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedE
     local chosenLeg = nil
     local chosenType = nil
     if recallLeg and #recallLeg > 0 and portalLeg and #portalLeg > 0 then
-        if (#walkPath + #recallLeg) <= (#walkPath + #portalLeg) then
-            chosenLeg, chosenType = recallLeg, "recall"
-        else
+        local recallPath = {}
+        local portalPath = {}
+        for _, step in ipairs(walkPath) do
+            table.insert(recallPath, step)
+            table.insert(portalPath, step)
+        end
+        for _, step in ipairs(recallLeg) do table.insert(recallPath, step) end
+        for _, step in ipairs(portalLeg) do table.insert(portalPath, step) end
+        local selected = snd.mapper.chooseShortestRoute({
+            {kind = "recall", path = recallPath},
+            {kind = "portal", path = portalPath},
+        }, {costContext = costContext})
+        if selected and selected.kind == "portal" then
             chosenLeg, chosenType = portalLeg, "portal"
+        else
+            chosenLeg, chosenType = recallLeg, "recall"
         end
     elseif recallLeg and #recallLeg > 0 then
         chosenLeg, chosenType = recallLeg, "recall"
@@ -3409,6 +4037,9 @@ end
 -- @param path Path table from findPath
 -- @param opts Optional execution controls; preserveExecutionSerial keeps an outer path alive
 function snd.mapper.executePath(path, opts)
+    if snd.mapper.persistenceArrivalSettling and snd.mapper.flushPendingPersists then
+        snd.mapper.flushPendingPersists()
+    end
     if not path or #path == 0 then
         return
     end
@@ -3932,6 +4563,227 @@ function snd.mapper.executePath(path, opts)
     runFrom(1)
 end
 
+-- Build the same route candidate set used by gotoRoom, then score it with the
+-- same live portal-cost snapshot. This function only plans; it does not change
+-- navigation state or execute any commands.
+function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreLockedExits)
+    currentRoom = tostring(currentRoom or "")
+    roomId = tostring(roomId or "")
+    usePortals = (usePortals ~= false)
+
+    local noPortals = not usePortals or not snd.mapper.config.usePortals
+    local noRecalls = not snd.mapper.config.useRecall
+    local areaGuardPlan = snd.mapper.planAreaGuardRoute(
+        currentRoom,
+        roomId,
+        noPortals,
+        noRecalls,
+        ignoreLockedExits
+    )
+    local directAreaSafe = areaGuardPlan.active
+        and areaGuardPlan.directSafe
+        and areaGuardPlan.candidate
+    local path, depth
+    local routeCandidates = {}
+    local costContext = snd.mapper.routeCostContext()
+
+    local function addPlanCandidates(plan)
+        if type(plan and plan.candidates) == "table" and #plan.candidates > 0 then
+            for _, candidate in ipairs(plan.candidates) do
+                table.insert(routeCandidates, candidate)
+            end
+        elseif plan and plan.candidate then
+            table.insert(routeCandidates, plan.candidate)
+        end
+    end
+
+    -- A valid direct route stays in the comparison, but is not final until a
+    -- portal-free alternative has been scored with the same live DINV snapshot.
+    if directAreaSafe then
+        path = areaGuardPlan.candidate.path
+        depth = areaGuardPlan.candidate.depth
+        addPlanCandidates(areaGuardPlan)
+    else
+        path, depth = snd.mapper.findPath(
+            currentRoom,
+            roomId,
+            noPortals,
+            noRecalls,
+            ignoreLockedExits
+        )
+        if path and #path > 0 then
+            table.insert(routeCandidates, {
+                kind = "normal",
+                path = path,
+                depth = depth,
+            })
+        end
+    end
+
+    local hasPortalCandidate = false
+    for _, candidate in ipairs(routeCandidates) do
+        if snd.mapper.pathPortalCount(candidate.path) > 0 then
+            hasPortalCandidate = true
+            break
+        end
+    end
+    if hasPortalCandidate then
+        local currentBest = snd.mapper.chooseShortestRoute(routeCandidates, {costContext = costContext})
+        local walkingDepthLimit = currentBest
+            and math.floor(snd.mapper.pathCost(currentBest.path, costContext))
+            or nil
+        snd.utils.debugNote(string.format(
+            "Route comparison: walk-only search capped at depth %s by current portal-route cost.",
+            tostring(walkingDepthLimit or "default")
+        ))
+        local walkingPath, walkingDepth = snd.mapper.findPath(
+            currentRoom,
+            roomId,
+            true,
+            true,
+            ignoreLockedExits,
+            nil,
+            nil,
+            walkingDepthLimit
+        )
+        if walkingPath and #walkingPath > 0 then
+            table.insert(routeCandidates, {
+                kind = "walk",
+                path = walkingPath,
+                depth = walkingDepth,
+            })
+        end
+    end
+
+    -- A room marked both norecall and noportal expands outward breadth-first to
+    -- the closest room with either jump method. Area boundaries do not stop it.
+    if not directAreaSafe and usePortals then
+        local outwardPath, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(
+            currentRoom,
+            roomId,
+            ignoreLockedExits,
+            costContext
+        )
+        if outwardPath and #outwardPath > 0 then
+            table.insert(routeCandidates, {
+                kind = "nearby_" .. tostring(outwardType or "jump"),
+                path = outwardPath,
+                viaRoom = outwardRoom,
+            })
+        end
+    end
+
+    local sourceInfo = snd.mapper.getRoomInfo(currentRoom)
+    local destinationInfo = snd.mapper.getRoomInfo(roomId)
+    local sourceAreaValue = sourceInfo and sourceInfo.area
+        or (snd.room and snd.room.current and snd.room.current.arid)
+        or ""
+    local sourceArea = snd.utils.trim(sourceAreaValue):lower()
+    local destinationArea = destinationInfo and snd.utils.trim(destinationInfo.area or ""):lower() or ""
+    local crossingAreas = sourceArea ~= "" and destinationArea ~= "" and sourceArea ~= destinationArea
+    local normalBypassesStart = path and snd.mapper.pathLeavesAreaBeforeJump(path, sourceArea) or false
+
+    -- Before accepting a walking prefix that leaves the source area, explicitly
+    -- cost the route through that area's designated start room. Walking remains a
+    -- valid candidate and wins whenever its complete path is shorter.
+    if not directAreaSafe and usePortals and crossingAreas and (not path or normalBypassesStart) then
+        local areaPath, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(
+            currentRoom,
+            roomId,
+            nil,
+            ignoreLockedExits,
+            {
+                allowPortals = not noPortals,
+                allowRecalls = not noRecalls,
+                costContext = costContext,
+            }
+        )
+        if areaPath and #areaPath > 0 then
+            table.insert(routeCandidates, {
+                kind = "area_start_" .. tostring(jumpType or "jump"),
+                path = areaPath,
+                areaKey = areaKey,
+                startRoom = startRoom,
+            })
+        end
+    end
+
+    local selectedRoute = snd.mapper.chooseShortestRoute(routeCandidates, {costContext = costContext})
+    if selectedRoute then
+        path = selectedRoute.path
+        depth = selectedRoute.depth or #path
+        if selectedRoute.kind == "direct_area_safe" then
+            snd.utils.debugNote("Area guard selected the unchanged safe direct path with " .. #path .. " steps.")
+        elseif selectedRoute.kind == "direct_clan_exempt" then
+            snd.utils.debugNote("Area guard selected the shortest safe route with local clan-room exemptions (" .. #path .. " steps).")
+        elseif selectedRoute.kind == "normal" then
+            snd.utils.debugNote("Route comparison selected normal path with " .. #path .. " steps.")
+        elseif selectedRoute.kind and selectedRoute.kind:match("^nearby_") then
+            snd.utils.debugNote(string.format(
+                "Route comparison selected nearby jump room %s (%s, %d steps).",
+                tostring(selectedRoute.viaRoom or "?"),
+                tostring(selectedRoute.kind),
+                #path
+            ))
+        else
+            snd.utils.debugNote(string.format(
+                "Route comparison selected %s start room %s (%d steps).",
+                tostring(selectedRoute.areaKey or sourceArea or "area"),
+                tostring(selectedRoute.startRoom or "?"),
+                #path
+            ))
+        end
+    end
+
+    return selectedRoute, {
+        areaGuardPlan = areaGuardPlan,
+        candidates = routeCandidates,
+        costContext = costContext,
+        depth = depth,
+        noPortals = noPortals,
+        noRecalls = noRecalls,
+        sourceArea = sourceArea,
+    }
+end
+
+-- Preview gotoRoom's route with AreaGuard forced on for this calculation only.
+-- PortalGuard, locked exits, portal/recall settings, and operational route cost
+-- remain exactly as they are for normal xrt navigation.
+function snd.mapper.previewGuardedRoute(currentRoom, roomId, usePortals)
+    local source = tostring(currentRoom or "")
+    local destination = tostring(roomId or "")
+
+    return snd.mapper.withAreaGuardForced(function()
+        local destinationGuard = snd.mapper.evaluateRoomAreaGuard(destination)
+        local destinationIsClan = snd.mapper.isClanArea(destinationGuard.mapperArea)
+        if destinationGuard.known and not destinationGuard.allowed and not destinationIsClan then
+            return nil, {
+                reason = "destination_blocked",
+                destinationGuard = destinationGuard,
+            }
+        end
+
+        local selectedRoute, details = snd.mapper.planNavigationRoute(
+            source,
+            destination,
+            usePortals,
+            false
+        )
+        details = details or {}
+        details.destinationGuard = destinationGuard
+        if not selectedRoute then
+            local rawPlan = details.areaGuardPlan
+            details.reason = rawPlan and rawPlan.directPath
+                and "area_guard_route_blocked"
+                or "path_not_found"
+            return nil, details
+        end
+
+        details.reason = "ok"
+        return selectedRoute, details
+    end)
+end
+
 --- Go to a room using portal-aware pathfinding
 -- @param roomId Destination room uid
 -- @param usePortals Whether to use portals (default: true)
@@ -4016,98 +4868,17 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
         snd.mapper.pendingBlockedTravel = nil
     end
     
-    -- Try our pathfinding first
-    local noPortals = not usePortals or not snd.mapper.config.usePortals
-    local noRecalls = not snd.mapper.config.useRecall
-
-    -- A nomap UID is not itself proof that recall/portal must be disabled.
-    -- Failed attempts persist the corresponding flags just like mapped rooms.
-
-    local path, depth = snd.mapper.findPath(currentRoom, roomId, noPortals, noRecalls, ignoreLockedExits)
-    local routeCandidates = {}
-    if path and #path > 0 then
-        table.insert(routeCandidates, {
-            kind = "normal",
-            path = path,
-            depth = depth,
-        })
-    end
-
-    -- A room marked both norecall and noportal expands outward breadth-first to
-    -- the closest room with either jump method. Area boundaries do not stop it.
-    if usePortals then
-        local outwardPath, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(
-            currentRoom,
-            roomId,
-            ignoreLockedExits
-        )
-        if outwardPath and #outwardPath > 0 then
-            table.insert(routeCandidates, {
-                kind = "nearby_" .. tostring(outwardType or "jump"),
-                path = outwardPath,
-                viaRoom = outwardRoom,
-            })
-        end
-    end
-
-    local sourceInfo = snd.mapper.getRoomInfo(currentRoom)
-    local destinationInfo = snd.mapper.getRoomInfo(roomId)
-    local sourceAreaValue = sourceInfo and sourceInfo.area
-        or (snd.room and snd.room.current and snd.room.current.arid)
-        or ""
-    local sourceArea = snd.utils.trim(sourceAreaValue):lower()
-    local destinationArea = destinationInfo and snd.utils.trim(destinationInfo.area or ""):lower() or ""
-    local crossingAreas = sourceArea ~= "" and destinationArea ~= "" and sourceArea ~= destinationArea
-    local normalBypassesStart = path and snd.mapper.pathLeavesAreaBeforeJump(path, sourceArea) or false
-
-    -- Before accepting a walking prefix that leaves the source area, explicitly
-    -- cost the route through that area's designated start room. Walking remains a
-    -- valid candidate and wins whenever its complete path is shorter.
-    if usePortals and crossingAreas and (not path or normalBypassesStart) then
-        local areaPath, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(
-            currentRoom,
-            roomId,
-            nil,
-            ignoreLockedExits,
-            {
-                allowPortals = not noPortals,
-                allowRecalls = not noRecalls,
-            }
-        )
-        if areaPath and #areaPath > 0 then
-            table.insert(routeCandidates, {
-                kind = "area_start_" .. tostring(jumpType or "jump"),
-                path = areaPath,
-                areaKey = areaKey,
-                startRoom = startRoom,
-            })
-        end
-    end
-
-    local selectedRoute = snd.mapper.chooseShortestRoute(routeCandidates)
-    if selectedRoute then
-        path = selectedRoute.path
-        depth = selectedRoute.depth or #path
-        if selectedRoute.kind == "normal" then
-            snd.utils.debugNote("Route comparison selected normal path with " .. #path .. " steps.")
-        elseif selectedRoute.kind and selectedRoute.kind:match("^nearby_") then
-            snd.utils.debugNote(string.format(
-                "Route comparison selected nearby jump room %s (%s, %d steps).",
-                tostring(selectedRoute.viaRoom or "?"),
-                tostring(selectedRoute.kind),
-                #path
-            ))
-        else
-            snd.utils.debugNote(string.format(
-                "Route comparison selected %s start room %s (%d steps).",
-                tostring(selectedRoute.areaKey or sourceArea or "area"),
-                tostring(selectedRoute.startRoom or "?"),
-                #path
-            ))
-        end
-    else
-        path = nil
-    end
+    local selectedRoute, routePlan = snd.mapper.planNavigationRoute(
+        currentRoom,
+        roomId,
+        usePortals,
+        ignoreLockedExits
+    )
+    routePlan = routePlan or {}
+    local path = selectedRoute and selectedRoute.path or nil
+    local depth = selectedRoute and (selectedRoute.depth or #path) or nil
+    local noPortals = routePlan.noPortals
+    local noRecalls = routePlan.noRecalls
 
     if path and #path > 0 then
         snd.utils.debugNote("Found path with " .. #path .. " steps (depth " .. depth .. ")")
@@ -5089,6 +5860,12 @@ end)
 --- Import all data from Aardwolf.db into Mudlet's internal map
 -- WARNING: This clears the existing Mudlet map first!
 function snd.mapper.importFromDb()
+    -- Retain the legacy API name, but always prefer the shared importer whose
+    -- room positions are derived from cardinal exits.
+    if mm and mm.import and type(mm.import.convert_sqlite_to_mudlet) == "function" then
+        return mm.import.convert_sqlite_to_mudlet(mm.state and mm.state.map_db or "Aardwolf.db")
+    end
+
     if not snd.mapper.db.open() then
         snd.utils.errorNote("Cannot open Aardwolf.db for import")
         return false
@@ -5160,7 +5937,7 @@ function snd.mapper.importFromDb()
     
     while true do
         local sql = string.format(
-            "SELECT uid, name, area, terrain, x, y, z, norecall, noportal FROM rooms LIMIT %d OFFSET %d",
+            "SELECT uid, name, area, terrain, norecall, noportal FROM rooms LIMIT %d OFFSET %d",
             batchSize, offset
         )
         local rooms = snd.mapper.db.query(sql)
@@ -5183,12 +5960,6 @@ function snd.mapper.importFromDb()
                     if room.area and areaMap[room.area] then
                         setRoomArea(roomId, areaMap[room.area])
                     end
-                    
-                    -- Set coordinates if available
-                    local x = tonumber(room.x) or 0
-                    local y = tonumber(room.y) or 0
-                    local z = tonumber(room.z) or 0
-                    setRoomCoordinates(roomId, x, y, z)
                     
                     -- Set room character for special flags
                     if tonumber(room.noportal) == 1 then
@@ -5284,6 +6055,14 @@ function snd.mapper.importFromDb()
     end
     echo("\n")
     
+    -- The compatibility fallback also derives room positions from exits. It
+    -- must never copy Aardwolf's continent coordinates into Mudlet rooms.
+    local layoutOk, layoutErr = snd.mapper.calculateCoordinates()
+    if not layoutOk then
+        snd.utils.errorNote("Cannot calculate native map layout: " .. tostring(layoutErr or "unknown error"))
+        return false
+    end
+
     -- Step 6: Save the map
     cecho("  <yellow>Saving map...<reset>\n")
     saveMap()

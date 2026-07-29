@@ -849,6 +849,7 @@ function snd.triggers.onWhereCommandIssued()
     quickWhere.processed = false
     quickWhere.awaitingCommandEcho = false
     quickWhere.probePending = false
+    quickWhere.commandInFlight = true
 
     if quickWhere.processTimer then
         killTimer(quickWhere.processTimer)
@@ -989,11 +990,15 @@ function snd.triggers.qwMatch(matches)
     local mobName = snd.utils.trim(mobPart)
     local roomName = snd.utils.trim(roomPart)
     local quickWhere = snd.nav.quickWhere
+    quickWhere.commandInFlight = false
 
     local function quickWhereBlockedReason()
-        local state = snd.char and snd.char.state
-        if (state == nil or tostring(state) == "") and gmcp and gmcp.char and gmcp.char.status then
+        local state = nil
+        if gmcp and gmcp.char and gmcp.char.status then
             state = gmcp.char.status.state
+        end
+        if state == nil or tostring(state) == "" then
+            state = snd.char and snd.char.state
         end
         state = tostring(state or "0")
         if state == "8" then
@@ -1052,22 +1057,56 @@ function snd.triggers.qwMatch(matches)
                 local cmd = string.format("where %d.%s", quickWhere.index, lookupKeyword)
                 snd.utils.qwDebugNote("QW DEBUG: line not accepted, probing next index with '" .. cmd .. "'")
                 quickWhere.probePending = true
-                quickWhere.awaitingCommandEcho = true
                 if type(tempTimer) == "function" then
                     local activeQuickWhere = quickWhere
-                    tempTimer(0, function()
+                    activeQuickWhere.probeTimer = tempTimer(0.05, function()
+                        activeQuickWhere.probeTimer = nil
                         if snd.nav and snd.nav.quickWhere == activeQuickWhere
                             and activeQuickWhere.processed == false
                             and activeQuickWhere.probePending == true
                         then
                             activeQuickWhere.probePending = false
+                            local currentBlockReason = quickWhereBlockedReason()
+                            if currentBlockReason then
+                                if currentBlockReason == "combat"
+                                    and snd.commands and snd.commands.abortQuickWhereForCombat
+                                then
+                                    snd.commands.abortQuickWhereForCombat()
+                                else
+                                    activeQuickWhere.processed = true
+                                    activeQuickWhere.completed = true
+                                    activeQuickWhere.awaitingCommandEcho = false
+                                    activeQuickWhere.commandInFlight = false
+                                    snd.triggers.disableQuickWhereTriggers()
+                                end
+                                return
+                            end
+
+                            activeQuickWhere.awaitingCommandEcho = true
+                            activeQuickWhere.commandInFlight = true
+                            local sent = false
+                            if snd.commands and snd.commands.sendGameCommand then
+                                sent = snd.commands.sendGameCommand(cmd, false) == true
+                            elseif type(send) == "function" then
+                                send(cmd, false)
+                                sent = true
+                            end
+                            if not sent then
+                                activeQuickWhere.commandInFlight = false
+                            end
                         end
                     end)
-                end
-                if snd.commands and snd.commands.sendGameCommand then
-                    snd.commands.sendGameCommand(cmd, false)
                 else
-                    send(cmd, false)
+                    quickWhere.probePending = false
+                    quickWhere.awaitingCommandEcho = true
+                    quickWhere.commandInFlight = true
+                    if snd.commands and snd.commands.sendGameCommand then
+                        if snd.commands.sendGameCommand(cmd, false) ~= true then
+                            quickWhere.commandInFlight = false
+                        end
+                    else
+                        send(cmd, false)
+                    end
                 end
             else
                 quickWhere.processed = true
@@ -1103,6 +1142,11 @@ function snd.triggers.qwMatch(matches)
     quickWhere.accepted = true
     quickWhere.awaitingCommandEcho = false
     quickWhere.probePending = false
+    quickWhere.commandInFlight = false
+    if quickWhere.probeTimer then
+        pcall(function() killTimer(quickWhere.probeTimer) end)
+        quickWhere.probeTimer = nil
+    end
 
     local ok, err = pcall(snd.commands.processQuickWhereResult)
     if not ok then
@@ -1111,6 +1155,7 @@ function snd.triggers.qwMatch(matches)
         quickWhere.completed = true
         quickWhere.awaitingCommandEcho = false
         quickWhere.probePending = false
+        quickWhere.commandInFlight = false
         snd.triggers.disableQuickWhereTriggers()
     end
 end
@@ -1121,6 +1166,11 @@ function snd.triggers.qwNoMatch()
     snd.utils.qwDebugNote("QW DEBUG: server returned 'There is no ... around here.'")
     
     if snd.nav.quickWhere and snd.nav.quickWhere.processed == false then
+        snd.nav.quickWhere.commandInFlight = false
+        if snd.nav.quickWhere.probeTimer then
+            pcall(function() killTimer(snd.nav.quickWhere.probeTimer) end)
+            snd.nav.quickWhere.probeTimer = nil
+        end
         if snd.utils.trim(snd.nav.quickWhere.exactTargetName or "") ~= "" then
             snd.utils.qwDebugNote("QW DEBUG: exact selected-target lookup stopped without broad fallback")
         end

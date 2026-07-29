@@ -221,15 +221,9 @@ function mm.minimap.set_room_title(room_name, room_id, area_name)
   local room_label = tostring(room_name or "")
   if room_label == "" then return end
 
-  local area_label = tostring(area_name or "")
   set_window_title("minimap", "")
-  local big_label = room_label
-  if room_id ~= nil and tostring(room_id) ~= "" then
-    big_label = string.format("%s (%s)", big_label, tostring(room_id))
-  end
-  if area_label ~= "" then
-    big_label = string.format("%s / %s", area_label, big_label)
-  end
+  local big_label = mm.ui and mm.ui.format_location_title and
+    mm.ui.format_location_title(area_name, room_name, room_id) or room_label
   set_window_title("bigmap", big_label)
 end
 

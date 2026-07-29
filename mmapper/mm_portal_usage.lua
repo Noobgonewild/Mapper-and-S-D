@@ -963,6 +963,15 @@ local function currently_worn_portal()
   return {id = id, item = item or {id = id}}
 end
 
+-- Navigation asks for a single live equipment snapshot before comparing route
+-- costs. Keep the DINV-specific response handling here so pathfinding only
+-- needs to compare normalized object IDs.
+function usage.currently_worn_portal_id()
+  local worn, err = currently_worn_portal()
+  if not worn then return nil, err end
+  return worn.id
+end
+
 local function gq_active()
   if snd and snd.gquest then
     local joined = snd.gquest.joined or snd.gquest.id

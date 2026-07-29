@@ -109,6 +109,37 @@ function mm.get_room_sectors_packet()
   return nil
 end
 
+function mm.request_sector_metadata(reason)
+  mm.runtime = mm.runtime or {}
+  local request = mm.runtime.sector_metadata_request or {}
+  mm.runtime.sector_metadata_request = request
+  local now = os.time()
+  local cooldown = 5
+  if request.in_flight and now - (tonumber(request.sent_at) or 0) < cooldown then
+    return false, "sector metadata request already in flight"
+  end
+  if now - (tonumber(request.sent_at) or 0) < cooldown then
+    return false, "sector metadata request is cooling down"
+  end
+  if type(sendGMCP) ~= "function" then return false, "sendGMCP unavailable" end
+  local ok, result = pcall(sendGMCP, "request sectors")
+  if not ok or result == false then
+    return false, ok and "sector metadata request was rejected" or tostring(result)
+  end
+  request.in_flight = true
+  request.sent_at = now
+  request.reason = tostring(reason or "explicit map build")
+  if type(tempTimer) == "function" then
+    local sent_at = request.sent_at
+    tempTimer(cooldown, function()
+      local active = mm.runtime and mm.runtime.sector_metadata_request
+      if active and active.sent_at == sent_at then active.in_flight = false end
+    end)
+  end
+  mm.debug("requested Room.Sectors for " .. request.reason)
+  return true
+end
+
 
 local function style_triplet(seg)
   if type(seg) ~= "table" then return nil end
@@ -244,59 +275,6 @@ local function room_exists(room_id)
   return area ~= nil and area ~= -1
 end
 
-local function locate_room_by_coords(info)
-  if not info then return nil end
-  if type(getRoomsByPosition) ~= "function" or type(getAreaTable) ~= "function" then return nil end
-
-  local coord = info.coord or {}
-  local x = tonumber(coord.x or info.x)
-  local y = tonumber(coord.y or info.y)
-  local z = tonumber(coord.z or info.z) or 0
-  if not x or not y then return nil end
-
-  local zone = tostring(info.zone or info.area or "")
-  local area_id
-  local area_table = getAreaTable() or {}
-  for key, value in pairs(area_table) do
-    if tostring(key) == zone then
-      area_id = tonumber(value)
-      break
-    elseif tostring(value) == zone then
-      area_id = tonumber(key)
-      break
-    end
-  end
-
-  local function find_in_area(aid)
-    local ok, rooms = pcall(getRoomsByPosition, aid, x, y, z)
-    if not ok or type(rooms) ~= "table" then return nil end
-    for room_id, _ in pairs(rooms) do
-      return tonumber(room_id)
-    end
-    return nil
-  end
-
-  if area_id then
-    local rid = find_in_area(area_id)
-    if rid then return rid end
-    mm.debug("coords lookup in matched area failed; scanning all areas")
-  end
-
-  for key, value in pairs(area_table) do
-    local aid = tonumber(value) or tonumber(key)
-    if aid then
-      local rid = find_in_area(aid)
-      if rid then
-        mm.debug("coords lookup found room in area " .. tostring(aid))
-        return rid
-      end
-    end
-  end
-
-  return nil
-end
-
-
 local function find_room_by_user_data(vnum)
   if type(getRooms) ~= "function" or type(getRoomUserData) ~= "function" then return nil end
   local ok_rooms, rooms = pcall(getRooms)
@@ -368,40 +346,11 @@ local function sync_to_room_id(room_id, reason)
   return true
 end
 
-local function sync_from_runtime_coords(reason)
-  local rt = mm.runtime or {}
-  local x = tonumber(rt.last_coords_x)
-  local y = tonumber(rt.last_coords_y)
-  local z = tonumber(rt.last_coords_z) or 0
-  if not x or not y then return false end
-
-  local info = {
-    x = x,
-    y = y,
-    z = z,
-    zone = rt.last_zone,
-    area = rt.last_zone,
-  }
-
-  local rid = locate_room_by_coords(info)
-  if not rid then
-    mm.debug("coords runtime fallback failed for " .. tostring(x) .. "," .. tostring(y) .. "," .. tostring(z))
-    return false
-  end
-
-  return sync_to_room_id(rid, reason or "runtime_coords")
-end
-
 local function sync_current_room(info, reason)
   if type(centerview) ~= "function" then return false end
 
   local gmcp_uid = tonumber(info and info.num)
-  local coord = (info and info.coord) or {}
-  local gx = tonumber(coord.x or info.x)
-  local gy = tonumber(coord.y or info.y)
-  local gz = tonumber(coord.z or info.z) or 0
-
-  mm.debug("gmcp room info: num=" .. tostring(info and info.num) .. " zone=" .. tostring(info and (info.zone or info.area)) .. " name=" .. tostring(info and info.name) .. " coords=" .. tostring(gx) .. "," .. tostring(gy) .. "," .. tostring(gz))
+  mm.debug("gmcp room info: num=" .. tostring(info and info.num) .. " zone=" .. tostring(info and (info.zone or info.area)) .. " name=" .. tostring(info and info.name))
 
   if gmcp_uid == -1 then gmcp_uid = nil end
 
@@ -417,21 +366,16 @@ local function sync_current_room(info, reason)
       return true
     end
     if not exists then
-      mm.debug("gmcp room id " .. tostring(gmcp_uid) .. " missing in loaded map; trying coordinate/userdata fallback")
+      mm.debug("gmcp room id " .. tostring(gmcp_uid) .. " missing in loaded map; trying userdata fallback")
     end
   end
 
-  local target_uid = locate_room_by_coords(info)
-  if target_uid then
-    if sync_to_room_id(target_uid, reason or "gmcp_coords_fallback") then return true end
-  end
-
-  target_uid = find_room_by_user_data(info and info.num)
+  local target_uid = find_room_by_user_data(info and info.num)
   if target_uid then
     if sync_to_room_id(target_uid, reason or "gmcp_userdata_fallback") then return true end
   end
 
-  mm.warn("Bigmap location unresolved. GMCP room=" .. tostring(info and info.num) .. " coords=" .. tostring(gx) .. "," .. tostring(gy) .. "," .. tostring(gz))
+  mm.warn("Bigmap location unresolved. GMCP room=" .. tostring(info and info.num) .. " is not present in the native map.")
   return false
 end
 
@@ -448,13 +392,6 @@ function mm.on_room_info()
     mm.debug("on_room_info: gmcp room info missing")
     return
   end
-
-  mm.runtime = mm.runtime or {}
-  local coord = info.coord or {}
-  mm.runtime.last_coords_x = tonumber(coord.x or info.x) or mm.runtime.last_coords_x
-  mm.runtime.last_coords_y = tonumber(coord.y or info.y) or mm.runtime.last_coords_y
-  mm.runtime.last_coords_z = tonumber(coord.z or info.z) or mm.runtime.last_coords_z
-  mm.runtime.last_zone = tostring(info.zone or info.area or mm.runtime.last_zone or "")
 
   if mm.minimap and mm.minimap.on_navigation_state_changed then
     mm.minimap.on_navigation_state_changed("room_update")
@@ -616,7 +553,7 @@ function mm.on_map_end()
 
   local first_line = lines[1]
   if type(first_line) == "table" then first_line = first_line.raw end
-  local room_name = trim(first_line or "")
+  local room_name = trim(mm.strip_ansi(first_line or ""))
   if room_name and room_name ~= "" and room_name ~= "<MAPSTART>" then
     mm.runtime.last_ascii_room_name = room_name
     local info = mm.get_room_info() or {}
@@ -723,9 +660,6 @@ function mm.on_room_info_event()
   end
   mm.on_room_info()
   if switched and continent then raiseWindow("mapper") end
-  if snd and snd.mapper and snd.mapper.requestMetadataForRoom then
-    snd.mapper.requestMetadataForRoom(info)
-  end
   if type(raiseEvent) == "function" then
     -- Integration surface: external scripts can listen to "mm.room.changed"
     raiseEvent("mm.room.changed", room_num, room_area)
@@ -744,8 +678,18 @@ function mm.on_room_area_event()
     mm.debug("gmcp.room.area event; area payload missing")
     return
   end
-  if snd and snd.mapper and snd.mapper.persistAreaInfo then
-    local ok, err = snd.mapper.persistAreaInfo(area)
+  if snd and snd.mapper then
+    local buffering = snd.mapper.persistenceNavigationActive
+      and snd.mapper.persistenceNavigationActive()
+    local ok, err
+    if buffering and snd.mapper.bufferAreaPersist then
+      ok = snd.mapper.bufferAreaPersist(area)
+      if not ok then err = "area packet could not be buffered" end
+    elseif snd.mapper.persistAreaInfo then
+      ok, err = snd.mapper.persistAreaInfo(area)
+    else
+      ok = true
+    end
     if not ok then
       mm.debug("gmcp.room.area persist skipped/failed: " .. tostring(err))
     end
@@ -765,8 +709,22 @@ function mm.on_room_sectors_event()
     mm.debug("gmcp.room.sectors event; sectors payload missing")
     return
   end
-  if snd and snd.mapper and snd.mapper.persistSectors then
-    local ok, err = snd.mapper.persistSectors(packet)
+  mm.runtime = mm.runtime or {}
+  mm.runtime.sector_metadata_request = mm.runtime.sector_metadata_request or {}
+  mm.runtime.sector_metadata_request.in_flight = false
+  mm.runtime.sector_metadata_request.received_at = os.time()
+  if snd and snd.mapper then
+    local buffering = snd.mapper.persistenceNavigationActive
+      and snd.mapper.persistenceNavigationActive()
+    local ok, err
+    if buffering and snd.mapper.bufferSectorsPersist then
+      ok = snd.mapper.bufferSectorsPersist(packet)
+      if not ok then err = "sector packet could not be buffered" end
+    elseif snd.mapper.persistSectors then
+      ok, err = snd.mapper.persistSectors(packet)
+    else
+      ok = true
+    end
     if not ok then
       mm.debug("gmcp.room.sectors persist skipped/failed: " .. tostring(err))
     end

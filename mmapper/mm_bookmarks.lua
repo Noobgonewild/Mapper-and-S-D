@@ -4,10 +4,13 @@ mm.bookmarks = mm.bookmarks or {}
 local bookmarks = mm.bookmarks
 
 local TABLE_NAME = "mapper_area_bookmarks"
+local ACTIVE_LABEL_INDEX = "mapper_area_bookmarks_active_label_unique"
+local SCHEMA_VERSION = 2
 local DELETED_LIMIT = 20
 local LABEL_WIDTH = 30
 local ROOM_WIDTH = 9
 local ACTION_WIDTH = 7
+local AREA_WIDTH = 24
 
 local function trim(value)
   return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -63,8 +66,31 @@ local function table_exists()
   return rows[1] ~= nil
 end
 
+local function column_exists(column_name)
+  local rows, err = mm.query_mapper_db("PRAGMA table_info(" .. TABLE_NAME .. ")")
+  if not rows then return nil, err end
+  for _, row in ipairs(rows) do
+    if tostring(row.name or "") == tostring(column_name or "") then return true end
+  end
+  return false
+end
+
+local function duplicate_active_label()
+  local rows, err = mm.query_mapper_db(string.format([[
+    SELECT lower(trim(label)) AS label_key, COUNT(*) AS duplicate_count
+    FROM %s
+    WHERE deleted_at IS NULL
+      AND trim(COALESCE(label, '')) <> ''
+    GROUP BY lower(trim(label))
+    HAVING COUNT(*) > 1
+    LIMIT 1
+  ]], TABLE_NAME))
+  if not rows then return nil, err end
+  return rows[1]
+end
+
 function bookmarks.ensure_schema()
-  if bookmarks._schema_ready then return true end
+  if bookmarks._schema_ready and bookmarks._schema_version == SCHEMA_VERSION then return true end
 
   local exists, err = table_exists()
   if exists == nil then
@@ -77,6 +103,7 @@ function bookmarks.ensure_schema()
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         room_uid TEXT NOT NULL UNIQUE,
         label TEXT,
+        is_permanent INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL DEFAULT 0,
         deleted_at INTEGER
@@ -85,7 +112,30 @@ function bookmarks.ensure_schema()
     if not ok then return false, create_err end
   end
 
+  local has_permanent, permanent_err = column_exists("is_permanent")
+  if has_permanent == nil then return false, permanent_err end
+  if not has_permanent then
+    local alter_ok, alter_err = mm.exec_mapper_db(
+      "ALTER TABLE " .. TABLE_NAME .. " ADD COLUMN is_permanent INTEGER NOT NULL DEFAULT 0"
+    )
+    if not alter_ok then return false, alter_err end
+  end
+
+  local duplicate, duplicate_err = duplicate_active_label()
+  if duplicate_err then return false, duplicate_err end
+  if duplicate then
+    return false, "duplicate active bookmark label already exists: " .. tostring(duplicate.label_key or "?")
+  end
+
+  local index_ok, index_err = mm.exec_mapper_db(string.format(
+    "CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s(lower(trim(label))) WHERE deleted_at IS NULL AND trim(COALESCE(label, '')) <> ''",
+    ACTIVE_LABEL_INDEX,
+    TABLE_NAME
+  ))
+  if not index_ok then return false, index_err end
+
   bookmarks._schema_ready = true
+  bookmarks._schema_version = SCHEMA_VERSION
   return true
 end
 
@@ -178,6 +228,83 @@ local function existing_bookmark(room_id)
   return rows[1]
 end
 
+local function active_bookmark_by_label(label, exclude_id)
+  local where_exclude = ""
+  if tonumber(exclude_id) then
+    where_exclude = " AND b.id <> " .. tostring(tonumber(exclude_id))
+  end
+  local rows, err = mm.query_mapper_db(string.format([[
+    SELECT b.*, COALESCE(rooms.area, '') AS area,
+           COALESCE(NULLIF(rooms.name, ''), lookup.name, '') AS room_name
+    FROM %s b
+    LEFT JOIN rooms ON rooms.uid = b.room_uid
+    LEFT JOIN (SELECT uid, MIN(name) AS name FROM rooms_lookup GROUP BY uid) lookup ON lookup.uid = b.room_uid
+    WHERE b.deleted_at IS NULL
+      AND lower(trim(COALESCE(b.label, ''))) = %s%s
+    LIMIT 1
+  ]], TABLE_NAME, mm.sql_escape(clean_line(label):lower()), where_exclude))
+  if not rows then return nil, err end
+  return rows[1]
+end
+
+local function active_bookmark_by_room(room_uid)
+  local rows, err = mm.query_mapper_db(string.format([[
+    SELECT b.*, COALESCE(rooms.area, '') AS area,
+           COALESCE(NULLIF(rooms.name, ''), lookup.name, '') AS room_name
+    FROM %s b
+    LEFT JOIN rooms ON rooms.uid = b.room_uid
+    LEFT JOIN (SELECT uid, MIN(name) AS name FROM rooms_lookup GROUP BY uid) lookup ON lookup.uid = b.room_uid
+    WHERE b.deleted_at IS NULL AND b.room_uid = %s
+    LIMIT 1
+  ]], TABLE_NAME, mm.sql_escape(tostring(room_uid or ""))))
+  if not rows then return nil, err end
+  return rows[1]
+end
+
+local function label_conflict_message(label, row)
+  return string.format(
+    "active bookmark label already exists: %s (room %s, area %s)",
+    clean_line(label),
+    tostring(row and row.room_uid or "?"),
+    tostring(row and row.area or "?")
+  )
+end
+
+local function unique_conflict_label(label, exclude_id)
+  local base = clean_line(label)
+  if base == "" then base = "bookmark" end
+  local candidate = base .. "_conflict"
+  local suffix = 2
+  while true do
+    local conflict, err = active_bookmark_by_label(candidate, exclude_id)
+    if err then return nil, err end
+    if not conflict then return candidate end
+    candidate = string.format("%s_conflict_%d", base, suffix)
+    suffix = suffix + 1
+  end
+end
+
+local function notify_changed(action, room_uid, area)
+  if type(raiseEvent) == "function" then
+    raiseEvent(
+      "mm.bookmarks.changed",
+      tostring(action or "changed"),
+      tostring(room_uid or ""),
+      tostring(area or "")
+    )
+  end
+end
+
+function bookmarks.current_area()
+  return current_area()
+end
+
+function bookmarks.resolve_area(raw_scope)
+  local ok, err = ensure_ready()
+  if not ok then return nil, err end
+  return resolve_area(raw_scope)
+end
+
 local function cap_deleted_history()
   local ok, err = mm.exec_mapper_db(string.format([[
     DELETE FROM %s
@@ -248,6 +375,16 @@ function bookmarks.add(raw_arg)
       return true
     end
 
+    local conflict, conflict_err = active_bookmark_by_label(label_text, existing.id)
+    if conflict_err then return false, conflict_err end
+    local restored_conflict_label
+    if conflict then
+      if active then return false, label_conflict_message(label_text, conflict) end
+      restored_conflict_label, conflict_err = unique_conflict_label(label_text, existing.id)
+      if not restored_conflict_label then return false, conflict_err end
+      label_text = restored_conflict_label
+    end
+
     local upd_ok, upd_err = mm.exec_mapper_db(string.format(
       "UPDATE %s SET label = %s, updated_at = %d, deleted_at = NULL WHERE id = %d",
       TABLE_NAME,
@@ -257,8 +394,17 @@ function bookmarks.add(raw_arg)
     ))
     if not upd_ok then return false, upd_err end
     mm.note(string.format("Bookmark %s for room %s: %s", active and "updated" or "restored", tostring(info.uid), label_text))
+    if restored_conflict_label then
+      mm.warn("The original label was already active; restored bookmark renamed to " .. restored_conflict_label .. ".")
+    end
+    notify_changed(active and "update" or "restore", info.uid, info.area)
     return true
   end
+
+
+  local conflict, conflict_err = active_bookmark_by_label(label_text)
+  if conflict_err then return false, conflict_err end
+  if conflict then return false, label_conflict_message(label_text, conflict) end
 
   local ins_ok, ins_err = mm.exec_mapper_db(string.format(
     "INSERT INTO %s (room_uid, label, created_at, updated_at, deleted_at) VALUES (%s, %s, %d, %d, NULL)",
@@ -271,12 +417,13 @@ function bookmarks.add(raw_arg)
   if not ins_ok then return false, ins_err end
 
   mm.note(string.format("Bookmark added for room %s: %s", tostring(info.uid), label_text))
+  notify_changed("add", info.uid, info.area)
   return true
 end
 
 local function active_rows_for_area(area)
   return mm.query_mapper_db(string.format([[
-    SELECT b.id, b.room_uid, b.label, b.created_at, b.updated_at,
+    SELECT b.id, b.room_uid, b.label, b.is_permanent, b.created_at, b.updated_at,
            COALESCE(NULLIF(rooms.name, ''), lookup.name, '') AS room_name,
            rooms.area AS area
     FROM %s b
@@ -286,6 +433,56 @@ local function active_rows_for_area(area)
       AND rooms.area = %s
     ORDER BY lower(b.label), lower(COALESCE(NULLIF(rooms.name, ''), lookup.name, '')), CAST(b.room_uid AS INTEGER)
   ]], TABLE_NAME, mm.sql_escape(area)))
+end
+
+function bookmarks.window_rows(area)
+  local ok, err = ensure_ready()
+  if not ok then return nil, err end
+  area = trim(area)
+  if area == "" then return nil, "bookmark window area is required" end
+
+  return mm.query_mapper_db(string.format([[
+    SELECT b.id, b.room_uid, b.label, b.is_permanent, b.created_at, b.updated_at,
+           COALESCE(NULLIF(rooms.name, ''), lookup.name, '') AS room_name,
+           COALESCE(rooms.area, '') AS area
+    FROM %s b
+    JOIN rooms ON rooms.uid = b.room_uid
+    LEFT JOIN (SELECT uid, MIN(name) AS name FROM rooms_lookup GROUP BY uid) lookup ON lookup.uid = rooms.uid
+    WHERE b.deleted_at IS NULL
+      AND (COALESCE(b.is_permanent, 0) <> 0 OR lower(rooms.area) = %s)
+    ORDER BY CASE WHEN COALESCE(b.is_permanent, 0) <> 0 THEN 0 ELSE 1 END, b.id
+  ]], TABLE_NAME, mm.sql_escape(area:lower())))
+end
+
+local function all_active_rows()
+  return mm.query_mapper_db(string.format([[
+    SELECT b.id, b.room_uid, b.label, b.is_permanent, b.created_at, b.updated_at,
+           COALESCE(NULLIF(rooms.name, ''), lookup.name, '') AS room_name,
+           rooms.area AS area
+    FROM %s b
+    JOIN rooms ON rooms.uid = b.room_uid
+    LEFT JOIN (SELECT uid, MIN(name) AS name FROM rooms_lookup GROUP BY uid) lookup ON lookup.uid = rooms.uid
+    WHERE b.deleted_at IS NULL
+    ORDER BY lower(rooms.area), lower(b.label),
+             lower(COALESCE(NULLIF(rooms.name, ''), lookup.name, '')),
+             CAST(b.room_uid AS INTEGER)
+  ]], TABLE_NAME))
+end
+
+local function active_rows_matching_label(label)
+  return mm.query_mapper_db(string.format([[
+    SELECT b.id, b.room_uid, b.label, b.is_permanent, b.created_at, b.updated_at,
+           COALESCE(NULLIF(rooms.name, ''), lookup.name, '') AS room_name,
+           rooms.area AS area
+    FROM %s b
+    JOIN rooms ON rooms.uid = b.room_uid
+    LEFT JOIN (SELECT uid, MIN(name) AS name FROM rooms_lookup GROUP BY uid) lookup ON lookup.uid = rooms.uid
+    WHERE b.deleted_at IS NULL
+      AND instr(lower(COALESCE(b.label, '')), lower(%s)) > 0
+    ORDER BY lower(rooms.area), lower(b.label),
+             lower(COALESCE(NULLIF(rooms.name, ''), lookup.name, '')),
+             CAST(b.room_uid AS INTEGER)
+  ]], TABLE_NAME, mm.sql_escape(label)))
 end
 
 local function room_link_command(room_id)
@@ -302,7 +499,7 @@ function bookmarks.where(room_id)
   if not ok then mm.warn(err) end
 end
 
-local function echo_active_row(index, row)
+local function echo_active_row(index, row, show_area)
   local room_id = tostring(row.room_uid or "")
   local label = clean_line(row.label or "")
   if label == "" then label = clean_line(row.room_name or ("room " .. room_id)) end
@@ -329,6 +526,13 @@ local function echo_active_row(index, row)
   link_or_echo(action_text, where_cmd, "Show path to room " .. room_id, true)
   cecho("<reset>")
   echo(action_pad .. "  ")
+  if show_area then
+    local area_text, area_pad = fit(row.area or "?", AREA_WIDTH)
+    cecho("<cyan>")
+    echo(area_text)
+    cecho("<reset>")
+    echo(area_pad .. "  ")
+  end
   local room_name = clean_line(row.room_name or "")
   if room_name == "" then room_name = "?" end
   cecho("<light_grey>")
@@ -337,11 +541,41 @@ local function echo_active_row(index, row)
   cecho("\n")
 end
 
-local function echo_active_header()
+local function echo_active_header(show_area)
   local label_text, label_pad = fit("Bookmark Name", LABEL_WIDTH)
   local room_text, room_pad = fit("Room ID", ROOM_WIDTH)
   local action_text, action_pad = fit("Route", ACTION_WIDTH)
-  cecho("<dim_gray>  #    " .. label_text .. label_pad .. " " .. room_text .. room_pad .. "  " .. action_text .. action_pad .. "  Room name<reset>\n")
+  local area_column = ""
+  if show_area then
+    local area_text, area_pad = fit("Area", AREA_WIDTH)
+    area_column = area_text .. area_pad .. "  "
+  end
+  cecho("<dim_gray>  #    " .. label_text .. label_pad .. " " .. room_text .. room_pad .. "  " .. action_text .. action_pad .. "  " .. area_column .. "Room name<reset>\n")
+end
+
+local function echo_active_separator(show_area)
+  cecho("<gray>" .. string.rep("-", show_area and 106 or 80) .. "<reset>\n")
+end
+
+local function display_active_rows(rows, empty_message, show_area)
+  mm.runtime = mm.runtime or {}
+  mm.runtime.bookmark_last_rows = rows
+
+  echo_active_separator(show_area)
+  if #rows == 0 then
+    cecho("<yellow>" .. empty_message .. "<reset>\n")
+    echo_active_separator(show_area)
+    return true
+  end
+
+  echo_active_header(show_area)
+  echo_active_separator(show_area)
+  for i, row in ipairs(rows) do
+    echo_active_row(i, row, show_area)
+  end
+  echo_active_separator(show_area)
+  cecho("<dim_gray>Click bookmark or type \"mapper bookmarks go #<index>\"<reset>\n")
+  return true
 end
 
 function bookmarks.list(raw_scope)
@@ -354,25 +588,37 @@ function bookmarks.list(raw_scope)
   local rows, rows_err = active_rows_for_area(area)
   if not rows then return false, rows_err end
 
-  mm.runtime = mm.runtime or {}
-  mm.runtime.bookmark_last_rows = rows
-
   cecho(string.format("\n<white>Showing %d bookmark%s - <cyan>%s<reset>\n", #rows, #rows == 1 and "" or "s", tostring(area)))
-  cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
-  if #rows == 0 then
-    cecho("<yellow>No bookmarks found in this area.<reset>\n")
-    cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
-    return true
+  return display_active_rows(rows, "No bookmarks found in this area.", false)
+end
+
+function bookmarks.list_all()
+  local ok, err = ensure_ready()
+  if not ok then return false, err end
+
+  local rows, rows_err = all_active_rows()
+  if not rows then return false, rows_err end
+
+  cecho(string.format("\n<white>Showing %d bookmark%s - <cyan>all areas<reset>\n", #rows, #rows == 1 and "" or "s"))
+  return display_active_rows(rows, "No bookmarks found.", true)
+end
+
+function bookmarks.search(raw_label)
+  local ok, err = ensure_ready()
+  if not ok then return false, err end
+
+  local label = clean_line(strip_wrapping_quotes(raw_label))
+  if label == "" then
+    return false, "Usage: mapper bookmarks search <label>"
   end
 
-  echo_active_header()
-  cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
-  for i, row in ipairs(rows) do
-    echo_active_row(i, row)
-  end
-  cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
-  cecho("<dim_gray>Click bookmark or type \"mapper bookmarks go #<index>\"<reset>\n")
-  return true
+  local rows, rows_err = active_rows_matching_label(label)
+  if not rows then return false, rows_err end
+
+  cecho(string.format("\n<white>Showing %d bookmark%s matching label: <cyan>", #rows, #rows == 1 and "" or "s"))
+  echo(label)
+  cecho("<reset>\n")
+  return display_active_rows(rows, "No bookmarks matched that label.", true)
 end
 
 local function active_row_by_index(index)
@@ -430,6 +676,8 @@ local function delete_bookmark_row(row)
   if not del_ok then return false, del_err end
   cap_deleted_history()
   mm.note(string.format("Bookmark deleted for room %s: %s", tostring(row.room_uid or full.room_uid), clean_line(row.label or full.label or "")))
+  local info = room_info(row.room_uid or full.room_uid)
+  notify_changed("delete", row.room_uid or full.room_uid, info and info.area or row.area)
   return true
 end
 
@@ -470,6 +718,10 @@ function bookmarks.rename_index(index, raw_label)
   local label = clean_line(strip_wrapping_quotes(raw_label))
   if label == "" then return false, "bookmark label cannot be empty" end
 
+  local conflict, conflict_err = active_bookmark_by_label(label, full.id)
+  if conflict_err then return false, conflict_err end
+  if conflict then return false, label_conflict_message(label, conflict) end
+
   local upd_ok, upd_err = mm.exec_mapper_db(string.format(
     "UPDATE %s SET label = %s, updated_at = %d WHERE id = %d AND deleted_at IS NULL",
     TABLE_NAME,
@@ -480,12 +732,87 @@ function bookmarks.rename_index(index, raw_label)
   if not upd_ok then return false, upd_err end
   row.label = label
   mm.note(string.format("Bookmark #%d renamed: %s", tonumber(index) or 0, label))
+  local info = room_info(full.room_uid)
+  notify_changed("rename", full.room_uid, info and info.area or row.area)
   return true
+end
+
+local function resolve_active_reference(raw_reference)
+  local reference = clean_line(strip_wrapping_quotes(raw_reference))
+  if reference == "" or reference:lower() == "here" then
+    local room_uid, room_err = current_room_id()
+    if not room_uid then return nil, room_err end
+    local row, err = active_bookmark_by_room(room_uid)
+    if err then return nil, err end
+    if not row then return nil, "current room is not bookmarked" end
+    return row
+  end
+
+  local room_uid = reference:match("^[Rr][Oo][Oo][Mm]%s+(%d+)$")
+  local explicit_label = reference:match("^[Ll][Aa][Bb][Ee][Ll]%s+(.+)$")
+  if room_uid or reference:match("^%d+$") then
+    room_uid = room_uid or reference
+    local row, err = active_bookmark_by_room(room_uid)
+    if err then return nil, err end
+    if not row then return nil, "no active bookmark found for room " .. tostring(room_uid) end
+    return row
+  end
+
+  local label = clean_line(strip_wrapping_quotes(explicit_label or reference))
+  local row, err = active_bookmark_by_label(label)
+  if err then return nil, err end
+  if not row then return nil, "no active bookmark found with exact label: " .. label end
+  return row
+end
+
+function bookmarks.set_permanent(raw_reference, permanent)
+  local ok, err = ensure_ready()
+  if not ok then return false, err end
+
+  local row, row_err = resolve_active_reference(raw_reference)
+  if not row then return false, row_err end
+  local requested = permanent and 1 or 0
+  local current = tonumber(row.is_permanent) or ((row.is_permanent == true) and 1 or 0)
+  if current == requested then
+    mm.note(string.format(
+      "Bookmark is already %s: %s",
+      requested == 1 and "pinned" or "unpinned",
+      clean_line(row.label)
+    ))
+    return true
+  end
+
+  local upd_ok, upd_err = mm.exec_mapper_db(string.format(
+    "UPDATE %s SET is_permanent = %d, updated_at = %d WHERE id = %d AND deleted_at IS NULL",
+    TABLE_NAME,
+    requested,
+    os.time(),
+    tonumber(row.id) or 0
+  ))
+  if not upd_ok then return false, upd_err end
+
+  row.is_permanent = requested
+  mm.note(string.format(
+    "Bookmark %s: %s (room %s)",
+    requested == 1 and "pinned" or "unpinned",
+    clean_line(row.label),
+    tostring(row.room_uid)
+  ))
+  notify_changed(requested == 1 and "pin" or "unpin", row.room_uid, row.area)
+  return true
+end
+
+function bookmarks.pin(raw_reference)
+  return bookmarks.set_permanent(raw_reference, true)
+end
+
+function bookmarks.unpin(raw_reference)
+  return bookmarks.set_permanent(raw_reference, false)
 end
 
 local function deleted_rows()
   return mm.query_mapper_db(string.format([[
-    SELECT b.id, b.room_uid, b.label, b.created_at, b.updated_at, b.deleted_at,
+    SELECT b.id, b.room_uid, b.label, b.is_permanent, b.created_at, b.updated_at, b.deleted_at,
            COALESCE(NULLIF(rooms.name, ''), lookup.name, '') AS room_name,
            rooms.area AS area
     FROM %s b
@@ -567,16 +894,36 @@ function bookmarks.restore_index(index)
     return false, "cannot restore bookmark; " .. tostring(info_err)
   end
 
+  local full, full_err = bookmark_by_id(row.id)
+  if not full then return false, full_err end
+  local restored_label = clean_line(full.label or row.label or info.name or ("room " .. tostring(info.uid)))
+  local conflict, conflict_err = active_bookmark_by_label(restored_label, full.id)
+  if conflict_err then return false, conflict_err end
+  local renamed_for_conflict = false
+  if conflict then
+    restored_label, conflict_err = unique_conflict_label(restored_label, full.id)
+    if not restored_label then return false, conflict_err end
+    renamed_for_conflict = true
+  end
+
   local upd_ok, upd_err = mm.exec_mapper_db(string.format(
-    "UPDATE %s SET deleted_at = NULL, updated_at = %d WHERE id = %d",
+    "UPDATE %s SET label = %s, deleted_at = NULL, updated_at = %d WHERE id = %d",
     TABLE_NAME,
+    mm.sql_escape(restored_label),
     os.time(),
     tonumber(row.id) or 0
   ))
   if not upd_ok then return false, upd_err end
 
   table.remove(rows, i)
-  mm.note(string.format("Bookmark restored for room %s: %s", tostring(info.uid), clean_line(row.label or info.name or "")))
+  mm.note(string.format("Bookmark restored for room %s: %s", tostring(info.uid), restored_label))
+  if renamed_for_conflict then
+    mm.warn(string.format(
+      "The original label was already active, so the restored bookmark was named %s. Use mapper bookmarks rename to change it.",
+      restored_label
+    ))
+  end
+  notify_changed("restore", info.uid, info.area)
   return true
 end
 

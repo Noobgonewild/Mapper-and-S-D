@@ -99,7 +99,6 @@ local STATS_FIELDS = {
   "areas_updated",
   "exits_updated",
   "env_rows_updated",
-  "coords_stored",
   "coords_set",
   "layouts_rebuilt",
   "room_colors_set",
@@ -174,7 +173,6 @@ function mm.show_stats()
   print_stat("Rooms updated", stats.rooms_updated)
   print_stat("Areas updated", stats.areas_updated)
   print_stat("Exits updated", stats.exits_updated)
-  print_stat("Coords stored", stats.coords_stored)
   print_stat("Env rows updated", stats.env_rows_updated)
 
   cecho("\n  <yellow>Map updates<reset>\n")
@@ -1421,20 +1419,32 @@ function mm.set_room_flag(flag, arg)
     return false, "invalid room flag"
   end
 
-  local room = mm.current_room()
-  if not room then
-    return false, "current room unknown"
-  end
-  if type(room) ~= "number" then
-    return false, "room flags are not available in unmapped rooms"
-  end
-
   local mode = tostring(arg or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
-  if mode == "" then
-    mode = "toggle"
+  local explicit_room, explicit_value = mode:match("^(%d+)%s+(%a+)$")
+  if explicit_value ~= "true" and explicit_value ~= "false" then
+    explicit_room, explicit_value = nil, nil
   end
-  if mode ~= "on" and mode ~= "off" and mode ~= "toggle" then
-    return false, string.format("Usage: mapper %s [on|off|toggle]", safe_flag)
+  local room
+  if explicit_room then
+    room = tonumber(explicit_room)
+  else
+    if mode == "" then
+      mode = "toggle"
+    end
+    if mode ~= "on" and mode ~= "off" and mode ~= "toggle" then
+      return false, string.format(
+        "Usage: mapper %s [on|off|toggle] OR mapper %s <room_id> <true|false>",
+        safe_flag, safe_flag
+      )
+    end
+
+    room = mm.current_room()
+    if not room then
+      return false, "current room unknown"
+    end
+    if type(room) ~= "number" then
+      return false, "room flags are not available in unmapped rooms"
+    end
   end
 
   local rows, read_err = mm.query_mapper_db(
@@ -1450,7 +1460,9 @@ function mm.set_room_flag(flag, arg)
 
   local current = tonumber(rows[1][safe_flag]) == 1
   local next_value
-  if mode == "on" then
+  if explicit_value then
+    next_value = explicit_value == "true"
+  elseif mode == "on" then
     next_value = true
   elseif mode == "off" then
     next_value = false
@@ -1624,6 +1636,7 @@ local MAPPER_SCHEMA_SQL = {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       room_uid TEXT NOT NULL UNIQUE,
       label TEXT,
+      is_permanent INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL DEFAULT 0,
       deleted_at INTEGER)]],
@@ -1856,6 +1869,23 @@ function mm.strip_ansi(text)
   cleaned = cleaned:gsub("\27%[[0-9;]*m", "")
   cleaned = cleaned:gsub("[%z\1-\8\11\12\14-\31]", "")
   return cleaned
+end
+
+mm.ui = mm.ui or {}
+
+function mm.ui.format_location_title(area_name, room_name, room_id)
+  local function clean_label(value)
+    return mm.strip_ansi(value):gsub("^%s+", ""):gsub("%s+$", "")
+  end
+
+  local area_label = clean_label(area_name)
+  local room_label = clean_label(room_name)
+  local id_label = clean_label(room_id)
+
+  if room_label == "" then room_label = "Unknown room" end
+  if id_label ~= "" then room_label = string.format("%s (%s)", room_label, id_label) end
+  if area_label ~= "" then return string.format("%s / %s", area_label, room_label) end
+  return room_label
 end
 
 function mm.query_mapper_db(sql, db_path)
@@ -2769,22 +2799,41 @@ function mm.where_room(dest)
   if not (nav and type(nav.findPath) == "function") then
     return false, "mapper where requires mapper navigation module"
   end
-  -- mapper where only displays a route; keep level, portal, and area guards
-  -- scoped to commands that actually move the character. Mirror xrt's
-  -- outward-jump planner first, since plain findPath can miss routes when the
-  -- current room blocks both portal and recall.
-  local path, depth
-  if type(nav.buildOutwardJumpRoute) == "function" then
-    path = nav.buildOutwardJumpRoute(tostring(src), tostring(dest), true)
-    if path and #path > 0 then
-      depth = #path
-    else
-      path = nil
+  -- mapper where is deliberately theoretical: ignore level, area, portal, and
+  -- source-room travel restrictions and rank only by database edge count. Ask
+  -- for a pure walking alternative as well so an equal-distance walk wins over
+  -- a portal route without importing xrt's live DINV operational cost.
+  local candidates = {}
+  local rawPath = nav.findPath(src, dest, nil, nil, true, true, true)
+  if rawPath and #rawPath > 0 then
+    table.insert(candidates, {kind = "raw", path = rawPath})
+  end
+  local walkingPath = nav.findPath(src, dest, true, true, true, true, true)
+  if walkingPath and #walkingPath > 0 then
+    table.insert(candidates, {kind = "walk", path = walkingPath})
+  end
+
+  local selected = nil
+  if type(nav.chooseShortestRoute) == "function" then
+    selected = nav.chooseShortestRoute(candidates, {mode = "distance"})
+  else
+    for _, candidate in ipairs(candidates) do
+      local portalCount = 0
+      for _, step in ipairs(candidate.path or {}) do
+        if step.travelType == "portal" then portalCount = portalCount + 1 end
+      end
+      if not selected
+          or #candidate.path < #selected.path
+          or (#candidate.path == #selected.path and portalCount < selected.portalCount)
+      then
+        selected = candidate
+        selected.portalCount = portalCount
+      end
     end
   end
-  if not path then
-    path, depth = nav.findPath(src, dest, nil, nil, true, true)
-  end
+
+  local path = selected and selected.path or nil
+  local depth = path and #path or nil
   if not path then return false, string.format("path from %s to %s not found", tostring(src), tostring(dest)) end
 
   local room_rows = mm.query_mapper_db(string.format(
@@ -2824,6 +2873,91 @@ function mm.where_room(dest)
   for _, p in ipairs(path) do table.insert(steps, tostring(p.dir or "")) end
   mm.note(string.format("Path to %d: %s", dest, table.concat(steps, " ; ")))
   mm.note(string.format("Distance: %d", tonumber(depth) or #steps))
+  return true
+end
+
+function mm.guarded_room(dest)
+  dest = tonumber(dest)
+  if not dest then return false, "mapper guarded expects a room id" end
+  local src = mm.current_room()
+  if not src then return false, "current room unknown; try LOOK first" end
+  if src == dest then return false, "you are already in that room" end
+
+  local nav = (mm and mm.nav) or (snd and snd.mapper) or nil
+  if not (nav and type(nav.previewGuardedRoute) == "function") then
+    return false, "mapper guarded requires mapper navigation module"
+  end
+
+  local savedConfig = type(nav.areaGuardConfig) == "function" and nav.areaGuardConfig() or nil
+  local savedEnabled = type(savedConfig) == "table" and savedConfig.enabled == true
+  local selected, details = nav.previewGuardedRoute(src, dest, true)
+  if not selected then
+    details = details or {}
+    if details.reason == "destination_blocked" then
+      local guard = details.destinationGuard or {}
+      return false, string.format(
+        "AreaGuard blocks room %d: %s requires level %d; your level is %d",
+        dest,
+        tostring(guard.area or guard.mapperArea or "destination area"),
+        tonumber(guard.required) or 0,
+        tonumber(guard.level) or 0
+      )
+    elseif details.reason == "area_guard_route_blocked" then
+      return false, string.format(
+        "no guarded path from %s to %d; the available route crosses an AreaGuard-blocked area",
+        tostring(src),
+        dest
+      )
+    end
+    return false, string.format("guarded path from %s to %d not found", tostring(src), dest)
+  end
+
+  local path = selected.path
+  if type(path) ~= "table" or #path == 0 then
+    return false, string.format("guarded path from %s to %d not found", tostring(src), dest)
+  end
+
+  local room_rows = mm.query_mapper_db(string.format(
+    "SELECT name, area, info FROM rooms WHERE uid = %d LIMIT 1",
+    dest
+  ))
+  local room = room_rows and room_rows[1] or nil
+  if room then
+    local name = mm.strip_ansi(room.name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local area = mm.strip_ansi(room.area or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local info = tostring(room.info or ""):lower()
+    local color = nil
+    local marker = nil
+    if info:find("pk", 1, true) then
+      color = "red"
+      marker = "PK"
+    elseif info:find("safe", 1, true) then
+      color = "green"
+      marker = "safe"
+    end
+
+    local room_label = name ~= "" and name or tostring(dest)
+    if marker then
+      room_label = string.format("%s (%s)", room_label, marker)
+    end
+    if color then
+      room_label = string.format("<%s>%s<reset>", color, room_label)
+    end
+    if area ~= "" then
+      cecho(string.format("<CornflowerBlue>[MMAPPER]<reset> %s / %s\n", room_label, area))
+    else
+      cecho(string.format("<CornflowerBlue>[MMAPPER]<reset> %s\n", room_label))
+    end
+  end
+
+  local steps = {}
+  for _, step in ipairs(path) do table.insert(steps, tostring(step.dir or "")) end
+  mm.note(string.format("Guarded path to %d: %s", dest, table.concat(steps, " ; ")))
+  mm.note(string.format("Distance: %d", #steps))
+  mm.note(string.format(
+    "Preview only: AreaGuard was forced on; saved setting remains %s.",
+    savedEnabled and "ON" or "OFF"
+  ))
   return true
 end
 

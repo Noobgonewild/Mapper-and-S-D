@@ -76,6 +76,7 @@ load_module(base, "mm_navigation.lua")
 load_module(base, "mm_portal_usage.lua")
 load_module(base, "mm_frontier.lua")
 load_module(base, "mm_bookmarks.lua")
+load_module(base, "mm_bookmark_window.lua")
 load_module(base, "mm_help.lua")
 load_module(base, "mm_minimap.lua")
 load_module(base, "mm_commands.lua")
@@ -292,6 +293,15 @@ function mm.initialize()
       end
     end)
   end
+
+  safe_step("bookmark_window.initialize", function()
+    if mm.bookmark_window and mm.bookmark_window.initialize then
+      local ok, window_err = mm.bookmark_window.initialize()
+      if not ok then
+        mm.warn("Could not initialize bookmark window: " .. tostring(window_err))
+      end
+    end
+  end)
 
   safe_step("load_portal_persistence", function()
     if mm.load_portal_persistence and mm.load_portal_persistence() then

@@ -112,7 +112,7 @@ local defaultConfig = {
     -- Next action after arriving at target (smartscan, qs, none)
     nxAction = "qs",
     
-    -- xcp post-arrival action mode: db|qw|ht (legacy "off" loads as db)
+    -- XCP target room source/lookup strategy: db|qw|hybrid|ht
     xcpActionMode = "qw",
     
     -- Overwrite con data
@@ -122,7 +122,7 @@ local defaultConfig = {
     soundEnabled = false,
     soundVolume = 100,
     
-    -- Express mode (skip targets with enough kills)
+    -- Express mode (direct-route proven fixed-room targets)
     express = {
         enabled = true,
         minKillCount = 2,
@@ -481,6 +481,86 @@ snd.targets = snd.targets or {
     ]]
 }
 
+-------------------------------------------------------------------------------
+-- Express Target Classification
+-------------------------------------------------------------------------------
+
+snd.express = snd.express or {}
+
+local function clearExpressTarget(target)
+    if type(target) ~= "table" then return target end
+    target.express = false
+    target.expressRoomId = nil
+    target.expressKillCount = 0
+    target.expressRoomCount = 0
+    return target
+end
+
+--- Snapshot whether a target qualifies for Express routing.
+-- Express is deliberately based only on area-scoped S&D mob sightings:
+-- exactly one unique room, with at least the configured number of kills.
+-- Mapper room-name matches are not mob sightings and do not qualify.
+function snd.express.classifyTarget(target)
+    clearExpressTarget(target)
+    if type(target) ~= "table" then return target end
+    if not snd.config or not snd.config.express or snd.config.express.enabled ~= true then return target end
+    if target.dead == true or target.killed == true or tonumber(target.remaining) == 0 then return target end
+
+    local trim = snd.utils and snd.utils.trim or function(value)
+        return tostring(value or ""):match("^%s*(.-)%s*$")
+    end
+    local mobName = trim(target.mob or target.name or "")
+    local areaKey = trim(target.arid or target.area or "")
+    if mobName == "" or areaKey == "" then return target end
+    if not snd.db or type(snd.db.getMobLocations) ~= "function" then return target end
+
+    local ok, rows = pcall(snd.db.getMobLocations, mobName, areaKey, { legacy = true })
+    if not ok or type(rows) ~= "table" then
+        if snd.utils and snd.utils.debugNote then
+            snd.utils.debugNote("Express classification failed for " .. mobName .. " in " .. areaKey)
+        end
+        return target
+    end
+
+    local uniqueRooms = {}
+    local roomCount = 0
+    local onlyRow = nil
+    local onlyRoomId = nil
+    for _, row in ipairs(rows) do
+        local roomId = tonumber(row.roomid or row.rmid)
+        if roomId and roomId > 0 and not uniqueRooms[roomId] then
+            uniqueRooms[roomId] = true
+            roomCount = roomCount + 1
+            onlyRow = row
+            onlyRoomId = roomId
+        end
+    end
+
+    target.expressRoomCount = roomCount
+    if roomCount ~= 1 or not onlyRow then return target end
+
+    local killCount = tonumber(onlyRow.kill_count) or 0
+    target.expressKillCount = killCount
+    local minimumKills = math.max(1, tonumber(snd.config.express.minKillCount) or 2)
+    if killCount >= minimumKills then
+        target.express = true
+        target.expressRoomId = onlyRoomId
+    end
+    return target
+end
+
+--- Reclassify the already-built list after changing Express settings.
+function snd.express.reclassifyTargets()
+    if snd.targets and type(snd.targets.list) == "table" then
+        for _, target in ipairs(snd.targets.list) do
+            snd.express.classifyTarget(target)
+        end
+    end
+    if snd.gui and snd.gui.refresh then
+        snd.gui.refresh()
+    end
+end
+
 snd.tabs = snd.tabs or {
     active = "auto", -- auto|quest|gq|cp
 }
@@ -496,6 +576,7 @@ snd.nav = snd.nav or {
     nextRoom = -1,
     goingToRoom = nil,
     nxState = nil,
+    xcpLookup = nil,
     
     -- Auto-hunt state
     autoHunt = {
@@ -650,7 +731,15 @@ end
 function snd.scan.currentTargetMatchesSmartScan(activeTab)
     local current = snd.targets and snd.targets.current or nil
     if not snd.scan.targetIsAlive(current) then return false end
-    if activeTab and activeTab ~= "" and current.activity ~= activeTab then
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    local ownsAdhocQuickWhere = current.activity == "qw"
+        and quickWhere and quickWhere.isAdhoc == true
+        and quickWhere.active == true
+        and type(quickWhere.rooms) == "table"
+        and #quickWhere.rooms > 0
+    if activeTab and activeTab ~= "" and current.activity ~= activeTab
+        and not ownsAdhocQuickWhere
+    then
         return false
     end
     return snd.scan.targetIsInCurrentArea(current)
@@ -1314,9 +1403,96 @@ function snd.sortTargetsByPriority()
     snd.reindexTargetsAfterSort()
 end
 
+local function quickWhereTargetIdentity(target)
+    if type(target) ~= "table" then return "" end
+    return table.concat({
+        tostring(target.activity or ""),
+        tostring(target.name or target.mob or ""),
+        tostring(target.area or target.arid or ""),
+    }, "|")
+end
+
+local function emptyQuickWhereScope()
+    return {
+        rooms = {},
+        index = 1,
+        active = false,
+        targetKey = "",
+    }
+end
+
+--- Invalidate global quick-where state before selecting a different target.
+-- QW replies are asynchronous and use temporary global triggers. Leaving an
+-- old ad-hoc lookup armed lets its eventual reply replace the newly selected
+-- target, while leaving its completed room list active makes nx cycle the old
+-- rooms. Target selection is the serialization boundary for both cases.
+function snd.nav.invalidateQuickWhereForTarget(nextTarget)
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    if type(quickWhere) ~= "table" then return false end
+
+    local currentKey = quickWhereTargetIdentity(snd.targets and snd.targets.current)
+    local nextKey = quickWhereTargetIdentity(nextTarget)
+    local storedKey = tostring(quickWhere.targetKey or "")
+    local changesIdentity = currentKey ~= nextKey
+    local mismatchedStoredList = storedKey ~= "" and nextKey ~= "" and storedKey ~= nextKey
+    if quickWhere.isAdhoc ~= true and not changesIdentity and not mismatchedStoredList then
+        return false
+    end
+
+    for _, timerField in ipairs({"probeTimer", "processTimer", "disableTimer"}) do
+        local timerId = quickWhere[timerField]
+        if timerId ~= nil and type(killTimer) == "function" then
+            pcall(killTimer, timerId)
+        end
+        quickWhere[timerField] = nil
+    end
+
+    if snd.triggers and type(snd.triggers.disableQuickWhereTriggers) == "function" then
+        pcall(snd.triggers.disableQuickWhereTriggers)
+    end
+
+    local previousScope = tostring(quickWhere.scope or "")
+    local nextActivity = tostring((type(nextTarget) == "table" and nextTarget.activity) or "")
+    if previousScope ~= "" and previousScope == nextActivity then
+        snd.nav.quickWhereByActivity = snd.nav.quickWhereByActivity or {}
+        snd.nav.quickWhereByActivity[previousScope] = emptyQuickWhereScope()
+    end
+
+    quickWhere.rooms = {}
+    quickWhere.index = 1
+    quickWhere.active = false
+    quickWhere.targetKey = ""
+    quickWhere.lastMatch = nil
+    quickWhere.pendingMatches = {}
+    quickWhere.processed = true
+    quickWhere.completed = true
+    quickWhere.accepted = false
+    quickWhere.awaitingCommandEcho = false
+    quickWhere.probePending = false
+    quickWhere.commandInFlight = false
+    quickWhere.isAdhoc = false
+    quickWhere.requestedKeyword = nil
+    quickWhere.lookupKeyword = nil
+    quickWhere.exact = false
+    quickWhere.exactMatchText = nil
+    quickWhere.exactTargetName = nil
+    quickWhere.source = nil
+    quickWhere.scope = nil
+
+    snd.nav.nxOverride = nil
+    snd.nav.nxState = nil
+    snd.nav.xcpLookup = nil
+
+    if snd.utils and type(snd.utils.debugNote) == "function" then
+        snd.utils.debugNote("Invalidated quick-where state for target change")
+    end
+    return true
+end
+
 --- Clear the current target
 function snd.clearTarget()
     local activity = snd.targets.current and snd.targets.current.activity or nil
+    snd.nav.invalidateQuickWhereForTarget(nil)
     snd.targets.current = nil
     if activity and snd.targets.scoped then
         snd.targets.scoped[activity] = nil
@@ -1349,6 +1525,10 @@ function snd.nav.clearActivityQuickWhere(activity)
     end
 
     local prefix = activity .. "|"
+    if snd.nav.xcpLookup and type(snd.nav.xcpLookup.targetKey) == "string"
+        and snd.nav.xcpLookup.targetKey:sub(1, #prefix) == prefix then
+        snd.nav.xcpLookup = nil
+    end
     if snd.nav.nxState and type(snd.nav.nxState.targetKey) == "string"
         and snd.nav.nxState.targetKey:sub(1, #prefix) == prefix then
         snd.nav.nxState = nil
@@ -1367,6 +1547,7 @@ end
 
 --- Set a new target
 function snd.setTarget(target)
+    snd.nav.invalidateQuickWhereForTarget(target)
     snd.targets.current = target
     if target and target.activity and snd.targets.scoped then
         snd.targets.scoped[target.activity] = snd.utils.deepcopy(target)
@@ -1472,7 +1653,9 @@ function snd.onRoomChange()
     if destination and tostring(snd.room.current.rmid) == tostring(destination) then
         snd.mapper.pathExecutionActive = false
         snd.mapper.pathExecutionHasPendingGroups = false
-        if snd.mapper and snd.mapper.flushPendingPersists then
+        if snd.mapper and snd.mapper.schedulePendingPersistFlush then
+            snd.mapper.schedulePendingPersistFlush()
+        elseif snd.mapper and snd.mapper.flushPendingPersists then
             snd.mapper.flushPendingPersists()
         end
         snd.onDestinationArrived()
@@ -1537,6 +1720,14 @@ function snd.onDestinationArrived()
             end
         end
     end
+
+    -- QW/hybrid/HT approaches own their arrival action. The live lookup must
+    -- run before the ordinary nx scan/kill action, and replaces it for this
+    -- one arrival.
+    if snd.commands and type(snd.commands.handleXcpLookupArrival) == "function"
+        and snd.commands.handleXcpLookupArrival(snd.room.current.rmid) == true then
+        return
+    end
     
     local action = snd.normalizeNxAction(snd.config.nxAction)
     snd.config.nxAction = action
@@ -1546,44 +1737,15 @@ function snd.onDestinationArrived()
         snd.scan.handleArrivalNxAction(action)
     end
 
-    local current = snd.targets and snd.targets.current
-    local mode = tostring((snd.config and snd.config.xcpActionMode) or "qw"):lower()
-    if mode == "off" then
-        mode = "db"
-    elseif mode ~= "db" and mode ~= "qw" and mode ~= "ht" then
-        mode = "qw"
-    end
-    local nxState = snd.nav and snd.nav.nxState or nil
-    local shouldRunXcpModeAction = false
-    if current and nxState and nxState.arrived and not nxState.xcpActionFired then
-        if snd.commands and snd.commands.buildTargetKeyFromCurrent then
-            local currentKey = snd.commands.buildTargetKeyFromCurrent(current)
-            shouldRunXcpModeAction = (currentKey ~= "" and currentKey == nxState.targetKey)
-        else
-            shouldRunXcpModeAction = true
-        end
-    end
-
-    if shouldRunXcpModeAction and (current.activity == "cp" or current.activity == "gq") then
-        if mode == "ht" and snd.commands and snd.commands.ht then
-            snd.utils.debugNote("xcp mode ht: running live hunt after arrival")
-            nxState.xcpActionFired = true
-            snd.commands.ht("")
-        elseif mode == "qw" and snd.commands and snd.commands.qw then
-            snd.utils.debugNote("xcp mode qw: running exact live where after arrival")
-            nxState.xcpActionFired = true
-            snd.commands.qw("")
-        elseif mode == "db" then
-            snd.utils.debugNote("xcp mode db: using existing DB/mapped room list after arrival")
-            nxState.xcpActionFired = true
-        end
-    end
-
 end
 
 --- Called when character state changes
 function snd.onStateChange()
-    -- Could trigger GUI updates, check for combat, etc.
+    if tostring(snd.char and snd.char.state or "0") == "8"
+        and snd.commands and snd.commands.abortQuickWhereForCombat
+    then
+        snd.commands.abortQuickWhereForCombat()
+    end
     if snd.gui and snd.gui.refresh then
         snd.gui.refresh()
     end

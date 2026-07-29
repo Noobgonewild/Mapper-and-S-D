@@ -70,6 +70,7 @@ mm.help_table = {
       { cmd = "mapper rebuild layout", desc = "Recalculate and save the current room's area from geometric database cardinal exits" },
       { cmd = "mapper rebuild layout <room>", desc = "Recalculate and save the specified room's area" },
       { cmd = "mapper rebuild lookup", desc = "Rebuild the rooms_lookup full-text room-name index from rooms; fixes missing/stale global search entries without changing rooms or exits" },
+      { cmd = "mapper refresh terrain", desc = "Explicitly request and persist fresh GMCP sector/terrain metadata" },
       { cmd = "mapper recolor map", desc = "Apply Aard terrain colors using GMCP sectors data" },
       { cmd = "mapper updatecolors (db)", desc = "Load environments/terrain colors from sqlite DB (default uses configured map DB)" },
       { cmd = "mapper showenv", desc = "Show environment/terrain color mapping from sqlite DB" },
@@ -142,7 +143,8 @@ mm.help_table = {
       { cmd = "mapper bounceportal clear", desc = "Clear the current bounce portal" },
       { cmd = "mapper bouncerecall clear", desc = "Clear the current bounce recall" },
       { cmd = "mapper noportal <room_id> (true/false)", desc = "Manually set noportal flag for a room id (not a portal index)" },
-      { cmd = "mapper norecall <room_id> (true/false)", desc = "Manually set norecall flag for a room id (not a portal index)" },
+      { cmd = "mapper norecall on/off/toggle", desc = "Set or toggle the norecall flag for the current room" },
+      { cmd = "mapper norecall <room_id> true/false", desc = "Manually set the norecall flag for a room id (not a portal index)" },
       { cmd = "mapper portallevel <ind> <lvl> (quiet)", desc = "Change the level lock on a portal. Find indices with 'mapper portals'. Do not manually account for tiers. Adding 'quiet' means no output." },
       { cmd = "mapper delete portal #<index>", desc = "Remove a hand-held portal by its index Find the indices with 'mapper portals'" },
       { cmd = "mapper editportal #<index> {<new cmd>}", desc = "Change a portal command using the exact index from mapper portals." },
@@ -167,7 +169,11 @@ mm.help_table = {
   ['bookmarks'] = {
     header = "Bookmarks",
     rows = {
+      { cmd = "bookmark <command>", desc = "Shortcut for mapper bookmarks <command>; bookmarks and mapper bookmark also work" },
+      { cmd = "bookmarkwin <command>", desc = "Shortcut for mapper bookmarkwin <command>" },
       { cmd = "mapper bookmarks", desc = "List bookmarks in your current area with clickable xrt links" },
+      { cmd = "mapper bookmarks list", desc = "List all bookmarks across every area" },
+      { cmd = "mapper bookmarks search <label>", desc = "Search all active bookmarks by label (case-insensitive partial match)" },
       { cmd = "mapper bookmarks here", desc = "List bookmarks in your current area" },
       { cmd = "mapper bookmarks <area>", desc = "List bookmarks in one exact or uniquely matched area" },
       { cmd = "mapper bookmarks add", desc = "Bookmark the current room using the room name as the label" },
@@ -178,8 +184,16 @@ mm.help_table = {
       { cmd = "mapper bookmarks delete #<index>", desc = "Delete a bookmark from the last mapper bookmarks list" },
       { cmd = "mapper bookmarks delete <roomID>", desc = "Delete the active bookmark for a specific room id" },
       { cmd = "mapper bookmarks rename #<index> <label>", desc = "Rename a bookmark from the last mapper bookmarks list" },
+      { cmd = "mapper bookmarks pin [<exact label>|room <roomID>]", desc = "Pin an active bookmark at the top of the window; defaults to the current room (use 'label <label>' for a numeric label)" },
+      { cmd = "mapper bookmarks unpin [<exact label>|room <roomID>]", desc = "Unpin by exact label or room without deleting the bookmark" },
       { cmd = "mapper bookmarks listdeleted", desc = "List the last 20 deleted bookmarks" },
-      { cmd = "mapper bookmarks restore #<index>", desc = "Restore a bookmark from the last deleted bookmark list" },
+      { cmd = "mapper bookmarks restore #<index>", desc = "Restore a bookmark; conflicting labels receive a _conflict name" },
+      { cmd = "mapper bookmarkwin [show|hide|toggle]", desc = "Show, hide, toggle, or report the mouse-movable bookmark window" },
+      { cmd = "mapper bookmarkwin auto", desc = "Show bookmarks for the current area and refresh only when the area changes" },
+      { cmd = "mapper bookmarkwin manual <area>", desc = "Keep showing one exact or uniquely matched area" },
+      { cmd = "mapper bookmarkwin refresh", desc = "Force the bookmark window to reload its bookmarks" },
+      { cmd = "mapper bookmarkwin font <7-24>", desc = "Set bookmark window card font size" },
+      { cmd = "mapper bookmarkwin title [on|off|toggle]", desc = "Show the detailed title/subtitle, or collapse them to one draggable 'Bookmarks' bar" },
     }
   },
   ['searching'] = {
@@ -200,6 +214,7 @@ mm.help_table = {
       { cmd = "mapper next", desc = "Visit the next room in the most recent list of results." },
       { cmd = "mapper next <index>", desc = "Ditto, but skip to the given result index." },
       { cmd = "mapper where <room id>", desc = "Show directions to a room number" },
+      { cmd = "mapper guarded <room id>", desc = "Preview the xrt route with AreaGuard forced on; does not move you (alias: mapper areaguard)" },
     }
   },
   ['exploring'] = {
@@ -217,7 +232,7 @@ mm.help_table = {
     header = "Moving",
     rows = {
       { cmd = "mapper goto <room id>", desc = "Run to a room by its room number" },
-      { cmd = "xset areaguard <on|off>", desc = "Persistently guard xrt routes from areas more than 30 levels above you; default off" },
+      { cmd = "xset areaguard <on|off>", desc = "Guard high-level xrt rooms; clan rooms are locally exempt, later rooms are checked; default off" },
       { cmd = "mapper portalguard [on|off]", desc = "Guard portal routes unless your level is within 30 of the portal level; xrtforce bypasses it" },
       { cmd = "xrtforce <area|room id>", desc = "Run like xrt but ignore area guard, portalguard, and exits.level checks (forced route)" },
       { cmd = "mapper walkto <room id>", desc = "Run to a room by its room number without using any mapper portals" },

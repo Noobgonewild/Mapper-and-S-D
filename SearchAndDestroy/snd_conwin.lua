@@ -11,6 +11,7 @@ snd.conwin = snd.conwin or {}
 local CW = snd.conwin
 
 CW.MARKER = "__SND_CONWIN_DONE__"
+CW.hybridArrivalCheckSupported = true
 CW.ids = CW.ids or {triggers = {}, events = {}}
 CW.ids.keys = CW.ids.keys or {}
 CW.ids.aliases = CW.ids.aliases or {}
@@ -166,19 +167,12 @@ local function currentPlayerState()
     return state ~= nil and tostring(state) or ""
 end
 
-local function mapperHasPendingTravel(roomId)
-    if snd and snd.mapper and snd.mapper.pathExecutionHasPendingGroups == true then
-        return true
-    end
-
-    local destination = snd and (
-        (snd.nav and snd.nav.goingToRoom) or
-        (snd.mapper and snd.mapper.goingToRoom)
-    ) or nil
-    if destination ~= nil and tostring(destination) ~= "" then
-        return tostring(destination) ~= tostring(roomId or "")
-    end
-    return false
+local function mapperHasPendingTravel(_roomId)
+    -- A selected destination records navigation intent, not live execution.
+    -- It may deliberately survive a stopped/failed route so the target remains
+    -- selected. Only unreleased mapper command groups should suppress a manual
+    -- room-change refresh; GMCP state separately guards a running character.
+    return snd and snd.mapper and snd.mapper.pathExecutionHasPendingGroups == true
 end
 
 local function trim(s) return (tostring(s or ""):gsub("^%s+",""):gsub("%s+$","")) end
@@ -385,11 +379,8 @@ function CW.isRefreshEligible(roomId)
         return false
     end
 
-    -- A combat-issued MUD stop can leave the old mapper destination in place
-    -- even though no client-side groups remain. That is a genuine ConWin stop.
-    if not CW.combatRefreshQueued and mapperHasPendingTravel(roomId) then
-        return false
-    end
+    -- Do not gate on goingToRoom here. A combat stop or failed route may keep
+    -- that destination selected after execution has ended.
     return true
 end
 
@@ -558,6 +549,16 @@ function CW.onCaptureMarker(serial)
     end
 
     CW.render()
+    -- Hybrid XCP uses the completed consider roster only to decide whether QW
+    -- is necessary. This remains navigation behavior; this file intentionally
+    -- has no mobdetect/xkill side effects.
+    if snd and snd.commands and type(snd.commands.handleXcpHybridConsiderResult) == "function" then
+        local targetHere = CW.detectActiveTargetInRoom()
+        snd.commands.handleXcpHybridConsiderResult(
+            completedRoom,
+            targetHere and true or false
+        )
+    end
     CW.resolveCurrentRoomTargetForNxAction()
     if CW.hasPendingRefresh() then
         CW.armRoomRefresh()
