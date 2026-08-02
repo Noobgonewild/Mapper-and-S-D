@@ -802,7 +802,6 @@ end
 -------------------------------------------------------------------------------
 
 local AREA_GUARD_DEFAULT_ALLOWANCE = 30
-local PORTAL_GUARD_ALLOWANCE = 30
 
 local function normalizeAreaKey(value)
     return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
@@ -851,25 +850,38 @@ function snd.mapper.isClanRoom(roomId, roomInfo)
 end
 
 function snd.mapper.portalGuardEnabled()
-    return not (mm and mm.state and mm.state.portal_guard_enabled == false)
+    return mm and type(mm.portal_guard_entries) == "function"
+        and #mm.portal_guard_entries() > 0
 end
 
 function snd.mapper.portalGuardBypassed(ignoreLockedExits)
-    return ignoreLockedExits == true or not snd.mapper.portalGuardEnabled()
+    return ignoreLockedExits == true
 end
 
-function snd.mapper.portalGuardSql(fromExpression, levelExpression, playerLevel, ignoreLockedExits)
+function snd.mapper.portalGuardSql(dirExpression, levelExpression, effectiveLevel, ignoreLockedExits)
     if snd.mapper.portalGuardBypassed(ignoreLockedExits) then
         return "1=1"
     end
 
-    local allowedLevel = (tonumber(playerLevel) or 0) + PORTAL_GUARD_ALLOWANCE
-    return string.format(
-        "(%s NOT IN ('*','**') OR %s <= %d)",
-        fromExpression,
-        levelExpression,
-        allowedLevel
-    )
+    local clauses = {}
+    local entries = mm and type(mm.portal_guard_entries) == "function"
+        and mm.portal_guard_entries()
+        or {}
+    for _, details in ipairs(entries) do
+        local command = tostring(details.portal and details.portal.command or ""):lower()
+        local guardLevel = tonumber(details.guard_level)
+        if command ~= "" and guardLevel and guardLevel > 0 then
+            table.insert(clauses, string.format(
+                "(LOWER(%s) <> %s OR (%s + %d) <= %d)",
+                dirExpression,
+                snd.mapper.db.escape(command),
+                levelExpression,
+                math.floor(guardLevel),
+                math.floor(tonumber(effectiveLevel) or 0)
+            ))
+        end
+    end
+    return #clauses > 0 and table.concat(clauses, " AND ") or "1=1"
 end
 
 function snd.mapper.portalStepAllowed(step, ignoreLockedExits)
@@ -878,8 +890,14 @@ function snd.mapper.portalStepAllowed(step, ignoreLockedExits)
     end
 
     local portalLevel = tonumber(step and step.level) or 0
-    local allowedLevel = (tonumber(snd.char and snd.char.level) or 0) + PORTAL_GUARD_ALLOWANCE
-    return portalLevel <= allowedLevel
+    local effectiveLevel = (tonumber(snd.char and snd.char.level) or 0)
+        + ((tonumber(snd.char and snd.char.tier) or 0) * 10)
+    local guardLevel = 0
+    if mm and type(mm.portal_guard_details_for_command) == "function" then
+        local details = mm.portal_guard_details_for_command(step and step.dir)
+        guardLevel = details and (tonumber(details.guard_level) or 0) or 0
+    end
+    return (portalLevel + guardLevel) <= effectiveLevel
 end
 
 function snd.mapper.areaGuardConfig()
@@ -2585,7 +2603,8 @@ function snd.mapper.findPath(
         myLevel,
         myLevel + (myTier * 10)
     )
-    local portalGuardWhere = snd.mapper.portalGuardSql("fromuid", "level", myLevel, ignoreLockedExits)
+    local effectiveLevel = myLevel + (myTier * 10)
+    local portalGuardWhere = snd.mapper.portalGuardSql("dir", "level", effectiveLevel, ignoreLockedExits)
     local chaosWhere = (gqActive and not ignoreTravelRestrictions)
         and "(fromuid <> '*' OR ifnull(chaos, 'no') <> 'yes')"
         or "1=1"
@@ -4747,7 +4766,7 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
 end
 
 -- Preview gotoRoom's route with AreaGuard forced on for this calculation only.
--- PortalGuard, locked exits, portal/recall settings, and operational route cost
+-- Per-portal guards, locked exits, portal/recall settings, and operational route cost
 -- remain exactly as they are for normal xrt navigation.
 function snd.mapper.previewGuardedRoute(currentRoom, roomId, usePortals)
     local source = tostring(currentRoom or "")

@@ -507,6 +507,43 @@ local xcpModeDescriptions = {
     ht = "ht - GQ hunt trick, then exact live where (quest/CP use qw)",
 }
 
+local function xcpMessageText(value)
+    local text = tostring(value or "")
+    if snd.utils and type(snd.utils.stripColors) == "function" then
+        text = snd.utils.stripColors(text)
+    end
+    if snd.utils and type(snd.utils.trim) == "function" then
+        text = snd.utils.trim(text)
+    end
+    return text
+end
+
+local function announceXcpSearch(current, style, suffix)
+    current = current or {}
+    local targetName = xcpMessageText(current.name or current.mob or current.keyword)
+    if targetName == "" then targetName = "the selected target" end
+
+    local areaName = xcpMessageText(current.areaName)
+    if areaName == "" then areaName = xcpMessageText(current.area) end
+
+    local message
+    if style == "db" then
+        message = "Searching known locations for " .. targetName
+    elseif style == "ht" then
+        message = "Tracking " .. targetName
+    else
+        message = "Searching for " .. targetName
+    end
+
+    if areaName ~= "" then
+        message = message .. " — " .. areaName
+    end
+    if suffix and suffix ~= "" then
+        message = message .. " (" .. suffix .. ")"
+    end
+    snd.utils.infoNote(message)
+end
+
 local function startSelectedTargetLiveLookup(mode, source)
     local current = snd.targets and snd.targets.current or nil
     if not current then return false end
@@ -574,7 +611,7 @@ local function startAreaBasedTargetLookup(mode, source)
         return installStoredFallback("xcpAreaStartMissing")
     end
 
-    snd.utils.infoNote("Going to " .. targetArea .. " (room " .. tostring(startRoom) .. ") before live lookup.")
+    snd.utils.debugNote("XCP: going to " .. targetArea .. " (room " .. tostring(startRoom) .. ") before live lookup")
     if scheduleSelectedTargetLookup(startRoom, mode, source, "xcp_area_start") then
         return true
     end
@@ -654,13 +691,14 @@ function snd.commands.beginXcpLookup()
     current.xcpRoomSource = nil
 
     if requestedMode == "ht" and effectiveMode == "qw" then
-        snd.utils.infoNote("XCP mode ht is only available for GQ targets; using qw for this " .. tostring(current.activity) .. " target.")
+        snd.utils.debugNote("XCP mode ht is only available for GQ targets; using qw for this " .. tostring(current.activity) .. " target")
     end
     syncCurrentTargetScope()
 
     if requestedMode == "db" then
         local results = storedTargetResults(current)
         if #results > 0 then
+            announceXcpSearch(current, "db")
             return installSelectedTargetRoomList(results, "db", {
                 reason = "xcpModeDb",
             })
@@ -668,7 +706,8 @@ function snd.commands.beginXcpLookup()
         current.xcpEffectiveMode = "qw"
         current.xcpRoomSource = "qw-fallback"
         syncCurrentTargetScope()
-        snd.utils.infoNote("No stored rooms for this target; falling back to qw.")
+        snd.utils.debugNote("XCP db: no stored rooms for this target; falling back to qw")
+        announceXcpSearch(current, "qw")
         return startAreaBasedTargetLookup("qw", "qw-fallback")
     end
 
@@ -690,8 +729,9 @@ function snd.commands.beginXcpLookup()
             })
             if not installed then return false end
 
-            snd.utils.infoNote(string.format(
-                "Express target: going directly to room %d; qw will run only if nx wraps.",
+            announceXcpSearch(current, "hybrid", "Express")
+            snd.utils.debugNote(string.format(
+                "XCP hybrid Express: going directly to room %d; qw will run only if nx wraps",
                 expressRoom
             ))
             return snd.commands.gotoRoomViaAlias(expressRoom, {
@@ -704,10 +744,16 @@ function snd.commands.beginXcpLookup()
         local best = results[1]
         local bestRoom = best and tonumber(best.rmid) or nil
         if bestRoom and bestRoom > 0 then
-            snd.utils.infoNote(string.format(
-                "Hybrid lookup: going to best stored room %d (seen %d times), then checking ConWin before qw.",
+            local sightings = tonumber(best.seen_count) or 0
+            local sightingLabel = nil
+            if sightings > 0 then
+                sightingLabel = string.format("%d sighting%s", sightings, sightings == 1 and "" or "s")
+            end
+            announceXcpSearch(current, "hybrid", sightingLabel)
+            snd.utils.debugNote(string.format(
+                "XCP hybrid: going to best stored room %d (seen %d times), then checking ConWin before qw",
                 bestRoom,
-                tonumber(best.seen_count) or 0
+                sightings
             ))
             if scheduleSelectedTargetLookup(bestRoom, "hybrid", "hybrid", "xcp_hybrid_best_room") then
                 return true
@@ -717,10 +763,12 @@ function snd.commands.beginXcpLookup()
                 reason = "xcpHybridTravelFailed",
             })
         end
-        snd.utils.infoNote("Hybrid lookup has no stored room; falling back to normal qw.")
+        snd.utils.debugNote("XCP hybrid: no stored room; falling back to normal qw")
+        announceXcpSearch(current, "qw")
         return startAreaBasedTargetLookup("hybrid", "hybrid")
     end
 
+    announceXcpSearch(current, effectiveMode)
     return startAreaBasedTargetLookup(effectiveMode, requestedMode)
 end
 
@@ -4488,7 +4536,9 @@ function snd.commands.selectQuestTarget(options)
             if snd.setActiveTab then
                 snd.setActiveTab("quest", {save = true, refresh = false})
             end
-            snd.utils.infoNote("Quest target selected: " .. target.mob)
+            if not opts.skipLookup then
+                snd.utils.infoNote("Quest target selected: " .. target.mob)
+            end
             return true
         end
     end

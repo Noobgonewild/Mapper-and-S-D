@@ -178,25 +178,52 @@ local function portal_command_for_selected_id(selected_id)
   return nil
 end
 
-local function handle_portalguard(mode)
-  mode = tostring(mode or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-  if mode == "" then
-    mm.note(mm.portal_guard_status_text())
-    return true
-  end
-  if mode ~= "on" and mode ~= "off" then
-    mm.warn("Usage: mapper portalguard [on|off]")
+local function handle_portalguard(args)
+  local raw = tostring(args or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if raw == "" then
+    local ok, err = mm.print_portal_guards()
+    if not ok and err then mm.warn(err) end
     return true
   end
 
-  local enabled = mode == "on"
-  local ok, err = mm.set_portal_guard(enabled)
-  if not ok then
-    mm.warn("Could not save portalguard setting: " .. tostring(err))
+  local portal_id, setting = raw:match("^(%S+)%s*(%S*)$")
+  if not portal_id or portal_id == "on" or portal_id == "off" then
+    mm.warn("PortalGuard is configured per portal. Usage: mapper portalguard <portal-id> [guard-level|off]")
     return true
   end
-  mm.note("Portal safety " .. (enabled and "ON" or "OFF") .. ".")
-  mm.note(mm.portal_guard_status_text())
+
+  setting = tostring(setting or ""):lower()
+  if setting == "off" then
+    local ok, result = mm.clear_portal_guard(portal_id)
+    if not ok then
+      mm.warn(result)
+    elseif result.previous then
+      mm.note("PortalGuard removed from portal " .. tostring(portal_id) .. ".")
+    else
+      mm.note("Portal " .. tostring(portal_id) .. " was already unguarded.")
+    end
+    return true
+  end
+
+  if setting ~= "" and not setting:match("^%d+$") then
+    mm.warn("Usage: mapper portalguard <portal-id> [guard-level|off]")
+    return true
+  end
+  local ok, result = mm.set_portal_guard_level(portal_id, setting ~= "" and tonumber(setting) or nil)
+  if not ok then
+    mm.warn(result)
+    return true
+  end
+  mm.note(string.format(
+    "PortalGuard set for %s: base level %d + guard %d = required effective level %d.",
+    tostring(result.portal_id),
+    tonumber(result.portal.level) or 0,
+    tonumber(result.guard_level) or 0,
+    tonumber(result.required_level) or 0
+  ))
+  if result.is_bounce_portal then
+    mm.warn("Portal " .. tostring(result.portal_id) .. " is your bounce portal. Guarding it may prevent escape when your effective level is below its guarded requirement.")
+  end
   return true
 end
 
@@ -353,9 +380,10 @@ local function handle_command_inline(line)
     return true
   end
 
-  local portalguard_mode = line:match("^mapper portalguard%s*(%S*)$")
-  if portalguard_mode ~= nil then
-    return handle_portalguard(portalguard_mode)
+  local portalguard_args = line == "mapper portalguard" and ""
+    or line:match("^mapper portalguard%s+(.+)$")
+  if portalguard_args ~= nil then
+    return handle_portalguard(portalguard_args)
   end
 
   local autostop_mode = line:match("^mapper autostop%s*(%S*)$")
@@ -566,11 +594,14 @@ local function handle_command_inline(line)
 
   local portalrecall_idx = line:match("^mapper portalrecall%s+(%d+)$")
   if portalrecall_idx then
-    local ok, err = mm.set_portal_recall(tonumber(portalrecall_idx))
+    local ok, err, removed_guard = mm.set_portal_recall(tonumber(portalrecall_idx))
     if not ok then
       mm.warn(err)
     else
       mm.note("Toggled recall flag for portal #" .. tostring(portalrecall_idx))
+      if removed_guard then
+        mm.note("Removed its PortalGuard because recall portals cannot be guarded.")
+      end
       mm.apply_bounce_settings_to_snd()
     end
     return true
@@ -641,6 +672,10 @@ local function handle_command_inline(line)
         mm.warn(portal_or_err)
       else
         mm.note("bounceportal set to #" .. tostring(bounceportal_idx) .. ": " .. tostring(portal_or_err.command))
+        local guard_level = mm.portal_guard_level and mm.portal_guard_level(portal_or_err.portal_id) or nil
+        if guard_level then
+          mm.warn("This bounce portal has a +" .. tostring(guard_level) .. " PortalGuard and may be unavailable below its guarded requirement.")
+        end
       end
       return true
     end
@@ -1207,7 +1242,8 @@ mm.alias_specs = {
   {"^mapper underlines?(?: (on|off))?$", function(m) if m[2] then mm.state.underline_links = mm.bool_arg(m[2], mm.state.underline_links) end; mm.note("underlines " .. (mm.state.underline_links and "on" or "off")) end},
   {"^mapper autolocate(?: (on|off))?$", function(m) set_native_follow(mm.bool_arg(m[2], not mm.state.auto_locate), "autolocate") end},
   {"^mapper centerlocate(?: (on|off))?$", function(m) set_native_follow(mm.bool_arg(m[2], not mm.state.auto_locate), "centerlocate") end},
-  {"^mapper portalguard%s*(%S*)$", function(m) handle_portalguard(m[2]) end},
+  {"^mapper portalguard$", function() handle_portalguard("") end},
+  {"^mapper portalguard%s+(.+)$", function(m) handle_portalguard(m[2]) end},
   {"^mapper autostop%s*(%S*)$", function(m) handle_autostop(m[2]) end},
   {"^mapper locate$", function() send("look") end},
   {"^mapper debug(?: (on|off))?$", function(m) if m[2] then mm.state.debug = (m[2] == "on"); mm.note("debug " .. m[2]); if m[2] == "on" then mm.debug("debugging enabled; watch for centerview/map capture lines") end else mm.note("debug " .. ((mm.state and mm.state.debug) and "on" or "off")) end end},
@@ -1239,7 +1275,7 @@ mm.alias_specs = {
   {"^mapper native convert (.+)$", function(m) local ok, err = mm.import.convert_sqlite_to_mudlet(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper rebuildportals$", function() local ok, err = mm.rebuild_portals_from_db(); if not ok then mm.warn(err) end end},
   {"^mapper portals$", function() local ok, err = mm.print_portals(); if not ok and err then mm.warn(err) end end},
-  {"^mapper portalrecall%s+(%d+)$", function(m) local ok, err = mm.set_portal_recall(tonumber(m[2])); if not ok then mm.warn(err) else mm.note("Toggled recall flag for portal #" .. tostring(m[2])); mm.apply_bounce_settings_to_snd() end end},
+  {"^mapper portalrecall%s+(%d+)$", function(m) local ok, err, removed_guard = mm.set_portal_recall(tonumber(m[2])); if not ok then mm.warn(err) else mm.note("Toggled recall flag for portal #" .. tostring(m[2])); if removed_guard then mm.note("Removed its PortalGuard because recall portals cannot be guarded.") end; mm.apply_bounce_settings_to_snd() end end},
   {"^mapper chaosportal%s+(%d+)$", function(m) local ok, err = mm.set_portal_chaos(tonumber(m[2])); if not ok then mm.warn(err) else mm.note("Toggled chaos flag for portal #" .. tostring(m[2])) end end},
   {"^mapper bounceportal$", function() local selected = mm.portals and mm.portals.settings and mm.portals.settings.bounce_portal_id; if not selected then mm.note("bounceportal is not set.") else local cmd = portal_command_for_selected_id(selected); if cmd and tostring(cmd) ~= "" then mm.note("bounceportal: #" .. tostring(selected) .. " -> " .. tostring(cmd)) else mm.note("bounceportal portal_id: " .. tostring(selected)) end end end},
   {"^mapper bouncerecall$", function()
@@ -1260,7 +1296,7 @@ mm.alias_specs = {
   end},
   {"^mapper bounceportal clear$", function() local ok, err = mm.clear_bounce_portal(); if not ok then mm.warn(err) else mm.note("bounceportal cleared.") end end},
   {"^mapper bouncerecall clear$", function() local ok, err = mm.clear_bounce_recall(); if not ok then mm.warn(err) else mm.note("bouncerecall cleared.") end end},
-  {"^mapper bounceportal%s+(%d+)$", function(m) local ok, portal_or_err = mm.set_bounce_portal(tonumber(m[2])); if not ok then mm.warn(portal_or_err) else mm.note("bounceportal set to #" .. tostring(m[2]) .. ": " .. tostring(portal_or_err.command)) end end},
+  {"^mapper bounceportal%s+(%d+)$", function(m) local ok, portal_or_err = mm.set_bounce_portal(tonumber(m[2])); if not ok then mm.warn(portal_or_err) else mm.note("bounceportal set to #" .. tostring(m[2]) .. ": " .. tostring(portal_or_err.command)); local guard_level = mm.portal_guard_level and mm.portal_guard_level(portal_or_err.portal_id) or nil; if guard_level then mm.warn("This bounce portal has a +" .. tostring(guard_level) .. " PortalGuard and may be unavailable below its guarded requirement.") end end end},
   {"^mapper bouncerecall%s+(%d+)$", function(m) local ok, portal_or_err = mm.set_bounce_recall(tonumber(m[2])); if not ok then mm.warn(portal_or_err) else mm.note("bouncerecall set to #" .. tostring(m[2]) .. ": " .. tostring(portal_or_err.command)) end end},
   {"^mapper rebuild map$", function() local ok, err = mm.import.convert_sqlite_to_mudlet(mm.state.map_db); if not ok then mm.warn(err) end end},
   {"^mapper import rooms$", function() local ok, err = mm.import.convert_sqlite_to_mudlet(mm.state.map_db); if not ok then mm.warn(err) end end},

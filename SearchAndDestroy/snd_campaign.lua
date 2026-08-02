@@ -1850,7 +1850,9 @@ function snd.cp.selectTarget(index, options)
     if target.loc and target.loc ~= "" then
         areaInfo = " in " .. target.loc
     end
-    snd.utils.infoNote("Target: " .. target.mob .. areaInfo)
+    if not opts.skipLookup then
+        snd.utils.infoNote("Target: " .. target.mob .. areaInfo)
+    end
     return true
 end
 

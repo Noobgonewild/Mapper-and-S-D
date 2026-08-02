@@ -430,7 +430,6 @@ function CW.startSerializedCapture(roomId)
         mobs = {},
     }
     CW.awaiting = true
-    CW.mobDetectDispatched = false
     send("consider all", false)
     send("echo " .. CW.MARKER .. ":" .. tostring(serial), false)
     return true
@@ -550,8 +549,8 @@ function CW.onCaptureMarker(serial)
 
     CW.render()
     -- Hybrid XCP uses the completed consider roster only to decide whether QW
-    -- is necessary. This remains navigation behavior; this file intentionally
-    -- has no mobdetect/xkill side effects.
+    -- is necessary. This remains navigation behavior; this variant has no
+    -- automatic xkill side effects.
     if snd and snd.commands and type(snd.commands.handleXcpHybridConsiderResult) == "function" then
         local targetHere = CW.detectActiveTargetInRoom()
         snd.commands.handleXcpHybridConsiderResult(

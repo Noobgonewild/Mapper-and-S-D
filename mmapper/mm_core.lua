@@ -19,7 +19,7 @@ mm.state = mm.state or {
   native_mapper_db = "mmapper_converted_map.dat",
   auto_locate = true,
   center_on_locate = true,
-  portal_guard_enabled = true,
+  portal_guard_enabled = false,
   autostop_enabled = true,
   debug = false,
 }
@@ -36,6 +36,9 @@ end
 if type(mm.state.autostop_enabled) ~= "boolean" then
   mm.state.autostop_enabled = true
 end
+-- Portal guarding is configured per DINV portal ID.  Keep the retired global
+-- flag false even across an in-session package reload where mm.state survives.
+mm.state.portal_guard_enabled = false
 
 mm.runtime = mm.runtime or {
   located_once = false,
@@ -55,8 +58,13 @@ mm.portals = mm.portals or {
     recall_ids = {},
     bounce_portal_id = nil,
     bounce_recall_id = nil,
+    portal_guard_levels = {},
+    portal_guard_migration_version = 1,
   },
 }
+
+local DEFAULT_PORTAL_GUARD_LEVEL = 20
+local PORTAL_GUARD_MIGRATION_VERSION = 1
 
 local function serialize_value(v)
   local t = type(v)
@@ -241,14 +249,12 @@ local DELETED_PORTALS_PERSIST_FILE = "mmapper_deleted_portals.lua"
 local SETTINGS_PERSIST_FILE = "mmapper_settings.lua"
 
 function mm.load_settings_persistence()
+  mm.state.portal_guard_enabled = false
   local chunk = mm.load_persistence_chunk(SETTINGS_PERSIST_FILE)
   if not chunk then return false end
 
   local ok, data = pcall(chunk)
   if not ok or type(data) ~= "table" then return false end
-  if type(data.portal_guard_enabled) == "boolean" then
-    mm.state.portal_guard_enabled = data.portal_guard_enabled
-  end
   if type(data.autostop_enabled) == "boolean" then
     mm.state.autostop_enabled = data.autostop_enabled
   end
@@ -281,7 +287,8 @@ function mm.save_settings_persistence()
     return false, "unable to open mapper settings persistence file for writing"
   end
   f:write("return " .. serialize_value({
-    portal_guard_enabled = mm.state.portal_guard_enabled ~= false,
+    -- Kept only so older builds also start with their retired global guard off.
+    portal_guard_enabled = false,
     autostop_enabled = mm.state.autostop_enabled ~= false,
     native_mapper_db = mm.state.native_mapper_db or "mmapper_converted_map.dat",
     auto_locate = mm.state.auto_locate ~= false,
@@ -296,19 +303,12 @@ function mm.save_settings_persistence()
 end
 
 function mm.portal_guard_status_text()
-  return string.format(
-    "portalguard %s: when on, guarded routes only use portals within 30 levels of your current level; xrtforce bypasses this safety.",
-    (mm.state.portal_guard_enabled ~= false) and "on" or "off"
-  )
+  return "PortalGuard is configured per DINV portal ID. Use 'mapper portalguard' to list guarded portals."
 end
 
-function mm.set_portal_guard(enabled)
-  mm.state.portal_guard_enabled = enabled ~= false
-  local ok, err = mm.save_settings_persistence()
-  if not ok then
-    return false, err
-  end
-  return true
+function mm.set_portal_guard()
+  mm.state.portal_guard_enabled = false
+  return false, "global PortalGuard was retired; use mapper portalguard <portal-id> [guard-level|off]"
 end
 
 function mm.autostop_status_text()
@@ -515,7 +515,32 @@ function mm.load_portal_persistence()
   end
   mm.portals.settings.bounce_portal_id = persisted_settings.bounce_portal_id and tostring(persisted_settings.bounce_portal_id) or nil
   mm.portals.settings.bounce_recall_id = persisted_settings.bounce_recall_id and tostring(persisted_settings.bounce_recall_id) or nil
-  if source_path == mm.legacy_persistence_path(PORTAL_PERSIST_FILE) then
+  local guard_migrated = tonumber(persisted_settings.portal_guard_migration_version)
+    == PORTAL_GUARD_MIGRATION_VERSION
+  mm.portals.settings.portal_guard_levels = {}
+  if guard_migrated then
+    for id, raw_level in pairs(persisted_settings.portal_guard_levels or {}) do
+      local normalized = tostring(id or ""):gsub("^%s+", ""):gsub("%s+$", "")
+      local guard_level = tonumber(raw_level)
+      if normalized ~= "" and guard_level and guard_level >= 1 and guard_level <= 201
+          and mm.portals.settings.recall_ids[normalized] ~= true then
+        local fixed_recall = false
+        for _, portal in ipairs(restored) do
+          if tostring(portal.portal_id) == normalized and portal.fixed_recall == true then
+            fixed_recall = true
+            break
+          end
+        end
+        if not fixed_recall then
+          mm.portals.settings.portal_guard_levels[normalized] = math.floor(guard_level)
+        end
+      end
+    end
+  end
+  -- A missing migration marker is the legacy global-guard format.  Its state is
+  -- deliberately not imported: every portal starts unguarded exactly once.
+  mm.portals.settings.portal_guard_migration_version = PORTAL_GUARD_MIGRATION_VERSION
+  if source_path == mm.legacy_persistence_path(PORTAL_PERSIST_FILE) or not guard_migrated then
     mm.save_portal_persistence()
   end
   return true
@@ -531,6 +556,13 @@ function mm.save_portal_persistence()
     end
   end
   table.sort(recall_ids)
+  local portal_guard_levels = {}
+  for id, raw_level in pairs(mm.portals.settings.portal_guard_levels or {}) do
+    local guard_level = tonumber(raw_level)
+    if guard_level and guard_level >= 1 and guard_level <= 201 then
+      portal_guard_levels[tostring(id)] = math.floor(guard_level)
+    end
+  end
   local payload = {
     rebuilt = mm.portals.rebuilt or {},
     rebuilt_at = mm.portals.rebuilt_at,
@@ -538,6 +570,8 @@ function mm.save_portal_persistence()
       recall_ids = recall_ids,
       bounce_portal_id = mm.portals.settings.bounce_portal_id and tostring(mm.portals.settings.bounce_portal_id) or nil,
       bounce_recall_id = mm.portals.settings.bounce_recall_id and tostring(mm.portals.settings.bounce_recall_id) or nil,
+      portal_guard_levels = portal_guard_levels,
+      portal_guard_migration_version = PORTAL_GUARD_MIGRATION_VERSION,
     },
   }
   local f = mm.open_persistence_file(PORTAL_PERSIST_FILE, "wb")
@@ -553,6 +587,11 @@ local function ensure_portal_settings()
   mm.portals = mm.portals or {}
   mm.portals.settings = mm.portals.settings or {}
   mm.portals.settings.recall_ids = mm.portals.settings.recall_ids or {}
+  if tonumber(mm.portals.settings.portal_guard_migration_version) ~= PORTAL_GUARD_MIGRATION_VERSION then
+    mm.portals.settings.portal_guard_levels = {}
+    mm.portals.settings.portal_guard_migration_version = PORTAL_GUARD_MIGRATION_VERSION
+  end
+  mm.portals.settings.portal_guard_levels = mm.portals.settings.portal_guard_levels or {}
 end
 
 local function get_portal_by_index(index)
@@ -596,10 +635,19 @@ function mm.set_portal_recall(index, explicit_state)
     return false, "portal is marked as chaos; toggle chaos off before marking it as recall"
   end
   mm.portals.settings.recall_ids[id] = next_state or nil
+  local removed_guard = nil
+  if next_state then
+    removed_guard = mm.portals.settings.portal_guard_levels[id]
+    mm.portals.settings.portal_guard_levels[id] = nil
+    if mm.portals.settings.bounce_portal_id == id then
+      mm.portals.settings.bounce_portal_id = nil
+    end
+  end
   if not next_state and mm.portals.settings.bounce_recall_id == id then
     mm.portals.settings.bounce_recall_id = nil
   end
-  return mm.save_portal_persistence()
+  local saved, save_err = mm.save_portal_persistence()
+  return saved, save_err, removed_guard
 end
 
 
@@ -715,6 +763,139 @@ local function find_portal_by_id(id)
     end
   end
   return nil
+end
+
+mm.find_portal_by_id = find_portal_by_id
+
+function mm.dinv_portal_id(command)
+  return tostring(command or ""):lower():match("^%s*dinv%s+portal%s+use%s+([%w_%-]+)")
+end
+
+function mm.portal_effective_level()
+  local level = tonumber(snd and snd.char and snd.char.level) or 0
+  local tier = tonumber(snd and snd.char and snd.char.tier) or 0
+  return level + (tier * 10)
+end
+
+function mm.portal_guard_level(portal_id)
+  ensure_portal_settings()
+  local guard_level = tonumber(mm.portals.settings.portal_guard_levels[tostring(portal_id or "")])
+  if not guard_level or guard_level < 1 then return nil end
+  return math.floor(guard_level)
+end
+
+function mm.portal_guard_details(portal_id)
+  local id = tostring(portal_id or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  local guard_level = mm.portal_guard_level(id)
+  if not guard_level then return nil end
+  local portal = find_portal_by_id(id)
+  if not portal or mm.is_portal_recall(portal) then return nil end
+  if tostring(mm.dinv_portal_id(portal.command) or "") ~= id then return nil end
+  local base_level = tonumber(portal.level) or 0
+  local effective_level = mm.portal_effective_level()
+  return {
+    portal_id = id,
+    portal = portal,
+    guard_level = guard_level,
+    base_level = base_level,
+    required_level = base_level + guard_level,
+    effective_level = effective_level,
+    blocked = effective_level < (base_level + guard_level),
+  }
+end
+
+function mm.portal_guard_details_for_command(command)
+  local portal_id = mm.dinv_portal_id(command)
+  if not portal_id then return nil end
+  return mm.portal_guard_details(portal_id)
+end
+
+function mm.portal_guard_entries()
+  ensure_portal_settings()
+  local entries = {}
+  for id in pairs(mm.portals.settings.portal_guard_levels) do
+    local details = mm.portal_guard_details(id)
+    if details then table.insert(entries, details) end
+  end
+  table.sort(entries, function(a, b)
+    local an, bn = tonumber(a.portal_id), tonumber(b.portal_id)
+    if an and bn and an ~= bn then return an < bn end
+    return tostring(a.portal_id) < tostring(b.portal_id)
+  end)
+  return entries
+end
+
+function mm.set_portal_guard_level(portal_id, raw_guard_level)
+  ensure_portal_settings()
+  local id = tostring(portal_id or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if id == "" then return false, "portal ID is required" end
+  local portal = find_portal_by_id(id)
+  if not portal then
+    return false, "portal ID " .. id .. " was not found; run 'mapper portals' to list stable portal IDs"
+  end
+  if tostring(mm.dinv_portal_id(portal.command) or "") ~= id then
+    return false, "only DINV portals can be guarded by portal ID"
+  end
+  if mm.is_portal_recall(portal) then
+    return false, "portal " .. id .. " is configured as recall and cannot be guarded; recall destinations are assumed safe"
+  end
+
+  local guard_level = tonumber(raw_guard_level == nil and DEFAULT_PORTAL_GUARD_LEVEL or raw_guard_level)
+  if not guard_level or guard_level ~= math.floor(guard_level) or guard_level < 1 or guard_level > 201 then
+    return false, "guard level must be a whole number from 1 to 201"
+  end
+  local previous = mm.portals.settings.portal_guard_levels[id]
+  mm.portals.settings.portal_guard_levels[id] = guard_level
+  local saved, save_err = mm.save_portal_persistence()
+  if not saved then
+    mm.portals.settings.portal_guard_levels[id] = previous
+    return false, save_err
+  end
+  return true, {
+    portal = portal,
+    portal_id = id,
+    guard_level = guard_level,
+    required_level = (tonumber(portal.level) or 0) + guard_level,
+    is_bounce_portal = tostring(mm.portals.settings.bounce_portal_id or "") == id,
+  }
+end
+
+function mm.clear_portal_guard(portal_id)
+  ensure_portal_settings()
+  local id = tostring(portal_id or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if id == "" then return false, "portal ID is required" end
+  local previous = mm.portals.settings.portal_guard_levels[id]
+  mm.portals.settings.portal_guard_levels[id] = nil
+  local saved, save_err = mm.save_portal_persistence()
+  if not saved then
+    mm.portals.settings.portal_guard_levels[id] = previous
+    return false, save_err
+  end
+  return true, {portal_id = id, previous = previous, portal = find_portal_by_id(id)}
+end
+
+function mm.print_portal_guards()
+  local entries = mm.portal_guard_entries()
+  if #entries == 0 then
+    mm.note("No individually guarded portals. Use: mapper portalguard <portal-id> [guard-level]")
+    return true
+  end
+  mm.note("Individually guarded DINV portals:")
+  for _, details in ipairs(entries) do
+    local portal = details.portal
+    mm.note(string.format(
+      "  %s: level %d + guard %d = %d -> %s (%s) [%s at effective level %d]",
+      details.portal_id,
+      details.base_level,
+      details.guard_level,
+      details.required_level,
+      tostring(portal.room_name or "?"),
+      tostring(portal.area or "?"),
+      details.blocked and "BLOCKED" or "allowed",
+      details.effective_level
+    ))
+  end
+  return true
 end
 
 -- Resolve bounce settings from their persisted portal IDs on demand.  The
@@ -2228,6 +2409,13 @@ function mm.rebuild_portals_from_db()
       mm.portals.settings.recall_ids[id] = nil
     end
   end
+  for id in pairs(mm.portals.settings.portal_guard_levels or {}) do
+    local portal = find_portal_by_id(id)
+    if not valid_ids[tostring(id)] or not portal or mm.is_portal_recall(portal)
+        or tostring(mm.dinv_portal_id(portal.command) or "") ~= tostring(id) then
+      mm.portals.settings.portal_guard_levels[id] = nil
+    end
+  end
   if mm.portals.settings.bounce_portal_id and not valid_ids[tostring(mm.portals.settings.bounce_portal_id)] then
     mm.portals.settings.bounce_portal_id = nil
   end
@@ -2466,6 +2654,14 @@ function mm.print_portals(area_arg)
     end
     if mm.portals.settings.bounce_recall_id == tostring(p.portal_id) then
       cecho(" <magenta>[BounceRecall]<reset>")
+    end
+    local guard_level = mm.portal_guard_level(p.portal_id)
+    if guard_level and not is_recall then
+      cecho(string.format(
+        " <orange>[Guard +%d -> %d]<reset>",
+        guard_level,
+        (tonumber(p.level) or 0) + guard_level
+      ))
     end
     cecho("\n")
   end
@@ -2873,6 +3069,23 @@ function mm.where_room(dest)
   for _, p in ipairs(path) do table.insert(steps, tostring(p.dir or "")) end
   mm.note(string.format("Path to %d: %s", dest, table.concat(steps, " ; ")))
   mm.note(string.format("Distance: %d", tonumber(depth) or #steps))
+  local warned = {}
+  for _, step in ipairs(path) do
+    local details = mm.portal_guard_details_for_command
+      and mm.portal_guard_details_for_command(step.dir)
+      or nil
+    if details and details.blocked and not warned[details.portal_id] then
+      warned[details.portal_id] = true
+      mm.warn(string.format(
+        "Theoretical route warning: portal %s requires effective level %d (base %d + guard %d); your effective level is %d. Normal xrt will choose another route.",
+        details.portal_id,
+        details.required_level,
+        details.base_level,
+        details.guard_level,
+        details.effective_level
+      ))
+    end
+  end
   return true
 end
 

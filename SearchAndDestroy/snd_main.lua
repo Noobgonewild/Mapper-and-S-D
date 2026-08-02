@@ -279,6 +279,7 @@ snd.campaign = snd.campaign or {
     completedTodayDate = "",
     targets = {},      -- Full target list from cp info
     checkList = {},    -- Current check list from cp check
+    resolved = false,  -- Location/zone snapshot built for the current campaign
     canGetNew = nil,
     lastCheck = 0,
     -- Rewards tracking
@@ -500,7 +501,8 @@ end
 -- Express is deliberately based only on area-scoped S&D mob sightings:
 -- exactly one unique room, with at least the configured number of kills.
 -- Mapper room-name matches are not mob sightings and do not qualify.
-function snd.express.classifyTarget(target)
+-- @param evidenceRows optional all-room S&D evidence already loaded for this mob
+function snd.express.classifyTarget(target, evidenceRows)
     clearExpressTarget(target)
     if type(target) ~= "table" then return target end
     if not snd.config or not snd.config.express or snd.config.express.enabled ~= true then return target end
@@ -514,12 +516,16 @@ function snd.express.classifyTarget(target)
     if mobName == "" or areaKey == "" then return target end
     if not snd.db or type(snd.db.getMobLocations) ~= "function" then return target end
 
-    local ok, rows = pcall(snd.db.getMobLocations, mobName, areaKey, { legacy = true })
-    if not ok or type(rows) ~= "table" then
-        if snd.utils and snd.utils.debugNote then
-            snd.utils.debugNote("Express classification failed for " .. mobName .. " in " .. areaKey)
+    local rows = evidenceRows
+    if type(rows) ~= "table" then
+        local ok, loadedRows = pcall(snd.db.getMobLocations, mobName, areaKey, { legacy = true })
+        if not ok or type(loadedRows) ~= "table" then
+            if snd.utils and snd.utils.debugNote then
+                snd.utils.debugNote("Express classification failed for " .. mobName .. " in " .. areaKey)
+            end
+            return target
         end
-        return target
+        rows = loadedRows
     end
 
     local uniqueRooms = {}
@@ -527,12 +533,21 @@ function snd.express.classifyTarget(target)
     local onlyRow = nil
     local onlyRoomId = nil
     for _, row in ipairs(rows) do
-        local roomId = tonumber(row.roomid or row.rmid)
-        if roomId and roomId > 0 and not uniqueRooms[roomId] then
-            uniqueRooms[roomId] = true
-            roomCount = roomCount + 1
-            onlyRow = row
-            onlyRoomId = roomId
+        local rowArea = trim(row.zone or row.arid or "")
+        if rowArea == "" or rowArea:lower() == areaKey:lower() then
+            local roomId = tonumber(row.roomid or row.rmid)
+            if roomId and roomId > 0 and not uniqueRooms[roomId] then
+                uniqueRooms[roomId] = row
+                roomCount = roomCount + 1
+                onlyRow = row
+                onlyRoomId = roomId
+            elseif roomId and roomId > 0 and uniqueRooms[roomId] then
+                local existingKills = tonumber(uniqueRooms[roomId].kill_count) or 0
+                if (tonumber(row.kill_count) or 0) > existingKills then
+                    uniqueRooms[roomId] = row
+                    onlyRow = row
+                end
+            end
         end
     end
 

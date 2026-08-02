@@ -794,7 +794,9 @@ function snd.gq.selectTarget(index, options)
         end
     end
     
-    snd.utils.infoNote("Target: " .. target.mob .. " (x" .. target.remaining .. ")")
+    if not opts.skipLookup then
+        snd.utils.infoNote("Target: " .. target.mob .. " (x" .. target.remaining .. ")")
+    end
     return true
 end
 
