@@ -502,7 +502,7 @@ function usage.echo_report_link(index)
   )
 end
 
-function usage.echo_report_id_link(portal_id, display_label)
+function usage.echo_report_id_link(portal_id, display_label, chaos_only)
   local id = normalized_id(portal_id)
   local label = tostring(display_label or id or "?")
   if not id then
@@ -512,8 +512,11 @@ function usage.echo_report_id_link(portal_id, display_label)
   echo_report_link(
     label,
     id,
-    function(channel) usage.report_id_from_link(id, channel) end,
-    string.format("mm.portal_usage.report_id_from_link(%q)", id)
+    function(channel) usage.report_id_from_link(id, channel, chaos_only) end,
+    string.format(
+      "mm.portal_usage.report_id_from_link(%q, nil, %s)",
+      id, tostring(chaos_only == true)
+    )
   )
 end
 
@@ -523,8 +526,8 @@ function usage.report_from_link(index, channel)
   return ok
 end
 
-function usage.report_id_from_link(portal_id, channel)
-  local ok, err = usage.report_by_id(portal_id, channel)
+function usage.report_id_from_link(portal_id, channel, chaos_only)
+  local ok, err = usage.report_by_id(portal_id, channel, chaos_only)
   if not ok and mm and mm.warn then mm.warn(err) end
   return ok
 end
@@ -538,8 +541,7 @@ local function portal_report_parts(portal)
   local area = trim(portal.area)
   if area == "" then area = "?" end
   local level = tonumber(portal.level) or tonumber(portal.portal_level) or 0
-  local times = count == 1 and "time" or "times"
-  return name, room, area, level, count, times
+  return name, room, area, level, count
 end
 
 local function has_leading_aard_color(value)
@@ -558,14 +560,86 @@ local function native_portal_name(color_name, plain_name, chaos)
   return name
 end
 
-function usage.build_report(portal)
-  local name, room, area, level, count, times = portal_report_parts(portal)
-  local chaos = mm.is_portal_chaos and mm.is_portal_chaos(portal) or false
-  local colored_name = native_portal_name(portal.portal_color_name, name, chaos)
+local function portal_is_chaos(portal)
+  if mm.is_portal_chaos then return mm.is_portal_chaos(portal) == true end
+  return tostring(portal and portal.chaos or "no") == "yes"
+end
 
+-- Compare confirmed uses across current inventory portals. Chaos-stat reports
+-- use the chaos-only subset. Neither form exposes the collection size.
+function usage.calculate_report_rank(portal, chaos_only)
+  chaos_only = chaos_only == true
+  local selected_id = normalized_id(portal and portal.portal_id)
+  if not selected_id then return nil, "Portal has no usage ID" end
+  if chaos_only and not portal_is_chaos(portal) then
+    return nil, "Portal is not a chaos portal"
+  end
+
+  local current_ids = {}
+  local quoted_ids = {}
+  for _, current in ipairs(mm.portals and mm.portals.rebuilt or {}) do
+    local id = normalized_id(current.portal_id)
+    if id and is_inventory_portal(current) and not current_ids[id]
+        and (not chaos_only or portal_is_chaos(current)) then
+      current_ids[id] = true
+      table.insert(quoted_ids, sql_quote(id))
+    end
+  end
+  if not current_ids[selected_id] then
+    current_ids[selected_id] = true
+    table.insert(quoted_ids, sql_quote(selected_id))
+  end
+
+  local rows, rows_err = query(
+    "SELECT portal_id, confirmed_count FROM portal_usage WHERE portal_id IN ("
+      .. table.concat(quoted_ids, ",") .. ")"
+  )
+  if not rows then return nil, rows_err end
+
+  local counts = {}
+  for _, row in ipairs(rows) do
+    local id = normalized_id(row.portal_id)
+    if id and current_ids[id] then
+      counts[id] = tonumber(row.confirmed_count) or 0
+    end
+  end
+
+  local selected_count = tonumber(portal.usage_count) or 0
+  counts[selected_id] = selected_count
+
+  local total = 0
+  local rank = 1
+  for id in pairs(current_ids) do
+    local count = tonumber(counts[id]) or 0
+    total = total + count
+    if count > selected_count then rank = rank + 1 end
+  end
+
+  return {
+    rank = rank,
+    total = total,
+    percentage = total > 0 and selected_count * 100 / total or 0,
+  }
+end
+
+function usage.build_report(portal, chaos_only)
+  chaos_only = chaos_only == true
+  local name, room, area, level, count = portal_report_parts(portal)
+  local chaos = portal_is_chaos(portal)
+  local colored_name = native_portal_name(portal.portal_color_name, name, chaos)
+  local stats, stats_err = usage.calculate_report_rank(portal, chaos_only)
+  if not stats then return nil, stats_err end
+  local uses = count == 1 and "use" or "uses"
+
+  if chaos_only then
+    return string.format(
+      "%s - @W%s @D(@W%s@D)@W | @Clevel %d@W | @C#%d@W most-used chaos portal | @C%d %s@W (@C%.1f%%@W of total chaos uses)",
+      colored_name, room, area, level, stats.rank, count, uses, stats.percentage
+    )
+  end
   return string.format(
-    "%s - @W%s @D(@W%s@D)@W | @Clevel %d@W | used @C%d %s@W",
-    colored_name, room, area, level, count, times
+    "%s - @W%s @D(@W%s@D)@W | @Clevel %d@W | @C#%d@W most-used portal | @C%d %s@W (@C%.1f%%@W of total)",
+    colored_name, room, area, level, stats.rank, count, uses, stats.percentage
   )
 end
 
@@ -614,14 +688,17 @@ local function dispatch_report(channel, payload)
   return false
 end
 
-local function report_portal(portal, channel)
+local function report_portal(portal, channel, chaos_only)
   local selected_channel = trim(channel)
   if selected_channel == "" then selected_channel = configured_report_channel() end
+  local payload, payload_err = usage.build_report(portal, chaos_only)
+  if not payload then
+    return false, "Could not calculate portal usage report: " .. tostring(payload_err)
+  end
   if selected_channel:lower() == "default" or selected_channel:lower() == "echo" then
-    echo_aard_report(usage.build_report(portal))
+    echo_aard_report(payload)
     return true
   end
-  local payload = usage.build_report(portal)
   if not dispatch_report(selected_channel, payload) then
     return false, "Could not report portal row via channel: " .. tostring(selected_channel)
   end
@@ -642,7 +719,7 @@ function usage.report(index, channel)
   return report_portal(portal, channel)
 end
 
-function usage.report_by_id(portal_id, channel)
+function usage.report_by_id(portal_id, channel, chaos_only)
   local id = normalized_id(portal_id)
   if not id then return false, "Invalid portal ID" end
 
@@ -652,7 +729,7 @@ function usage.report_by_id(portal_id, channel)
     if not portal.usage_trackable then
       return false, "Portal ID " .. id .. " is not a DINV handheld portal."
     end
-    return report_portal(portal, channel)
+    return report_portal(portal, channel, chaos_only)
   end
 
   local rows, rows_err = query(string.format([[
@@ -678,7 +755,7 @@ function usage.report_by_id(portal_id, channel)
     usage_trackable = true,
     chaos = tonumber(row.last_was_chaos) == 1 and "yes" or "no",
   }
-  return report_portal(portal, channel)
+  return report_portal(portal, channel, chaos_only)
 end
 
 local function clean_stat_text(value, fallback)
@@ -692,12 +769,6 @@ local function display_reason(value)
   local code = clean_stat_text(value, "")
   if code == "" then return "unknown/unrecorded" end
   return REASON_LABELS[code] or code:gsub("_", " ")
-end
-
-local function stat_date(value)
-  local timestamp = tonumber(value)
-  if not timestamp or timestamp <= 0 then return "-" end
-  return os.date("%Y-%m-%d", timestamp)
 end
 
 local function stat_recent_time(value)
@@ -715,8 +786,12 @@ end
 local function current_portal_stats(row)
   local portal = find_mapper_portal(row and row.portal_id)
   local chaos
-  if portal and mm.is_portal_chaos then
-    chaos = mm.is_portal_chaos(portal)
+  if portal then
+    if mm.is_portal_chaos then
+      chaos = mm.is_portal_chaos(portal)
+    else
+      chaos = tostring(portal.chaos or "no") == "yes"
+    end
   else
     chaos = tonumber(row and row.last_was_chaos) == 1
   end
@@ -751,7 +826,10 @@ local function refresh_stats_metadata()
   return sync_metadata(portals, dinv_portal_items())
 end
 
-function usage.show_stats(count)
+function usage.show_stats(count, chaos_only, unused_only)
+  chaos_only = chaos_only == true
+  unused_only = unused_only == true
+  local command_name = chaos_only and "mapper chaosstats" or "mapper portalstats"
   local limit = DEFAULT_STATS_LIMIT
   if count ~= nil then
     local requested = trim(count):lower()
@@ -760,26 +838,74 @@ function usage.show_stats(count)
     else
       limit = tonumber(requested)
       if not limit or limit < 1 or limit ~= math.floor(limit) then
-        return false, "Usage: mapper portalstats [count|all]"
+        return false, "Usage: " .. command_name
+          .. (unused_only and " unused [count|all]" or " [count|all]")
       end
     end
   end
 
   refresh_stats_metadata()
-  local rows, rows_err = query([[
+  local database_rows, rows_err = query([[
     SELECT portal_id, confirmed_count, attempt_count, blocked_count, unconfirmed_count,
-           manual_count, mapper_count, first_used_at, last_used_at, last_attempt_at,
+           manual_count, mapper_count, last_used_at, last_attempt_at,
            last_was_chaos, portal_name, portal_color_name,
            last_landing_room_id, last_landing_room_name, last_landing_area
     FROM portal_usage
-    WHERE attempt_count > 0 OR confirmed_count > 0
-       OR blocked_count > 0 OR unconfirmed_count > 0
     ORDER BY attempt_count DESC, confirmed_count DESC, last_attempt_at DESC, portal_id
   ]])
-  if not rows then return false, rows_err end
+  if not database_rows then return false, rows_err end
+
+  local current_portals = {}
+  local current_by_id = {}
+  for _, portal in ipairs(mm.portals and mm.portals.rebuilt or {}) do
+    local id = normalized_id(portal.portal_id)
+    if id and not current_by_id[id] and is_inventory_portal(portal)
+        and (not chaos_only or portal_is_chaos(portal)) then
+      current_by_id[id] = portal
+      table.insert(current_portals, portal)
+    end
+  end
+
+  local rows_by_id = {}
+  local attempted_rows = {}
+  for _, row in ipairs(database_rows) do
+    local id = normalized_id(row.portal_id)
+    if id and current_by_id[id] then
+      row.portal_id = id
+      rows_by_id[id] = row
+      if (tonumber(row.attempt_count) or 0) > 0 then
+        table.insert(attempted_rows, row)
+      end
+    end
+  end
+
+  local unused_rows = {}
+  for _, portal in ipairs(current_portals) do
+    local id = normalized_id(portal.portal_id)
+    local row = rows_by_id[id]
+    if not row then
+      row = {
+        portal_id = id,
+        confirmed_count = 0,
+        attempt_count = 0,
+        blocked_count = 0,
+        unconfirmed_count = 0,
+        manual_count = 0,
+        mapper_count = 0,
+      }
+      rows_by_id[id] = row
+    end
+    if (tonumber(row.attempt_count) or 0) == 0 then
+      table.insert(unused_rows, row)
+    end
+  end
+
+  local all_rows = {}
+  for _, row in ipairs(attempted_rows) do table.insert(all_rows, row) end
+  for _, row in ipairs(unused_rows) do table.insert(all_rows, row) end
 
   local totals = {used = 0, tried = 0, manual = 0, mapper = 0, blocked = 0, unconfirmed = 0}
-  for _, row in ipairs(rows) do
+  for _, row in ipairs(all_rows) do
     totals.used = totals.used + (tonumber(row.confirmed_count) or 0)
     totals.tried = totals.tried + (tonumber(row.attempt_count) or 0)
     totals.manual = totals.manual + (tonumber(row.manual_count) or 0)
@@ -788,26 +914,38 @@ function usage.show_stats(count)
     totals.unconfirmed = totals.unconfirmed + (tonumber(row.unconfirmed_count) or 0)
   end
 
-  local mapped = #(mm.portals and mm.portals.rebuilt or {})
+  local rows = unused_only and unused_rows or all_rows
+  local mapped = #current_portals
   local display_count = limit and math.min(limit, #rows) or #rows
+  local heading = chaos_only and "Mapper Chaos Portal Statistics" or "Mapper Portal Statistics"
+  if unused_only then
+    cecho(string.format(
+      "\n<white>%s - Unused<reset> <dim_gray>(showing %d of %d, mapper order)<reset>\n",
+      heading, display_count, #rows
+    ))
+  else
+    cecho(string.format(
+      "\n<white>%s<reset> <dim_gray>(showing %d of %d, ranked by Used/Tried; unused last)<reset>\n",
+      heading, display_count, #rows
+    ))
+  end
   cecho(string.format(
-    "\n<white>Mapper Portal Statistics<reset> <dim_gray>(showing %d of %d, ranked by Used/Tried)<reset>\n",
-    display_count, #rows
-  ))
-  cecho(string.format(
-    "<dim_gray>Mapped: %d | Active: %d | Used/attempted: %d/%d | Manual/mapper: %d/%d | Blocked: %d | Unconfirmed: %d<reset>\n",
-    mapped, #rows, totals.used, totals.tried, totals.manual, totals.mapper,
+    "<dim_gray>Mapped: %d | Attempted: %d | Unused: %d | Used/attempted: %d/%d | Manual/mapper: %d/%d | Blocked: %d | Unverified: %d<reset>\n",
+    mapped, #attempted_rows, #unused_rows, totals.used, totals.tried, totals.manual, totals.mapper,
     totals.blocked, totals.unconfirmed
   ))
   cecho("<gray>------------------------------------------------------------------------------------------------------------------------------------------------<reset>\n")
   cecho(string.format(
-    "<deep_sky_blue>%-12s %-6s %5s %11s %9s %5s %5s %-10s %-11s  %s<reset>\n",
-    "Portal ID", "Now", "Lock", "Used/Tried", "Manual/X", "Block", "Uncf", "First", "Last", "Portal / destination"
+    "<deep_sky_blue>%-12s %-6s %5s %11s %9s %5s %5s %-11s  %s<reset>\n",
+    "Portal ID", "Now", "Lock", "Used/Tried", "Manual/X", "Block", "Unver", "Last used", "Portal / destination"
   ))
   cecho("<gray>------------------------------------------------------------------------------------------------------------------------------------------------<reset>\n")
 
   if #rows == 0 then
-    cecho("<yellow>No portal attempts have been recorded.<reset>\n")
+    local noun = chaos_only and "chaos portals" or "portals"
+    cecho(unused_only
+      and "<yellow>No unused " .. noun .. " are currently mapped.<reset>\n"
+      or "<yellow>No " .. noun .. " are currently mapped.<reset>\n")
   end
 
   for index = 1, display_count do
@@ -816,13 +954,17 @@ function usage.show_stats(count)
     local lock = details.lock and tostring(details.lock) or "-"
     local used_tried = string.format("%d/%d", tonumber(row.confirmed_count) or 0, tonumber(row.attempt_count) or 0)
     local manual_mapper = string.format("%d/%d", tonumber(row.manual_count) or 0, tonumber(row.mapper_count) or 0)
-    usage.echo_report_id_link(row.portal_id, string.format("%-12s", tostring(row.portal_id or "?")))
+    usage.echo_report_id_link(
+      row.portal_id,
+      string.format("%-12s", tostring(row.portal_id or "?")),
+      chaos_only
+    )
     cecho(string.format(
-      " <%s>%-6s<reset> <white>%5s %11s %9s %5d %5d<reset> <dim_gray>%-10s %-11s<reset>  ",
+      " <%s>%-6s<reset> <white>%5s %11s %9s %5d %5d<reset> <dim_gray>%-11s<reset>  ",
       details.chaos and "medium_purple" or "light_grey",
       details.chaos and "Chaos" or "Normal", lock, used_tried, manual_mapper,
       tonumber(row.blocked_count) or 0, tonumber(row.unconfirmed_count) or 0,
-      stat_date(row.first_used_at), stat_last_time(row.last_used_at)
+      stat_last_time(row.last_used_at)
     ))
     echo_aard_text(details.name, false)
     cecho(" <dim_gray>-<reset> <white>")
@@ -835,12 +977,16 @@ function usage.show_stats(count)
   return true
 end
 
+function usage.show_chaos_stats(count, unused_only)
+  return usage.show_stats(count, true, unused_only)
+end
+
 local function recent_status_style(status)
   status = trim(status):lower()
   if status == "confirmed" then return "green", "Confirmed" end
   if status == "blocked" then return "red", "Blocked" end
   if status == "pending" then return "cyan", "Pending" end
-  return "yellow", "Unconfirmed"
+  return "yellow", "Unverified"
 end
 
 local function recent_room_label(id, name, area)

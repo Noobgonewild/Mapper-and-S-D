@@ -142,6 +142,26 @@ local function normalize_bookmark_command(line)
   return line
 end
 
+local function parse_portal_stats_args(raw, command_name)
+  local argument = tostring(raw or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+  local usage_text = "Usage: " .. command_name .. " [count|all|unused [count|all]]"
+  if argument == "" then return nil, false end
+  if argument == "unused" then return nil, true end
+
+  local unused_limit = argument:match("^unused%s+(.+)$")
+  if unused_limit then
+    if unused_limit == "all" or unused_limit:match("^%d+$") then
+      return unused_limit, true
+    end
+    return nil, nil, usage_text
+  end
+
+  if argument == "all" or argument:match("^%d+$") then
+    return argument, false
+  end
+  return nil, nil, usage_text
+end
+
 local function parse_command_with_optional_level(raw)
   local cleaned = tostring(raw or ""):gsub("^%s+", ""):gsub("%s+$", "")
   if mm.normalize_stacked_command then
@@ -524,13 +544,24 @@ local function handle_command_inline(line)
   local portalstats_arg = line == "mapper portalstats" and ""
     or line:match("^mapper portalstats%s+(.+)$")
   if portalstats_arg ~= nil then
-    portalstats_arg = portalstats_arg:lower()
-    if portalstats_arg == "" then portalstats_arg = nil end
-    if portalstats_arg ~= nil and portalstats_arg ~= "all" and not portalstats_arg:match("^%d+$") then
-      mm.warn("Usage: mapper portalstats [count|all]")
+    local count, unused_only, parse_err = parse_portal_stats_args(portalstats_arg, "mapper portalstats")
+    if parse_err then
+      mm.warn(parse_err)
       return true
     end
-    local ok, err = mm.portal_usage.show_stats(portalstats_arg)
+    local ok, err = mm.portal_usage.show_stats(count, false, unused_only)
+    if not ok then mm.warn(err) end
+    return true
+  end
+  local chaosstats_arg = line == "mapper chaosstats" and ""
+    or line:match("^mapper chaosstats%s+(.+)$")
+  if chaosstats_arg ~= nil then
+    local count, unused_only, parse_err = parse_portal_stats_args(chaosstats_arg, "mapper chaosstats")
+    if parse_err then
+      mm.warn(parse_err)
+      return true
+    end
+    local ok, err = mm.portal_usage.show_chaos_stats(count, unused_only)
     if not ok then mm.warn(err) end
     return true
   end

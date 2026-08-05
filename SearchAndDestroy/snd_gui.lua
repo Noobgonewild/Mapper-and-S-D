@@ -1354,13 +1354,10 @@ function snd.gui.isCurrentTarget(target, index)
         end
     end
     if not ct then return false end
-    if target.mob ~= ct.name then return false end
-    if ct.activity and target.activity ~= ct.activity then return false end
-    -- For room-based, also check room name
-    if ct.roomName and ct.roomName ~= "" then
-        if target.roomName ~= ct.roomName then return false end
+    if snd.commands and type(snd.commands.targetMatchesCurrent) == "function" then
+        return snd.commands.targetMatchesCurrent(target, ct)
     end
-    return true
+    return target.mob == ct.name and (not ct.activity or target.activity == ct.activity)
 end
 
 -------------------------------------------------------------------------------

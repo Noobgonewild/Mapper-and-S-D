@@ -43,11 +43,29 @@ snd.db.createdEmpty = false
 snd.db.file = getMudletHomeDir() .. "/SnDdb.db"
 
 local SND_CORE_TABLES = { "area", "mobs", "mob_keyword_exceptions", "history" }
+local SND_LEGACY_CORE_TABLES = { "area", "mobs", "mob_keyword_exceptions" }
 local SND_REQUIRED_COLUMNS = {
     area = { "name", "key", "minlvl", "maxlvl", "lock", "startRoom", "noquest", "vidblain", "userKey" },
     mobs = { "mob", "room", "roomid", "zone", "seen_count", "kill_count" },
     mob_keyword_exceptions = { "area_name", "mob_name", "keyword" },
     history = { "id", "type", "level_taken", "start_time", "end_time", "status", "qp_rewards", "tp_rewards", "train_rewards", "prac_rewards", "gold_rewards" },
+}
+local SND_HISTORY_SCHEMA_SQL = {
+    [[CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY,
+        type INTEGER NOT NULL,
+        level_taken INTEGER NOT NULL,
+        start_time INTEGER NOT NULL,
+        end_time INTEGER,
+        status INTEGER DEFAULT 1,
+        qp_rewards INTEGER DEFAULT 0,
+        tp_rewards INTEGER DEFAULT 0,
+        train_rewards INTEGER DEFAULT 0,
+        prac_rewards INTEGER DEFAULT 0,
+        gold_rewards INTEGER DEFAULT 0)]],
+    [[CREATE INDEX IF NOT EXISTS history_end_time_status_type ON history(end_time, status, type)]],
+    [[CREATE INDEX IF NOT EXISTS history_start_time_type ON history(start_time, type)]],
+    [[CREATE INDEX IF NOT EXISTS history_type_status ON history(type, status)]],
 }
 local SND_SCHEMA_SQL = {
     [[CREATE TABLE IF NOT EXISTS area (
@@ -73,18 +91,7 @@ local SND_SCHEMA_SQL = {
         mob_name TEXT NOT NULL,
         keyword TEXT NOT NULL,
         UNIQUE(area_name, mob_name))]],
-    [[CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY,
-        type INTEGER NOT NULL,
-        level_taken INTEGER NOT NULL,
-        start_time INTEGER NOT NULL,
-        end_time INTEGER,
-        status INTEGER DEFAULT 1,
-        qp_rewards INTEGER DEFAULT 0,
-        tp_rewards INTEGER DEFAULT 0,
-        train_rewards INTEGER DEFAULT 0,
-        prac_rewards INTEGER DEFAULT 0,
-        gold_rewards INTEGER DEFAULT 0)]],
+    SND_HISTORY_SCHEMA_SQL[1],
     [[CREATE TABLE IF NOT EXISTS campaign_history_identity (
         id INTEGER PRIMARY KEY,
         complete_by TEXT NOT NULL UNIQUE,
@@ -99,9 +106,9 @@ local SND_SCHEMA_SQL = {
         UNIQUE(mob, zone))]],
     [[CREATE INDEX IF NOT EXISTS area_key ON area(key)]],
     [[CREATE INDEX IF NOT EXISTS mobs_zone_mob_room ON mobs(zone, mob, room)]],
-    [[CREATE INDEX IF NOT EXISTS history_end_time_status_type ON history(end_time, status, type)]],
-    [[CREATE INDEX IF NOT EXISTS history_start_time_type ON history(start_time, type)]],
-    [[CREATE INDEX IF NOT EXISTS history_type_status ON history(type, status)]],
+    SND_HISTORY_SCHEMA_SQL[2],
+    SND_HISTORY_SCHEMA_SQL[3],
+    SND_HISTORY_SCHEMA_SQL[4],
     [[CREATE INDEX IF NOT EXISTS idx_campaign_identity_complete_by ON campaign_history_identity(complete_by)]],
     [[CREATE INDEX IF NOT EXISTS idx_campaign_identity_history_id ON campaign_history_identity(history_id)]],
     [[CREATE INDEX IF NOT EXISTS idx_mob_tags_zone ON mob_tags(zone)]],
@@ -129,7 +136,8 @@ local function database_looks_like_sqlite(path)
 end
 
 local function close_sql_cursor(cursor)
-    if type(cursor) == "userdata" and type(cursor.close) == "function" then
+    local cursor_type = type(cursor)
+    if (cursor_type == "userdata" or cursor_type == "table") and type(cursor.close) == "function" then
         pcall(function() cursor:close() end)
     end
 end
@@ -171,7 +179,8 @@ end
 local function scalar_from_connection(conn, sql)
     local cursor, err = conn:execute(sql)
     if not cursor then return nil, err end
-    if type(cursor) ~= "userdata" or type(cursor.fetch) ~= "function" then
+    local cursor_type = type(cursor)
+    if (cursor_type ~= "userdata" and cursor_type ~= "table") or type(cursor.fetch) ~= "function" then
         return cursor
     end
     local row = cursor:fetch({}, "n")
@@ -235,6 +244,63 @@ local function validate_existing_snd_database(conn)
     return true
 end
 
+-- Upgrade the one legacy S&D layout that can be identified without ambiguity:
+-- the v5 core tables and columns are intact, but the v6 history table is absent.
+-- All DDL is transactional. Every other incomplete or corrupt layout remains
+-- untouched and is rejected by validate_existing_snd_database().
+local function migrate_legacy_history_schema(conn)
+    local tables, tables_err = table_set_from_connection(conn)
+    if not tables then return false, tables_err end
+    if tables.history then return false end
+
+    for _, table_name in ipairs(SND_LEGACY_CORE_TABLES) do
+        if not tables[table_name] then
+            return false
+        end
+        local columns, columns_err = column_set_from_connection(conn, table_name)
+        if not columns then return false, columns_err end
+        for _, column_name in ipairs(SND_REQUIRED_COLUMNS[table_name]) do
+            if not columns[column_name] then
+                return false
+            end
+        end
+    end
+
+    local integrity = tostring(scalar_from_connection(conn, "PRAGMA quick_check") or "unknown")
+    if integrity ~= "ok" then
+        return false, "SQLite quick_check: " .. integrity
+    end
+
+    local current_version = tonumber(scalar_from_connection(conn, "PRAGMA user_version")) or 0
+    local ok, err = execute_on_connection(conn, "BEGIN IMMEDIATE")
+    if ok then
+        for _, sql in ipairs(SND_HISTORY_SCHEMA_SQL) do
+            ok, err = execute_on_connection(conn, sql)
+            if not ok then break end
+        end
+    end
+    if ok and current_version < snd.db.schemaVersion then
+        ok, err = execute_on_connection(conn, "PRAGMA user_version = " .. tostring(snd.db.schemaVersion))
+    end
+    if ok then
+        ok, err = validate_existing_snd_database(conn)
+    end
+    if ok then
+        local committed, commit_err = execute_on_connection(conn, "COMMIT")
+        if not committed then
+            ok, err = false, commit_err
+            pcall(function() conn:execute("ROLLBACK") end)
+        end
+    else
+        pcall(function() conn:execute("ROLLBACK") end)
+    end
+
+    if not ok then
+        return false, "legacy history migration failed: " .. tostring(err)
+    end
+    return true
+end
+
 -------------------------------------------------------------------------------
 -- Database Connection
 -------------------------------------------------------------------------------
@@ -252,8 +318,9 @@ function snd.db.open()
         return false
     end
     
-    -- Opening a missing SQLite path creates a new file.  Existing files are
-    -- never removed, replaced, truncated, or recreated here.
+    -- Opening a missing SQLite path creates a new file. Existing files are
+    -- never removed, replaced, truncated, or recreated here. The single known
+    -- v5 layout is upgraded transactionally by adding its history table.
     local existed = database_file_exists(snd.db.file)
     if existed and not database_looks_like_sqlite(snd.db.file) then
         snd.db.env:close()
@@ -271,6 +338,16 @@ function snd.db.open()
     end
 
     if existed then
+        local migrated, migration_err = migrate_legacy_history_schema(snd.db.conn)
+        if migration_err then
+            snd.db.conn:close()
+            snd.db.env:close()
+            snd.db.conn = nil
+            snd.db.env = nil
+            snd.utils.errorNote("Existing database was left untouched: " .. tostring(migration_err))
+            snd.utils.infoNote("Expected S&D database path: " .. tostring(snd.db.file))
+            return false
+        end
         local valid, validation_err = validate_existing_snd_database(snd.db.conn)
         if not valid then
             snd.db.conn:close()
@@ -282,6 +359,9 @@ function snd.db.open()
             return false
         end
         snd.db.createdEmpty = false
+        if migrated then
+            snd.utils.infoNote("Upgraded legacy S&D database to schema v" .. tostring(snd.db.schemaVersion) .. " (added history table).")
+        end
     else
         local created, create_err = create_empty_snd_schema(snd.db.conn)
         if not created then

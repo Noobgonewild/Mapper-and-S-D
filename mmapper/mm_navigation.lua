@@ -289,6 +289,7 @@ snd.mapper.config = {
     usePortals = true,          -- Use portal exits
     useRecall = true,           -- Use recall-based portals
     maxSearchDepth = 100,       -- Max BFS depth for pathfinding
+    nearbyJumpRadius = 10,      -- Max walking radius before area-start fallback
     bouncePortal = nil,         -- Fallback portal for norecall rooms
     bounceRecall = nil,         -- Fallback recall for noportal rooms
 }
@@ -2560,6 +2561,7 @@ end
 -- @param ignoreAreaGuard If true, ignore only the area guard
 -- @param ignoreTravelRestrictions If true, ignore source noportal/norecall flags
 -- @param searchDepthLimit Optional per-call BFS depth cap
+-- @param originMode Optional origin filter: "walk", "portal", "recall", or "jump"
 -- @return Path table, depth, or nil if no path
 function snd.mapper.findPath(
     src,
@@ -2569,7 +2571,8 @@ function snd.mapper.findPath(
     ignoreLockedExits,
     ignoreAreaGuard,
     ignoreTravelRestrictions,
-    searchDepthLimit
+    searchDepthLimit,
+    originMode
 )
     if not snd.mapper.db.open() then
         return nil
@@ -2578,17 +2581,18 @@ function snd.mapper.findPath(
     src = tostring(src)
     dst = tostring(dst)
     snd.utils.debugNote(string.format(
-        "findPath start src=%s dst=%s noPortals=%s noRecalls=%s ignoreLocked=%s ignoreAreaGuard=%s depthLimit=%s",
+        "findPath start src=%s dst=%s noPortals=%s noRecalls=%s ignoreLocked=%s ignoreAreaGuard=%s depthLimit=%s originMode=%s",
         src,
         dst,
         tostring(noPortals == true),
         tostring(noRecalls == true),
         tostring(ignoreLockedExits == true),
         tostring(ignoreAreaGuard == true),
-        tostring(searchDepthLimit or "default")
+        tostring(searchDepthLimit or "default"),
+        tostring(originMode or "any")
     ))
     
-    if src == dst then
+    if src == dst and (originMode == nil or originMode == "walk") then
         snd.utils.debugNote("findPath early return: source equals destination.")
         return {}, 0
     end
@@ -2652,7 +2656,7 @@ function snd.mapper.findPath(
     local directPath = snd.mapper.checkDirectPath(
         src, dst, myLevel, ignoreLockedExits, ignoreAreaGuard, randomCexits
     )
-    if directPath then
+    if directPath and (originMode == nil or originMode == "walk") then
         snd.utils.debugNote("findPath direct one-room path found.")
         return directPath, 1
     end
@@ -2794,19 +2798,29 @@ function snd.mapper.findPath(
             end
         end
 
-        -- Match the old MUSH mapper: find the globally shortest origin before
-        -- considering the current room's noportal/norecall flags.  At the same
-        -- BFS depth, an available '*' portal wins, then '**' recall/home, then
-        -- the walking source.  A blocked winning jump is repaired only while
-        -- reconstructing the route by prepending the configured opposite
-        -- bounce command; its already-selected suffix is never recalculated
-        -- from the bounce landing room.
-        if depthCandidates.portal then
+        -- One backwards BFS sees walking, portal, and recall origins together.
+        -- Do not launch a second walk-only search. At the same depth the real
+        -- walking source wins; otherwise the first origin reached is already
+        -- the strictly shorter route. Callers that require an immediate jump
+        -- can filter the accepted origin without calculating a walking rival.
+        if originMode == "walk" then
+            foundFrom = depthCandidates.src and src or nil
+        elseif originMode == "portal" then
+            foundFrom = depthCandidates.portal and "*" or nil
+        elseif originMode == "recall" then
+            foundFrom = depthCandidates.recall and "**" or nil
+        elseif originMode == "jump" then
+            if depthCandidates.portal then
+                foundFrom = "*"
+            elseif depthCandidates.recall then
+                foundFrom = "**"
+            end
+        elseif depthCandidates.src then
+            foundFrom = src
+        elseif depthCandidates.portal then
             foundFrom = "*"
         elseif depthCandidates.recall then
             foundFrom = "**"
-        elseif depthCandidates.src then
-            foundFrom = src
         end
 
         if foundFrom then
@@ -2879,32 +2893,19 @@ function snd.mapper.findPath(
                     if tostring(dst) == tostring(bouncePortal.uid) then
                         return path, foundDepth
                     end
+                elseif srcNoPortal and srcNoRecall then
+                    -- Both-flags recovery is owned by the explicit bounded
+                    -- nearby -> area-start ladder. Never start an implicit,
+                    -- unbounded nearest-room search during reconstruction.
+                    snd.utils.debugNote("findPath restricted source has both flags; deferring to bounded fallback policy.")
+                    return nil
                 else
-                    -- Need to walk to nearest portalable/recallable room
-                    local jumpRoom = snd.mapper.findNearestJumpRoom(src, dst, foundFrom, ignoreLockedExits)
-                    if jumpRoom then
-                        snd.utils.debugNote("findPath restricted source: nearest jump room candidate " .. tostring(jumpRoom))
-                        local walkPath = snd.mapper.findPath(src, jumpRoom, true, true, ignoreLockedExits, ignoreAreaGuard)
-                        if walkPath then
-                            for _, step in ipairs(walkPath) do
-                                table.insert(path, step)
-                            end
-                            local portalPath = snd.mapper.findPath(jumpRoom, dst, nil, nil, ignoreLockedExits, ignoreAreaGuard)
-                            if portalPath then
-                                for _, step in ipairs(portalPath) do
-                                    table.insert(path, step)
-                                end
-                            end
-                            snd.utils.debugNote(string.format(
-                                "findPath restricted source resolved via jump room=%s walkSteps=%d",
-                                tostring(jumpRoom),
-                                #walkPath
-                            ))
-                            return path, foundDepth
-                        end
-                    end
-                    snd.utils.debugNote("findPath restricted source failed: no jump room route.")
-                    return nil  -- Can't find path from restricted room
+                    -- A one-flag room must use the opposite jump where it is,
+                    -- never walk outward implicitly. The caller may retry with
+                    -- that legal origin forced; nearby probing is reserved for
+                    -- rooms carrying both restrictions.
+                    snd.utils.debugNote("findPath restricted source has no configured bounce; refusing implicit nearby search.")
+                    return nil
                 end
             end
         end
@@ -3022,6 +3023,8 @@ function snd.mapper.abortFailedNavigation(reason)
     if snd.nav then
         snd.nav.goingToRoom = nil
         snd.nav.pendingManualApproachRequest = nil
+        snd.nav.pendingTargetRoomFallback = nil
+        snd.nav.targetAreaFallback = nil
     end
     snd.mapper.pendingBlockedTravel = nil
     snd.mapper.pendingRestrictionMarks.portal = nil
@@ -3062,49 +3065,12 @@ function snd.mapper.roomsShareArea(firstRoom, secondRoom)
     return firstArea ~= "" and firstArea == secondArea
 end
 
-local function dinv_portal_id(command)
-    return tostring(command or ""):lower():match("^%s*dinv%s+portal%s+use%s+([%w_%-]+)")
-end
-
-function snd.mapper.routeCostContext()
-    local wornPortalId = nil
-    local usage = mm and mm.portal_usage or nil
-    if usage and type(usage.currently_worn_portal_id) == "function" then
-        local ok, result = pcall(usage.currently_worn_portal_id)
-        if ok and result ~= nil and tostring(result) ~= "" then
-            wornPortalId = tostring(result):lower()
-        end
-    end
-    return {wornPortalId = wornPortalId}
-end
-
 function snd.mapper.pathPortalCount(path)
     local count = 0
     for _, step in ipairs(path or {}) do
         if step.travelType == "portal" then count = count + 1 end
     end
     return count
-end
-
--- Operational xrt cost. Ordinary edges, recalls, non-DINV jumps, and an
--- already-worn DINV portal cost one. A DINV portal that must be fetched/worn
--- (or whose live equipment state is unavailable) costs two.
-function snd.mapper.pathCost(path, costContext)
-    if not path then return math.huge end
-    local context = costContext or snd.mapper.routeCostContext()
-    local wornPortalId = context.wornPortalId and tostring(context.wornPortalId):lower() or nil
-    local cost = 0
-    for _, step in ipairs(path) do
-        local stepCost = 1
-        if step.travelType == "portal" then
-            local portalId = dinv_portal_id(step.dir)
-            if portalId and portalId ~= wornPortalId then
-                stepCost = 2
-            end
-        end
-        cost = cost + stepCost
-    end
-    return cost
 end
 
 function snd.mapper.pathStartsWithTravel(path)
@@ -3137,31 +3103,18 @@ function snd.mapper.pathLeavesAreaBeforeJump(path, sourceArea)
 end
 
 function snd.mapper.chooseShortestRoute(candidates, opts)
-    opts = opts or {}
-    local distanceOnly = opts.mode == "distance"
-    local costContext = opts.costContext
-    if not distanceOnly and not costContext then
-        costContext = snd.mapper.routeCostContext()
-    end
-
     local best = nil
-    local bestCost = math.huge
     local bestPortalCount = math.huge
     local bestSteps = math.huge
     for _, candidate in ipairs(candidates or {}) do
         if candidate and candidate.path and #candidate.path > 0 then
-            local candidateCost = distanceOnly and #candidate.path
-                or snd.mapper.pathCost(candidate.path, costContext)
             local candidatePortalCount = snd.mapper.pathPortalCount(candidate.path)
             local candidateSteps = #candidate.path
             if not best
-                or candidateCost < bestCost
-                or (candidateCost == bestCost and candidatePortalCount < bestPortalCount)
-                or (candidateCost == bestCost and candidatePortalCount == bestPortalCount
-                    and candidateSteps < bestSteps)
+                or candidateSteps < bestSteps
+                or (candidateSteps == bestSteps and candidatePortalCount < bestPortalCount)
             then
                 best = candidate
-                bestCost = candidateCost
                 bestPortalCount = candidatePortalCount
                 bestSteps = candidateSteps
             end
@@ -3255,53 +3208,47 @@ function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blocked
         end
     end
 
-    local jumpOrder
-    if blockedType == "recall" then
-        jumpOrder = {"portal", "recall"}
-    else
-        jumpOrder = {"recall", "portal"}
+    local allowPortals = opts.allowPortals ~= false
+    local allowRecalls = opts.allowRecalls ~= false
+    local noPortals = not allowPortals
+    local noRecalls = not allowRecalls
+    local originMode
+    if allowPortals and allowRecalls then
+        originMode = "jump"
+    elseif allowPortals then
+        originMode = "portal"
+    elseif allowRecalls then
+        originMode = "recall"
     end
 
-    local jumpLeg = nil
-    local jumpType = nil
-    local jumpCandidates = {}
-    for _, candidateType in ipairs(jumpOrder) do
-        local allowed = (candidateType == "portal" and opts.allowPortals ~= false)
-            or (candidateType == "recall" and opts.allowRecalls ~= false)
-        if allowed then
-            local noPortals = candidateType == "recall"
-            local noRecalls = candidateType == "portal"
-            local candidate = snd.mapper.findPath(startRoom, destination, noPortals, noRecalls, ignoreLockedExits)
-            if candidate and candidate[1] and candidate[1].travelType == candidateType then
-                local combinedCandidate = {}
-                for _, step in ipairs(walkPath) do table.insert(combinedCandidate, step) end
-                for _, step in ipairs(candidate) do table.insert(combinedCandidate, step) end
-                table.insert(jumpCandidates, {
-                    kind = candidateType,
-                    path = combinedCandidate,
-                    leg = candidate,
-                })
-            end
-        end
-    end
-    local selectedJump = snd.mapper.chooseShortestRoute(jumpCandidates, {
-        costContext = opts.costContext,
-    })
-    if selectedJump then
-        jumpLeg = selectedJump.leg
-        jumpType = selectedJump.kind
-    end
+    -- The area start is already a late fallback. Find its first usable jump in
+    -- the ordinary BFS instead of running separate portal and recall searches.
+    local jumpLeg = originMode and snd.mapper.findPath(
+        startRoom,
+        destination,
+        noPortals,
+        noRecalls,
+        ignoreLockedExits,
+        nil,
+        nil,
+        nil,
+        originMode
+    ) or nil
+    local jumpType = jumpLeg and jumpLeg[1] and jumpLeg[1].travelType or nil
 
     -- If the designated start has learned that both jump methods are blocked,
-    -- leave from the start toward its nearest usable room and try there. This
-    -- still forms one costed area-start candidate; it is never executed ahead
-    -- of a shorter direct walk.
+    -- make one bounded nearby attempt from the start itself. This remains part
+    -- of the area-start fallback and therefore precedes a cross-area long walk.
     if not jumpLeg and type(snd.mapper.buildOutwardJumpRoute) == "function" then
         local outwardLeg, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(
             startRoom,
             destination,
             ignoreLockedExits,
-            opts.costContext
+            {
+                allowPortals = allowPortals,
+                allowRecalls = allowRecalls,
+                searchDepthLimit = opts.nearbyJumpRadius,
+            }
         )
         local outwardAllowed = (outwardType == "portal" and opts.allowPortals ~= false)
             or (outwardType == "recall" and opts.allowRecalls ~= false)
@@ -3437,126 +3384,128 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
         tostring(currentNoRecall)
     ))
 
-    local routeCandidates = {}
-    local costContext = snd.mapper.routeCostContext()
-    local function addCandidate(kind, candidatePath, details)
-        if candidatePath and #candidatePath > 0 then
-            local candidate = details or {}
-            candidate.kind = kind
-            candidate.path = candidatePath
-            table.insert(routeCandidates, candidate)
-        end
+    local expectedType = (blockedType == "portal") and "recall" or "portal"
+    local expectedBlocked
+    if expectedType == "portal" then
+        expectedBlocked = currentNoPortal
+    else
+        expectedBlocked = currentNoRecall
     end
 
-    -- Re-run the same global src/'*'/'**' search after persisting the newly
-    -- discovered restriction. Keep it as a candidate so the walking and
-    -- alternate-jump routes are still compared with operational portal cost.
-    local preferredPath = snd.mapper.findPath(
-        currentRoom,
-        destination,
-        false,
-        false,
-        ignoreLockedExits
-    )
-    addCandidate("preferred", preferredPath)
-
-    -- A complete walking route is always legal. It is deliberately inserted
-    -- first so it wins ties, but it is not executed until nearby and area-start
-    -- jump routes have also been costed.
-    local walkingPath = snd.mapper.findPath(currentRoom, destination, true, true, ignoreLockedExits)
-    addCandidate("walk", walkingPath)
-
-    -- If both flags are set, expand outward breadth-first until the closest
-    -- usable jump room is found. Mapper area boundaries are not barriers.
-    if currentNoPortal and currentNoRecall then
-        snd.utils.debugNote("current room is both norecall/noportal; costing outward jump-room expansion.")
-        local combined, chosenType, closestRoom = snd.mapper.buildOutwardJumpRoute(
+    -- The opposite jump is legal in the current room: calculate that jump once,
+    -- execute it immediately, and do not look for walking, nearby, or area-start
+    -- competitors. originMode prevents a shorter walking origin from replacing
+    -- the explicitly requested recovery method.
+    if not expectedBlocked then
+        local directJump = snd.mapper.findPath(
             currentRoom,
             destination,
+            false,
+            false,
             ignoreLockedExits,
-            costContext
+            nil,
+            nil,
+            nil,
+            "jump"
         )
-        addCandidate("nearby_" .. tostring(chosenType or "jump"), combined, {
-            viaRoom = closestRoom,
-        })
-    end
-
-    local forceNoPortals = (blockedType == "portal")
-    local forceNoRecalls = (blockedType == "recall")
-    local expectedType = (blockedType == "portal") and "recall" or "portal"
-    local alternatePath = snd.mapper.findPath(
-        currentRoom,
-        destination,
-        forceNoPortals,
-        forceNoRecalls,
-        ignoreLockedExits
-    )
-    if alternatePath
-        and (snd.mapper.pathStartsWithJump(alternatePath, expectedType)
-            or snd.mapper.roomsShareArea(currentRoom, destination))
-    then
-        addCandidate("direct_" .. expectedType, alternatePath)
-    elseif alternatePath then
-        snd.utils.debugNote("blocked travel deferred a cross-area walk-only alternate until area-start fallback is costed.")
-    end
-
-    local nearbyPath, nearbyRoom = snd.mapper.findNearestAlternateRoute(
-        currentRoom,
-        destination,
-        blockedType,
-        ignoreLockedExits,
-        false
-    )
-    addCandidate("nearby_" .. expectedType, nearbyPath, {viaRoom = nearbyRoom})
-
-    -- The start-room option is always evaluated before a cross-area walk can be
-    -- selected. It still loses normally when walking has the lower full cost.
-    local areaRoute, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(
-        currentRoom,
-        destination,
-        blockedType,
-        ignoreLockedExits,
-        {
-            allowPortals = snd.mapper.config.usePortals ~= false,
-            allowRecalls = snd.mapper.config.useRecall ~= false,
-            costContext = costContext,
-        }
-    )
-    addCandidate("area_start_" .. tostring(jumpType or "jump"), areaRoute, {
-        areaKey = areaKey,
-        startRoom = startRoom,
-    })
-
-    local selected = snd.mapper.chooseShortestRoute(routeCandidates, {costContext = costContext})
-    if selected then
-        if selected.kind and selected.kind:match("^nearby_") then
-            snd.utils.infoNote(string.format(
-                "Rerouting via nearby room %s (%d steps).",
-                tostring(selected.viaRoom or "?"),
-                #selected.path
-            ))
-        elseif selected.kind and selected.kind:match("^area_start_") then
-            snd.utils.infoNote(string.format(
-                "Rerouting through %s start room %s (%d steps).",
-                tostring(selected.areaKey or "area"),
-                tostring(selected.startRoom or "?"),
-                #selected.path
-            ))
-        else
-            snd.utils.debugNote(string.format(
-                "blocked travel route comparison selected %s (%d steps).",
-                tostring(selected.kind or "route"),
-                #selected.path
-            ))
+        if directJump and #directJump > 0 and snd.mapper.pathStartsWithJump(directJump, expectedType) then
+            snd.utils.debugNote("Blocked " .. blockedType .. "; using immediate " .. expectedType .. " route.")
+            snd.mapper.executePath(directJump)
+            return true
         end
 
-        snd.mapper.executePath(selected.path)
-        return true
-    else
-        snd.utils.infoNote("You couldn't find a path to " .. destination .. " from here.")
-        snd.utils.infoNote("Blocked " .. blockedType .. " and no alternate route found from room " .. currentRoom .. ".")
+        -- Without a configured bounce, the combined jump search may reject a
+        -- blocked winning origin. Retry only the legal opposite origin; never
+        -- substitute walking or a nearby-room search.
+        local forcedJump = snd.mapper.findPath(
+            currentRoom,
+            destination,
+            expectedType == "recall",
+            expectedType == "portal",
+            ignoreLockedExits,
+            nil,
+            nil,
+            nil,
+            expectedType
+        )
+        if forcedJump and #forcedJump > 0 then
+            snd.utils.debugNote("Blocked " .. blockedType .. "; using forced immediate " .. expectedType .. " route.")
+            snd.mapper.executePath(forcedJump)
+            return true
+        end
+        snd.utils.debugNote("Blocked " .. blockedType .. "; no immediate " .. expectedType .. " route was mapped from this room.")
         return false
     end
+
+    -- Nearby and area-start recovery are only meaningful when neither jump can
+    -- be used in the current room. The nearby probe has a hard walking radius;
+    -- once exhausted, the designated area start is the next fallback.
+    if currentNoPortal and currentNoRecall then
+        local nearbyRadius = tonumber(snd.mapper.config.nearbyJumpRadius) or 10
+        local nearbyPath, nearbyRoom = snd.mapper.findNearestAlternateRoute(
+            currentRoom,
+            destination,
+            blockedType,
+            ignoreLockedExits,
+            false,
+            nearbyRadius
+        )
+        if nearbyPath and #nearbyPath > 0 then
+            snd.utils.infoNote(string.format(
+                "Rerouting via nearby room %s to use %s (%d steps).",
+                tostring(nearbyRoom or "?"),
+                expectedType,
+                #nearbyPath
+            ))
+            snd.mapper.executePath(nearbyPath)
+            return true
+        end
+
+        local areaRoute, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(
+            currentRoom,
+            destination,
+            blockedType,
+            ignoreLockedExits,
+            {
+                allowPortals = snd.mapper.config.usePortals ~= false,
+                allowRecalls = snd.mapper.config.useRecall ~= false,
+                nearbyJumpRadius = nearbyRadius,
+            }
+        )
+        if areaRoute and #areaRoute > 0 then
+            snd.utils.infoNote(string.format(
+                "Nearby jump options exhausted. Rerouting through %s start room %s, then using %s.",
+                tostring(areaKey or "area"),
+                tostring(startRoom or "?"),
+                tostring(jumpType or "a jump")
+            ))
+            snd.mapper.executePath(areaRoute)
+            return true
+        end
+
+        -- A long walk is genuinely last: both immediate jumps, the bounded
+        -- nearby search, and the area-start route have already failed.
+        local walkingPath = snd.mapper.findPath(
+            currentRoom,
+            destination,
+            true,
+            true,
+            ignoreLockedExits,
+            nil,
+            nil,
+            nil,
+            "walk"
+        )
+        if walkingPath and #walkingPath > 0 then
+            snd.utils.infoNote("Nearby and area-start jump options failed; using the remaining walking route.")
+            snd.mapper.executePath(walkingPath)
+            return true
+        end
+    end
+
+    snd.utils.infoNote("You couldn't find a path to " .. destination .. " from here.")
+    snd.utils.infoNote("Blocked " .. blockedType .. " and no alternate route found from room " .. currentRoom .. ".")
+    return false
 end
 
 --- Check for direct one-room path
@@ -3600,9 +3549,10 @@ function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits, ignoreAr
     return nil
 end
 
-function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedExits, costContext)
+function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedExits, opts)
     sourceRoom = tostring(sourceRoom or "")
     destination = tostring(destination or "")
+    opts = type(opts) == "table" and opts or {}
     if sourceRoom == "" or sourceRoom == "-1" or destination == "" then
         return nil
     end
@@ -3615,7 +3565,35 @@ function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedE
         return nil
     end
 
-    local closestRoom, walkPath = snd.mapper.findNearestRoomWithoutBothFlags(sourceRoom, ignoreLockedExits)
+    local allowPortals = opts.allowPortals ~= false
+    local allowRecalls = opts.allowRecalls ~= false
+    local requiredType = opts.requiredType
+    local searchDepthLimit = tonumber(opts.searchDepthLimit)
+        or tonumber(snd.mapper.config.nearbyJumpRadius)
+        or 10
+
+    local closestRoom, walkPath
+    if requiredType == "portal" then
+        closestRoom, walkPath = snd.mapper.findNearestRoomWithoutFlag(
+            sourceRoom,
+            "noportal",
+            ignoreLockedExits,
+            searchDepthLimit
+        )
+    elseif requiredType == "recall" then
+        closestRoom, walkPath = snd.mapper.findNearestRoomWithoutFlag(
+            sourceRoom,
+            "norecall",
+            ignoreLockedExits,
+            searchDepthLimit
+        )
+    else
+        closestRoom, walkPath = snd.mapper.findNearestRoomWithoutBothFlags(
+            sourceRoom,
+            ignoreLockedExits,
+            searchDepthLimit
+        )
+    end
     if not closestRoom or not walkPath then
         snd.utils.debugNote("outward jump-route: no nearby room with jump access found.")
         return nil
@@ -3632,52 +3610,35 @@ function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedE
         tostring(closestNoRecall)
     ))
 
-    local recallLeg = nil
-    local portalLeg = nil
-    if not closestNoRecall then
-        recallLeg = snd.mapper.findPath(tostring(closestRoom), destination, true, nil, ignoreLockedExits) -- recall only
-        if not snd.mapper.pathStartsWithJump(recallLeg, "recall") then
-            recallLeg = nil
-        end
-    end
-    if not closestNoPortal then
-        portalLeg = snd.mapper.findPath(tostring(closestRoom), destination, nil, true, ignoreLockedExits) -- portal only
-        if not snd.mapper.pathStartsWithJump(portalLeg, "portal") then
-            portalLeg = nil
-        end
-    end
-
-    local chosenLeg = nil
-    local chosenType = nil
-    if recallLeg and #recallLeg > 0 and portalLeg and #portalLeg > 0 then
-        local recallPath = {}
-        local portalPath = {}
-        for _, step in ipairs(walkPath) do
-            table.insert(recallPath, step)
-            table.insert(portalPath, step)
-        end
-        for _, step in ipairs(recallLeg) do table.insert(recallPath, step) end
-        for _, step in ipairs(portalLeg) do table.insert(portalPath, step) end
-        local selected = snd.mapper.chooseShortestRoute({
-            {kind = "recall", path = recallPath},
-            {kind = "portal", path = portalPath},
-        }, {costContext = costContext})
-        if selected and selected.kind == "portal" then
-            chosenLeg, chosenType = portalLeg, "portal"
-        else
-            chosenLeg, chosenType = recallLeg, "recall"
-        end
-    elseif recallLeg and #recallLeg > 0 then
-        chosenLeg, chosenType = recallLeg, "recall"
-    elseif portalLeg and #portalLeg > 0 then
-        chosenLeg, chosenType = portalLeg, "portal"
-    else
-        snd.utils.debugNote("outward jump-route: candidate room has no recall or portal continuation.")
-        return nil
+    local canPortal = allowPortals and not closestNoPortal
+    local canRecall = allowRecalls and not closestNoRecall
+    local originMode
+    if requiredType == "portal" and canPortal then
+        originMode = "portal"
+    elseif requiredType == "recall" and canRecall then
+        originMode = "recall"
+    elseif canPortal and canRecall then
+        originMode = "jump"
+    elseif canPortal then
+        originMode = "portal"
+    elseif canRecall then
+        originMode = "recall"
     end
 
+    local chosenLeg = originMode and snd.mapper.findPath(
+        tostring(closestRoom),
+        destination,
+        not canPortal,
+        not canRecall,
+        ignoreLockedExits,
+        nil,
+        nil,
+        nil,
+        originMode
+    ) or nil
+    local chosenType = chosenLeg and chosenLeg[1] and chosenLeg[1].travelType or nil
     if not chosenLeg or #chosenLeg == 0 then
-        snd.utils.debugNote("outward jump-route: no continuation from candidate room " .. tostring(closestRoom))
+        snd.utils.debugNote("outward jump-route: candidate room has no recall or portal continuation.")
         return nil
     end
 
@@ -3694,71 +3655,7 @@ function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedE
 end
 
 --- Find nearest room that allows portal/recall
-function snd.mapper.findNearestJumpRoom(src, dst, targetType, ignoreLockedExits)
-    local depth = 0
-    local maxDepth = snd.mapper.config.maxSearchDepth
-    local roomsList = {snd.mapper.db.escape(src)}
-    local visited = table.concat(roomsList, ",")
-    local myLevel = snd.char.level or 201
-    local levelWhere = ignoreLockedExits and "1=1" or string.format("exits.level <= %d", myLevel)
-    local areaWhere = snd.mapper.areaGuardRoomSql("exits.touid", src, ignoreLockedExits)
-    
-    while depth < maxDepth do
-        depth = depth + 1
-        
-        local sql = string.format([[
-            SELECT exits.fromuid, exits.touid, exits.dir, rooms.norecall, rooms.noportal 
-            FROM exits 
-            JOIN rooms ON rooms.uid = exits.touid 
-            WHERE exits.fromuid IN (%s) 
-            AND exits.touid NOT IN (%s) 
-            AND %s
-            AND %s
-            ORDER BY %s
-        ]],
-            table.concat(roomsList, ","),
-            visited,
-            levelWhere,
-            areaWhere,
-            snd.mapper.exitPreferenceOrderSql("exits.dir")
-        )
-        
-        local results = snd.mapper.db.query(sql) or {}
-        roomsList = {}
-        
-        for _, row in ipairs(results) do
-            local touid = tostring(row.touid or "")
-            if touid ~= "" and touid ~= "-1" then
-                table.insert(roomsList, snd.mapper.db.escape(touid))
-            end
-            
-            local canUse = false
-            if touid == "-1" then
-                canUse = false
-            elseif targetType == "*" and tonumber(row.noportal) ~= 1 then
-                canUse = true
-            elseif targetType == "**" and tonumber(row.norecall) ~= 1 then
-                canUse = true
-            elseif touid == dst then
-                canUse = true
-            end
-            
-            if canUse then
-                return touid
-            end
-        end
-        
-        if #roomsList == 0 then
-            break
-        end
-        
-        visited = visited .. "," .. table.concat(roomsList, ",")
-    end
-    
-    return nil
-end
-
-function snd.mapper.findNearestRoomWithoutFlag(src, restrictionFlag, ignoreLockedExits)
+function snd.mapper.findNearestRoomWithoutFlag(src, restrictionFlag, ignoreLockedExits, searchDepthLimit)
     if not src then return nil, nil end
     local safeFlag = (restrictionFlag == "norecall") and "norecall" or "noportal"
     local source = tostring(src)
@@ -3778,7 +3675,11 @@ function snd.mapper.findNearestRoomWithoutFlag(src, restrictionFlag, ignoreLocke
     ))
 
     local myLevel = snd.char.level or 201
-    local maxDepth = snd.mapper.config.maxSearchDepth
+    local configuredDepth = tonumber(snd.mapper.config.maxSearchDepth) or 100
+    local requestedDepth = tonumber(searchDepthLimit)
+    local maxDepth = requestedDepth
+        and math.max(0, math.min(configuredDepth, math.floor(requestedDepth)))
+        or configuredDepth
     local queue = {{room = source, depth = 0}}
     local head = 1
     local visited = {[source] = true}
@@ -3846,7 +3747,7 @@ function snd.mapper.findNearestRoomWithoutFlag(src, restrictionFlag, ignoreLocke
     return nil, nil
 end
 
-function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
+function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits, searchDepthLimit)
     local source = tostring(src or "")
     if source == "" or source == "-1" then
         return nil, nil
@@ -3862,7 +3763,11 @@ function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
     snd.utils.debugNote("findNearestRoomWithoutBothFlags: searching for nearest room with portal or recall access.")
 
     local myLevel = snd.char.level or 201
-    local maxDepth = snd.mapper.config.maxSearchDepth
+    local configuredDepth = tonumber(snd.mapper.config.maxSearchDepth) or 100
+    local requestedDepth = tonumber(searchDepthLimit)
+    local maxDepth = requestedDepth
+        and math.max(0, math.min(configuredDepth, math.floor(requestedDepth)))
+        or configuredDepth
     local queue = {{room = source, depth = 0}}
     local head = 1
     local visited = {[source] = true}
@@ -3928,7 +3833,14 @@ function snd.mapper.findNearestRoomWithoutBothFlags(src, ignoreLockedExits)
     return nil, nil
 end
 
-function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLockedExits, allowGeneralFallback)
+function snd.mapper.findNearestAlternateRoute(
+    src,
+    dst,
+    blockedType,
+    ignoreLockedExits,
+    allowGeneralFallback,
+    searchDepthLimit
+)
     local source = tostring(src or "")
     local destination = tostring(dst or "")
     if source == "" or destination == "" then
@@ -3940,7 +3852,11 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
     local forceNoRecalls = (blockedType == "recall")
     local expectedType = (blockedType == "portal") and "recall" or "portal"
     local myLevel = snd.char.level or 201
-    local maxDepth = snd.mapper.config.maxSearchDepth
+    local configuredDepth = tonumber(snd.mapper.config.maxSearchDepth) or 100
+    local requestedDepth = tonumber(searchDepthLimit)
+    local maxDepth = requestedDepth
+        and math.max(0, math.min(configuredDepth, math.floor(requestedDepth)))
+        or configuredDepth
     local maxCandidates = 40
     local testedCandidates = 0
 
@@ -3958,7 +3874,17 @@ function snd.mapper.findNearestAlternateRoute(src, dst, blockedType, ignoreLocke
         local canUseAlternate = roomInfo and tonumber(roomInfo[requiredFlag]) ~= 1
         if canUseAlternate then
             testedCandidates = testedCandidates + 1
-            local leg = snd.mapper.findPath(node.room, destination, forceNoPortals, forceNoRecalls, ignoreLockedExits)
+            local leg = snd.mapper.findPath(
+                node.room,
+                destination,
+                forceNoPortals,
+                forceNoRecalls,
+                ignoreLockedExits,
+                nil,
+                nil,
+                nil,
+                expectedType
+            )
             if leg and #leg > 0 and snd.mapper.pathStartsWithJump(leg, expectedType) then
                 local walkPath = {}
                 local cursor = node.room
@@ -4582,9 +4508,9 @@ function snd.mapper.executePath(path, opts)
     runFrom(1)
 end
 
--- Build the same route candidate set used by gotoRoom, then score it with the
--- same live portal-cost snapshot. This function only plans; it does not change
--- navigation state or execute any commands.
+-- Build the route used by gotoRoom. Ordinary navigation performs one combined
+-- shortest-path search; restricted-room recovery follows the explicit nearby
+-- then area-start hierarchy. This function only plans and never sends commands.
 function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreLockedExits)
     currentRoom = tostring(currentRoom or "")
     roomId = tostring(roomId or "")
@@ -4592,6 +4518,108 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
 
     local noPortals = not usePortals or not snd.mapper.config.usePortals
     local noRecalls = not snd.mapper.config.useRecall
+    local sourceInfo = snd.mapper.getRoomInfo(currentRoom)
+    local destinationInfo = snd.mapper.getRoomInfo(roomId)
+    local sourceAreaValue = sourceInfo and sourceInfo.area
+        or (snd.room and snd.room.current and snd.room.current.arid)
+        or ""
+    local sourceArea = snd.utils.trim(sourceAreaValue):lower()
+    local destinationArea = destinationInfo and snd.utils.trim(destinationInfo.area or ""):lower() or ""
+    local crossingAreas = sourceArea ~= "" and destinationArea ~= "" and sourceArea ~= destinationArea
+    local currentNoPortal = sourceInfo and tonumber(sourceInfo.noportal) == 1 or false
+    local currentNoRecall = sourceInfo and tonumber(sourceInfo.norecall) == 1 or false
+    local nearbyRadius = tonumber(snd.mapper.config.nearbyJumpRadius) or 10
+
+    local function details(areaGuardPlan, candidate)
+        return {
+            areaGuardPlan = areaGuardPlan or {active = false, directSafe = false},
+            candidates = candidate and {candidate} or {},
+            depth = candidate and (candidate.depth or #candidate.path) or nil,
+            noPortals = noPortals,
+            noRecalls = noRecalls,
+            sourceArea = sourceArea,
+        }
+    end
+
+    -- A room with both restrictions follows a strict recovery ladder. Do not
+    -- calculate a global walking route until the bounded nearby search and the
+    -- source-area start have both failed.
+    if usePortals and currentNoPortal and currentNoRecall then
+        local outwardPath, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(
+            currentRoom,
+            roomId,
+            ignoreLockedExits,
+            {
+                allowPortals = not noPortals,
+                allowRecalls = not noRecalls,
+                searchDepthLimit = nearbyRadius,
+            }
+        )
+        if outwardPath and #outwardPath > 0 then
+            local nearbyCandidate = {
+                kind = "nearby_" .. tostring(outwardType or "jump"),
+                path = outwardPath,
+                viaRoom = outwardRoom,
+            }
+            snd.utils.debugNote(string.format(
+                "Selected nearby jump room %s within radius %d (%d steps).",
+                tostring(outwardRoom or "?"),
+                nearbyRadius,
+                #outwardPath
+            ))
+            return nearbyCandidate, details(nil, nearbyCandidate)
+        end
+
+        if crossingAreas then
+            local areaPath, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(
+                currentRoom,
+                roomId,
+                nil,
+                ignoreLockedExits,
+                {
+                    allowPortals = not noPortals,
+                    allowRecalls = not noRecalls,
+                    nearbyJumpRadius = nearbyRadius,
+                }
+            )
+            if areaPath and #areaPath > 0 then
+                local areaCandidate = {
+                    kind = "area_start_" .. tostring(jumpType or "jump"),
+                    path = areaPath,
+                    areaKey = areaKey,
+                    startRoom = startRoom,
+                }
+                snd.utils.debugNote(string.format(
+                    "Nearby jump radius exhausted; selected %s start room %s (%d steps).",
+                    tostring(areaKey or sourceArea or "area"),
+                    tostring(startRoom or "?"),
+                    #areaPath
+                ))
+                return areaCandidate, details(nil, areaCandidate)
+            end
+        end
+
+        local walkingPath, walkingDepth = snd.mapper.findPath(
+            currentRoom,
+            roomId,
+            true,
+            true,
+            ignoreLockedExits,
+            nil,
+            nil,
+            nil,
+            "walk"
+        )
+        local walkingCandidate = walkingPath and #walkingPath > 0 and {
+            kind = "walk_last_resort",
+            path = walkingPath,
+            depth = walkingDepth,
+        } or nil
+        return walkingCandidate, details(nil, walkingCandidate)
+    end
+
+    -- Ordinary xrt performs one combined shortest-path search. Walking is not
+    -- searched separately; findPath itself prefers it only on an equal-depth tie.
     local areaGuardPlan = snd.mapper.planAreaGuardRoute(
         currentRoom,
         roomId,
@@ -4602,26 +4630,11 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
     local directAreaSafe = areaGuardPlan.active
         and areaGuardPlan.directSafe
         and areaGuardPlan.candidate
-    local path, depth
-    local routeCandidates = {}
-    local costContext = snd.mapper.routeCostContext()
-
-    local function addPlanCandidates(plan)
-        if type(plan and plan.candidates) == "table" and #plan.candidates > 0 then
-            for _, candidate in ipairs(plan.candidates) do
-                table.insert(routeCandidates, candidate)
-            end
-        elseif plan and plan.candidate then
-            table.insert(routeCandidates, plan.candidate)
-        end
-    end
-
-    -- A valid direct route stays in the comparison, but is not final until a
-    -- portal-free alternative has been scored with the same live DINV snapshot.
+    local path, depth, selectedRoute
     if directAreaSafe then
-        path = areaGuardPlan.candidate.path
-        depth = areaGuardPlan.candidate.depth
-        addPlanCandidates(areaGuardPlan)
+        selectedRoute = areaGuardPlan.candidate
+        path = selectedRoute.path
+        depth = selectedRoute.depth
     else
         path, depth = snd.mapper.findPath(
             currentRoom,
@@ -4630,82 +4643,46 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
             noRecalls,
             ignoreLockedExits
         )
+        -- If the globally shortest jump was blocked and no configured bounce
+        -- could repair it, retry only the other jump that is legal in this room.
+        -- This is not a walking comparison and never invokes nearby recovery.
+        if (not path or #path == 0) and usePortals then
+            if currentNoRecall and not currentNoPortal and not noPortals then
+                path, depth = snd.mapper.findPath(
+                    currentRoom,
+                    roomId,
+                    false,
+                    true,
+                    ignoreLockedExits,
+                    nil,
+                    nil,
+                    nil,
+                    "portal"
+                )
+            elseif currentNoPortal and not currentNoRecall and not noRecalls then
+                path, depth = snd.mapper.findPath(
+                    currentRoom,
+                    roomId,
+                    true,
+                    false,
+                    ignoreLockedExits,
+                    nil,
+                    nil,
+                    nil,
+                    "recall"
+                )
+            end
+        end
         if path and #path > 0 then
-            table.insert(routeCandidates, {
-                kind = "normal",
-                path = path,
-                depth = depth,
-            })
+            selectedRoute = {kind = "normal", path = path, depth = depth}
         end
     end
 
-    local hasPortalCandidate = false
-    for _, candidate in ipairs(routeCandidates) do
-        if snd.mapper.pathPortalCount(candidate.path) > 0 then
-            hasPortalCandidate = true
-            break
-        end
-    end
-    if hasPortalCandidate then
-        local currentBest = snd.mapper.chooseShortestRoute(routeCandidates, {costContext = costContext})
-        local walkingDepthLimit = currentBest
-            and math.floor(snd.mapper.pathCost(currentBest.path, costContext))
-            or nil
-        snd.utils.debugNote(string.format(
-            "Route comparison: walk-only search capped at depth %s by current portal-route cost.",
-            tostring(walkingDepthLimit or "default")
-        ))
-        local walkingPath, walkingDepth = snd.mapper.findPath(
-            currentRoom,
-            roomId,
-            true,
-            true,
-            ignoreLockedExits,
-            nil,
-            nil,
-            walkingDepthLimit
-        )
-        if walkingPath and #walkingPath > 0 then
-            table.insert(routeCandidates, {
-                kind = "walk",
-                path = walkingPath,
-                depth = walkingDepth,
-            })
-        end
-    end
-
-    -- A room marked both norecall and noportal expands outward breadth-first to
-    -- the closest room with either jump method. Area boundaries do not stop it.
-    if not directAreaSafe and usePortals then
-        local outwardPath, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(
-            currentRoom,
-            roomId,
-            ignoreLockedExits,
-            costContext
-        )
-        if outwardPath and #outwardPath > 0 then
-            table.insert(routeCandidates, {
-                kind = "nearby_" .. tostring(outwardType or "jump"),
-                path = outwardPath,
-                viaRoom = outwardRoom,
-            })
-        end
-    end
-
-    local sourceInfo = snd.mapper.getRoomInfo(currentRoom)
-    local destinationInfo = snd.mapper.getRoomInfo(roomId)
-    local sourceAreaValue = sourceInfo and sourceInfo.area
-        or (snd.room and snd.room.current and snd.room.current.arid)
-        or ""
-    local sourceArea = snd.utils.trim(sourceAreaValue):lower()
-    local destinationArea = destinationInfo and snd.utils.trim(destinationInfo.area or ""):lower() or ""
-    local crossingAreas = sourceArea ~= "" and destinationArea ~= "" and sourceArea ~= destinationArea
     local normalBypassesStart = path and snd.mapper.pathLeavesAreaBeforeJump(path, sourceArea) or false
-
-    -- Before accepting a walking prefix that leaves the source area, explicitly
-    -- cost the route through that area's designated start room. Walking remains a
-    -- valid candidate and wins whenever its complete path is shorter.
-    if not directAreaSafe and usePortals and crossingAreas and (not path or normalBypassesStart) then
+    -- An immediate portal/recall never reaches this branch. If the only normal
+    -- result walks out of the source area before jumping, try the designated
+    -- start first; only use the long walking route when that fallback fails.
+    if usePortals and crossingAreas and (not path or normalBypassesStart) then
         local areaPath, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(
             currentRoom,
             roomId,
@@ -4714,39 +4691,31 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
             {
                 allowPortals = not noPortals,
                 allowRecalls = not noRecalls,
-                costContext = costContext,
+                nearbyJumpRadius = nearbyRadius,
             }
         )
         if areaPath and #areaPath > 0 then
-            table.insert(routeCandidates, {
+            selectedRoute = {
                 kind = "area_start_" .. tostring(jumpType or "jump"),
                 path = areaPath,
                 areaKey = areaKey,
                 startRoom = startRoom,
-            })
+            }
+            path = areaPath
+            depth = #areaPath
         end
     end
 
-    local selectedRoute = snd.mapper.chooseShortestRoute(routeCandidates, {costContext = costContext})
     if selectedRoute then
-        path = selectedRoute.path
-        depth = selectedRoute.depth or #path
         if selectedRoute.kind == "direct_area_safe" then
             snd.utils.debugNote("Area guard selected the unchanged safe direct path with " .. #path .. " steps.")
         elseif selectedRoute.kind == "direct_clan_exempt" then
             snd.utils.debugNote("Area guard selected the shortest safe route with local clan-room exemptions (" .. #path .. " steps).")
         elseif selectedRoute.kind == "normal" then
-            snd.utils.debugNote("Route comparison selected normal path with " .. #path .. " steps.")
-        elseif selectedRoute.kind and selectedRoute.kind:match("^nearby_") then
-            snd.utils.debugNote(string.format(
-                "Route comparison selected nearby jump room %s (%s, %d steps).",
-                tostring(selectedRoute.viaRoom or "?"),
-                tostring(selectedRoute.kind),
-                #path
-            ))
+            snd.utils.debugNote("Selected normal shortest path with " .. #path .. " steps.")
         else
             snd.utils.debugNote(string.format(
-                "Route comparison selected %s start room %s (%d steps).",
+                "Selected %s start room %s before a cross-area walking route (%d steps).",
                 tostring(selectedRoute.areaKey or sourceArea or "area"),
                 tostring(selectedRoute.startRoom or "?"),
                 #path
@@ -4754,20 +4723,12 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
         end
     end
 
-    return selectedRoute, {
-        areaGuardPlan = areaGuardPlan,
-        candidates = routeCandidates,
-        costContext = costContext,
-        depth = depth,
-        noPortals = noPortals,
-        noRecalls = noRecalls,
-        sourceArea = sourceArea,
-    }
+    return selectedRoute, details(areaGuardPlan, selectedRoute)
 end
 
 -- Preview gotoRoom's route with AreaGuard forced on for this calculation only.
--- Per-portal guards, locked exits, portal/recall settings, and operational route cost
--- remain exactly as they are for normal xrt navigation.
+-- Per-portal guards, locked exits, and portal/recall settings remain exactly as
+-- they are for normal xrt navigation.
 function snd.mapper.previewGuardedRoute(currentRoom, roomId, usePortals)
     local source = tostring(currentRoom or "")
     local destination = tostring(roomId or "")
@@ -4980,6 +4941,10 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
         end
 
         snd.utils.infoNote("You couldn't find a path to " .. roomId .. " from here.")
+        snd.mapper.goingToRoom = nil
+        snd.nav.goingToRoom = nil
+        snd.mapper.notifyBigmapNavigationState("path_not_found")
+
         local offeredManualApproach = false
         if snd.commands and type(snd.commands.offerManualApproach) == "function" then
             local ok, offered = pcall(snd.commands.offerManualApproach, roomId)
@@ -4988,12 +4953,20 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
                 snd.utils.debugNote("Manual approach display failed: " .. tostring(offered))
             end
         end
-        if not offeredManualApproach then
-            snd.utils.infoNote("Try 'xrtnear " .. roomId .. "' to list reachable boundary rooms. The lookup may take a moment.")
+        if offeredManualApproach then
+            return false
         end
-        snd.mapper.goingToRoom = nil
-        snd.nav.goingToRoom = nil
-        snd.mapper.notifyBigmapNavigationState("path_not_found")
+
+        if snd.commands and type(snd.commands.fallbackToTargetAreaStart) == "function" then
+            local ok, handled = pcall(snd.commands.fallbackToTargetAreaStart, roomId)
+            if ok and handled == true then
+                return true
+            elseif not ok then
+                snd.utils.debugNote("Target area-start fallback failed: " .. tostring(handled))
+            end
+        end
+
+        snd.utils.infoNote("Try 'xrtnear " .. roomId .. "' to list reachable boundary rooms. The lookup may take a moment.")
         return false
     end
 end
@@ -5790,12 +5763,28 @@ function snd.mapper.walkTo(dest, opts)
         end
         cecho("<red>[MMAPPER]<reset> No walking path found to " .. displayName .. "\n")
         cecho("<dim_gray>The destination may not be reachable by walking alone.<reset>\n")
+        local offeredManualApproach = false
         if snd.commands and type(snd.commands.offerManualApproach) == "function" then
             local ok, offered = pcall(snd.commands.offerManualApproach, targetRoom)
+            offeredManualApproach = ok and offered == true
             if not ok then
                 snd.utils.debugNote("Manual approach display failed: " .. tostring(offered))
             end
         end
+        if offeredManualApproach then
+            return false
+        end
+
+        if snd.commands and type(snd.commands.fallbackToTargetAreaStart) == "function" then
+            local ok, handled = pcall(snd.commands.fallbackToTargetAreaStart, targetRoom)
+            if ok and handled == true then
+                return true
+            elseif not ok then
+                snd.utils.debugNote("Target area-start fallback failed: " .. tostring(handled))
+            end
+        end
+
+        snd.utils.infoNote("Try 'xrtnear " .. targetRoom .. "' to list reachable boundary rooms. The lookup may take a moment.")
         return false
     end
 end

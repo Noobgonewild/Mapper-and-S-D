@@ -11,6 +11,136 @@
 snd = snd or {}
 snd.commands = snd.commands or {}
 
+local function targetIdentityText(value)
+    local text = tostring(value or "")
+    if snd.utils and type(snd.utils.stripColors) == "function" then
+        text = snd.utils.stripColors(text)
+    end
+    if snd.utils and type(snd.utils.trim) == "function" then
+        text = snd.utils.trim(text)
+    else
+        text = text:match("^%s*(.-)%s*$") or text
+    end
+    text = text:lower():gsub("%s+", " ")
+    return text
+end
+
+local function targetSelectionDiscriminator(target)
+    if type(target) ~= "table" then return "" end
+    local explicit = tostring(target.selectionDiscriminator or "")
+    if explicit ~= "" then return explicit end
+
+    local activity = tostring(target.activity or ""):lower()
+    local sourceIndex = nil
+    local duplicateIndex = nil
+    if activity == "cp" then
+        sourceIndex = target.campaignIndex
+        duplicateIndex = target.dupIndex
+    elseif activity == "gq" then
+        sourceIndex = target.sourceIndex
+        if tonumber(target.duplicates) and tonumber(target.duplicates) > 1 then
+            duplicateIndex = target.index
+        end
+    end
+
+    local parts = {}
+    if sourceIndex ~= nil and tostring(sourceIndex) ~= "" then
+        table.insert(parts, "source:" .. tostring(sourceIndex))
+    end
+    if duplicateIndex ~= nil and tostring(duplicateIndex) ~= "" then
+        table.insert(parts, "duplicate:" .. tostring(duplicateIndex))
+    end
+    return table.concat(parts, ":")
+end
+
+local function computedTargetSelectionKey(target)
+    if type(target) ~= "table" then return "" end
+    return table.concat({
+        targetIdentityText(target.activity),
+        targetIdentityText(target.selectionName or target.name or target.mob),
+        targetIdentityText(target.selectionArea or target.area or target.arid or target.loc),
+        targetSelectionDiscriminator(target),
+    }, "|")
+end
+
+function snd.commands.buildTargetSelectionKey(target)
+    if type(target) ~= "table" then return "" end
+    local stored = tostring(target.selectionKey or "")
+    if stored ~= "" then return stored end
+    return computedTargetSelectionKey(target)
+end
+
+function snd.commands.targetSelectionBaseMatches(entry, selection)
+    if type(entry) ~= "table" or type(selection) ~= "table" then return false end
+    if targetIdentityText(entry.activity) ~= targetIdentityText(selection.activity) then return false end
+    if targetIdentityText(entry.mob or entry.name) ~= targetIdentityText(selection.selectionName or selection.name or selection.mob) then
+        return false
+    end
+
+    local entryArea = targetIdentityText(entry.arid or entry.area or entry.loc)
+    local selectionArea = targetIdentityText(selection.selectionArea or selection.area or selection.arid or selection.loc)
+    return entryArea == "" or selectionArea == "" or entryArea == selectionArea
+end
+
+function snd.commands.targetMatchesCurrent(entry, current)
+    if not snd.commands.targetSelectionBaseMatches(entry, current) then return false end
+    local storedKey = type(current) == "table" and tostring(current.selectionKey or "") or ""
+    if storedKey ~= "" then
+        return computedTargetSelectionKey(entry) == storedKey
+    end
+    return true
+end
+
+function snd.commands.findTargetSelectionEntry(selection, entries)
+    if type(selection) ~= "table" or type(entries) ~= "table" then return nil end
+    local storedKey = tostring(selection.selectionKey or "")
+    if storedKey ~= "" then
+        for _, entry in ipairs(entries) do
+            if computedTargetSelectionKey(entry) == storedKey then
+                return entry
+            end
+        end
+    end
+
+    local best = nil
+    local bestScore = -1
+    for _, entry in ipairs(entries) do
+        if snd.commands.targetSelectionBaseMatches(entry, selection) then
+            local score = 0
+            if selection.roomId ~= nil and entry.rmid ~= nil
+                and tostring(selection.roomId) == tostring(entry.rmid)
+            then
+                score = score + 4
+            end
+            local selectedRoomName = targetIdentityText(selection.roomName)
+            local entryRoomName = targetIdentityText(entry.roomName)
+            if selectedRoomName ~= "" and entryRoomName ~= "" and selectedRoomName == entryRoomName then
+                score = score + 2
+            end
+            if score > bestScore then
+                best = entry
+                bestScore = score
+            end
+        end
+    end
+    return best
+end
+
+function snd.commands.bindTargetSelection(selection, entry)
+    if type(selection) ~= "table" then return selection end
+    local source = entry
+    if type(source) ~= "table" and snd.targets and type(snd.targets.list) == "table" then
+        source = snd.commands.findTargetSelectionEntry(selection, snd.targets.list)
+    end
+    if type(source) ~= "table" then return selection end
+
+    selection.selectionName = source.mob or source.name or selection.name or selection.mob or ""
+    selection.selectionArea = source.arid or source.area or source.loc or selection.area or selection.arid or ""
+    selection.selectionDiscriminator = targetSelectionDiscriminator(source)
+    selection.selectionKey = computedTargetSelectionKey(selection)
+    return selection
+end
+
 local function getScopedActivity()
     if snd and snd.getActiveTab then
         local tab = snd.getActiveTab()
@@ -190,6 +320,22 @@ local function currentAreaKey()
     return snd.utils.trim(snd.room and snd.room.current and snd.room.current.arid or "")
 end
 
+local function targetAreaStartRoom(target)
+    local areaKey = currentTargetAreaKey(target)
+    if areaKey == "" then return nil, "" end
+
+    local startRoom = nil
+    if snd.db and type(snd.db.getAreaStartRoom) == "function" then
+        startRoom = tonumber(snd.db.getAreaStartRoom(areaKey))
+    end
+    if (not startRoom or startRoom <= 0) and snd.data and snd.data.areaDefaultStartRooms then
+        local areaData = snd.data.areaDefaultStartRooms[areaKey]
+        startRoom = areaData and tonumber(areaData.start) or nil
+    end
+    if not startRoom or startRoom <= 0 then return nil, areaKey end
+    return startRoom, areaKey
+end
+
 local function syncCurrentTargetScope()
     local current = snd.targets and snd.targets.current or nil
     if current and current.activity then
@@ -282,6 +428,8 @@ local function resetSelectedTargetRoomList()
     snd.nav = snd.nav or {}
     snd.nav.xcpLookup = nil
     snd.nav.nxState = nil
+    snd.nav.pendingTargetRoomFallback = nil
+    snd.nav.targetAreaFallback = nil
     snd.nav.gotoList = {}
     snd.nav.gotoListTargetKey = ""
     snd.nav.quickWhere = snd.nav.quickWhere or {}
@@ -586,6 +734,7 @@ local function scheduleSelectedTargetLookup(destinationRoom, mode, source, reaso
 
     local dispatched = snd.commands.gotoRoomViaAlias(roomId, {
         allowManualApproach = false,
+        targetRoom = reason == "xcp_hybrid_best_room",
         source = reason or "xcp_lookup",
     })
     if dispatched ~= true then
@@ -1007,8 +1156,9 @@ function snd.commands.gotoRoomViaAlias(roomId, options)
     local opts = type(options) == "table" and options or {}
     local walkOnly = snd.config and snd.config.speed == "walk"
     local request = nil
+    local fallbackRequest = nil
     local current = snd.targets and snd.targets.current or nil
-    local isTargetRoom = current and tonumber(current.roomId) == roomId
+    local isTargetRoom = opts.targetRoom == true or (current and tonumber(current.roomId) == roomId)
     if not isTargetRoom and current and snd.nav and snd.nav.quickWhere and snd.nav.quickWhere.rooms then
         for _, candidate in ipairs(snd.nav.quickWhere.rooms) do
             if tonumber(candidate) == roomId then
@@ -1039,6 +1189,33 @@ function snd.commands.gotoRoomViaAlias(roomId, options)
         snd.nav.pendingManualApproachRequest = request
     end
 
+    if opts.allowAreaStartFallback ~= false and isTargetRoom and current then
+        local startRoom, areaKey = targetAreaStartRoom(current)
+        if startRoom and startRoom ~= roomId then
+            fallbackRequest = {
+                requestedRoom = roomId,
+                startRoom = startRoom,
+                areaKey = areaKey,
+                source = tostring(opts.source or "snd"),
+                targetName = tostring(current.name or current.mob or ""),
+                targetKey = snd.commands.buildQuickWhereTargetKeyFromCurrent
+                    and snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
+                    or "",
+            }
+            snd.nav = snd.nav or {}
+            snd.nav.pendingTargetRoomFallback = fallbackRequest
+        end
+    end
+
+    local function clearPendingRequests()
+        if request and snd.nav and snd.nav.pendingManualApproachRequest == request then
+            snd.nav.pendingManualApproachRequest = nil
+        end
+        if fallbackRequest and snd.nav and snd.nav.pendingTargetRoomFallback == fallbackRequest then
+            snd.nav.pendingTargetRoomFallback = nil
+        end
+    end
+
     local travelApi = nil
     if snd.mapper then
         if walkOnly then
@@ -1048,35 +1225,146 @@ function snd.commands.gotoRoomViaAlias(roomId, options)
         end
     end
     if type(travelApi) ~= "function" then
-        if request and snd.nav and snd.nav.pendingManualApproachRequest == request then
-            snd.nav.pendingManualApproachRequest = nil
-        end
+        clearPendingRequests()
         snd.utils.errorNote("Mapper navigation API is unavailable.")
         return false
     end
 
     local dispatched, travelResult = pcall(travelApi, tostring(roomId))
     if not dispatched then
-        if request and snd.nav and snd.nav.pendingManualApproachRequest == request then
-            snd.nav.pendingManualApproachRequest = nil
-        end
+        clearPendingRequests()
         snd.utils.errorNote("Mapper navigation failed: " .. tostring(travelResult))
         return false
     end
     if travelResult == false then
-        if request and snd.nav and snd.nav.pendingManualApproachRequest == request then
-            snd.nav.pendingManualApproachRequest = nil
-        end
+        clearPendingRequests()
         return false
     end
 
     -- Mapper API dispatch is synchronous. A failed route consumes this
     -- request while building its manual-approach list; successful routes leave
     -- no fallback state behind.
-    if request and snd.nav and snd.nav.pendingManualApproachRequest == request then
-        snd.nav.pendingManualApproachRequest = nil
-    end
+    clearPendingRequests()
     return true
+end
+
+local function suggestXrtNear(requestedRoom)
+    snd.utils.infoNote(
+        "Try 'xrtnear " .. tostring(requestedRoom)
+        .. "' to list reachable boundary rooms. The lookup may take a moment."
+    )
+end
+
+--- Route an unreachable selected-target room to that target area's start room.
+-- The target room and QW list remain unchanged; this is only an approach route.
+function snd.commands.fallbackToTargetAreaStart(requestedRoom)
+    local requestedId = tonumber(requestedRoom)
+    local pending = snd.nav and snd.nav.pendingTargetRoomFallback or nil
+    if not requestedId or not pending or tonumber(pending.requestedRoom) ~= requestedId then
+        return false
+    end
+    snd.nav.pendingTargetRoomFallback = nil
+
+    local current = snd.targets and snd.targets.current or nil
+    if not current then return false end
+    local currentKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
+    local pendingKey = tostring(pending.targetKey or "")
+    if pendingKey ~= "" and currentKey ~= "" and pendingKey ~= currentKey then
+        return false
+    end
+
+    local startRoom = tonumber(pending.startRoom)
+    if not startRoom or startRoom <= 0 or startRoom == requestedId then
+        return false
+    end
+
+    local function clearManualRequest()
+        local manual = snd.nav and snd.nav.pendingManualApproachRequest or nil
+        if manual and tonumber(manual.requestedRoom) == requestedId then
+            snd.nav.pendingManualApproachRequest = nil
+        end
+    end
+
+    local continueXcpLookup = false
+    local xcpLookup = snd.nav and snd.nav.xcpLookup or nil
+    if xcpLookup and tostring(xcpLookup.destinationRoom or "") == tostring(requestedId)
+        and (pendingKey == "" or tostring(xcpLookup.targetKey or "") == pendingKey)
+    then
+        xcpLookup.destinationRoom = startRoom
+        xcpLookup.reason = "xcp_area_start"
+        xcpLookup.waitingForConwin = nil
+        continueXcpLookup = true
+    end
+
+    local liveRoom = getCurrentRoomUid()
+    if liveRoom and tostring(liveRoom) == tostring(startRoom) then
+        clearManualRequest()
+        snd.utils.infoNote(string.format(
+            "Target room %d is unreachable; already at the %s area start (room %d).",
+            requestedId,
+            tostring(pending.areaKey or "target"),
+            startRoom
+        ))
+        if continueXcpLookup then
+            snd.commands.handleXcpLookupArrival(startRoom)
+        else
+            suggestXrtNear(requestedId)
+        end
+        return true
+    end
+
+    snd.nav.targetAreaFallback = {
+        destinationRoom = startRoom,
+        requestedRoom = requestedId,
+        areaKey = tostring(pending.areaKey or ""),
+        targetKey = currentKey ~= "" and currentKey or pendingKey,
+        continueXcpLookup = continueXcpLookup,
+    }
+    snd.utils.infoNote(string.format(
+        "Target room %d is unreachable; going to the %s area start (room %d).",
+        requestedId,
+        tostring(pending.areaKey or "target"),
+        startRoom
+    ))
+
+    local dispatched = snd.commands.gotoRoomViaAlias(startRoom, {
+        allowManualApproach = false,
+        allowAreaStartFallback = false,
+        source = "target_area_start_fallback",
+    })
+    if dispatched == true then
+        clearManualRequest()
+        return true
+    end
+
+    snd.nav.targetAreaFallback = nil
+    snd.utils.infoNote("Could not reach the target-area start room either.")
+    return false
+end
+
+function snd.commands.handleTargetAreaFallbackArrival(roomId)
+    local pending = snd.nav and snd.nav.targetAreaFallback or nil
+    if not pending or tostring(pending.destinationRoom or "") ~= tostring(roomId or "") then
+        return false
+    end
+    snd.nav.targetAreaFallback = nil
+
+    local current = snd.targets and snd.targets.current or nil
+    local currentKey = current and snd.commands.buildQuickWhereTargetKeyFromCurrent(current) or ""
+    local pendingKey = tostring(pending.targetKey or "")
+    if pendingKey ~= "" and currentKey ~= "" and pendingKey ~= currentKey then
+        return false
+    end
+
+    snd.utils.infoNote(string.format(
+        "Reached the %s area start; target room %s remains selected but unreachable.",
+        tostring(pending.areaKey or "target"),
+        tostring(pending.requestedRoom or "?")
+    ))
+    if pending.continueXcpLookup ~= true then
+        suggestXrtNear(pending.requestedRoom)
+    end
+    return pending.continueXcpLookup ~= true
 end
 
 -------------------------------------------------------------------------------
@@ -1618,16 +1906,7 @@ end
 
 
 local function targetMatchesCurrent(entry, current)
-    if not entry or not current then return false end
-    if entry.activity ~= current.activity then return false end
-    if entry.mob ~= current.name then return false end
-    if current.roomId and current.roomId ~= "" then
-        return tostring(entry.rmid) == tostring(current.roomId)
-    end
-    if current.roomName and current.roomName ~= "" then
-        return entry.roomName == current.roomName
-    end
-    return true
+    return snd.commands.targetMatchesCurrent(entry, current)
 end
 
 local function getNxTargets()
@@ -1730,6 +2009,11 @@ function snd.commands.nx()
         end
 
         return nil
+    end
+
+    if useAdhocQuickWhere and not currentQuickWhereList() then
+        snd.utils.infoNote("Ad-hoc quick where has no mappable rooms; nx cannot navigate this target.")
+        return
     end
 
     local initialCurrentRoom = getCurrentRoomUid()
@@ -2521,14 +2805,31 @@ function snd.commands.processQuickWhereResult()
         end
     end
 
-    if #quickWhereRooms == 0 and not isAdhocQuickWhere then
-        snd.utils.infoNote("Live where returned no mappable rooms; trying stored DB/mapped rooms.")
-        if snd.commands.processQuickWhereNoMatch({
-            restartsNxCycle = restartsNxCycle,
-            reason = "quickWhereUnmappedResult",
-        }) then
-            snd.triggers.disableQuickWhereTriggers()
-            return
+    if #quickWhereRooms == 0 then
+        if isAdhocQuickWhere then
+            -- The MUD already returned a useful answer, but qw gagged that row
+            -- before asking the mapper to resolve it. Restore the original,
+            -- non-clickable where output only when no mapper room was found.
+            local rawWhereLine = tostring(lastMatch.rawLine or "")
+            if rawWhereLine == "" then
+                local mobText = tostring(lastMatch.mob or "")
+                local roomText = tostring(lastMatch.room or "")
+                if #mobText < 30 then
+                    rawWhereLine = mobText .. string.rep(" ", 30 - #mobText) .. roomText
+                else
+                    rawWhereLine = mobText .. "  " .. roomText
+                end
+            end
+            echo("\n" .. rawWhereLine .. "\n")
+        else
+            snd.utils.infoNote("Live where returned no mappable rooms; trying stored DB/mapped rooms.")
+            if snd.commands.processQuickWhereNoMatch({
+                restartsNxCycle = restartsNxCycle,
+                reason = "quickWhereUnmappedResult",
+            }) then
+                snd.triggers.disableQuickWhereTriggers()
+                return
+            end
         end
     end
 
@@ -3099,8 +3400,15 @@ end
 
 --- Kill current target using configured kill command
 function snd.commands.xkill()
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    local nxOverride = snd.nav and snd.nav.nxOverride or nil
+    local useAdhocQuickWhere = (nxOverride and nxOverride.mode == "adhoc_qw")
+        or (quickWhere and quickWhere.isAdhoc == true)
     local scopedActivity = getScopedActivity()
-    if scopedActivity and (not snd.targets.current or snd.targets.current.activity ~= scopedActivity) then
+    if not useAdhocQuickWhere
+        and scopedActivity
+        and (not snd.targets.current or snd.targets.current.activity ~= scopedActivity)
+    then
         activateTabTarget(scopedActivity)
     end
 
@@ -3244,8 +3552,15 @@ end
 -------------------------------------------------------------------------------
 
 function snd.commands.gotoTarget()
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    local nxOverride = snd.nav and snd.nav.nxOverride or nil
+    local useAdhocQuickWhere = (nxOverride and nxOverride.mode == "adhoc_qw")
+        or (quickWhere and quickWhere.isAdhoc == true)
     local scopedActivity = getScopedActivity()
-    if scopedActivity and (not snd.targets.current or snd.targets.current.activity ~= scopedActivity) then
+    if not useAdhocQuickWhere
+        and scopedActivity
+        and (not snd.targets.current or snd.targets.current.activity ~= scopedActivity)
+    then
         activateTabTarget(scopedActivity)
     end
 
@@ -4404,15 +4719,8 @@ end
 function snd.commands.selectTarget(index, activity, options)
     local opts = type(options) == "table" and options or {}
     local runsXcpLookup = opts.xcpLookup ~= false
-    clearNxOverride()
     local previousCurrent = snd.targets and snd.targets.current or nil
     local didSelect = false
-
-    if runsXcpLookup and snd.nav and snd.nav.invalidateQuickWhereForTarget then
-        -- Re-selecting the same target is still a fresh xcp request. Invalidate
-        -- the previous list and any in-flight reply before selecting it again.
-        snd.nav.invalidateQuickWhereForTarget(nil)
-    end
 
     if activity == "cp" then
         didSelect = snd.cp.selectTarget(index, {skipLookup = runsXcpLookup}) == true
@@ -4422,7 +4730,16 @@ function snd.commands.selectTarget(index, activity, options)
         didSelect = snd.commands.selectQuestTarget({skipLookup = runsXcpLookup}) == true
     end
 
-    if snd.targets and snd.targets.current and snd.targets.current.activity then
+    local selectedCurrent = didSelect and snd.targets and snd.targets.current
+        and snd.targets.current.activity == activity
+    if selectedCurrent then
+        clearNxOverride()
+        if runsXcpLookup and snd.nav and snd.nav.invalidateQuickWhereForTarget then
+            -- Re-selecting the same target is still a fresh xcp request, but
+            -- invalidate only after selection succeeds so a bad index cannot
+            -- discard an active ad-hoc QW target.
+            snd.nav.invalidateQuickWhereForTarget(nil)
+        end
         setScopedCurrent(snd.targets.current.activity, snd.targets.current)
         if not runsXcpLookup then
             activateQuickWhereScope(snd.targets.current.activity)
@@ -4435,9 +4752,7 @@ function snd.commands.selectTarget(index, activity, options)
             raiseEvent("snd.target.selected", snd.targets.current)
         end
     end
-    if didSelect and runsXcpLookup and snd.targets and snd.targets.current
-        and snd.targets.current.activity == activity
-    then
+    if selectedCurrent and runsXcpLookup then
         snd.commands.beginXcpLookup()
     end
     return didSelect

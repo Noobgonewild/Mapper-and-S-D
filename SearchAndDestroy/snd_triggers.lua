@@ -777,6 +777,9 @@ function snd.triggers.roomCharsStart()
         pcall(killTrigger, snd.roomChars.lineCaptureId)
         snd.roomChars.lineCaptureId = nil
     end
+    if snd.conwin and snd.conwin.onMobdetectRoomcharsStart then
+        snd.conwin.onMobdetectRoomcharsStart()
+    end
 end
 
 function snd.triggers.roomCharsEnd()
@@ -1134,6 +1137,7 @@ function snd.triggers.qwMatch(matches)
     quickWhere.lastMatch = {
         mob = mobName,
         room = roomName,
+        rawLine = rawLine,
         matchesCurrentTarget = true,
     }
     quickWhere.pendingMatches = {quickWhere.lastMatch}

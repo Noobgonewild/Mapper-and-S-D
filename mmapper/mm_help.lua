@@ -127,7 +127,10 @@ mm.help_table = {
     header = "Portal Actions",
     rows = {
       { cmd = "mapper portals", desc = "List known hand-held portals; click/right-click a bracketed portal row to report it" },
-      { cmd = "mapper portalstats [count|all]", desc = "Show the top portals ranked by used/tried (default 20), or all portal statistics; click/right-click a portal ID to report it" },
+      { cmd = "mapper portalstats [count|all]", desc = "Show current portals ranked by used/tried, followed by unused portals in mapper order (default 20); click/right-click a portal ID to report it" },
+      { cmd = "mapper portalstats unused [count|all]", desc = "Show only current portals that have never been attempted" },
+      { cmd = "mapper chaosstats [count|all]", desc = "Show the same statistics for current chaos portals only, including unused chaos portals (default 20)" },
+      { cmd = "mapper chaosstats unused [count|all]", desc = "Show only current chaos portals that have never been attempted" },
       { cmd = "mapper portalstats recent [count]", desc = "Show the newest portal attempts with confirmation details (default 20, maximum 50)" },
       { cmd = "mapper rebuildportals", desc = "Rebuild portal list from exits with commands starting 'dinv portal use <id>'" },
       { cmd = "mapper portalguard", desc = "List individually guarded DINV portals and their required effective levels" },

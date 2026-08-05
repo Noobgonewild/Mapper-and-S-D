@@ -747,13 +747,14 @@ function snd.scan.currentTargetMatchesSmartScan(activeTab)
     local current = snd.targets and snd.targets.current or nil
     if not snd.scan.targetIsAlive(current) then return false end
     local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    local nxOverride = snd.nav and snd.nav.nxOverride or nil
     local ownsAdhocQuickWhere = current.activity == "qw"
-        and quickWhere and quickWhere.isAdhoc == true
-        and quickWhere.active == true
-        and type(quickWhere.rooms) == "table"
-        and #quickWhere.rooms > 0
+        and ((quickWhere and quickWhere.isAdhoc == true)
+            or (nxOverride and nxOverride.mode == "adhoc_qw"))
+    if ownsAdhocQuickWhere then
+        return true
+    end
     if activeTab and activeTab ~= "" and current.activity ~= activeTab
-        and not ownsAdhocQuickWhere
     then
         return false
     end
@@ -1497,6 +1498,8 @@ function snd.nav.invalidateQuickWhereForTarget(nextTarget)
     snd.nav.nxOverride = nil
     snd.nav.nxState = nil
     snd.nav.xcpLookup = nil
+    snd.nav.pendingTargetRoomFallback = nil
+    snd.nav.targetAreaFallback = nil
 
     if snd.utils and type(snd.utils.debugNote) == "function" then
         snd.utils.debugNote("Invalidated quick-where state for target change")
@@ -1562,6 +1565,9 @@ end
 
 --- Set a new target
 function snd.setTarget(target)
+    if target and snd.commands and type(snd.commands.bindTargetSelection) == "function" then
+        snd.commands.bindTargetSelection(target)
+    end
     snd.nav.invalidateQuickWhereForTarget(target)
     snd.targets.current = target
     if target and target.activity and snd.targets.scoped then
@@ -1734,6 +1740,14 @@ function snd.onDestinationArrived()
                 snd.nav.nxState.arrived = true
             end
         end
+    end
+
+    -- An unreachable target's area-start fallback is an approach destination,
+    -- not proof that the target room was reached. Preserve the selected target
+    -- and room list without firing the normal target-room arrival action.
+    if snd.commands and type(snd.commands.handleTargetAreaFallbackArrival) == "function"
+        and snd.commands.handleTargetAreaFallbackArrival(snd.room.current.rmid) == true then
+        return
     end
 
     -- QW/hybrid/HT approaches own their arrival action. The live lookup must

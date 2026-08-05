@@ -953,51 +953,43 @@ function snd.cp.reconcileSelectionAfterRebuild()
         end
     end
 
-    local function matchesEntry(selection, entry)
-        if type(selection) ~= "table" or type(entry) ~= "table" then
-            return false
-        end
-
-        local selMob = tostring(selection.name or selection.mob or ""):lower()
-        local entryMob = tostring(entry.mob or ""):lower()
-        if selMob == "" or entryMob == "" or selMob ~= entryMob then
-            return false
-        end
-
-        local selArea = tostring(selection.areaName or selection.loc or selection.area or ""):lower()
-        local entryArea = tostring(entry.loc or entry.areaName or entry.area or ""):lower()
-        if selArea ~= "" and entryArea ~= "" and selArea ~= entryArea then
-            return false
-        end
-
-        return true
-    end
-
-    local function selectionStillValid(selection)
+    local function reconcileSelection(selection)
         if type(selection) ~= "table" then
             return false
         end
         if selection.activity ~= "cp" then
             return true
         end
-        for _, entry in ipairs(cpEntries) do
-            if matchesEntry(selection, entry) then
-                return true
+        if not snd.commands or type(snd.commands.findTargetSelectionEntry) ~= "function" then
+            local selectedMob = tostring(selection.name or selection.mob or ""):lower()
+            local selectedArea = tostring(selection.area or selection.arid or ""):lower()
+            for _, entry in ipairs(cpEntries) do
+                local entryMob = tostring(entry.mob or entry.name or ""):lower()
+                local entryArea = tostring(entry.arid or entry.area or ""):lower()
+                if selectedMob ~= "" and selectedMob == entryMob
+                    and (selectedArea == "" or entryArea == "" or selectedArea == entryArea)
+                then
+                    return true
+                end
             end
+            return false
         end
-        return false
+        local entry = snd.commands.findTargetSelectionEntry(selection, cpEntries)
+        if not entry then return false end
+        snd.commands.bindTargetSelection(selection, entry)
+        return true
     end
 
     local clearedScoped = false
     local clearedCurrent = false
 
-    if snd.targets and snd.targets.scoped and snd.targets.scoped.cp and not selectionStillValid(snd.targets.scoped.cp) then
+    if snd.targets and snd.targets.scoped and snd.targets.scoped.cp and not reconcileSelection(snd.targets.scoped.cp) then
         snd.targets.scoped.cp = nil
         clearedScoped = true
     end
 
     if snd.targets and snd.targets.current and snd.targets.current.activity == "cp"
-        and not selectionStillValid(snd.targets.current) then
+        and not reconcileSelection(snd.targets.current) then
         if snd.nav and snd.nav.invalidateQuickWhereForTarget then
             snd.nav.invalidateQuickWhereForTarget(nil)
         end
