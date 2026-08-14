@@ -5333,10 +5333,60 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
         }
     end
 
-    -- A room with both restrictions follows a strict recovery ladder. Do not
-    -- calculate a global walking route until the bounded nearby search and the
-    -- source-area start have both failed.
+    -- A room with both restrictions normally follows a strict recovery ladder.
+    -- A known same-area destination is different: inspect the unrestricted
+    -- shortest route first. If it walks, the room flags are irrelevant. If its
+    -- first step is a blocked jump, compare the complete walk-only route with
+    -- the nearby-jump recovery route before choosing either one.
     if usePortals and currentNoPortal and currentNoRecall then
+        local sameKnownArea = sourceArea ~= ""
+            and destinationArea ~= ""
+            and sourceArea == destinationArea
+        local walkingCandidate = nil
+
+        if sameKnownArea then
+            local shortestPath, shortestDepth = snd.mapper.findPath(
+                currentRoom,
+                roomId,
+                noPortals,
+                noRecalls,
+                ignoreLockedExits,
+                nil,
+                true
+            )
+            if shortestPath and #shortestPath > 0 and not snd.mapper.pathStartsWithJump(shortestPath) then
+                local shortestCandidate = {
+                    kind = "normal",
+                    path = shortestPath,
+                    depth = shortestDepth,
+                }
+                snd.utils.debugNote(string.format(
+                    "Both-flags same-area route is a valid %d-step walk; skipping jump recovery.",
+                    #shortestPath
+                ))
+                return shortestCandidate, details(nil, shortestCandidate)
+            end
+
+            local walkingPath, walkingDepth = snd.mapper.findPath(
+                currentRoom,
+                roomId,
+                true,
+                true,
+                ignoreLockedExits,
+                nil,
+                nil,
+                nil,
+                "walk"
+            )
+            if walkingPath and #walkingPath > 0 then
+                walkingCandidate = {
+                    kind = "same_area_walk",
+                    path = walkingPath,
+                    depth = walkingDepth,
+                }
+            end
+        end
+
         local outwardPath, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(
             currentRoom,
             roomId,
@@ -5347,12 +5397,26 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
                 searchDepthLimit = nearbyRadius,
             }
         )
-        if outwardPath and #outwardPath > 0 then
-            local nearbyCandidate = {
-                kind = "nearby_" .. tostring(outwardType or "jump"),
-                path = outwardPath,
-                viaRoom = outwardRoom,
-            }
+        local nearbyCandidate = outwardPath and #outwardPath > 0 and {
+            kind = "nearby_" .. tostring(outwardType or "jump"),
+            path = outwardPath,
+            viaRoom = outwardRoom,
+        } or nil
+
+        if sameKnownArea then
+            local sameAreaCandidate = snd.mapper.chooseShortestRoute({
+                walkingCandidate,
+                nearbyCandidate,
+            })
+            if sameAreaCandidate then
+                snd.utils.debugNote(string.format(
+                    "Selected legal same-area route kind=%s steps=%d.",
+                    tostring(sameAreaCandidate.kind),
+                    #sameAreaCandidate.path
+                ))
+                return sameAreaCandidate, details(nil, sameAreaCandidate)
+            end
+        elseif nearbyCandidate then
             snd.utils.debugNote(string.format(
                 "Selected nearby jump room %s within radius %d (%d steps).",
                 tostring(outwardRoom or "?"),
@@ -5391,22 +5455,24 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
             end
         end
 
-        local walkingPath, walkingDepth = snd.mapper.findPath(
-            currentRoom,
-            roomId,
-            true,
-            true,
-            ignoreLockedExits,
-            nil,
-            nil,
-            nil,
-            "walk"
-        )
-        local walkingCandidate = walkingPath and #walkingPath > 0 and {
-            kind = "walk_last_resort",
-            path = walkingPath,
-            depth = walkingDepth,
-        } or nil
+        if not sameKnownArea then
+            local walkingPath, walkingDepth = snd.mapper.findPath(
+                currentRoom,
+                roomId,
+                true,
+                true,
+                ignoreLockedExits,
+                nil,
+                nil,
+                nil,
+                "walk"
+            )
+            walkingCandidate = walkingPath and #walkingPath > 0 and {
+                kind = "walk_last_resort",
+                path = walkingPath,
+                depth = walkingDepth,
+            } or nil
+        end
         return walkingCandidate, details(nil, walkingCandidate)
     end
 
