@@ -161,19 +161,34 @@ local function clamp_local_room_size(value)
   return n
 end
 
+local function clamp_local_zoom(value)
+  local n = tonumber(value) or 100
+  n = math.floor(n + 0.5)
+  if n < 50 then n = 50 end
+  if n > 300 then n = 300 end
+  return n
+end
+
 local function ensure_minimap_options()
   mm.state = mm.state or {}
   mm.state.minimap = mm.state.minimap or {}
   local opts = mm.state.minimap
-  if opts.bigmap_mode ~= "local" and opts.bigmap_mode ~= "native" and opts.bigmap_mode ~= "hybrid" then
+  if opts.bigmap_mode == "local" then
+    opts.bigmap_mode = "hybrid"
+  elseif opts.bigmap_mode ~= "native" and opts.bigmap_mode ~= "hybrid" then
     opts.bigmap_mode = "hybrid"
   end
   opts.local_radius = clamp_local_radius(opts.local_radius)
   opts.local_room_size = clamp_local_room_size(opts.local_room_size)
+  opts.local_zoom = clamp_local_zoom(opts.local_zoom)
   return opts
 end
 
 local function active_bigmap_mode()
+  local runtime_override = mm.runtime and mm.runtime.bigmap_mode_override
+  if runtime_override == "local" or runtime_override == "native" then
+    return runtime_override
+  end
   local configured = ensure_minimap_options().bigmap_mode
   if configured == "hybrid" then
     local runtime_mode = mm.runtime and mm.runtime.hybrid_bigmap_backend
@@ -557,6 +572,7 @@ local function create_local_map_canvas()
     canvas = canvas,
     background = background,
     drawables = {},
+    drawable_pools = {},
     draw_serial = 0,
     adjustable = shell and true or false,
   }
@@ -673,17 +689,23 @@ local function create_window(which)
     if active_bigmap_mode() == "native" then
       local win, err = create_bigmap_mapper()
       if win then
+        if mm.runtime then mm.runtime.hybrid_native_unavailable_reason = nil end
         mm.minimap.backend = "mudlet_mapper"
         mm.minimap.lines.bigmap = mm.minimap.lines.bigmap or {}
         return win
       end
-      mm.warn("Mudlet mapper widget unavailable for bigmap (" .. tostring(err) .. "). Falling back to local radius map.")
+      mm.warn("Mudlet mapper widget unavailable for bigmap (" .. tostring(err) .. ").")
       if opts.bigmap_mode == "hybrid" then
         mm.runtime = mm.runtime or {}
-        mm.runtime.hybrid_bigmap_backend = "local"
-      else
-        opts.bigmap_mode = "local"
+        mm.runtime.hybrid_native_unavailable_reason = tostring(err)
       end
+      local unavailable = create_miniconsole(which)
+      unavailable.kind = "native_unavailable"
+      mm.minimap.backend = "native_unavailable"
+      mm.minimap.lines[which] = {
+        "Native continent map unavailable: " .. tostring(err),
+      }
+      return unavailable
     end
   end
 
@@ -900,22 +922,25 @@ local function clean_local_label(text, max_len)
   return s
 end
 
-local function add_local_stub(graph, source_id, dir, target_id, reason, one_way)
+local function add_local_stub(graph, source_id, dir, target_id, reason, one_way, level, lock_styled)
   graph.stubs[source_id] = graph.stubs[source_id] or {}
   if graph.stubs[source_id][dir] then return end
   graph.stubs[source_id][dir] = {
     target = target_id,
     reason = reason,
     one_way = one_way == true,
+    level = tonumber(level) or 0,
+    lock_styled = lock_styled == true,
   }
   graph.stub_count = (graph.stub_count or 0) + 1
 end
 
-local function add_local_connection(graph, source_id, dir, target_id, one_way)
+local function add_local_connection(graph, source_id, dir, target_id, one_way, level)
   graph.connections[source_id] = graph.connections[source_id] or {}
   graph.connections[source_id][dir] = {
     target = target_id,
     one_way = one_way == true,
+    level = tonumber(level) or 0,
   }
 end
 
@@ -1047,6 +1072,8 @@ local function build_local_graph(center_id, radius)
           graph.vertical[source_key][dir] = {
             target = target_key,
             one_way = one_way,
+            level = tonumber(exit.level) or 0,
+            lock_styled = exit.map_kind == "direct",
           }
         else
           local def = LOCAL_DIRS[dir]
@@ -1062,22 +1089,25 @@ local function build_local_graph(center_id, radius)
 
           if not can_place then
             add_local_stub(graph, source_key, dir, target_key,
-              exit.stub_reason or "non-geometric local edge", one_way)
+              exit.stub_reason or "non-geometric local edge", one_way,
+              exit.level, exit.map_kind == "direct")
           elseif target_pos then
             if target_pos.x == nx and target_pos.y == ny then
-              add_local_connection(graph, source_key, dir, target_key, one_way)
+              add_local_connection(graph, source_key, dir, target_key, one_way, exit.level)
             else
               add_local_stub(graph, source_key, dir, target_key,
-                "target already placed elsewhere", one_way)
+                "target already placed elsewhere", one_way, exit.level, true)
             end
           elseif not in_bounds then
-            add_local_stub(graph, source_key, dir, target_key, "outside local radius", one_way)
+            add_local_stub(graph, source_key, dir, target_key,
+              "outside local radius", one_way, exit.level, true)
           elseif occupant and occupant ~= target_key then
-            add_local_stub(graph, source_key, dir, target_key, "local coordinate overlap", one_way)
+            add_local_stub(graph, source_key, dir, target_key,
+              "local coordinate overlap", one_way, exit.level, true)
           else
             graph.rooms[target_key] = target_room
             place_local_room(graph, target_key, nx, ny)
-            add_local_connection(graph, source_key, dir, target_key, one_way)
+            add_local_connection(graph, source_key, dir, target_key, one_way, exit.level)
             table.insert(queue, target_num)
           end
         end
@@ -1089,6 +1119,8 @@ local function build_local_graph(center_id, radius)
 end
 
 local LOCAL_EXIT_COLOR = "rgba(224,255,255,220)"
+local LOCAL_EXIT_RESTRICTED_COLOR = "#f2b84b"
+local LOCAL_EXIT_BLOCKED_COLOR = "#ff4d5d"
 local LOCAL_VERTICAL_COLOR = "#ffb6c1"
 local LOCAL_CURRENT_COLOR = "#ff1493"
 local LOCAL_TRIANGLE = {
@@ -1098,33 +1130,135 @@ local LOCAL_TRIANGLE = {
   w = "\226\151\128",
 }
 
-local function clear_local_drawables(window)
-  for i = #(window.drawables or {}), 1, -1 do
-    local drawable = window.drawables[i]
-    if drawable and type(drawable.delete) == "function" then
-      pcall(drawable.delete, drawable)
+local function current_exit_visual_level()
+  if snd and snd.mapper and type(snd.mapper.currentExitVisualLevel) == "function" then
+    return snd.mapper.currentExitVisualLevel()
+  end
+  local status = gmcp and gmcp.char and gmcp.char.status
+  local level = status and tonumber(status.level) or nil
+  if level == nil then level = tonumber(snd and snd.char and snd.char.level) end
+  return level or 0
+end
+
+local function local_exit_visual_state(level, player_level)
+  local lock_level = tonumber(level) or 0
+  if lock_level <= 0 then return "normal" end
+  if (tonumber(player_level) or current_exit_visual_level()) < lock_level then
+    return "blocked"
+  end
+  return "restricted"
+end
+
+local function local_exit_visual_color(state)
+  if state == "blocked" then return LOCAL_EXIT_BLOCKED_COLOR end
+  if state == "restricted" then return LOCAL_EXIT_RESTRICTED_COLOR end
+  return LOCAL_EXIT_COLOR
+end
+
+local function local_render_now_ms()
+  if type(getEpoch) == "function" then
+    local ok, value = pcall(getEpoch)
+    value = ok and tonumber(value) or nil
+    if value then return value < 10000000000 and value * 1000 or value end
+  end
+  return (os.clock() or 0) * 1000
+end
+
+local function begin_local_drawables(window)
+  window.drawable_pools = window.drawable_pools or {}
+  window.drawables = window.drawables or {}
+  window._local_visible_drawables = 0
+  for _, pool in pairs(window.drawable_pools) do
+    pool.used = 0
+  end
+end
+
+local function finish_local_drawables(window)
+  for _, pool in pairs(window.drawable_pools or {}) do
+    for index = (tonumber(pool.used) or 0) + 1, #(pool.items or {}) do
+      local drawable = pool.items[index]
+      if drawable and type(drawable.hide) == "function" then
+        pcall(drawable.hide, drawable)
+      end
     end
   end
-  window.drawables = {}
+end
+
+local function record_local_render(window, started_at)
+  local elapsed = math.max(0, local_render_now_ms() - (tonumber(started_at) or local_render_now_ms()))
+  local rounded = math.floor(elapsed + 0.5)
+  window.local_render_stats = window.local_render_stats or {
+    renders = 0, total_ms = 0, max_ms = 0, created = 0, reused = 0, peak_visible = 0,
+  }
+  local stats = window.local_render_stats
+  stats.renders = (tonumber(stats.renders) or 0) + 1
+  stats.total_ms = (tonumber(stats.total_ms) or 0) + elapsed
+  stats.max_ms = math.max(tonumber(stats.max_ms) or 0, elapsed)
+  stats.peak_visible = math.max(tonumber(stats.peak_visible) or 0,
+    tonumber(window._local_visible_drawables) or 0)
+  if mm and mm.bump_stats_many then
+    mm.bump_stats_many({
+      local_map_renders = 1,
+      local_map_render_ms = rounded,
+    })
+    local global_stats = mm.ensure_stats and mm.ensure_stats() or nil
+    if global_stats then
+      global_stats.local_map_render_max_ms = math.max(
+        tonumber(global_stats.local_map_render_max_ms) or 0, rounded)
+    end
+  end
 end
 
 local function new_local_drawable(window, kind, x, y, width, height, stylesheet, text, tooltip)
-  window.draw_serial = (window.draw_serial or 0) + 1
-  local ok, label = pcall(function()
-    return Geyser.Label:new({
-      name = string.format("mm_bigmap_local_%s_%d", kind, window.draw_serial),
-      x = math.floor(x + 0.5),
-      y = math.floor(y + 0.5),
-      width = math.max(1, math.floor(width + 0.5)),
-      height = math.max(1, math.floor(height + 0.5)),
-    }, window.canvas)
-  end)
-  if not ok or not label then return nil end
+  window.drawable_pools = window.drawable_pools or {}
+  local pool = window.drawable_pools[kind]
+  if not pool then
+    pool = {items = {}, used = 0}
+    window.drawable_pools[kind] = pool
+  end
+  pool.used = (tonumber(pool.used) or 0) + 1
+  local index = pool.used
+  local label = pool.items[index]
+  local px = math.floor(x + 0.5)
+  local py = math.floor(y + 0.5)
+  local pw = math.max(1, math.floor(width + 0.5))
+  local ph = math.max(1, math.floor(height + 0.5))
+
+  if not label then
+    window.draw_serial = (window.draw_serial or 0) + 1
+    local ok, created = pcall(function()
+      return Geyser.Label:new({
+        name = string.format("mm_bigmap_local_%s_%d", kind, window.draw_serial),
+        x = px,
+        y = py,
+        width = pw,
+        height = ph,
+      }, window.canvas)
+    end)
+    if not ok or not created then return nil end
+    label = created
+    pool.items[index] = label
+    table.insert(window.drawables, label)
+    window.local_render_stats = window.local_render_stats or {}
+    window.local_render_stats.created = (tonumber(window.local_render_stats.created) or 0) + 1
+    if mm and mm.bump_stats then mm.bump_stats("local_drawables_created") end
+  else
+    if type(label.move) == "function" then pcall(label.move, label, px, py) end
+    if type(label.resize) == "function" then pcall(label.resize, label, pw, ph) end
+    window.local_render_stats = window.local_render_stats or {}
+    window.local_render_stats.reused = (tonumber(window.local_render_stats.reused) or 0) + 1
+    if mm and mm.bump_stats then mm.bump_stats("local_drawables_reused") end
+  end
+
+  -- Keep these fields accurate for lightweight test doubles and for useful
+  -- inspection in Mudlet; Geyser's move/resize methods remain authoritative.
+  label.x, label.y, label.width, label.height = px, py, pw, ph
 
   if stylesheet and label.setStyleSheet then label:setStyleSheet(stylesheet) end
   if text and label.echo then pcall(label.echo, label, text, nil, "c") end
-  if tooltip and label.setToolTip then pcall(label.setToolTip, label, tooltip) end
-  table.insert(window.drawables, label)
+  if label.setToolTip then pcall(label.setToolTip, label, tooltip or "") end
+  if type(label.show) == "function" then pcall(label.show, label) end
+  window._local_visible_drawables = (tonumber(window._local_visible_drawables) or 0) + 1
   return label
 end
 
@@ -1168,49 +1302,80 @@ local function local_point(layout, pos)
     layout.center_y - pos.y * layout.cell
 end
 
-local function draw_local_line(window, x1, y1, x2, y2, color)
+local function draw_local_line(window, x1, y1, x2, y2, color, thickness)
+  thickness = math.max(1, math.floor(tonumber(thickness) or 1))
   if math.abs(x2 - x1) >= math.abs(y2 - y1) then
-    return new_local_drawable(window, "hline", math.min(x1, x2), y1,
-      math.max(1, math.abs(x2 - x1)), 1,
+    return new_local_drawable(window, "hline", math.min(x1, x2), y1 - thickness / 2,
+      math.max(1, math.abs(x2 - x1)), thickness,
       "background-color: " .. color .. "; border: 0px;")
   end
-  return new_local_drawable(window, "vline", x1, math.min(y1, y2),
-    1, math.max(1, math.abs(y2 - y1)),
+  return new_local_drawable(window, "vline", x1 - thickness / 2, math.min(y1, y2),
+    thickness, math.max(1, math.abs(y2 - y1)),
     "background-color: " .. color .. "; border: 0px;")
 end
 
 local function draw_local_direction_marker(window, layout, source_pos, dir, color)
   local def = LOCAL_DIRS[dir]
   if not def then return end
+
   local sx, sy = local_point(layout, source_pos)
-  local distance = layout.node_half + 5
-  local mx = sx + def.dx * distance - 5
-  local my = sy - def.dy * distance - 5
-  new_local_drawable(window, "arrow", mx, my, 10, 10,
-    "background-color: transparent; border: 0px; color: " .. color .. "; font-size: 7pt;",
-    LOCAL_TRIANGLE[dir])
+  local screen_dx, screen_dy = def.dx, -def.dy
+  local size = math.max(5, math.min(11, math.floor(7 * layout.zoom + 0.5)))
+  if size % 2 == 0 then size = size + 1 end
+  local half = math.floor(size / 2)
+  local gap = math.max(1, layout.cell - layout.node_size)
+  local distance = layout.node_half + math.max(half + 1, gap * 0.32)
+  local center_x = sx + screen_dx * distance
+  local center_y = sy + screen_dy * distance
+
+  -- Build a filled arrowhead from small solid rectangles.  This avoids the
+  -- font-dependent alignment and shape of Unicode triangle glyphs.
+  for offset = 0, half do
+    local cross_size = math.max(1, size - offset * 2)
+    local axis_offset = -half + offset * 2
+    local axis_size = offset == half and 1 or 2
+    local x, y, width, height
+    if screen_dx ~= 0 then
+      x = center_x + screen_dx * axis_offset - axis_size / 2
+      y = center_y - cross_size / 2
+      width, height = axis_size, cross_size
+    else
+      x = center_x - cross_size / 2
+      y = center_y + screen_dy * axis_offset - axis_size / 2
+      width, height = cross_size, axis_size
+    end
+    new_local_drawable(window, "arrow", x, y, width, height,
+      "background-color: " .. color .. "; border: 0px;")
+  end
 end
 
 local function render_local_graphical(window, graph)
-  clear_local_drawables(window)
+  local started_at = local_render_now_ms()
+  begin_local_drawables(window)
   window.graph = graph
 
   local width, height = local_canvas_dimensions(window)
   local span = graph.radius * 2 + 1
   local available = math.min((width - 24) / span, (height - 24) / span)
   local requested_room_size = clamp_local_room_size(graph.local_room_size)
+  local zoom = clamp_local_zoom(graph.local_zoom) / 100
   local cell_cap = math.min(48, math.max(30, requested_room_size + 10))
-  local cell = math.max(18, math.min(cell_cap, math.floor(available)))
-  local node_size = math.max(10, math.min(requested_room_size, cell - 6))
+  local base_cell = math.max(18, math.min(cell_cap, math.floor(available)))
+  local cell = math.max(10, math.floor(base_cell * zoom + 0.5))
+  local node_size = math.max(6, math.min(
+    math.floor(requested_room_size * zoom + 0.5), cell - 4))
   local layout = {
     center_x = width / 2,
     center_y = height / 2,
     cell = cell,
     node_size = node_size,
     node_half = node_size / 2,
+    zoom = zoom,
   }
 
-  local drawn_segments = {}
+  local player_level = current_exit_visual_level()
+  local state_rank = { normal = 0, restricted = 1, blocked = 2 }
+  local segments = {}
   for source_id, dirs in pairs(graph.connections) do
     local source_pos = graph.placed[source_id]
     if source_pos then
@@ -1223,20 +1388,46 @@ local function render_local_graphical(window, graph)
           local key_a = local_coord_key(source_pos.x, source_pos.y)
           local key_b = local_coord_key(target_pos.x, target_pos.y)
           local segment_key = key_a < key_b and (key_a .. "|" .. key_b) or (key_b .. "|" .. key_a)
-          if not drawn_segments[segment_key] then
-            drawn_segments[segment_key] = true
-            draw_local_line(window,
-              source_x + def.dx * layout.node_half,
-              source_y - def.dy * layout.node_half,
-              target_x - def.dx * layout.node_half,
-              target_y + def.dy * layout.node_half,
-              LOCAL_EXIT_COLOR)
+          local state = local_exit_visual_state(connection.level, player_level)
+          local segment = segments[segment_key]
+          if not segment then
+            segment = {
+              x1 = source_x + def.dx * layout.node_half,
+              y1 = source_y - def.dy * layout.node_half,
+              x2 = target_x - def.dx * layout.node_half,
+              y2 = target_y + def.dy * layout.node_half,
+              state = state,
+              markers = {},
+            }
+            segments[segment_key] = segment
+          elseif state_rank[state] > state_rank[segment.state] then
+            segment.state = state
           end
-          if connection.one_way then
-            draw_local_direction_marker(window, layout, source_pos, dir, "#e0ffff")
+          if (tonumber(connection.level) or 0) > 0 then
+            table.insert(segment.markers, {
+              source_pos = source_pos,
+              dir = dir,
+              color = local_exit_visual_color(state),
+            })
+          elseif connection.one_way then
+            table.insert(segment.markers, {
+              source_pos = source_pos,
+              dir = dir,
+              color = "#e0ffff",
+            })
           end
         end
       end
+    end
+  end
+
+  for _, segment in pairs(segments) do
+    local thickness = segment.state == "normal" and 1 or math.max(2, math.floor(zoom + 0.5))
+    draw_local_line(window,
+      segment.x1, segment.y1, segment.x2, segment.y2,
+      local_exit_visual_color(segment.state), thickness)
+    for _, marker in ipairs(segment.markers) do
+      draw_local_direction_marker(window, layout, marker.source_pos, marker.dir, marker.color)
     end
   end
 
@@ -1248,13 +1439,19 @@ local function render_local_graphical(window, graph)
       for dir, stub in pairs(dirs) do
         local def = LOCAL_DIRS[dir]
         if def then
+          local state = stub.lock_styled
+            and local_exit_visual_state(stub.level, player_level)
+            or "normal"
+          local color = local_exit_visual_color(state)
           local x1 = source_x + def.dx * layout.node_half
           local y1 = source_y - def.dy * layout.node_half
           draw_local_line(window, x1, y1,
             x1 + def.dx * stub_length,
             y1 - def.dy * stub_length,
-            LOCAL_EXIT_COLOR)
-          if stub.one_way then
+            color, state == "normal" and 1 or math.max(2, math.floor(zoom + 0.5)))
+          if stub.lock_styled and (tonumber(stub.level) or 0) > 0 then
+            draw_local_direction_marker(window, layout, source_pos, dir, color)
+          elseif stub.one_way then
             draw_local_direction_marker(window, layout, source_pos, dir, "#e0ffff")
           end
         end
@@ -1281,31 +1478,47 @@ local function render_local_graphical(window, graph)
 
     local vertical = graph.vertical[room_id] or {}
     if vertical.u then
+      local up_state = vertical.u.lock_styled
+        and local_exit_visual_state(vertical.u.level, player_level)
+        or "normal"
+      local up_color = up_state == "normal" and LOCAL_VERTICAL_COLOR
+        or local_exit_visual_color(up_state)
       new_local_drawable(window, "up", x + layout.node_half - 2, y - layout.node_half - 7,
-        8, 8, "background-color: transparent; border: 0px; color: " .. LOCAL_VERTICAL_COLOR .. "; font-size: 6pt;",
+        8, 8, "background-color: transparent; border: 0px; color: " .. up_color .. "; font-size: 6pt;",
         LOCAL_TRIANGLE.n)
     end
     if vertical.d then
+      local down_state = vertical.d.lock_styled
+        and local_exit_visual_state(vertical.d.level, player_level)
+        or "normal"
+      local down_color = down_state == "normal" and LOCAL_VERTICAL_COLOR
+        or local_exit_visual_color(down_state)
       new_local_drawable(window, "down", x - layout.node_half - 6, y + layout.node_half - 1,
-        8, 8, "background-color: transparent; border: 0px; color: " .. LOCAL_VERTICAL_COLOR .. "; font-size: 6pt;",
+        8, 8, "background-color: transparent; border: 0px; color: " .. down_color .. "; font-size: 6pt;",
         LOCAL_TRIANGLE.s)
     end
   end
 
   if window.background and window.background.lower then pcall(window.background.lower, window.background) end
+  finish_local_drawables(window)
+  record_local_render(window, started_at)
 end
 
 local function render_local_error(window, message)
-  clear_local_drawables(window)
+  local started_at = local_render_now_ms()
+  begin_local_drawables(window)
   window.graph = nil
   local width, height = local_canvas_dimensions(window)
   new_local_drawable(window, "error", 12, height / 2 - 12, width - 24, 24,
     "background-color: transparent; border: 0px; color: #ff7878; font-size: 9pt;",
     clean_local_label(message, 120))
+  finish_local_drawables(window)
+  record_local_render(window, started_at)
 end
 
 local function render_local_nomap(window, room_size)
-  clear_local_drawables(window)
+  local started_at = local_render_now_ms()
+  begin_local_drawables(window)
   window.graph = nil
   local width, height = local_canvas_dimensions(window)
   local size = clamp_local_room_size(room_size)
@@ -1313,9 +1526,20 @@ local function render_local_nomap(window, room_size)
     size, size,
     "background-color: rgba(105,105,105,155); border: 3px solid " .. LOCAL_CURRENT_COLOR .. ";")
   if window.background and window.background.lower then pcall(window.background.lower, window.background) end
+  finish_local_drawables(window)
+  record_local_render(window, started_at)
 end
 
 mm.minimap._build_local_graph = build_local_graph
+mm.minimap._local_exit_visual_state = local_exit_visual_state
+
+function mm.minimap.refresh_exit_lock_styles()
+  if active_bigmap_mode() ~= "local" then return false end
+  local window = mm.minimap.windows and mm.minimap.windows.bigmap
+  if not (window and window.kind == "local_radius" and window.graph) then return false end
+  mm.minimap.redraw("bigmap")
+  return true
+end
 
 function mm.minimap.update_local_map(room_id, update_opts)
   local opts = ensure_minimap_options()
@@ -1351,6 +1575,7 @@ function mm.minimap.update_local_map(room_id, update_opts)
     and tostring(window.local_center_id or "") == tostring(center_id)
     and tonumber(window.local_radius) == tonumber(opts.local_radius)
     and tonumber(window.local_room_size) == tonumber(opts.local_room_size)
+    and tonumber(window.local_zoom) == tonumber(opts.local_zoom)
     and tonumber(window.layout_cache_generation or 0) == cache_generation
   if same_view and not (update_opts and update_opts.force) then
     return true
@@ -1363,10 +1588,12 @@ function mm.minimap.update_local_map(room_id, update_opts)
   end
 
   graph.local_room_size = opts.local_room_size
+  graph.local_zoom = opts.local_zoom
   window.graph = graph
   window.local_center_id = center_id
   window.local_radius = opts.local_radius
   window.local_room_size = opts.local_room_size
+  window.local_zoom = opts.local_zoom
   window.layout_cache_generation = cache_generation
   mm.minimap.redraw("bigmap")
   return true
@@ -1397,6 +1624,59 @@ function mm.minimap.set_local_room_size(room_size)
   mm.note(string.format("Bigmap local room size set to %d pixels.", opts.local_room_size))
 end
 
+function mm.minimap.set_local_zoom(zoom)
+  local opts = ensure_minimap_options()
+  opts.local_zoom = clamp_local_zoom(zoom)
+  if mm.save_settings_persistence then
+    mm.save_settings_persistence()
+  end
+
+  local window = mm.minimap.windows and mm.minimap.windows.bigmap
+  if active_bigmap_mode() == "local" and window and window.kind == "local_radius" and window.graph then
+    window.local_zoom = opts.local_zoom
+    window.graph.local_zoom = opts.local_zoom
+    mm.minimap.redraw("bigmap")
+  elseif active_bigmap_mode() == "local" then
+    mm.minimap.update_local_map(nil, {force = true})
+  end
+  mm.note(string.format("Bigmap local zoom set to %d%%.", opts.local_zoom))
+  return true, opts.local_zoom
+end
+
+function mm.minimap.zoom_bigmap(direction)
+  direction = tostring(direction or ""):lower()
+  if direction ~= "in" and direction ~= "out" then
+    return false, "zoom direction must be 'in' or 'out'"
+  end
+
+  if active_bigmap_mode() == "native" then
+    if type(getMapZoom) ~= "function" or type(setMapZoom) ~= "function" then
+      mm.warn("Native mapper zoom APIs are unavailable in this Mudlet version.")
+      return false
+    end
+    local got, current = pcall(getMapZoom)
+    current = got and tonumber(current) or nil
+    if not current then
+      mm.warn("Could not read the native mapper zoom level.")
+      return false
+    end
+    -- Mudlet's native zoom scale is inverse: smaller values are closer.
+    local target = direction == "in" and math.max(3, current - 2.5) or current + 2.5
+    local called, result, err = pcall(setMapZoom, target)
+    if not called or (result == nil and err ~= nil) or result == false then
+      mm.warn("Could not change native mapper zoom: " .. tostring(err or result))
+      return false
+    end
+    if type(updateMap) == "function" then pcall(updateMap) end
+    mm.note(string.format("Bigmap native zoom set to %.1f.", target))
+    return true, target
+  end
+
+  local opts = ensure_minimap_options()
+  local delta = direction == "in" and 20 or -20
+  return mm.minimap.set_local_zoom(opts.local_zoom + delta)
+end
+
 local function ensure_native_bigmap_data()
   if not mm.load_native_mapper_db then return true end
   local native_path = mm.resolve_native_mapper_db and
@@ -1413,7 +1693,7 @@ local function ensure_native_bigmap_data()
   return true
 end
 
-local function activate_current_bigmap_surface(reason)
+local function activate_current_bigmap_surface(reason, completion, load_immediately)
   destroy_window("bigmap")
   mm.minimap.lines = mm.minimap.lines or {}
   mm.minimap.lines.bigmap = {}
@@ -1423,12 +1703,18 @@ local function activate_current_bigmap_surface(reason)
     mm.minimap.update_local_map(nil, { force = true })
   elseif mm.minimap.backend == "mudlet_mapper" then
     if mm.schedule_native_mapper_load then
-      mm.schedule_native_mapper_load(reason or "bigmap_backend_switch")
+      mm.schedule_native_mapper_load(reason or "bigmap_backend_switch", completion, load_immediately)
     else
-      ensure_native_bigmap_data()
+      local loaded = ensure_native_bigmap_data()
       if mm.sync_native_bigmap_to_current_room then
         mm.sync_native_bigmap_to_current_room(reason or "bigmap_backend_switch")
       end
+      if type(completion) == "function" then completion(loaded == true) end
+    end
+  else
+    mm.minimap.redraw("bigmap")
+    if type(completion) == "function" then
+      completion(false, "native BigMap surface could not be created")
     end
   end
   return true
@@ -1456,8 +1742,8 @@ end
 
 function mm.minimap.set_bigmap_mode(mode)
   local requested = tostring(mode or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-  if requested ~= "local" and requested ~= "native" and requested ~= "hybrid" then
-    mm.warn("Usage: mapper bigmap local|native|hybrid")
+  if requested ~= "native" and requested ~= "hybrid" then
+    mm.warn("Usage: mapper bigmap native|hybrid")
     return false
   end
   if mm.minimap.is_navigation_active() then
@@ -1467,6 +1753,11 @@ function mm.minimap.set_bigmap_mode(mode)
 
   local opts = ensure_minimap_options()
   mm.runtime = mm.runtime or {}
+  if mm.cancel_native_mapper_startup_load then
+    mm.cancel_native_mapper_startup_load()
+  end
+  mm.runtime.bigmap_mode_override = nil
+  mm.runtime.native_preload_active = nil
   mm.runtime.hybrid_navigation_active = nil
   mm.runtime.hybrid_navigation_destination = nil
   mm.runtime.hybrid_bigmap_backend = nil
@@ -1477,31 +1768,103 @@ function mm.minimap.set_bigmap_mode(mode)
   end
 
   activate_current_bigmap_surface("bigmap_mode_switch")
-  if requested == "native" and mm.minimap.backend ~= "mudlet_mapper" then
-    opts.bigmap_mode = "local"
-    if mm.save_settings_persistence then
-      mm.save_settings_persistence()
-    end
-  end
-
   mm.note(string.format("Bigmap mode set to %s.", opts.bigmap_mode))
   return true
 end
 
-function mm.minimap.activate_bigmap_native()
-  if active_bigmap_mode() == "native" then return false end
+function mm.minimap.get_local_render_stats()
+  local window = mm.minimap.windows and mm.minimap.windows.bigmap
+  local stats = window and window.local_render_stats or {}
+  local renders = tonumber(stats.renders) or 0
+  return {
+    renders = renders,
+    total_ms = tonumber(stats.total_ms) or 0,
+    average_ms = renders > 0 and ((tonumber(stats.total_ms) or 0) / renders) or 0,
+    max_ms = tonumber(stats.max_ms) or 0,
+    created = tonumber(stats.created) or 0,
+    reused = tonumber(stats.reused) or 0,
+    peak_visible = tonumber(stats.peak_visible) or 0,
+  }
+end
+
+function mm.minimap.reset_local_render_stats()
+  local window = mm.minimap.windows and mm.minimap.windows.bigmap
+  if window then
+    window.local_render_stats = {
+      renders = 0, total_ms = 0, max_ms = 0, created = 0, reused = 0,
+      peak_visible = 0,
+    }
+  end
+  local global_stats = mm.ensure_stats and mm.ensure_stats() or nil
+  if global_stats then
+    global_stats.local_map_renders = 0
+    global_stats.local_map_render_ms = 0
+    global_stats.local_map_render_max_ms = 0
+    global_stats.local_drawables_created = 0
+    global_stats.local_drawables_reused = 0
+  end
+  return true
+end
+
+local function restore_after_native_preload(loaded, err)
   mm.runtime = mm.runtime or {}
-  if mm.runtime.hybrid_native_unavailable_reason then
+  if not mm.runtime.native_preload_active then return false end
+  mm.runtime.native_preload_active = nil
+  mm.runtime.bigmap_mode_override = nil
+  activate_current_bigmap_surface("native_preload_restore")
+  if loaded then
+    mm.debug("Native mapper preload completed; restored configured BigMap mode.")
+  else
+    mm.debug("Native mapper preload ended without a loaded map: " .. tostring(err))
+  end
+  return true
+end
+
+function mm.minimap.begin_native_preload(reason)
+  local opts = ensure_minimap_options()
+  mm.runtime = mm.runtime or {}
+  if opts.bigmap_mode == "native" then
+    return false, "configured BigMap mode is already native"
+  end
+  if mm.minimap.is_navigation_active() then
+    return false, "navigation is active"
+  end
+  if mm.runtime.native_preload_active then
+    return false, "a native map preload is already active"
+  end
+
+  mm.runtime.native_preload_active = true
+  mm.runtime.bigmap_mode_override = "native"
+  activate_current_bigmap_surface(reason or "native_preload_startup", restore_after_native_preload, true)
+  return true
+end
+
+function mm.minimap.cancel_native_preload(reason)
+  if not (mm.runtime and mm.runtime.native_preload_active) then return false end
+  return restore_after_native_preload(false, reason or "native preload canceled")
+end
+
+function mm.minimap.activate_bigmap_native()
+  local opts = ensure_minimap_options()
+  mm.runtime = mm.runtime or {}
+  if mm.runtime.native_preload_active and opts.bigmap_mode == "hybrid" then
+    mm.runtime.hybrid_bigmap_backend = "native"
     return false
   end
+  if active_bigmap_mode() == "native" then return false end
   mm.runtime.hybrid_bigmap_backend = "native"
   activate_current_bigmap_surface("gmcp_continent_room")
   return true
 end
 
 function mm.minimap.activate_bigmap_local()
-  if active_bigmap_mode() == "local" then return false end
+  local opts = ensure_minimap_options()
   mm.runtime = mm.runtime or {}
+  if mm.runtime.native_preload_active and opts.bigmap_mode == "hybrid" then
+    mm.runtime.hybrid_bigmap_backend = "local"
+    return false
+  end
+  if active_bigmap_mode() == "local" then return false end
   mm.runtime.hybrid_bigmap_backend = "local"
   activate_current_bigmap_surface("gmcp_area_room")
   return true
@@ -1509,7 +1872,7 @@ end
 
 function mm.minimap.get_bigmap_mode()
   local opts = ensure_minimap_options()
-  return opts.bigmap_mode, opts.local_radius, opts.local_room_size
+  return opts.bigmap_mode, opts.local_radius, opts.local_room_size, opts.local_zoom
 end
 
 function mm.minimap.get_active_bigmap_mode()

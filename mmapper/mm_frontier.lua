@@ -610,6 +610,18 @@ local function show_reachable_target(target, path)
   cecho("\n")
 end
 
+local function show_gq_blocked_chaos_target(target, path)
+  local info = mapper_room_info(target) or {}
+  local name = trim(info.name) ~= "" and trim(info.name) or "room"
+  cecho("\n<yellow>Mapper found a chaos-portal route, but it is disabled during GQ:<reset>\n")
+  cecho(string.format(
+    "  %-36s (%-8d) path %d <yellow>[GQ chaos blocked]<reset>\n",
+    tostring(name):sub(1, 36),
+    target,
+    path and #path or 0
+  ))
+end
+
 function frontier.xrtnear(targetUid)
   local target = normalize_uid(targetUid)
   if not target then return false, "Usage: xrtnear <room UID>" end
@@ -646,13 +658,48 @@ function frontier.xrtnear(targetUid)
     return false, string.format("stored xrtnear redirect %d -> %d could not be started", target, destination)
   end
 
-  local directPath = path_between(nav, source, target)
-  if not directPath and type(nav.buildOutwardJumpRoute) == "function" then
-    directPath = nav.buildOutwardJumpRoute(tostring(source), tostring(target), nil)
+  local directPath, routePlan
+  if type(nav.planNavigationRoute) == "function" then
+    local ok, selected, details = pcall(
+      nav.planNavigationRoute,
+      tostring(source),
+      tostring(target),
+      true,
+      false
+    )
+    if ok then
+      directPath = selected and selected.path or nil
+      routePlan = details
+    else
+      if type(mm.debug) == "function" then
+        mm.debug("xrtnear route preview failed: " .. tostring(selected))
+      end
+    end
+  else
+    directPath = path_between(nav, source, target)
+    if not directPath and type(nav.buildOutwardJumpRoute) == "function" then
+      directPath = nav.buildOutwardJumpRoute(tostring(source), tostring(target), nil)
+    end
   end
   if directPath then
     show_reachable_target(target, directPath)
     return true
+  end
+
+  if type(nav.findGqChaosDiagnosticPath) == "function" then
+    routePlan = type(routePlan) == "table" and routePlan or {}
+    local chaosPath = nav.findGqChaosDiagnosticPath(
+      tostring(source),
+      tostring(target),
+      routePlan.noPortals,
+      routePlan.noRecalls,
+      false,
+      false
+    )
+    if chaosPath then
+      show_gq_blocked_chaos_target(target, chaosPath)
+      return true
+    end
   end
 
   return frontier.show_near_boundaries(tostring(target))

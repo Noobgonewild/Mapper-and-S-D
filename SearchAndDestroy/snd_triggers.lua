@@ -718,50 +718,135 @@ function snd.triggers.tagGqTargetLine()
     appendTargetTag("[GQ]", "<yellow>")
 end
 
+function snd.triggers.tagQuestTargetLine()
+    -- The server already identifies the real quest instance with a trailing
+    -- [QUEST]. Keep room output authoritative and reserve [Q] for ConWin.
+    return false
+end
+
+local function currentRoomCharsRoomId()
+    local roomInfo = gmcp and gmcp.room and gmcp.room.info or nil
+    if type(roomInfo) == "table" and type(mm) == "table"
+        and type(mm.canonical_room_uid) == "function"
+    then
+        local ok, roomId = pcall(mm.canonical_room_uid, roomInfo)
+        if ok and roomId ~= nil and tostring(roomId) ~= "" then
+            return tostring(roomId)
+        end
+    end
+
+    local roomId = snd.room and snd.room.current and snd.room.current.rmid or nil
+    if roomId ~= nil and tostring(roomId) ~= "" then
+        return tostring(roomId)
+    end
+    return tostring(type(roomInfo) == "table" and roomInfo.num or "")
+end
+
+local function currentTargetTagArea()
+    return snd.utils.trim(snd.room and snd.room.current and snd.room.current.arid or ""):lower()
+end
+
+local function resolvedTargetTagArea(target)
+    local area = snd.utils.trim(target and target.arid or "")
+    local needsResolution = area == ""
+    if needsResolution and target then area = snd.utils.trim(target.area or target.loc or "") end
+    if needsResolution and area ~= "" and snd.db and snd.db.getAreaKeyFromName then
+        area = snd.db.getAreaKeyFromName(area) or area
+    end
+    return tostring(area or ""):lower()
+end
+
+local function targetActivityIsLive(target)
+    if not target or target.dead or target.killed then return false end
+    if target.activity == "cp" then return snd.campaign and snd.campaign.active == true end
+    if target.activity == "gq" then return snd.gquest and snd.gquest.active == true end
+    if target.activity == "quest" then
+        local status = snd.quest and snd.quest.target and tostring(snd.quest.target.status or "") or ""
+        return status == "2" or status == "active" or status == "missing"
+    end
+    return false
+end
+
+local function markerSetFromText(text)
+    local tags = {}
+    if tostring(text):find("[Q]", 1, true) then tags.quest = true end
+    if tostring(text):find("[CP]", 1, true) then tags.cp = true end
+    if tostring(text):find("[GQ]", 1, true) then tags.gq = true end
+    return tags
+end
+
+function snd.triggers.tagCurrentRoomCharsLine()
+    if not (snd.roomChars and snd.roomChars.active) then return end
+    local line = snd.utils.stripColors(type(getCurrentLine) == "function" and getCurrentLine() or ""):lower()
+    if line == "" then return end
+    local tags = {}
+    for _, matcher in ipairs(snd.roomChars.targetMatchers or {}) do
+        if matcher.name ~= "" and line:find(matcher.name, 1, true) then
+            for activity in pairs(matcher.tags or {}) do tags[activity] = true end
+        end
+    end
+
+    if tags.quest then
+        local evidence = snd.roomChars.questTargetEvidence
+        if evidence and not evidence.complete then
+            evidence.matchingCount = (tonumber(evidence.matchingCount) or 0) + 1
+            if line:match("%[quest%]%s*$") then
+                evidence.markedOrdinal = evidence.matchingCount
+            end
+        end
+    end
+
+    if tags.cp then snd.triggers.tagCpTargetLine() end
+    if tags.gq then snd.triggers.tagGqTargetLine() end
+end
+
 function snd.triggers.registerTargetLineTriggers()
     snd.triggers.unregisterTargetLineTriggers()
+    snd.roomChars = snd.roomChars or {}
+    local currentArea = currentTargetTagArea()
+    snd.roomChars.targetMatcherArea = currentArea
     if not snd.targets or not snd.targets.list or #snd.targets.list == 0 then
         return
     end
 
-    if not snd.campaign.active and not snd.gquest.active then
-        return
+    local byName = {}
+    local function addMatcher(rawName, activity)
+        local name = snd.utils.trim(snd.utils.stripColors(rawName or "")):lower()
+        if name == "" then return end
+        local matcher = byName[name]
+        if not matcher then
+            matcher = {name = name, tags = {}}
+            byName[name] = matcher
+        end
+        matcher.tags[activity] = true
     end
 
-    snd.targets.lineTriggerIds = {}
-    local seen = {}
-
     for _, target in ipairs(snd.targets.list) do
-        if target.activity == "cp" and not target.dead and snd.campaign.active then
-            local mob = snd.utils.stripColors(target.mob or "")
-            if mob ~= "" then
-                local key = "cp:" .. mob
-                if not seen[key] then
-                    seen[key] = true
-                    local escaped = snd.utils.escapeRegex(mob)
-                    local pattern = ".*" .. escaped .. ".*"
-                    local id = tempRegexTrigger(pattern, function()
-                        snd.triggers.tagCpTargetLine()
-                    end)
-                    table.insert(snd.targets.lineTriggerIds, id)
-                end
-            end
-        elseif target.activity == "gq" and not target.dead and snd.gquest.active then
-            local mob = snd.utils.stripColors(target.mob or "")
-            if mob ~= "" then
-                local key = "gq:" .. mob
-                if not seen[key] then
-                    seen[key] = true
-                    local escaped = snd.utils.escapeRegex(mob)
-                    local pattern = ".*" .. escaped .. ".*"
-                    local id = tempRegexTrigger(pattern, function()
-                        snd.triggers.tagGqTargetLine()
-                    end)
-                    table.insert(snd.targets.lineTriggerIds, id)
-                end
+        if targetActivityIsLive(target) and currentArea ~= ""
+            and resolvedTargetTagArea(target) == currentArea
+        then
+            addMatcher(target.mob or target.name, target.activity)
+            addMatcher(target.matchedMobName, target.activity)
+        end
+    end
+
+    -- A successfully parsed consider roster can contribute the exact visible
+    -- description when it already resolves unambiguously to an activity target.
+    if snd.conwin and snd.conwin.activityMarkersForMob then
+        for _, mob in ipairs(snd.conwin.mobs or {}) do
+            local markerText = snd.conwin.activityMarkersForMob(mob.name or "")
+            for activity in pairs(markerSetFromText(markerText)) do
+                addMatcher(mob.name, activity)
             end
         end
     end
+
+    snd.roomChars.targetMatchers = {}
+    for _, matcher in pairs(byName) do
+        snd.roomChars.targetMatchers[#snd.roomChars.targetMatchers + 1] = matcher
+    end
+    table.sort(snd.roomChars.targetMatchers, function(a, b) return a.name < b.name end)
+    snd.roomChars.targetMatcherArea = currentArea
 end
 
 -------------------------------------------------------------------------------
@@ -771,12 +856,19 @@ end
 function snd.triggers.roomCharsStart()
     snd.roomChars = snd.roomChars or {}
     snd.roomChars.active = true
+    snd.roomChars.questTargetEvidence = {
+        roomId = currentRoomCharsRoomId(),
+        matchingCount = 0,
+        markedOrdinal = nil,
+        complete = false,
+    }
     -- Clean up a line-capture trigger left by an older plugin version. ConWin
     -- must only consume consider output, never the broad RoomChars stream.
     if snd.roomChars.lineCaptureId then
         pcall(killTrigger, snd.roomChars.lineCaptureId)
         snd.roomChars.lineCaptureId = nil
     end
+    snd.roomChars.lineCaptureId = tempRegexTrigger("^.*$", snd.triggers.tagCurrentRoomCharsLine)
     if snd.conwin and snd.conwin.onMobdetectRoomcharsStart then
         snd.conwin.onMobdetectRoomcharsStart()
     end
@@ -789,8 +881,14 @@ function snd.triggers.roomCharsEnd()
         snd.roomChars.lineCaptureId = nil
     end
     snd.roomChars.active = false
+    if snd.roomChars.questTargetEvidence then
+        snd.roomChars.questTargetEvidence.complete = true
+    end
     if snd.conwin and snd.conwin.onRoomcharsEnd then
         snd.conwin.onRoomcharsEnd()
+    end
+    if snd.conwin and snd.conwin.onQuestTargetEvidenceUpdated then
+        snd.conwin.onQuestTargetEvidenceUpdated(snd.roomChars.questTargetEvidence)
     end
 end
 
@@ -952,6 +1050,9 @@ function snd.triggers.unregisterTargetLineTriggers()
         end
         snd.targets.lineTriggerIds = nil
     end
+    snd.roomChars = snd.roomChars or {}
+    snd.roomChars.targetMatchers = {}
+    snd.roomChars.targetMatcherArea = nil
 end
 
 -------------------------------------------------------------------------------

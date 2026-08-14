@@ -9,7 +9,7 @@ mm.state = mm.state or {
   backups_compressed = false,
   show_up_down = false,
   underline_links = true,
-  minimap = { enabled = true, show_room = true, show_exits = true, show_coords = true, echo = true, bigmap_mode = "hybrid", local_radius = 4, local_room_size = 15 },
+  minimap = { enabled = true, show_room = true, show_exits = true, show_coords = true, echo = true, bigmap_mode = "hybrid", local_radius = 4, local_room_size = 15, local_zoom = 100 },
   windows = {
     minimap = { x = "70%", y = "0%", width = "30%", height = "35%", max_lines = 16, enabled = true, locked = false, font_size = 8 },
     bigmap = { x = "45%", y = "35%", width = "55%", height = "65%", max_lines = 60, enabled = true, locked = false, font_size = 9 },
@@ -17,6 +17,7 @@ mm.state = mm.state or {
   last_target = nil,
   map_db = "Aardwolf.db",
   native_mapper_db = "mmapper_converted_map.dat",
+  native_mapper_preload_enabled = false,
   auto_locate = true,
   center_on_locate = true,
   portal_guard_enabled = false,
@@ -32,6 +33,9 @@ if type(mm.state.map_db) ~= "string" or not mm.state.map_db:match("%S") then
 end
 if type(mm.state.native_mapper_db) ~= "string" or not mm.state.native_mapper_db:match("%S") then
   mm.state.native_mapper_db = "mmapper_converted_map.dat"
+end
+if type(mm.state.native_mapper_preload_enabled) ~= "boolean" then
+  mm.state.native_mapper_preload_enabled = false
 end
 if type(mm.state.autostop_enabled) ~= "boolean" then
   mm.state.autostop_enabled = true
@@ -111,6 +115,11 @@ local STATS_FIELDS = {
   "layouts_rebuilt",
   "room_colors_set",
   "env_colors_set",
+  "local_map_renders",
+  "local_map_render_ms",
+  "local_map_render_max_ms",
+  "local_drawables_created",
+  "local_drawables_reused",
   "skipped",
   "failed",
 }
@@ -189,6 +198,13 @@ function mm.show_stats()
   print_stat("Room colors set", stats.room_colors_set)
   print_stat("Env colors set", stats.env_colors_set)
 
+  cecho("\n  <yellow>Local BigMap rendering<reset>\n")
+  print_stat("Renders", stats.local_map_renders)
+  print_stat("Total render ms", stats.local_map_render_ms)
+  print_stat("Slowest render ms", stats.local_map_render_max_ms)
+  print_stat("Drawables created", stats.local_drawables_created)
+  print_stat("Drawables reused", stats.local_drawables_reused)
+
   cecho("\n  <yellow>Problems<reset>\n")
   print_stat("Skipped", stats.skipped)
   print_stat("Failed", stats.failed)
@@ -261,21 +277,31 @@ function mm.load_settings_persistence()
   if type(data.native_mapper_db) == "string" and data.native_mapper_db ~= "" then
     mm.state.native_mapper_db = data.native_mapper_db
   end
+  if type(data.native_mapper_preload_enabled) == "boolean" then
+    mm.state.native_mapper_preload_enabled = data.native_mapper_preload_enabled
+  end
   if type(data.auto_locate) == "boolean" then
     mm.state.auto_locate = data.auto_locate
     mm.state.center_on_locate = data.auto_locate
   end
   if type(data.minimap) == "table" then
     mm.state.minimap = mm.state.minimap or {}
-    if data.minimap.bigmap_mode == "local" or data.minimap.bigmap_mode == "native" or
-        data.minimap.bigmap_mode == "hybrid" then
+    if data.minimap.bigmap_mode == "native" or data.minimap.bigmap_mode == "hybrid" then
       mm.state.minimap.bigmap_mode = data.minimap.bigmap_mode
+    elseif data.minimap.bigmap_mode == "local" then
+      -- Local remains an internal hybrid backend, but is no longer a public
+      -- configuration. Migrate old profiles without making them render
+      -- continents through the area renderer.
+      mm.state.minimap.bigmap_mode = "hybrid"
     end
     if tonumber(data.minimap.local_radius) then
       mm.state.minimap.local_radius = tonumber(data.minimap.local_radius)
     end
     if tonumber(data.minimap.local_room_size) then
       mm.state.minimap.local_room_size = tonumber(data.minimap.local_room_size)
+    end
+    if tonumber(data.minimap.local_zoom) then
+      mm.state.minimap.local_zoom = tonumber(data.minimap.local_zoom)
     end
   end
   return true
@@ -291,11 +317,13 @@ function mm.save_settings_persistence()
     portal_guard_enabled = false,
     autostop_enabled = mm.state.autostop_enabled ~= false,
     native_mapper_db = mm.state.native_mapper_db or "mmapper_converted_map.dat",
+    native_mapper_preload_enabled = mm.state.native_mapper_preload_enabled == true,
     auto_locate = mm.state.auto_locate ~= false,
     minimap = {
       bigmap_mode = (mm.state.minimap and mm.state.minimap.bigmap_mode) or "hybrid",
       local_radius = tonumber(mm.state.minimap and mm.state.minimap.local_radius) or 4,
       local_room_size = tonumber(mm.state.minimap and mm.state.minimap.local_room_size) or 15,
+      local_zoom = tonumber(mm.state.minimap and mm.state.minimap.local_zoom) or 100,
     },
   }))
   f:close()
@@ -333,14 +361,24 @@ local function sanitize_deleted_cexit_entry(entry)
   local touid = tostring(entry.touid or ""):gsub("^%s+", ""):gsub("%s+$", "")
   local dir = tostring(entry.dir or ""):gsub("^%s+", ""):gsub("%s+$", "")
   if fromuid == "" or touid == "" or dir == "" then return nil end
-  return {
+  local cleaned = {
     fromuid = fromuid,
     touid = touid,
     dir = dir,
     area = tostring(entry.area or ""),
     name = tostring(entry.name or ""),
+    level = tonumber(entry.level) or 0,
     deleted_at = tonumber(entry.deleted_at) or os.time(),
   }
+  local key_name = tostring(entry.key_name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  local key_keywords = tostring(entry.key_keywords or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  local alternate_command = tostring(entry.alternate_command or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if key_keywords ~= "" and alternate_command ~= "" then
+    cleaned.key_name = key_name
+    cleaned.key_keywords = key_keywords
+    cleaned.alternate_command = alternate_command
+  end
+  return cleaned
 end
 
 function mm.load_deleted_cexits_persistence()
@@ -1184,7 +1222,37 @@ function mm.set_native_mapper_db(path)
   mm.note("Native mapper DB set to: " .. tostring(resolved))
 end
 
+function mm.native_mapper_preload_status_text()
+  if mm.state.native_mapper_preload_enabled == true then
+    return "native map preload on: hybrid briefly initializes the normal native BigMap at startup, loads once, then restores the configured display mode."
+  end
+  return "native map preload off: hybrid loads the native map lazily on the first continent that needs it."
+end
+
+function mm.set_native_mapper_preload(enabled)
+  mm.state.native_mapper_preload_enabled = enabled == true
+  local ok, err = mm.save_settings_persistence()
+  if not ok then
+    return false, err
+  end
+
+  if mm.state.native_mapper_preload_enabled then
+    if mm.initialized and mm.schedule_native_mapper_preload then
+      mm.schedule_native_mapper_preload("native_preload_enabled")
+    end
+  else
+    if mm.cancel_native_mapper_startup_load then
+      mm.cancel_native_mapper_startup_load()
+    end
+    if mm.minimap and mm.minimap.cancel_native_preload then
+      mm.minimap.cancel_native_preload("native preload disabled")
+    end
+  end
+  return true
+end
+
 function mm.load_native_mapper_db(path)
+  local pipeline_started = now_millis()
   local resolved = mm.resolve_native_mapper_db(path)
   if not resolved then
     return false, "native mapper DB path is empty"
@@ -1223,7 +1291,9 @@ function mm.load_native_mapper_db(path)
   mm.runtime.native_mapper_db_loaded_path = resolved
   mm.runtime.hybrid_native_unavailable_reason = nil
   mm.runtime.terrain_colors_applied = nil
+  mm.runtime.native_missing_room_warnings = {}
   mm.note("Loaded native Mudlet mapper DB: " .. resolved)
+  local colors_started = now_millis()
   if mm.import and mm.import.apply_environment_colors_from_sqlite then
     local colors_ok, colors_err = mm.import.apply_environment_colors_from_sqlite(mm.state.map_db)
     if not colors_ok then mm.debug("Native map terrain colors deferred: " .. tostring(colors_err)) end
@@ -1231,9 +1301,30 @@ function mm.load_native_mapper_db(path)
     local colors_ok, colors_err = mm.apply_terrain_colors()
     if not colors_ok then mm.debug("Native map terrain colors deferred: " .. tostring(colors_err)) end
   end
+  mm.debug(string.format(
+    "native mapper terrain-color timing: %.1fms",
+    now_millis() - colors_started))
+  mm.runtime.native_exit_lock_visuals = {}
+  local exit_visuals_started = now_millis()
+  if snd and snd.mapper and type(snd.mapper.refreshNativeExitLockVisuals) == "function" then
+    local visuals_ok, visuals_err = snd.mapper.refreshNativeExitLockVisuals(nil, true)
+    if not visuals_ok then
+      mm.debug("Native exit-lock colors deferred: " .. tostring(visuals_err))
+    end
+  end
+  mm.debug(string.format(
+    "native mapper exit-lock visual timing: %.1fms",
+    now_millis() - exit_visuals_started))
+  local sync_started = now_millis()
   if mm.sync_native_bigmap_to_current_room then
     mm.sync_native_bigmap_to_current_room("native_map_loaded")
   end
+  mm.debug(string.format(
+    "native mapper room-sync timing: %.1fms",
+    now_millis() - sync_started))
+  mm.debug(string.format(
+    "native mapper total load pipeline timing: %.1fms",
+    now_millis() - pipeline_started))
   return true
 end
 
@@ -1292,9 +1383,12 @@ function mm.goto_room(target)
     return false, "xrt requires mapper navigation module"
   end
 
-  local ok, result = pcall(nav.xrt, tostring(target))
+  local ok, result, route_error = pcall(nav.xrt, tostring(target))
   if not ok then
     return false, "xrt failed: " .. tostring(result)
+  end
+  if result ~= true then
+    return false, route_error or "xrt could not start a route to room " .. tostring(target)
   end
   mm.state.last_target = target
   return true
@@ -1347,7 +1441,12 @@ function mm.lock_exit(direction, level)
     return false, string.format("no '%s' exit found in room %s", dir, tostring(room))
   end
 
-  mm.note(string.format("Locked exit %s in room %s below level %d.", dir, tostring(room), lockLevel))
+  if type(nav.syncExitLockVisual) == "function" then
+    local visual_ok, visual_err = pcall(nav.syncExitLockVisual, room, dir)
+    if not visual_ok then mm.debug("lockexit visual refresh failed: " .. tostring(visual_err)) end
+  end
+
+  mm.note(string.format("Set exit lock %s in room %s to %d.", dir, tostring(room), lockLevel))
   return true
 end
 
@@ -1375,6 +1474,10 @@ function mm.unlock_exit(direction)
   if affected == 0 then
     return false, string.format("no '%s' exit found in room %s", dir, tostring(room))
   end
+  if type(nav.syncExitLockVisual) == "function" then
+    local visual_ok, visual_err = pcall(nav.syncExitLockVisual, room, dir)
+    if not visual_ok then mm.debug("unlockexit visual refresh failed: " .. tostring(visual_err)) end
+  end
   mm.note(string.format("Unlocked exit %s in room %s.", dir, tostring(room)))
   return true
 end
@@ -1396,31 +1499,26 @@ function mm.list_locked_exits_here()
     return true
   end
 
-  local byRoom = {}
-  for _, row in ipairs(rows) do
-    local dir = nav.normalizeDirection and nav.normalizeDirection(row.dir) or tostring(row.dir):lower()
-    local lvl = tonumber(row.level)
-    if dir and lvl and lvl > 0 then
-      byRoom[dir] = math.max(byRoom[dir] or 0, lvl)
-    end
-  end
-
-  if next(byRoom) == nil then
-    mm.note("No locked exits set for room " .. tostring(room) .. ".")
-    return true
-  end
-
   mm.note("Locked exits for room " .. tostring(room) .. ":")
-  local order = {"n", "s", "e", "w", "u", "d"}
-  for _, dir in ipairs(order) do
-    local lvl = byRoom[dir]
-    if lvl then
-      if lvl >= 999 then
-        mm.note("  " .. dir .. " => all levels (db level " .. tostring(lvl) .. ")")
-      else
-        mm.note("  " .. dir .. " => below level " .. tostring(lvl))
-      end
+  cecho("<gray>#   Command                        To             Lock<reset>\n")
+  cecho("<gray>------------------------------------------------------------<reset>\n")
+  for i, row in ipairs(rows) do
+    local command = tostring(row.dir or "")
+    local destination = tostring(row.touid or "")
+    local destination_number = tonumber(destination)
+    local level = tonumber(row.level) or 0
+    cecho(string.format("<light_grey>%-3d %-30.30s <reset>", i, command))
+    if destination_number and destination_number > 0 then
+      echoLink(
+        string.format("%-14s", "(" .. tostring(destination_number) .. ")"),
+        [[mm.goto_room(]] .. tostring(destination_number) .. [[)]],
+        "Go to destination room",
+        true
+      )
+    else
+      cecho(string.format("<light_grey>%-14.14s<reset>", "(" .. destination .. ")"))
     end
+    cecho(string.format(" <light_grey>%d<reset>\n", level))
   end
   return true
 end
@@ -1665,6 +1763,59 @@ function mm.set_room_flag(flag, arg)
 end
 
 local NOTES_DB_NAME = "Aardwolf.db"
+mm.room_notes_cache = mm.room_notes_cache or {}
+mm.room_notes_cache_loaded = mm.room_notes_cache_loaded == true
+
+function mm.invalidate_room_notes_cache()
+  mm.room_notes_cache = {}
+  mm.room_notes_cache_loaded = false
+end
+
+function mm.load_room_notes_cache()
+  local rows, err
+  if snd and snd.mapper and snd.mapper.db and type(snd.mapper.db.query) == "function" then
+    rows = snd.mapper.db.query("SELECT uid, notes FROM bookmarks WHERE notes IS NOT NULL AND notes <> ''")
+    if not rows then err = "persistent mapper database query failed" end
+  end
+  if not rows and type(mm.query_mapper_db) == "function" then
+    rows, err = mm.query_mapper_db(
+      "SELECT uid, notes FROM bookmarks WHERE notes IS NOT NULL AND notes <> ''",
+      NOTES_DB_NAME)
+  end
+  if not rows then
+    mm.room_notes_cache_loaded = false
+    return false, err
+  end
+
+  local cache = {}
+  for _, row in ipairs(rows) do
+    local room_id = tonumber(row.uid)
+    local note = tostring(row.notes or "")
+    if room_id and note ~= "" then cache[room_id] = note end
+  end
+  mm.room_notes_cache = cache
+  mm.room_notes_cache_loaded = true
+  return true, cache
+end
+
+local function cache_room_note(room_id, note_text)
+  if not mm.room_notes_cache_loaded then return end
+  local rid = tonumber(room_id)
+  if not rid then return end
+  local note = tostring(note_text or "")
+  mm.room_notes_cache[rid] = note ~= "" and note or nil
+end
+
+local function split_room_notes(note_text)
+  local normalized = tostring(note_text or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+  local notes = {}
+  for line in (normalized .. "\n"):gmatch("(.-)\n") do
+    if line:match("%S") then
+      notes[#notes + 1] = line
+    end
+  end
+  return notes
+end
 
 function mm.add_note(note_text)
   local room = mm.current_room()
@@ -1680,22 +1831,25 @@ function mm.add_note(note_text)
     return false, "note text cannot be empty"
   end
 
-  local clear_ok, clear_err = mm.exec_mapper_db(string.format("DELETE FROM bookmarks WHERE uid=%d", room), NOTES_DB_NAME)
-  if not clear_ok then
-    return false, clear_err
+  local existing_note, read_err = mm.get_room_note(room)
+  if existing_note == nil then
+    return false, read_err or "could not read the existing room notes"
   end
 
-  local sql = string.format("INSERT INTO bookmarks (uid, notes) VALUES (%d, %s)", room, mm.sql_escape(note))
+  existing_note = tostring(existing_note)
+  local combined_note = existing_note ~= "" and (existing_note .. "\n" .. note) or note
+  local sql = string.format("INSERT OR REPLACE INTO bookmarks (uid, notes) VALUES (%d, %s)", room, mm.sql_escape(combined_note))
   local ok, err = mm.exec_mapper_db(sql, NOTES_DB_NAME)
   if not ok then
     return false, err
   end
 
-  mm.note(string.format("Room note saved for %d.", room))
+  cache_room_note(room, combined_note)
+  mm.note(string.format("Room note %s for %d.", existing_note ~= "" and "appended" or "saved", room))
   return true
 end
 
-function mm.delete_note()
+function mm.delete_note(note_selector)
   local room = mm.current_room()
   if not room then
     return false, "current room unknown"
@@ -1704,12 +1858,65 @@ function mm.delete_note()
     return false, "notes are not available in unmapped rooms"
   end
 
-  local ok, err = mm.exec_mapper_db(string.format("DELETE FROM bookmarks WHERE uid=%d", room), NOTES_DB_NAME)
+  local existing_note, read_err = mm.get_room_note(room)
+  if existing_note == nil then
+    return false, read_err or "could not read the existing room notes"
+  end
+
+  local notes = split_room_notes(existing_note)
+  if #notes == 0 then
+    return false, string.format("room %d has no saved notes", room)
+  end
+
+  local selector = tostring(note_selector or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if selector == "" and #notes > 1 then
+    mm.note(string.format("Room %d has %d notes:", room, #notes))
+    for index, note in ipairs(notes) do
+      mm.note(string.format("  %d) %s", index, note))
+    end
+    mm.note("Use 'mapper delete note <number>' to remove one, or 'mapper delete note all' to remove every note.")
+    return true
+  end
+
+  if selector:lower() == "all" then
+    local ok, err = mm.exec_mapper_db(string.format("DELETE FROM bookmarks WHERE uid=%d", room), NOTES_DB_NAME)
+    if not ok then
+      return false, err
+    end
+    cache_room_note(room, "")
+    mm.note(string.format("All room notes deleted for %d.", room))
+    return true
+  end
+
+  if selector == "" then selector = "1" end
+  if not selector:match("^%d+$") then
+    return false, "Usage: mapper delete note <number|all>"
+  end
+
+  local note_index = tonumber(selector)
+  if note_index < 1 or note_index > #notes then
+    return false, string.format("note number must be between 1 and %d", #notes)
+  end
+
+  local removed_note = table.remove(notes, note_index)
+  local sql
+  if #notes == 0 then
+    sql = string.format("DELETE FROM bookmarks WHERE uid=%d", room)
+  else
+    sql = string.format(
+      "INSERT OR REPLACE INTO bookmarks (uid, notes) VALUES (%d, %s)",
+      room,
+      mm.sql_escape(table.concat(notes, "\n"))
+    )
+  end
+
+  local ok, err = mm.exec_mapper_db(sql, NOTES_DB_NAME)
   if not ok then
     return false, err
   end
 
-  mm.note(string.format("Room note deleted for %d.", room))
+  cache_room_note(room, table.concat(notes, "\n"))
+  mm.note(string.format("Room note %d deleted for %d: %s", note_index, room, removed_note))
   return true
 end
 
@@ -1717,6 +1924,10 @@ function mm.get_room_note(room_id)
   local rid = tonumber(room_id)
   if not rid then
     return nil
+  end
+
+  if mm.room_notes_cache_loaded then
+    return tostring(mm.room_notes_cache[rid] or "")
   end
 
   local sql = string.format("SELECT notes FROM bookmarks WHERE uid = %d LIMIT 1", rid)
@@ -1799,6 +2010,26 @@ local MAPPER_SCHEMA_SQL = {
       touid TEXT NOT NULL,
       level STRING NOT NULL DEFAULT '0',
       PRIMARY KEY(fromuid, dir, touid))]],
+  [[CREATE TABLE IF NOT EXISTS cexit_key_alternates(
+      fromuid TEXT NOT NULL,
+      dir TEXT NOT NULL,
+      touid TEXT NOT NULL,
+      key_name TEXT NOT NULL,
+      key_keywords TEXT NOT NULL DEFAULT '',
+      alternate_command TEXT NOT NULL,
+      PRIMARY KEY(fromuid, dir))]],
+  [[CREATE TABLE IF NOT EXISTS cexit_key_observations(
+      fromuid TEXT NOT NULL,
+      dir TEXT NOT NULL,
+      touid TEXT NOT NULL,
+      observed_key TEXT NOT NULL,
+      observed_key_normalized TEXT NOT NULL,
+      resolved_key_name TEXT,
+      door_direction TEXT,
+      seen_count INTEGER NOT NULL DEFAULT 0,
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      PRIMARY KEY(fromuid, dir, touid, observed_key_normalized))]],
   [[CREATE TABLE IF NOT EXISTS bookmarks(
       uid TEXT NOT NULL,
       notes TEXT,
@@ -2160,8 +2391,165 @@ function mm.ensure_random_cexits_table()
   )
 end
 
+function mm.ensure_cexit_key_alternates_table()
+  local ok, err = mm.exec_mapper_db([[
+    CREATE TABLE IF NOT EXISTS cexit_key_alternates(
+      fromuid TEXT NOT NULL,
+      dir TEXT NOT NULL,
+      touid TEXT NOT NULL,
+      key_name TEXT NOT NULL,
+      key_keywords TEXT NOT NULL DEFAULT '',
+      alternate_command TEXT NOT NULL,
+      PRIMARY KEY(fromuid, dir))
+  ]])
+  if not ok then return false, err end
+
+  local columns, columns_err = mm.query_mapper_db("PRAGMA table_info('cexit_key_alternates')")
+  if not columns then return false, columns_err end
+  local has_key_keywords = false
+  for _, column in ipairs(columns) do
+    if tostring(column.name or ""):lower() == "key_keywords" then
+      has_key_keywords = true
+      break
+    end
+  end
+  if not has_key_keywords then
+    local altered, alter_err = mm.exec_mapper_db(
+      "ALTER TABLE cexit_key_alternates ADD COLUMN key_keywords TEXT NOT NULL DEFAULT ''"
+    )
+    if not altered then return false, alter_err end
+  end
+
+  local indexed, index_err = mm.exec_mapper_db(
+    "CREATE INDEX IF NOT EXISTS cexit_key_alternates_touid_index ON cexit_key_alternates(touid)"
+  )
+  if not indexed then return false, index_err end
+
+  local orphan_rows, orphan_err = mm.query_mapper_db([[
+    SELECT COUNT(*) AS cnt
+    FROM cexit_key_alternates AS cka
+    WHERE NOT EXISTS (
+      SELECT 1 FROM exits
+      WHERE exits.fromuid = cka.fromuid
+        AND exits.dir = cka.dir
+        AND exits.touid = cka.touid)
+  ]])
+  if not orphan_rows then return false, orphan_err end
+  local orphan_count = tonumber(orphan_rows[1] and orphan_rows[1].cnt) or 0
+  if orphan_count > 0 then
+    local cleaned, cleanup_err = mm.exec_mapper_db([[
+      DELETE FROM cexit_key_alternates
+      WHERE NOT EXISTS (
+        SELECT 1 FROM exits
+        WHERE exits.fromuid = cexit_key_alternates.fromuid
+          AND exits.dir = cexit_key_alternates.dir
+          AND exits.touid = cexit_key_alternates.touid)
+    ]])
+    if not cleaned then return false, cleanup_err end
+    mm.warn(string.format("Removed %d orphaned conditional cexit record%s.",
+      orphan_count, orphan_count == 1 and "" or "s"))
+  end
+  return true
+end
+
+function mm.ensure_cexit_key_observations_table()
+  local ok, err = mm.exec_mapper_db([[
+    CREATE TABLE IF NOT EXISTS cexit_key_observations(
+      fromuid TEXT NOT NULL,
+      dir TEXT NOT NULL,
+      touid TEXT NOT NULL,
+      observed_key TEXT NOT NULL,
+      observed_key_normalized TEXT NOT NULL,
+      resolved_key_name TEXT,
+      door_direction TEXT,
+      seen_count INTEGER NOT NULL DEFAULT 0,
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      PRIMARY KEY(fromuid, dir, touid, observed_key_normalized))
+  ]])
+  if not ok then return false, err end
+
+  local indexed, index_err = mm.exec_mapper_db(
+    "CREATE INDEX IF NOT EXISTS cexit_key_observations_touid_index ON cexit_key_observations(touid)"
+  )
+  if not indexed then return false, index_err end
+
+  local last_seen_indexed, last_seen_index_err = mm.exec_mapper_db(
+    "CREATE INDEX IF NOT EXISTS cexit_key_observations_last_seen_index ON cexit_key_observations(last_seen_at)"
+  )
+  if not last_seen_indexed then return false, last_seen_index_err end
+
+  return mm.exec_mapper_db([[
+    DELETE FROM cexit_key_observations
+    WHERE NOT EXISTS (
+      SELECT 1 FROM exits
+      WHERE exits.fromuid = cexit_key_observations.fromuid
+        AND exits.dir = cexit_key_observations.dir
+        AND exits.touid = cexit_key_observations.touid)
+  ]])
+end
+
 local function trim(value)
   return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function normalize_observed_key(value)
+  local cleaned = tostring(value or "")
+  if mm.strip_ansi then cleaned = mm.strip_ansi(cleaned) end
+  return cleaned:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+end
+
+local function normalize_keyword_signature(value)
+  local cleaned = tostring(value or "")
+  if mm.strip_ansi then cleaned = mm.strip_ansi(cleaned) end
+  return cleaned:lower():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function without_leading_article(value)
+  for _, article in ipairs({"a ", "an ", "the "}) do
+    if value:sub(1, #article) == article then return value:sub(#article + 1) end
+  end
+  return value
+end
+
+local function delete_cexit_key_observation_record(row)
+  return mm.exec_mapper_db(string.format(
+    "DELETE FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s AND observed_key_normalized=%s",
+    mm.sql_escape(row.fromuid), mm.sql_escape(row.dir), mm.sql_escape(row.touid),
+    mm.sql_escape(row.observed_key_normalized)
+  ))
+end
+
+local function configured_cexit_key(fromuid, dir, touid)
+  local rows, err = mm.query_mapper_db(string.format(
+    "SELECT key_name, key_keywords FROM cexit_key_alternates WHERE fromuid=%s AND dir=%s AND touid=%s LIMIT 1",
+    mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid)
+  ))
+  if not rows then return nil, err end
+  return rows[1] or {}, nil
+end
+
+local function remove_configured_cexit_key_observations(fromuid, dir, touid)
+  local ensured, ensure_err = mm.ensure_cexit_key_observations_table()
+  if not ensured then return false, ensure_err end
+  local rows, query_err = mm.query_mapper_db(string.format(
+    "SELECT fromuid, dir, touid, observed_key, observed_key_normalized, resolved_key_name FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s",
+    mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid)
+  ))
+  if not rows then return false, query_err end
+
+  local removed = #rows
+  if removed > 0 then
+    local deleted, delete_err = mm.exec_mapper_db(string.format(
+      "DELETE FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s",
+      mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid)
+    ))
+    if not deleted then return false, delete_err end
+  end
+  if removed > 0 then
+    mm.runtime.cexit_key_observation_last_rows = {}
+  end
+  return true, removed
 end
 
 local function normalize_uid(value)
@@ -2171,6 +2559,926 @@ local function normalize_uid(value)
   local s = trim(value)
   if s == "" then return nil end
   return s
+end
+
+local function is_cardinal_cexit_dir(value)
+  local dir = trim(value):lower()
+  return dir == "n" or dir == "s" or dir == "e" or dir == "w" or dir == "u" or dir == "d"
+    or dir == "north" or dir == "south" or dir == "east" or dir == "west"
+    or dir == "up" or dir == "down"
+end
+
+local function selected_cexit_row(index)
+  local n = tonumber(index)
+  if not n then return nil, "cexit row must be a number from the last mapper cexits list" end
+  local row = (mm.runtime.cexit_last_rows or {})[n]
+  if not row then
+    return nil, "cexit row is not available; run 'mapper cexits thisroom' first, then use the row number shown"
+  end
+  local fromuid = trim(row.uid or row.fromuid)
+  local dir = trim(row.dir)
+  local touid = trim(row.touid)
+  if fromuid == "" or dir == "" or touid == "" then
+    return nil, "selected cexit is missing its source, command, or destination"
+  end
+  return row, nil, n, fromuid, dir, touid
+end
+
+local function dinv_api_ready()
+  local api = _G.DINV and _G.DINV.api
+  if not api then return nil, "DINV API is unavailable" end
+  if type(api.isReady) == "function" then
+    local ready_ok, ready = pcall(api.isReady)
+    if not ready_ok or ready ~= true then return nil, "DINV is not ready" end
+  end
+  return api, nil
+end
+
+function mm.check_dinv_key_keywords(key_keywords)
+  key_keywords = normalize_keyword_signature(key_keywords)
+  if key_keywords == "" then return nil, {reason = "key keyword identity is empty"} end
+
+  local api, api_err = dinv_api_ready()
+  if not api or type(api.getKeys) ~= "function" then
+    return nil, {reason = api_err or "DINV getKeys API is unavailable"}
+  end
+  if type(api.getStatus) == "function" then
+    local status_ok, status = pcall(api.getStatus, {})
+    if not status_ok or type(status) ~= "table" or status.ok ~= true then
+      return nil, {reason = "DINV status is unavailable"}
+    end
+    if status.buildInProgress == true or status.refreshInProgress == true then
+      return nil, {reason = "DINV inventory refresh is in progress"}
+    end
+  end
+
+  local ok, result = pcall(api.getKeys, {
+    source = "live",
+    includeIgnored = true,
+    exactKeywords = key_keywords,
+    fields = {"id", "name", "normalizedName", "keywords", "identifyLevel", "type", "flags", "location", "container", "worn"},
+  })
+  if not ok or type(result) ~= "table" or result.ok ~= true then
+    return nil, {
+      reason = type(result) == "table" and tostring(result.message or result.code or "DINV key query failed")
+        or tostring(result),
+    }
+  end
+  if result.keyDefinition ~= "isKeyOrTypeKey"
+      or result.exactKeywordsApplied ~= true
+      or result.keywordDefinition ~= "exactFullIdentifyTokenSet" then
+    return nil, {reason = "DINV getKeys API does not support exact full-identify keyword queries"}
+  end
+
+  local items = type(result.items) == "table" and result.items or {}
+  local count = tonumber(result.total) or tonumber(result.count) or #items
+  local ids, locations = {}, {}
+  for _, item in ipairs(items) do
+    table.insert(ids, tostring(item.id or "?"))
+    table.insert(locations, tostring(item.location or item.worn or item.container or "unknown"))
+  end
+  return count > 0, {
+    count = count,
+    items = items,
+    ids = ids,
+    locations = locations,
+    keyword_signature = result.exactKeywords,
+  }
+end
+
+local function note_dinv_key_check(key_keywords)
+  local exists, details = mm.check_dinv_key_keywords(key_keywords)
+  details = details or {}
+  if exists == true then
+    mm.note(string.format(
+      "DINV currently has %d matching key%s: %s.",
+      tonumber(details.count) or 1,
+      tonumber(details.count) == 1 and "" or "s",
+      key_keywords
+    ))
+  elseif exists == false then
+    mm.note("DINV does not currently have a matching key; the regular cexit will be used.")
+  else
+    mm.warn("DINV could not verify the key keywords: " .. tostring(details.reason or "unknown error"))
+  end
+  return exists, details
+end
+
+local function has_exact_flag(flags, wanted)
+  wanted = tostring(wanted or ""):lower()
+  for token in tostring(flags or ""):lower():gmatch("[^,%s]+") do
+    if token == wanted then return true end
+  end
+  return false
+end
+
+local function is_dinv_key_item(item)
+  return tostring(item and item.type or ""):lower() == "key"
+    or has_exact_flag(item and item.flags, "iskey")
+end
+
+local function get_dinv_item_by_id(obj_id)
+  obj_id = trim(obj_id)
+  if not obj_id:match("^%d+$") then return nil, "key object id must be numeric" end
+  local api, api_err = dinv_api_ready()
+  if not api or type(api.getItem) ~= "function" then
+    return nil, api_err or "DINV getItem API is unavailable"
+  end
+  local ok, result = pcall(api.getItem, obj_id, {
+    source = "live",
+    includeIgnored = true,
+    fields = {"id", "name", "normalizedName", "keywords", "identifyLevel", "type", "flags", "location", "container", "worn"},
+  })
+  if not ok or type(result) ~= "table" or result.ok ~= true or type(result.item) ~= "table" then
+    return nil, type(result) == "table" and tostring(result.message or result.code or "DINV item query failed")
+      or tostring(result)
+  end
+  return result.item, nil
+end
+
+function mm.on_dinv_item_observed(event_name, obj_id)
+  local id = trim(obj_id)
+  if id == "" and trim(event_name):match("^%d+$") then id = trim(event_name) end
+  if not id:match("^%d+$") then return false end
+
+  mm.runtime = mm.runtime or {}
+  mm.runtime.cexitif_name_identify_ids = mm.runtime.cexitif_name_identify_ids or {}
+  if mm.runtime.cexitif_name_identify_ids[id] then return false end
+
+  local api, api_err = dinv_api_ready()
+  if not api then
+    mm.debug("CEXITIF KEY WATCH DEBUG: DINV unavailable: " .. tostring(api_err))
+    return false
+  end
+  if type(api.getStatus) == "function" then
+    local status_ok, status = pcall(api.getStatus, {})
+    if not status_ok or type(status) ~= "table" or status.ok ~= true then return false end
+    if status.refreshInProgress == true
+        or (status.buildInProgress == true and status.targetedIdentifyInProgress ~= true) then
+      return false
+    end
+  end
+
+  local item, item_err = get_dinv_item_by_id(id)
+  if not item then
+    mm.debug("CEXITIF KEY WATCH DEBUG: item lookup failed id=" .. id
+      .. " reason=" .. tostring(item_err))
+    return false
+  end
+  if tostring(item.identifyLevel or ""):lower() == "full" then return false end
+  local item_name_source = trim(item.normalizedName)
+  if item_name_source == "" then item_name_source = item.name end
+  local item_name = normalize_observed_key(item_name_source)
+  if item_name == "" then return false end
+
+  local rows, query_err = mm.query_mapper_db(
+    "SELECT DISTINCT key_name FROM cexit_key_alternates WHERE trim(key_name) <> ''"
+  )
+  if not rows then
+    mm.debug("CEXITIF KEY WATCH DEBUG: configured-name query failed: " .. tostring(query_err))
+    return false
+  end
+  local watched = false
+  for _, row in ipairs(rows) do
+    if normalize_observed_key(row.key_name) == item_name then
+      watched = true
+      break
+    end
+  end
+  if not watched then return false end
+
+  local actions = _G.DINV and _G.DINV.actions
+  if not actions or type(actions.identify) ~= "function" then
+    mm.debug("CEXITIF KEY WATCH DEBUG: targeted identify action unavailable")
+    return false
+  end
+  mm.runtime.cexitif_name_identify_ids[id] = true
+  local action_ok, result = pcall(actions.identify, id, {source = "Mapper configured key name"})
+  if not action_ok or type(result) ~= "table" or result.ok ~= true then
+    mm.runtime.cexitif_name_identify_ids[id] = nil
+    mm.debug("CEXITIF KEY WATCH DEBUG: identify rejected id=" .. id
+      .. " reason=" .. tostring(type(result) == "table"
+        and (result.message or result.code) or result))
+    return false
+  end
+  mm.debug("CEXITIF KEY WATCH DEBUG: identifying configured key-name candidate id="
+    .. id .. " name='" .. item_name .. "'")
+  return true
+end
+
+local function validate_cexitif_target(index, alternate_command)
+  local row, row_err, n, fromuid, dir, touid = selected_cexit_row(index)
+  if not row then return nil, row_err end
+  alternate_command = trim(alternate_command)
+  if alternate_command == "" then return nil, "alternate cexit command is required" end
+  if is_cardinal_cexit_dir(dir) or fromuid == "*" or fromuid == "**" then
+    return nil, "cexitif supports regular custom exits only"
+  end
+
+  local ensured, ensure_err = mm.ensure_cexit_key_alternates_table()
+  if not ensured then return nil, ensure_err end
+  local current, current_err = mm.query_mapper_db(string.format(
+    "SELECT COUNT(*) AS cnt FROM exits WHERE fromuid=%s AND dir=%s AND touid=%s",
+    mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid)
+  ))
+  if not current then return nil, current_err end
+  if tonumber(current[1] and current[1].cnt) ~= 1 then
+    return nil, "selected cexit no longer exists; run mapper cexits again"
+  end
+  return {
+    row = row,
+    row_number = n,
+    fromuid = fromuid,
+    dir = dir,
+    touid = touid,
+    alternate_command = alternate_command,
+  }, nil
+end
+
+local function same_cexitif_route(target, fromuid, dir, touid)
+  return type(target) == "table"
+    and tostring(target.fromuid or "") == tostring(fromuid or "")
+    and tostring(target.dir or "") == tostring(dir or "")
+    and tostring(target.touid or "") == tostring(touid or "")
+end
+
+local function clear_pending_cexitif_route(fromuid, dir, touid)
+  local pending = mm.runtime and mm.runtime.pending_cexitif_keyids
+  if type(pending) ~= "table" then return 0 end
+  local removed = 0
+  for token, entry in pairs(pending) do
+    local target = type(entry) == "table" and (entry.target or entry) or nil
+    if same_cexitif_route(target, fromuid, dir, touid) then
+      pending[token] = nil
+      removed = removed + 1
+    end
+  end
+  return removed
+end
+
+local function add_pending_cexitif_keyid(obj_id, target)
+  mm.runtime.pending_cexitif_keyids = mm.runtime.pending_cexitif_keyids or {}
+  mm.runtime.cexitif_keyid_serial = (tonumber(mm.runtime.cexitif_keyid_serial) or 0) + 1
+  local token = tostring(mm.runtime.cexitif_keyid_serial)
+  mm.runtime.pending_cexitif_keyids[token] = {
+    obj_id = tostring(obj_id),
+    target = target,
+  }
+  return token
+end
+
+local function save_cexitif_target(target, key_name, key_keywords)
+  key_name = trim(key_name)
+  key_keywords = normalize_keyword_signature(key_keywords)
+  if key_keywords == "" then return false, "a full key keyword identity is required" end
+  clear_pending_cexitif_route(target.fromuid, target.dir, target.touid)
+  local ensured, ensure_err = mm.ensure_cexit_key_alternates_table()
+  if not ensured then return false, ensure_err end
+  local current, current_err = mm.query_mapper_db(string.format(
+    "SELECT COUNT(*) AS cnt FROM exits WHERE fromuid=%s AND dir=%s AND touid=%s",
+    mm.sql_escape(target.fromuid), mm.sql_escape(target.dir), mm.sql_escape(target.touid)
+  ))
+  if not current then return false, current_err end
+  if tonumber(current[1] and current[1].cnt) ~= 1 then
+    return false, "selected cexit no longer exists; run mapper cexits again"
+  end
+
+  local ok, err = mm.exec_mapper_db(string.format(
+    "INSERT OR REPLACE INTO cexit_key_alternates (fromuid, dir, touid, key_name, key_keywords, alternate_command) VALUES (%s, %s, %s, %s, %s, %s)",
+    mm.sql_escape(target.fromuid), mm.sql_escape(target.dir), mm.sql_escape(target.touid),
+    mm.sql_escape(key_name), mm.sql_escape(key_keywords), mm.sql_escape(target.alternate_command)
+  ))
+  if not ok then return false, err end
+
+  local row = target.row
+  if type(row) == "table" then
+    row.key_name = key_name
+    row.key_keywords = key_keywords
+    row.alternate_command = target.alternate_command
+  end
+  mm.note(string.format(
+    "Conditional cexit #%d saved: key keywords {%s} -> %s",
+    tonumber(target.row_number) or 0, key_keywords, target.alternate_command
+  ))
+
+  local observations_cleaned, removed_or_err = remove_configured_cexit_key_observations(
+    target.fromuid, target.dir, target.touid
+  )
+  if not observations_cleaned then
+    mm.warn("Conditional cexit was saved, but its matching key observation could not be removed: "
+      .. tostring(removed_or_err))
+  elseif tonumber(removed_or_err) and tonumber(removed_or_err) > 0 then
+    mm.note(string.format(
+      "Removed %d matching key observation%s; this cexit no longer needs key monitoring.",
+      tonumber(removed_or_err), tonumber(removed_or_err) == 1 and "" or "s"
+    ))
+  end
+
+  note_dinv_key_check(key_keywords)
+  return true
+end
+
+function mm.set_cexitif(index)
+  return false, "name-only conditional keys are not supported; use 'mapper cexitif <row> keyid <id> do {<alternate command>}'"
+end
+
+function mm.set_cexitif_keywords(index, key_keywords, alternate_command)
+  local target, target_err = validate_cexitif_target(index, alternate_command)
+  if not target then return false, target_err end
+  key_keywords = normalize_keyword_signature(key_keywords)
+  if key_keywords == "" then return false, "key keywords are required" end
+  local exists, details = mm.check_dinv_key_keywords(key_keywords)
+  if exists == nil then return false, tostring(details and details.reason or "DINV keyword query failed") end
+  local key_name = ""
+  if details and details.items and details.items[1] then
+    key_name = trim(details.items[1].name)
+  end
+  return save_cexitif_target(target, key_name, key_keywords)
+end
+
+function mm.set_cexitif_keyid(index, obj_id, alternate_command)
+  obj_id = trim(obj_id)
+  local target, target_err = validate_cexitif_target(index, alternate_command)
+  if not target then return false, target_err end
+  local item, item_err = get_dinv_item_by_id(obj_id)
+  if not item then return false, item_err end
+
+  local identify_level = tostring(item.identifyLevel or ""):lower()
+  if identify_level == "full" then
+    if not is_dinv_key_item(item) then return false, "DINV item " .. obj_id .. " is not a key" end
+    local key_keywords = normalize_keyword_signature(item.keywords)
+    if key_keywords == "" then return false, "fully identified key has no keywords" end
+    return save_cexitif_target(target, item.name, key_keywords)
+  end
+
+  local actions = _G.DINV and _G.DINV.actions
+  if not actions or type(actions.identify) ~= "function" then
+    return false, "DINV targeted identify action is unavailable"
+  end
+
+  clear_pending_cexitif_route(target.fromuid, target.dir, target.touid)
+  local pending_token = add_pending_cexitif_keyid(obj_id, target)
+  local action_ok, result = pcall(actions.identify, obj_id, {source = "Mapper cexitif keyid"})
+  if not action_ok or type(result) ~= "table" or result.ok ~= true then
+    mm.runtime.pending_cexitif_keyids[pending_token] = nil
+    return false, type(result) == "table" and tostring(result.message or result.code or "DINV identify failed")
+      or tostring(result)
+  end
+  mm.note(string.format(
+    "DINV is fully identifying item %s and verifying it is a key; the conditional cexit will be saved automatically when identification finishes.",
+    obj_id
+  ))
+  return true
+end
+
+function mm.on_cexitif_key_identify_complete(event_name, obj_id)
+  local id = trim(obj_id)
+  if id == "" and trim(event_name):match("^%d+$") then id = trim(event_name) end
+  if mm.runtime and mm.runtime.cexitif_name_identify_ids then
+    mm.runtime.cexitif_name_identify_ids[id] = nil
+  end
+  local pending = mm.runtime and mm.runtime.pending_cexitif_keyids
+  if type(pending) ~= "table" then return false end
+  local targets = {}
+  for token, entry in pairs(pending) do
+    local entry_id = type(entry) == "table" and tostring(entry.obj_id or "") or ""
+    local target = type(entry) == "table" and (entry.target or entry) or nil
+    -- Accept the old id-keyed runtime shape during a hot package reload.
+    if (entry_id == id or (entry_id == "" and tostring(token) == id)) and target then
+      pending[token] = nil
+      table.insert(targets, target)
+    end
+  end
+  if #targets == 0 then return false end
+
+  local item, item_err = get_dinv_item_by_id(id)
+  if not item then
+    mm.warn("Could not finish cexitif keyid " .. id .. ": " .. tostring(item_err))
+    return false
+  end
+  if tostring(item.identifyLevel or ""):lower() ~= "full" then
+    mm.warn("Could not finish cexitif keyid " .. id .. ": DINV did not obtain a full identify.")
+    return false
+  end
+  if not is_dinv_key_item(item) then
+    mm.warn("Could not finish cexitif keyid " .. id .. ": the fully identified item is not a key.")
+    return false
+  end
+  local key_keywords = normalize_keyword_signature(item.keywords)
+  if key_keywords == "" then
+    mm.warn("Could not finish cexitif keyid " .. id .. ": the full identify contains no keywords.")
+    return false
+  end
+  local saved = 0
+  for _, target in ipairs(targets) do
+    local ok, err = save_cexitif_target(target, item.name, key_keywords)
+    if ok then
+      saved = saved + 1
+    else
+      mm.warn("Could not finish cexitif keyid " .. id .. ": " .. tostring(err))
+    end
+  end
+  return saved > 0
+end
+
+function mm.remove_cexitif(index)
+  local row, row_err, n, fromuid, dir, touid = selected_cexit_row(index)
+  if not row then return false, row_err end
+  clear_pending_cexitif_route(fromuid, dir, touid)
+  local ensured, ensure_err = mm.ensure_cexit_key_alternates_table()
+  if not ensured then return false, ensure_err end
+  local ok, err = mm.exec_mapper_db(string.format(
+    "DELETE FROM cexit_key_alternates WHERE fromuid=%s AND dir=%s",
+    mm.sql_escape(fromuid), mm.sql_escape(dir)
+  ))
+  if not ok then return false, err end
+  row.key_name = nil
+  row.key_keywords = nil
+  row.alternate_command = nil
+  mm.note(string.format("Conditional cexit #%d removed; the regular cexit is unchanged.", n))
+  return true
+end
+
+function mm.test_cexitif(index)
+  local row, row_err, n, fromuid, dir, touid = selected_cexit_row(index)
+  if not row then return false, row_err end
+  local ensured, ensure_err = mm.ensure_cexit_key_alternates_table()
+  if not ensured then return false, ensure_err end
+  local rows, query_err = mm.query_mapper_db(string.format(
+    "SELECT key_name, key_keywords, alternate_command FROM cexit_key_alternates WHERE fromuid=%s AND dir=%s AND touid=%s LIMIT 1",
+    mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid)
+  ))
+  if not rows then return false, query_err end
+  local config = rows[1]
+  if not config then return false, string.format("cexit #%d has no conditional alternate", n) end
+  if normalize_keyword_signature(config.key_keywords) == "" then
+    mm.note(string.format(
+      "Cexit #%d has a legacy name-only key and is inactive; rewrite it with mapper cexitif %d keyid <id> do {<alternate command>}.",
+      n, n
+    ))
+    return true
+  end
+
+  local exists, details = mm.check_dinv_key_keywords(config.key_keywords)
+  details = details or {}
+  if exists == true then
+    mm.note(string.format(
+      "Cexit #%d test: DINV has %d matching key%s; would execute alternate: %s",
+      n, tonumber(details.count) or 1, tonumber(details.count) == 1 and "" or "s",
+      tostring(config.alternate_command)
+    ))
+  elseif exists == false then
+    mm.note(string.format(
+      "Cexit #%d test: DINV has no matching key; would execute regular cexit: %s",
+      n, dir
+    ))
+  else
+    mm.note(string.format(
+      "Cexit #%d test: DINV key state is unavailable (%s); would execute regular cexit: %s",
+      n, tostring(details.reason or "unknown error"), dir
+    ))
+  end
+  return true
+end
+
+function mm.cexit_key_alternates_for_path(path, initial_source)
+  if type(path) ~= "table" or #path == 0 then return {} end
+  local sources, wanted_sources, source = {}, {}, trim(initial_source)
+  for index, step in ipairs(path) do
+    sources[index] = source
+    local dir = trim(step and step.dir)
+    if source ~= "" and source ~= "*" and source ~= "**"
+        and dir ~= "" and not is_cardinal_cexit_dir(dir)
+        and not (step and step.randomCexit == true)
+        and not (step and (step.travelType == "portal" or step.travelType == "recall"))
+    then
+      wanted_sources[source] = true
+    end
+    local destination = trim(step and step.uid)
+    if destination ~= "" and destination ~= "-1" then source = destination end
+  end
+  if not next(wanted_sources) then return {} end
+
+  local quoted = {}
+  for fromuid in pairs(wanted_sources) do table.insert(quoted, mm.sql_escape(fromuid)) end
+  table.sort(quoted)
+  local rows, err = mm.query_mapper_db(
+    "SELECT fromuid, dir, touid, key_name, key_keywords, alternate_command FROM cexit_key_alternates WHERE fromuid IN ("
+      .. table.concat(quoted, ",") .. ")"
+  )
+  if not rows then
+    mm.debug("CEXITIF DEBUG: route metadata query failed: " .. tostring(err))
+    return {}
+  end
+
+  local by_identity = {}
+  for _, row in ipairs(rows) do
+    local identity = tostring(row.fromuid) .. "\0" .. tostring(row.dir) .. "\0" .. tostring(row.touid)
+    by_identity[identity] = row
+  end
+  local configured = {}
+  for index, step in ipairs(path) do
+    local identity = tostring(sources[index] or "") .. "\0" .. tostring(step.dir or "") .. "\0" .. tostring(step.uid or "")
+    local config = by_identity[identity]
+    if config and normalize_keyword_signature(config.key_keywords) ~= "" then
+      config.source_room = tostring(sources[index])
+      config.destination_room = tostring(step.uid)
+      configured[index] = config
+    end
+  end
+  return configured
+end
+
+function mm.choose_cexit_key_command(config, regular_command)
+  config = type(config) == "table" and config or {}
+  regular_command = tostring(regular_command or config.dir or "")
+  local exists, details = mm.check_dinv_key_keywords(config.key_keywords)
+  details = details or {}
+  local branch = exists == true and "alternate" or "regular"
+  local selected = branch == "alternate" and tostring(config.alternate_command or "") or regular_command
+  mm.debug(string.format(
+    "CEXITIF DEBUG: from=%s to=%s key='%s' keywords='{%s}' result=%s count=%s ids={%s} locations={%s} branch=%s command='%s'%s",
+    tostring(config.source_room or config.fromuid or "?"),
+    tostring(config.destination_room or config.touid or "?"),
+    tostring(config.key_name or ""),
+    tostring(config.key_keywords or ""),
+    exists == nil and "unknown" or tostring(exists),
+    tostring(details.count or 0),
+    table.concat(details.ids or {}, ","),
+    table.concat(details.locations or {}, ","),
+    branch,
+    selected,
+    details.reason and (" reason='" .. tostring(details.reason) .. "'") or ""
+  ))
+  if exists == nil then
+    mm.warn("DINV key state unavailable; using the regular cexit.")
+  end
+  return selected, branch, details
+end
+
+local CEXIT_KEY_OBSERVATION_MAX_AGE = 60
+
+local function infer_cexit_door_direction(command)
+  local aliases = {
+    n = "n", north = "n", s = "s", south = "s",
+    e = "e", east = "e", w = "w", west = "w",
+    u = "u", up = "u", d = "d", down = "d",
+  }
+  local inferred
+  for token in tostring(command or ""):gmatch("[^;]+") do
+    local verb, argument = token:lower():match("^%s*(%S+)%s+(%S+)")
+    if verb == "o" or verb == "op" or verb == "ope" or verb == "open"
+        or verb == "unlock" then
+      inferred = aliases[argument] or inferred
+    end
+  end
+  return inferred
+end
+
+function mm.resolve_observed_dinv_key(observed_key)
+  local observed_normalized = normalize_observed_key(observed_key)
+  if observed_normalized == "" then return nil, {reason = "empty observed key"} end
+
+  local api = _G.DINV and _G.DINV.api
+  if not api or type(api.getKeys) ~= "function" then
+    return nil, {reason = "DINV getKeys API is unavailable"}
+  end
+
+  local ok, result = pcall(api.getKeys, {
+    source = "live",
+    includeIgnored = true,
+    fields = {"id", "name", "normalizedName", "keywords", "type", "flags", "location", "container", "worn"},
+  })
+  if not ok or type(result) ~= "table" or result.ok ~= true then
+    return nil, {reason = type(result) == "table" and tostring(result.message or result.code or "DINV key query failed") or tostring(result)}
+  end
+  if result.keyDefinition ~= "isKeyOrTypeKey" then
+    return nil, {reason = "DINV getKeys API does not support isKey-or-Type-Key queries"}
+  end
+
+  local matched_names = {}
+  local matched_items = {}
+  for _, item in ipairs(type(result.items) == "table" and result.items or {}) do
+    local normalized_name = normalize_observed_key(item.normalizedName or item.name)
+    local name_matches = normalized_name == observed_normalized
+      or without_leading_article(normalized_name) == observed_normalized
+    local keyword_matches = false
+    if not observed_normalized:find(" ", 1, true) then
+      for keyword in tostring(item.keywords or ""):lower():gmatch("[^,%s]+") do
+        if keyword == observed_normalized then
+          keyword_matches = true
+          break
+        end
+      end
+    end
+    if name_matches or keyword_matches then
+      local identity = normalized_name ~= "" and normalized_name or normalize_observed_key(item.name)
+      if identity ~= "" then
+        matched_names[identity] = tostring(item.name or observed_key)
+        table.insert(matched_items, item)
+      end
+    end
+  end
+
+  local identities = {}
+  for identity in pairs(matched_names) do table.insert(identities, identity) end
+  table.sort(identities)
+  if #identities == 1 then
+    return matched_names[identities[1]], {
+      normalized_name = identities[1],
+      items = matched_items,
+      count = #matched_items,
+    }
+  end
+  return nil, {
+    reason = #identities == 0 and "no live DINV key matched the unlock text" or "multiple DINV key names matched the unlock text",
+    items = matched_items,
+    count = #matched_items,
+  }
+end
+
+function mm.track_cexit_key_observation_path(path, initial_source, execution_serial)
+  mm.runtime = mm.runtime or {}
+  local context = {
+    execution_serial = tonumber(execution_serial) or 0,
+    started_at = os.time(),
+    edges = {},
+  }
+  local source = normalize_uid(initial_source)
+  local seen = {}
+  for index, step in ipairs(type(path) == "table" and path or {}) do
+    local executed_command = trim(step and step.dir)
+    local base_command = trim(step and (step.cexitBaseDir or step.cexit_base_dir) or executed_command)
+    local destination = normalize_uid(step and step.uid)
+    local regular = source and destination and source ~= "*" and source ~= "**"
+      and destination ~= "*" and destination ~= "**"
+      and base_command ~= "" and not is_cardinal_cexit_dir(base_command)
+      and not (step and step.randomCexit == true)
+      and not (step and (step.travelType == "portal" or step.travelType == "recall"))
+    if regular then
+      local identity = source .. "\0" .. base_command .. "\0" .. destination
+      if not seen[identity] then
+        seen[identity] = true
+        table.insert(context.edges, {
+          path_index = index,
+          fromuid = source,
+          dir = base_command,
+          touid = destination,
+          executed_command = executed_command,
+          door_direction = infer_cexit_door_direction(executed_command),
+        })
+      end
+    end
+    if destination then source = destination end
+  end
+  mm.runtime.cexit_key_observation_context = context
+  mm.debug(string.format(
+    "CEXIT KEY OBSERVE DEBUG: tracking serial=%s regular_cexits=%d",
+    tostring(context.execution_serial), #context.edges
+  ))
+  return context
+end
+
+function mm.observe_cexit_key_unlock(observed_key)
+  mm.runtime = mm.runtime or {}
+  local context = mm.runtime.cexit_key_observation_context
+  local nav = snd and snd.mapper or nil
+  if type(context) ~= "table" or not nav
+      or tonumber(nav.pathExecutionSerial) ~= tonumber(context.execution_serial)
+      or nav.pathExecutionActive ~= true then
+    mm.debug("CEXIT KEY OBSERVE DEBUG: ignored unlock line outside active tracked navigation")
+    return false, "no active tracked mapper route"
+  end
+
+  local source = normalize_uid(mm.current_room())
+  local observed = tostring(observed_key or "")
+  if mm.strip_ansi then observed = mm.strip_ansi(observed) end
+  observed = trim(observed)
+  local observed_normalized = normalize_observed_key(observed)
+  if not source or observed_normalized == "" then
+    return false, "unlock observation is missing its source room or key text"
+  end
+
+  local candidates = {}
+  for _, edge in ipairs(context.edges or {}) do
+    if edge.fromuid == source then table.insert(candidates, edge) end
+  end
+  if #candidates ~= 1 then
+    mm.debug(string.format(
+      "CEXIT KEY OBSERVE DEBUG: ignored key='%s' source=%s candidate_cexits=%d",
+      observed, tostring(source), #candidates
+    ))
+    return false, #candidates == 0 and "no tracked cexit starts in the unlock room" or "multiple tracked cexits start in the unlock room"
+  end
+
+  local resolved_key_name, resolution = mm.resolve_observed_dinv_key(observed)
+  local edge = candidates[1]
+  local pending = {
+    execution_serial = context.execution_serial,
+    observed_at = os.time(),
+    fromuid = edge.fromuid,
+    dir = edge.dir,
+    touid = edge.touid,
+    observed_key = observed,
+    observed_key_normalized = observed_normalized,
+    resolved_key_name = resolved_key_name,
+    door_direction = edge.door_direction,
+  }
+  mm.runtime.pending_cexit_key_unlocks = mm.runtime.pending_cexit_key_unlocks or {}
+  table.insert(mm.runtime.pending_cexit_key_unlocks, pending)
+  mm.debug(string.format(
+    "CEXIT KEY OBSERVE DEBUG: pending from=%s to=%s key='%s' resolved='%s' door=%s cexit='%s'%s",
+    pending.fromuid, pending.touid, pending.observed_key,
+    tostring(pending.resolved_key_name or ""), tostring(pending.door_direction or "-"), pending.dir,
+    resolution and resolution.reason and (" reason='" .. tostring(resolution.reason) .. "'") or ""
+  ))
+  return true, pending
+end
+
+function mm.record_cexit_key_observation(entry)
+  entry = type(entry) == "table" and entry or {}
+  local fromuid = normalize_uid(entry.fromuid)
+  local touid = normalize_uid(entry.touid)
+  local dir = trim(entry.dir)
+  local observed_key = trim(entry.observed_key)
+  local observed_normalized = normalize_observed_key(entry.observed_key_normalized or observed_key)
+  if not fromuid or not touid or dir == "" or observed_key == "" or observed_normalized == "" then
+    return false, "incomplete cexit key observation"
+  end
+  if fromuid == "*" or fromuid == "**" or is_cardinal_cexit_dir(dir) then
+    return false, "key observations require a regular custom exit"
+  end
+
+  local valid_rows, valid_err = mm.query_mapper_db(string.format(
+    "SELECT COUNT(*) AS cnt FROM exits WHERE fromuid=%s AND dir=%s AND touid=%s",
+    mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid)
+  ))
+  if not valid_rows then return false, valid_err end
+  if tonumber(valid_rows[1] and valid_rows[1].cnt) ~= 1 then
+    return false, "the observed source, command, and destination no longer identify an existing cexit"
+  end
+
+  local ensured, ensure_err = mm.ensure_cexit_key_observations_table()
+  if not ensured then return false, ensure_err end
+  local alternates_ensured, alternates_ensure_err = mm.ensure_cexit_key_alternates_table()
+  if not alternates_ensured then return false, alternates_ensure_err end
+  local configured, configured_key_err = configured_cexit_key(fromuid, dir, touid)
+  if configured == nil then return false, configured_key_err end
+  local configured_key = trim(configured.key_name)
+  if normalize_keyword_signature(configured.key_keywords) ~= "" then
+    local deleted, delete_err = delete_cexit_key_observation_record({
+      fromuid = fromuid,
+      dir = dir,
+      touid = touid,
+      observed_key_normalized = observed_normalized,
+    })
+    if not deleted then return false, delete_err end
+    mm.runtime.cexit_key_observation_last_rows = {}
+    mm.debug(string.format(
+      "CEXIT KEY OBSERVE DEBUG: skipped configured pair from=%s to=%s key='%s' cexit='%s'",
+      fromuid, touid, configured_key, dir
+    ))
+    return false, "this cexit/key pair is already configured"
+  end
+  local existing, existing_err = mm.query_mapper_db(string.format(
+    "SELECT seen_count, first_seen_at, resolved_key_name, door_direction FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s AND observed_key_normalized=%s LIMIT 1",
+    mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid), mm.sql_escape(observed_normalized)
+  ))
+  if not existing then return false, existing_err end
+
+  local previous = existing[1] or {}
+  local now = tonumber(entry.observed_at) or os.time()
+  local first_seen = tonumber(previous.first_seen_at) or now
+  local seen_count = (tonumber(previous.seen_count) or 0) + 1
+  local resolved_key_name = trim(entry.resolved_key_name)
+  if resolved_key_name == "" then resolved_key_name = trim(previous.resolved_key_name) end
+  local door_direction = trim(entry.door_direction)
+  if door_direction == "" then door_direction = trim(previous.door_direction) end
+
+  local ok, write_err = mm.exec_mapper_db(string.format(
+    "INSERT OR REPLACE INTO cexit_key_observations (fromuid, dir, touid, observed_key, observed_key_normalized, resolved_key_name, door_direction, seen_count, first_seen_at, last_seen_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %d, %d, %d)",
+    mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid),
+    mm.sql_escape(observed_key), mm.sql_escape(observed_normalized),
+    mm.sql_escape(resolved_key_name), mm.sql_escape(door_direction),
+    seen_count, first_seen, now
+  ))
+  if not ok then return false, write_err end
+  mm.debug(string.format(
+    "CEXIT KEY OBSERVE DEBUG: recorded from=%s to=%s key='%s' resolved='%s' count=%d",
+    fromuid, touid, observed_key, resolved_key_name, seen_count
+  ))
+  return true, seen_count
+end
+
+function mm.on_cexit_key_observation_room(room_info)
+  mm.runtime = mm.runtime or {}
+  local pending = mm.runtime.pending_cexit_key_unlocks
+  if type(pending) ~= "table" or #pending == 0 then return false end
+
+  local room_uid = type(room_info) == "table" and mm.canonical_room_uid(room_info) or normalize_uid(room_info)
+  if not room_uid then return false end
+  room_uid = tostring(room_uid)
+  local current_serial = snd and snd.mapper and tonumber(snd.mapper.pathExecutionSerial) or nil
+  local now = os.time()
+  local remaining = {}
+  local recorded = 0
+  for _, entry in ipairs(pending) do
+    local expired = now - (tonumber(entry.observed_at) or now) > CEXIT_KEY_OBSERVATION_MAX_AGE
+    local stale_serial = current_serial == nil or tonumber(entry.execution_serial) ~= current_serial
+    if stale_serial or expired then
+      mm.debug(string.format(
+        "CEXIT KEY OBSERVE DEBUG: discarded pending key='%s' stale_serial=%s expired=%s",
+        tostring(entry.observed_key or ""), tostring(stale_serial), tostring(expired)
+      ))
+    elseif room_uid == tostring(entry.touid) then
+      local ok, count_or_err = mm.record_cexit_key_observation(entry)
+      if ok then
+        recorded = recorded + 1
+      else
+        mm.debug("CEXIT KEY OBSERVE DEBUG: validation/save rejected observation: " .. tostring(count_or_err))
+      end
+    else
+      table.insert(remaining, entry)
+    end
+  end
+  mm.runtime.pending_cexit_key_unlocks = remaining
+  return recorded > 0, recorded
+end
+
+local function print_cexit_key_observations(rows)
+  cecho("<gray>#   From     To       Door  Seen  Key                              Existing cexit                 Last observed<reset>\n")
+  cecho("<gray>------------------------------------------------------------------------------------------------------------------------<reset>\n")
+  for index, row in ipairs(rows) do
+    local key_name = trim(row.resolved_key_name)
+    if key_name == "" then key_name = tostring(row.observed_key or "?") end
+    local last_seen = tonumber(row.last_seen_at)
+    local last_text = last_seen and os.date("%Y-%m-%d %H:%M", last_seen) or "?"
+    cecho(string.format(
+      "<light_grey>%-3d %-8.8s %-8.8s %-5.5s %-5d %-32.32s %-30.30s %s<reset>\n",
+      index, tostring(row.fromuid or "?"), tostring(row.touid or "?"),
+      trim(row.door_direction) ~= "" and tostring(row.door_direction) or "-",
+      tonumber(row.seen_count) or 0, key_name, tostring(row.dir or ""), last_text
+    ))
+  end
+end
+
+function mm.list_cexit_key_observations(scope_arg)
+  local ensured, ensure_err = mm.ensure_cexit_key_observations_table()
+  if not ensured then return false, ensure_err end
+  local alternates_ensured, alternates_ensure_err = mm.ensure_cexit_key_alternates_table()
+  if not alternates_ensured then return false, alternates_ensure_err end
+  local scope = trim(scope_arg):lower()
+  local where = "1=1"
+  if scope == "thisroom" or scope == "here" then
+    local room = normalize_uid(mm.current_room())
+    if not room then return false, "current room is unknown; try LOOK first" end
+    where = "o.fromuid=" .. mm.sql_escape(room)
+  elseif scope ~= "" then
+    return false, "Usage: mapper cexitkeys [thisroom]"
+  end
+  local rows, err = mm.query_mapper_db(
+    "SELECT o.fromuid, o.dir, o.touid, o.observed_key, o.observed_key_normalized, o.resolved_key_name, o.door_direction, o.seen_count, o.first_seen_at, o.last_seen_at, a.key_name AS configured_key_name, a.key_keywords AS configured_key_keywords "
+      .. "FROM cexit_key_observations AS o LEFT JOIN cexit_key_alternates AS a "
+      .. "ON a.fromuid=o.fromuid AND a.dir=o.dir AND a.touid=o.touid WHERE "
+      .. where .. " ORDER BY o.seen_count DESC, o.last_seen_at DESC, o.fromuid, o.dir"
+  )
+  if not rows then return false, err end
+  local unresolved = {}
+  for _, row in ipairs(rows) do
+    if normalize_keyword_signature(row.configured_key_keywords) ~= "" then
+      local deleted, delete_err = delete_cexit_key_observation_record(row)
+      if not deleted then
+        mm.debug("CEXIT KEY OBSERVE DEBUG: could not remove configured observation: " .. tostring(delete_err))
+      end
+    else
+      table.insert(unresolved, row)
+    end
+  end
+  rows = unresolved
+  mm.runtime.cexit_key_observation_last_rows = rows
+  mm.note(scope == "" and "Observed cexit key uses:" or "Observed cexit key uses from this room:")
+  if #rows == 0 then
+    mm.note("Found 0 observed cexit key uses.")
+    return true
+  end
+  print_cexit_key_observations(rows)
+  mm.note(string.format("Found %d observed cexit/key pair%s.", #rows, #rows == 1 and "" or "s"))
+  return true
+end
+
+function mm.delete_cexit_key_observation(index)
+  local row_number = tonumber(index)
+  local row = row_number and (mm.runtime.cexit_key_observation_last_rows or {})[row_number] or nil
+  if not row then return false, "cexit key observation row is out of range for the last mapper cexitkeys list" end
+  local ok, err = delete_cexit_key_observation_record(row)
+  if not ok then return false, err end
+  table.remove(mm.runtime.cexit_key_observation_last_rows, row_number)
+  mm.note(string.format(
+    "Deleted observed cexit key row %d: %s -> %s, key '%s'.",
+    row_number, tostring(row.fromuid), tostring(row.touid),
+    trim(row.resolved_key_name) ~= "" and tostring(row.resolved_key_name) or tostring(row.observed_key)
+  ))
+  return true
 end
 
 local function parse_portal_command(dir)
@@ -3270,6 +4578,21 @@ function mm.add_full_cexit(command, src, dst, level, quiet, opts)
   ))
   if not ok then return false, err end
 
+  -- Replacing a cexit with a different destination must not silently carry an
+  -- alternate whose declared landing belonged to the old edge.
+  local alt_ready = mm.ensure_cexit_key_alternates_table()
+  if alt_ready then
+    local cleaned, cleanup_err = mm.exec_mapper_db(string.format(
+      "DELETE FROM cexit_key_alternates WHERE fromuid=%s AND dir=%s AND touid<>%s",
+      mm.sql_escape(src), mm.sql_escape(command), mm.sql_escape(dst)
+    ))
+    if not cleaned then mm.warn("Could not clear stale conditional cexit: " .. tostring(cleanup_err)) end
+  end
+  local observation_ready, observation_err = mm.ensure_cexit_key_observations_table()
+  if not observation_ready then
+    mm.warn("Could not clear stale cexit key observations: " .. tostring(observation_err))
+  end
+
   -- Mudlet bigmap APIs require numeric room IDs; skip them for nomap_ virtual rooms.
   if not srcIsNomap and not dstIsNomap then
     if is_cardinal_dir(command) and type(setExit) == "function" then
@@ -3522,21 +4845,35 @@ function mm.cexit(command)
 end
 
 local function print_cexits_table(rows)
-  cecho("<gray>#   From     Area         Name                           Dir                    To<reset>\n")
-  cecho("<gray>-----------------------------------------------------------------------------------<reset>\n")
+  cecho("<gray>#   From     Area         Name                           Dir                    Key                    Alternate              Lock   To<reset>\n")
+  cecho("<gray>------------------------------------------------------------------------------------------------------------------------------------------<reset>\n")
   for i, row in ipairs(rows) do
     local from = tonumber(row.uid or row.fromuid) or -1
     local to = tonumber(row.touid) or -1
     local area = tostring(row.area or "")
     local name = tostring(row.name or "")
     local dir = tostring(row.dir or "")
+    local key_name = tostring(row.key_name or "")
+    local key_keywords = normalize_keyword_signature(row.key_keywords)
+    local key_label = "-"
+    if key_keywords ~= "" then
+      key_label = "kw:" .. key_keywords
+    elseif key_name ~= "" then
+      key_label = "NEEDS KEYID"
+    end
+    local alternate = tostring(row.alternate_command or "")
+    if alternate == "" then alternate = "-" end
+    local level = tonumber(row.level) or 0
     cecho(string.format("<light_grey>%-3d<reset> ", i))
     if from > 0 then
       echoLink(string.format("(%d)", from), [[mm.goto_room(]] .. from .. [[)]], "Go to source room", true)
     else
       echo("(?)")
     end
-    cecho(string.format("  <light_grey>%-10.10s %-30.30s %-22.22s<reset> ", area, name, dir))
+    cecho(string.format(
+      "  <light_grey>%-10.10s %-30.30s %-22.22s %-22.22s %-22.22s %-6d<reset> ",
+      area, name, dir, key_label, alternate, level
+    ))
     if to > 0 then
       echoLink(string.format("(%d)", to), [[mm.goto_room(]] .. to .. [[)]], "Go to destination room", true)
     else
@@ -3550,12 +4887,12 @@ end
 local function cexit_where_for_scope(scope_arg)
   local arg = tostring(scope_arg or ""):gsub("^%s+", ""):gsub("%s+$", "")
   local lower = arg:lower()
-  local where = "dir NOT IN ('n','s','e','w','u','d') AND fromuid NOT IN ('*','**')"
+  local where = "lower(exits.dir) NOT IN ('n','s','e','w','u','d','north','south','east','west','up','down') AND exits.fromuid NOT IN ('*','**')"
   local intro = "The following rooms have custom exits:"
   if lower == "thisroom" then
     local room = mm.current_room()
     if not room then return nil, nil, "CEXITS THISROOM ERROR: unknown current room; try LOOK" end
-    where = where .. " AND fromuid = " .. mm.sql_escape(room)
+    where = where .. " AND exits.fromuid = " .. mm.sql_escape(room)
     intro = "The following custom exits are in this room:"
   elseif lower == "here" then
     local area = current_area_name()
@@ -3578,8 +4915,10 @@ function mm.list_cexits(scope_arg)
   local where, intro, err = cexit_where_for_scope(scope_arg)
   if not where then return false, err end
 
-  local sql = "SELECT COALESCE(rooms.uid, exits.fromuid) AS uid, COALESCE(rooms.name, exits.fromuid) AS name, COALESCE(rooms.area, '') AS area, exits.dir, exits.touid "
-    .. "FROM exits LEFT JOIN rooms ON rooms.uid = exits.fromuid WHERE " .. where .. " ORDER BY area, uid, dir"
+  local sql = "SELECT COALESCE(rooms.uid, exits.fromuid) AS uid, COALESCE(rooms.name, exits.fromuid) AS name, COALESCE(rooms.area, '') AS area, exits.dir, exits.touid, exits.level, cka.key_name, cka.key_keywords, cka.alternate_command "
+    .. "FROM exits LEFT JOIN rooms ON rooms.uid = exits.fromuid "
+    .. "LEFT JOIN cexit_key_alternates AS cka ON cka.fromuid = exits.fromuid AND cka.dir = exits.dir AND cka.touid = exits.touid "
+    .. "WHERE " .. where .. " ORDER BY area, uid, exits.dir"
   local rows, qerr = mm.query_mapper_db(sql)
   if not rows then return false, qerr end
 
@@ -3716,6 +5055,18 @@ function mm.delete_cexits_here()
   ))
   if not ok then return false, err end
 
+  local alt_ok, alt_err = mm.exec_mapper_db(string.format(
+    "DELETE FROM cexit_key_alternates WHERE fromuid=%s",
+    mm.sql_escape(room)
+  ))
+  if not alt_ok then mm.warn("Could not remove conditional cexits from this room: " .. tostring(alt_err)) end
+
+  local observed_ok, observed_err = mm.exec_mapper_db(string.format(
+    "DELETE FROM cexit_key_observations WHERE fromuid=%s",
+    mm.sql_escape(room)
+  ))
+  if not observed_ok then mm.warn("Could not remove cexit key observations from this room: " .. tostring(observed_err)) end
+
   if type(getSpecialExits) == "function" and type(removeSpecialExit) == "function" then
     local se = getSpecialExits(room) or {}
     for dir, _ in pairs(se) do pcall(removeSpecialExit, room, dir) end
@@ -3738,14 +5089,24 @@ local function remember_deleted_cexit(entry)
 end
 
 local function cexit_row_to_entry(row)
-  return {
+  local entry = {
     fromuid = tostring(row.uid or row.fromuid or ""),
     touid = tostring(row.touid or ""),
     dir = tostring(row.dir or ""),
     area = tostring(row.area or ""),
     name = tostring(row.name or ""),
+    level = tonumber(row.level) or 0,
     deleted_at = os.time(),
   }
+  local key_name = trim(row.key_name)
+  local key_keywords = normalize_keyword_signature(row.key_keywords)
+  local alternate_command = trim(row.alternate_command)
+  if key_keywords ~= "" and alternate_command ~= "" then
+    entry.key_name = key_name
+    entry.key_keywords = key_keywords
+    entry.alternate_command = alternate_command
+  end
+  return entry
 end
 
 function mm.delete_cexit(index)
@@ -3770,6 +5131,22 @@ function mm.delete_cexit(index)
   ))
   local db_done = timing_enabled and now_millis() or nil
   if not ok then return false, err end
+
+  local alt_ok, alt_err = mm.exec_mapper_db(string.format(
+    "DELETE FROM cexit_key_alternates WHERE fromuid=%s AND dir=%s",
+    mm.sql_escape(entry.fromuid), mm.sql_escape(entry.dir)
+  ))
+  if not alt_ok then
+    mm.warn("Could not remove the cexit's conditional alternate: " .. tostring(alt_err))
+  end
+
+  local observed_ok, observed_err = mm.exec_mapper_db(string.format(
+    "DELETE FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s",
+    mm.sql_escape(entry.fromuid), mm.sql_escape(entry.dir), mm.sql_escape(entry.touid)
+  ))
+  if not observed_ok then
+    mm.warn("Could not remove the cexit's key observations: " .. tostring(observed_err))
+  end
 
   local remove_done = db_done
   if type(removeSpecialExit) == "function" then
@@ -3819,6 +5196,10 @@ function mm.list_deleted_cexits()
       name = row.name,
       dir = row.dir,
       touid = row.touid,
+      level = tonumber(row.level) or 0,
+      key_name = row.key_name,
+      key_keywords = row.key_keywords,
+      alternate_command = row.alternate_command,
     })
   end
   print_cexits_table(shaped)
@@ -3841,11 +5222,22 @@ function mm.restore_cexit(which)
   if not pick then return false, "Usage: mapper restorecexit <number|last>" end
   if pick < 1 or pick > #rows then return false, "RESTORE CEXIT ERROR: index out of range" end
   local row = rows[pick]
+  local level = tonumber(row.level) or 0
   local ok, err = mm.exec_mapper_db(string.format(
-    "INSERT OR REPLACE INTO exits (fromuid, dir, touid, level) VALUES (%s, %s, %s, 0)",
-    mm.sql_escape(row.fromuid), mm.sql_escape(row.dir), mm.sql_escape(row.touid)
+    "INSERT OR REPLACE INTO exits (fromuid, dir, touid, level) VALUES (%s, %s, %s, %d)",
+    mm.sql_escape(row.fromuid), mm.sql_escape(row.dir), mm.sql_escape(row.touid), level
   ))
   if not ok then return false, err end
+  if normalize_keyword_signature(row.key_keywords) ~= "" and trim(row.alternate_command) ~= "" then
+    local alt_ready, alt_ready_err = mm.ensure_cexit_key_alternates_table()
+    if not alt_ready then return false, alt_ready_err end
+    local alt_ok, alt_err = mm.exec_mapper_db(string.format(
+      "INSERT OR REPLACE INTO cexit_key_alternates (fromuid, dir, touid, key_name, key_keywords, alternate_command) VALUES (%s, %s, %s, %s, %s, %s)",
+      mm.sql_escape(row.fromuid), mm.sql_escape(row.dir), mm.sql_escape(row.touid),
+      mm.sql_escape(row.key_name), mm.sql_escape(row.key_keywords), mm.sql_escape(row.alternate_command)
+    ))
+    if not alt_ok then return false, alt_err end
+  end
   table.remove(rows, pick)
   mm.save_deleted_cexits_persistence()
   if not from_last then

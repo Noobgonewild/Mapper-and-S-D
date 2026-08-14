@@ -666,7 +666,7 @@ local function load_layout_graph(source_path, opts)
       end
     end
 
-    local exit_sql = "SELECT e.fromuid, e.touid, e.dir, source_record.uid AS source_exists, destination.uid AS target_exists " ..
+    local exit_sql = "SELECT e.fromuid, e.touid, e.dir, e.level, source_record.uid AS source_exists, destination.uid AS target_exists " ..
       "FROM exits e " ..
       "LEFT JOIN rooms source_record ON source_record.uid = e.fromuid " ..
       "LEFT JOIN rooms destination ON destination.uid = e.touid " ..
@@ -705,6 +705,7 @@ local function load_layout_graph(source_path, opts)
           to = to_id,
           dir = dir,
           raw_dir = trim(row.dir):lower(),
+          level = tonumber(row.level) or 0,
           source_exists = row.source_exists ~= nil,
           target_exists = row.target_exists ~= nil,
         }
@@ -803,9 +804,22 @@ local function load_layout_graph(source_path, opts)
       local sentinel = nil
       for _, raw in ipairs(slot.rows) do
         if raw.to and raw.to > 0 then
-          positive_targets[raw.to] = positive_targets[raw.to] or raw
+          local existing = positive_targets[raw.to]
+          if not existing then
+            positive_targets[raw.to] = raw
+          else
+            local max_level = math.max(tonumber(existing.level) or 0, tonumber(raw.level) or 0)
+            if raw.raw_dir == raw.dir then
+              raw.level = max_level
+              positive_targets[raw.to] = raw
+            else
+              existing.level = max_level
+            end
+          end
         else
-          sentinel = sentinel or raw
+          if not sentinel or (tonumber(raw.level) or 0) > (tonumber(sentinel.level) or 0) then
+            sentinel = raw
+          end
         end
       end
 
@@ -820,6 +834,7 @@ local function load_layout_graph(source_path, opts)
           to = -1,
           dir = slot.dir,
           raw_dir = sentinel.raw_dir,
+          level = tonumber(sentinel.level) or 0,
           source_exists = sentinel.source_exists,
           target_exists = false,
           force_stub = true,
@@ -832,6 +847,7 @@ local function load_layout_graph(source_path, opts)
           to = targets[1],
           dir = slot.dir,
           raw_dir = first.raw_dir,
+          level = tonumber(first.level) or 0,
           source_exists = first.source_exists,
           target_exists = first.target_exists,
           force_stub = true,
@@ -868,6 +884,7 @@ local function load_layout_graph(source_path, opts)
           dir = dir,
           mudlet_dir = exit_def.name,
           area = source_room.area,
+          level = tonumber(raw.level) or 0,
           map_kind = "direct",
         }
         table.insert(graph.actual_exits, map_exit)
@@ -1801,6 +1818,10 @@ local function finish_map_job(job)
     mm.runtime.hybrid_native_unavailable_reason = nil
   end
 
+  if snd and snd.mapper and type(snd.mapper.refreshNativeExitLockVisuals) == "function" then
+    snd.mapper.refreshNativeExitLockVisuals(nil, true)
+  end
+
   if job.target_path then mm.note("Map saved to: " .. tostring(job.target_path)) end
   if type(updateMap) == "function" then pcall(updateMap) end
   if job.player_room and type(centerview) == "function" then pcall(centerview, job.player_room) end
@@ -2311,6 +2332,10 @@ function mm.import.rebuild_layout_from(start_room, opts)
   if not save_ok then
     if not opts.silent then emit_area_layout_diagnostics(area, stats, preparation) end
     return false, "layout rebuilt but map save failed: " .. tostring(save_err)
+  end
+
+  if snd and snd.mapper and type(snd.mapper.refreshNativeExitLockVisuals) == "function" then
+    snd.mapper.refreshNativeExitLockVisuals(nil, true)
   end
 
   local cache_ok, cache_result = refresh_compiled_layout_area(graph, area)

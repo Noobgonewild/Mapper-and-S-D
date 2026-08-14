@@ -192,8 +192,9 @@ local function styles_to_decho()
 end
 
 
-function mm.refresh_terrain_ids()
+function mm.refresh_terrain_ids(force)
   mm.terrain_ids = mm.terrain_ids or {}
+  if not force and mm.runtime and mm.runtime.terrain_ids_ready then return true end
   local packet = mm.get_room_sectors_packet()
   local sectors = packet and packet.sectors
   if type(sectors) ~= "table" then return false end
@@ -206,6 +207,8 @@ function mm.refresh_terrain_ids()
     end
   end
   if count > 0 then
+    mm.runtime = mm.runtime or {}
+    mm.runtime.terrain_ids_ready = true
     mm.debug("loaded terrain sector map entries: " .. tostring(count))
     return true
   end
@@ -254,9 +257,22 @@ function mm.apply_room_terrain(room_id, terrain_name)
   mm.refresh_terrain_ids()
   local env = mm.terrain_ids and mm.terrain_ids[tostring(terrain_name)]
   if not env then return end
-  local ok, result = pcall(setRoomEnv, tonumber(room_id), env)
+  mm.runtime = mm.runtime or {}
+  mm.runtime.applied_room_env = mm.runtime.applied_room_env or {}
+  local numeric_room = tonumber(room_id)
+  if not numeric_room then return end
+  if mm.runtime.applied_room_env[numeric_room] == env then return end
+  if type(getRoomEnv) == "function" then
+    local got, current = pcall(getRoomEnv, numeric_room)
+    if got and tonumber(current) == tonumber(env) then
+      mm.runtime.applied_room_env[numeric_room] = env
+      return
+    end
+  end
+  local ok, result = pcall(setRoomEnv, numeric_room, env)
   if mm and mm.bump_stats then
     if ok and result ~= false then
+      mm.runtime.applied_room_env[numeric_room] = env
       mm.bump_stats("room_colors_set")
     else
       mm.bump_stats("failed")
@@ -275,23 +291,18 @@ local function room_exists(room_id)
   return area ~= nil and area ~= -1
 end
 
-local function find_room_by_user_data(vnum)
-  if type(getRooms) ~= "function" or type(getRoomUserData) ~= "function" then return nil end
-  local ok_rooms, rooms = pcall(getRooms)
-  if not ok_rooms or type(rooms) ~= "table" then return nil end
-
-  local target = tostring(vnum or "")
-  if target == "" then return nil end
-
-  for room_id, _ in pairs(rooms) do
-    local ok_ud, ud = pcall(getRoomUserData, room_id)
-    if ok_ud and type(ud) == "table" then
-      if tostring(ud.vnum or "") == target or tostring(ud.id or "") == target or tostring(ud.roomid or "") == target then
-        return tonumber(room_id)
-      end
-    end
+local function warn_missing_native_room(room_id)
+  mm.runtime = mm.runtime or {}
+  mm.runtime.native_missing_room_warnings = mm.runtime.native_missing_room_warnings or {}
+  local key = tostring(room_id or "unknown")
+  if mm.runtime.native_missing_room_warnings[key] then
+    mm.debug("Native bigmap room still unresolved: " .. key)
+    return
   end
-  return nil
+
+  mm.runtime.native_missing_room_warnings[key] = true
+  mm.warn("Bigmap location unresolved. GMCP room=" .. key ..
+    " is not present in the native map; keeping the last valid native position.")
 end
 
 local function native_bigmap_active()
@@ -357,25 +368,21 @@ local function sync_current_room(info, reason)
   if gmcp_uid then
     local exists = room_exists(gmcp_uid)
     mm.debug("gmcp room id exists in map DB=" .. tostring(exists))
-    if exists and sync_to_room_id(gmcp_uid, reason or "gmcp_room_direct") then
-      mm.runtime = mm.runtime or {}
-      if not mm.runtime.located_once then
-        mm.runtime.located_once = true
-        mm.note("Mapper synchronized to room " .. tostring(gmcp_uid) .. ".")
+    if exists then
+      if sync_to_room_id(gmcp_uid, reason or "gmcp_room_direct") then
+        mm.runtime = mm.runtime or {}
+        if not mm.runtime.located_once then
+          mm.runtime.located_once = true
+          mm.note("Mapper synchronized to room " .. tostring(gmcp_uid) .. ".")
+        end
+        return true
       end
-      return true
+      return false
     end
-    if not exists then
-      mm.debug("gmcp room id " .. tostring(gmcp_uid) .. " missing in loaded map; trying userdata fallback")
-    end
+    mm.debug("gmcp room id " .. tostring(gmcp_uid) .. " is missing in the loaded native map")
   end
 
-  local target_uid = find_room_by_user_data(info and info.num)
-  if target_uid then
-    if sync_to_room_id(target_uid, reason or "gmcp_userdata_fallback") then return true end
-  end
-
-  mm.warn("Bigmap location unresolved. GMCP room=" .. tostring(info and info.num) .. " is not present in the native map.")
+  warn_missing_native_room(info and info.num)
   return false
 end
 
@@ -455,9 +462,24 @@ function mm.show_room_note(room_id, info, source)
     ))
   end
 
-  -- Defer one tick so the room title line is already printed, avoiding the
+  -- Defer briefly so the room title line is already printed, avoiding the
   -- note being concatenated onto the same row as the room name.
+  mm.runtime = mm.runtime or {}
+  mm.runtime.room_note_serial = (tonumber(mm.runtime.room_note_serial) or 0) + 1
+  local note_serial = mm.runtime.room_note_serial
+  local requested_room_id = tostring(room_id)
+  if mm.runtime.room_note_timer and type(killTimer) == "function" then
+    pcall(killTimer, mm.runtime.room_note_timer)
+    mm.runtime.room_note_timer = nil
+  end
+
   local emit_note = function()
+    if note_serial ~= tonumber(mm.runtime and mm.runtime.room_note_serial) then return end
+    local current_info = mm.get_room_info and mm.get_room_info() or nil
+    local current_room_id = current_info and mm.canonical_room_uid and
+      mm.canonical_room_uid(current_info) or (current_info and current_info.num)
+    if current_room_id ~= nil and tostring(current_room_id) ~= requested_room_id then return end
+    if mm.runtime then mm.runtime.room_note_timer = nil end
     local player_state = nil
     if gmcp and gmcp.char and gmcp.char.status and gmcp.char.status.state ~= nil then
       player_state = tonumber(gmcp.char.status.state) or tostring(gmcp.char.status.state)
@@ -473,7 +495,7 @@ function mm.show_room_note(room_id, info, source)
     end
   end
   if type(tempTimer) == "function" then
-    tempTimer(0, emit_note)
+    mm.runtime.room_note_timer = tempTimer(0.2, emit_note)
   else
     emit_note()
   end
@@ -587,11 +609,7 @@ function mm.on_room_vnum_line()
   end
 
   if room_exists(vnum) and sync_to_room_id(vnum, "vnum_line") then return end
-
-  local mapped = find_room_by_user_data(vnum)
-  if mapped then
-    sync_to_room_id(mapped, "vnum_userdata")
-  end
+  warn_missing_native_room(vnum)
 end
 
 function mm.on_coords_line()
@@ -652,6 +670,10 @@ function mm.on_room_info_event()
   local room_area = tostring(info and (info.zone or info.area) or "")
 
   local switched, continent = false, false
+  if mm.on_cexit_key_observation_room then
+    local ok, err = pcall(mm.on_cexit_key_observation_room, info)
+    if not ok then mm.debug("cexit key observation room handler failed: " .. tostring(err)) end
+  end
   if mm.portal_usage and mm.portal_usage.on_room_info then
     mm.portal_usage.on_room_info(info)
   end
@@ -704,7 +726,7 @@ end
 
 function mm.on_room_sectors_event()
   local packet = mm.get_room_sectors_packet()
-  local refreshed = mm.refresh_terrain_ids()
+  local refreshed = mm.refresh_terrain_ids(true)
   if type(packet) ~= "table" then
     mm.debug("gmcp.room.sectors event; sectors payload missing")
     return
@@ -747,11 +769,24 @@ local function current_char_status_state()
   return tonumber(gmcp.char.status.state)
 end
 
+local function current_char_status_level()
+  if not (gmcp and gmcp.char and gmcp.char.status) then return nil end
+  return tonumber(gmcp.char.status.level)
+end
+
 function mm.on_char_status_event()
+  mm.runtime = mm.runtime or {}
+  local level = current_char_status_level()
+  if level ~= nil and tonumber(mm.runtime.exit_lock_visual_level) ~= level then
+    mm.runtime.exit_lock_visual_level = level
+    if snd and snd.mapper and type(snd.mapper.refreshExitLockVisualStates) == "function" then
+      snd.mapper.refreshExitLockVisualStates()
+    end
+  end
+
   local state = current_char_status_state()
   if state == nil then return end
 
-  mm.runtime = mm.runtime or {}
   local previous_state = mm.runtime.autostop_previous_char_state
   mm.runtime.autostop_previous_char_state = state
 
@@ -775,6 +810,20 @@ local function kill_trigger_field(field)
   mm[field] = nil
 end
 
+function mm.on_cexit_key_unlock_line()
+  local observed_key = matches and matches[2] or nil
+  if not observed_key or not mm.observe_cexit_key_unlock then return false end
+  local ok, result, detail = pcall(mm.observe_cexit_key_unlock, observed_key)
+  if not ok then
+    mm.debug("cexit key unlock observer failed: " .. tostring(result))
+    return false
+  end
+  if result ~= true and detail then
+    mm.debug("CEXIT KEY OBSERVE DEBUG: unlock line not retained: " .. tostring(detail))
+  end
+  return result == true
+end
+
 function mm.register_events()
   if mm._events then
     if type(killAnonymousEventHandler) ~= "function" then return end
@@ -795,9 +844,11 @@ function mm.register_events()
   kill_trigger_field("_roomobjs_close_trigger")
   kill_trigger_field("_rdesc_open_trigger")
   kill_trigger_field("_rdesc_close_trigger")
+  kill_trigger_field("_cexit_key_unlock_trigger")
 
   mm.runtime = mm.runtime or {}
   mm.runtime.autostop_previous_char_state = current_char_status_state()
+  mm.runtime.exit_lock_visual_level = current_char_status_level()
 
   mm._events = {
     registerAnonymousEventHandler("gmcp.char.status", "mm.on_char_status_event"),
@@ -811,6 +862,8 @@ function mm.register_events()
     registerAnonymousEventHandler("gmcp.Room.Area", "mm.on_room_area_event"),
     registerAnonymousEventHandler("gmcp.room.sectors", "mm.on_room_sectors_event"),
     registerAnonymousEventHandler("gmcp.Room.Sectors", "mm.on_room_sectors_event"),
+    registerAnonymousEventHandler("DINV.itemObserved", "mm.on_dinv_item_observed"),
+    registerAnonymousEventHandler("DINV.identifyComplete", "mm.on_cexitif_key_identify_complete"),
   }
 
   -- Capture every line while the map block is active; Aardwolf map lines contain
@@ -828,4 +881,8 @@ function mm.register_events()
   mm._roomobjs_close_trigger = tempTrigger("{/roomobjs}", "mm.on_tag_line()")
   mm._rdesc_open_trigger = tempTrigger("{rdesc}", "mm.on_tag_line()")
   mm._rdesc_close_trigger = tempTrigger("{/rdesc}", "mm.on_tag_line()")
+  mm._cexit_key_unlock_trigger = tempRegexTrigger(
+    "^You unlock .+ with (.+)\\.$",
+    "mm.on_cexit_key_unlock_line()"
+  )
 end

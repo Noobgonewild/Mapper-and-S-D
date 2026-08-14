@@ -40,6 +40,8 @@ CW.ROOM_REFRESH_DELAY = 0.20
 CW.roomRefreshSerial = tonumber(CW.roomRefreshSerial) or 0
 CW.captureSerial = tonumber(CW.captureSerial) or 0
 CW.captureInFlight = nil -- A reload invalidates any marker from the old code.
+CW.pendingSightings = nil
+CW.lastRenderSignature = nil
 CW.suppressConsiderLines = false
 CW.refreshDirty = CW.refreshDirty == true
 CW.pendingRefreshReason = CW.pendingRefreshReason or nil
@@ -117,6 +119,7 @@ local function cfg()
         mode = "consider", -- consider | off
         strictFocusIdOnly = false, -- When true, ambiguous duplicate targets require currentEnemyMobId for HP overlay/death mark.
         killCommand = "kill",
+        targetMode = "auto", -- auto | skill | cast | raw
         repopulate = 3, -- Refresh window after N confirmed kills (0 = disabled)
         clearOnSafe = true,
         clearOnEmptyRoomchars = true,
@@ -129,6 +132,17 @@ local function cfg()
         mode = "consider"
     end
     snd.config.conwin.mode = mode
+    local targetMode
+    if snd.utils and type(snd.utils.normalizeMobTargetMode) == "function" then
+        targetMode = snd.utils.normalizeMobTargetMode(snd.config.conwin.targetMode or "auto")
+    else
+        targetMode = tostring(snd.config.conwin.targetMode or "auto"):lower()
+        if targetMode == "pro" then targetMode = "raw" end
+        if targetMode ~= "auto" and targetMode ~= "skill" and targetMode ~= "cast" and targetMode ~= "raw" then
+            targetMode = nil
+        end
+    end
+    snd.config.conwin.targetMode = targetMode or "auto"
     return snd.config.conwin
 end
 
@@ -265,19 +279,25 @@ function CW.detectActiveTargetInRoom()
 
     local targetName = normalizeMobName(current.name or current.mob or current.matchedMobName or "")
     if targetName == "" then return false end
-    local present = false
-    for _, m in ipairs(CW.mobs or {}) do
-        if not m.dead and normalizeMobName(m.name) == targetName then
-            present = true
+    local matchedMob = nil
+    local matchedIndex = nil
+    for index, m in ipairs(CW.mobs or {}) do
+        if not m.dead and normalizeMobName(m.name) == targetName
+            and (activityLabel ~= "quest" or m.questTarget == true)
+        then
+            matchedMob = m
+            matchedIndex = index
             break
         end
     end
-    if not present then return false end
+    if not matchedMob then return false end
 
     return {
         roomId = roomId,
         activityLabel = activityLabel,
         target = current,
+        mob = matchedMob,
+        mobIndex = matchedIndex,
     }
 end
 
@@ -417,6 +437,7 @@ function CW.startSerializedCapture(roomId)
     CW.suppressConsiderLines = false
     CW.captureSerial = (tonumber(CW.captureSerial) or 0) + 1
     local serial = CW.captureSerial
+    local room = snd.room and snd.room.current or {}
     CW.captureInFlight = {
         serial = serial,
         requestRoom = tostring(roomId or currentRoomId()),
@@ -428,6 +449,12 @@ function CW.startSerializedCapture(roomId)
         cancelled = false,
         observedRoom = nil,
         mobs = {},
+        sightings = {},
+        sightingRoom = {
+            roomId = room.rmid,
+            roomName = room.name or "",
+            zone = room.arid or "",
+        },
     }
     CW.awaiting = true
     send("consider all", false)
@@ -518,10 +545,19 @@ function CW.onCaptureMarker(serial)
         return false
     end
 
+    if snd.db and snd.db.recordMobSeenBatch and #(flight.sightings or {}) > 0 then
+        local ok = snd.db.recordMobSeenBatch(flight.sightings)
+        if not ok then snd.utils.debugNote("ConWin sighting batch could not be committed") end
+    end
+
     -- Keep the previous rows visible while the server produces consider output,
     -- then replace the list immediately before the completed result is rendered.
     CW.resetConsideredMobs(false)
     CW.mobs = flight.mobs or {}
+    CW.applyQuestTargetEvidence(CW.mobs, completedRoom)
+    if snd.triggers and snd.triggers.registerTargetLineTriggers then
+        snd.triggers.registerTargetLineTriggers()
+    end
     CW.killsSinceRefresh = 0
     CW.lastSuccessfulAutomaticKey = automaticRefreshKey(completedRoom)
     CW.lastAutoRoomId = completedRoom
@@ -634,17 +670,90 @@ function CW.shouldClearForSafeRoom()
     return CW.isCurrentRoomSafe()
 end
 
-function CW.activityMarkersForMob(name)
+local function mobMatchesActivityTarget(name, activity)
+    local needle = trim(name)
+    if needle == "" or not snd.targets or not snd.targets.list then return false end
+    for _, target in ipairs(snd.targets.list) do
+        if tostring(target.activity or ""):lower() == tostring(activity or ""):lower() then
+            for _, candidate in ipairs({target.mob or "", target.name or "", target.matchedMobName or ""}) do
+                if candidate ~= "" and snd.utils.mobIdentityMatches(candidate, needle) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function questEvidenceForRoom(roomId)
+    local evidence = snd and snd.roomChars and snd.roomChars.questTargetEvidence or nil
+    if type(evidence) ~= "table" or evidence.complete ~= true then return nil end
+    local markedOrdinal = tonumber(evidence.markedOrdinal)
+    if not markedOrdinal or markedOrdinal < 1 then return nil end
+    if tostring(evidence.roomId or "") == ""
+        or tostring(evidence.roomId) ~= tostring(roomId or "")
+    then
+        return nil
+    end
+    return evidence
+end
+
+function CW.applyQuestTargetEvidence(mobs, roomId)
+    local rows = mobs or CW.mobs or {}
+    for _, mob in ipairs(rows) do
+        mob.questTarget = false
+        mob.questTargetOrdinal = nil
+    end
+
+    local evidence = questEvidenceForRoom(roomId or currentRoomId())
+    if not evidence then return nil end
+
+    local matchingOrdinal = 0
+    for index, mob in ipairs(rows) do
+        if not mob.dead and mobMatchesActivityTarget(mob.name, "quest") then
+            matchingOrdinal = matchingOrdinal + 1
+            if matchingOrdinal == tonumber(evidence.markedOrdinal) then
+                mob.questTarget = true
+                mob.questTargetOrdinal = matchingOrdinal
+                return index
+            end
+        end
+    end
+    return nil
+end
+
+function CW.onQuestTargetEvidenceUpdated(_evidence)
+    local markedIndex = CW.applyQuestTargetEvidence(CW.mobs, currentRoomId())
+    CW.render()
+    return markedIndex
+end
+
+function CW.activityMarkersForMob(name, mob)
     local markers = {}
-    local needle = trim(name):lower()
+    local needle = trim(name)
     if needle == "" or not snd.targets or not snd.targets.list then return "" end
     local seen = {}
     for _, t in ipairs(snd.targets.list) do
-        if trim(t.mob or ""):lower() == needle and t.activity and not seen[t.activity] then
-            seen[t.activity] = true
-            if t.activity == "quest" then markers[#markers+1] = "[Q]"
-            elseif t.activity == "gq" then markers[#markers+1] = "[GQ]"
-            elseif t.activity == "cp" then markers[#markers+1] = "[CP]" end
+        local matchesTarget = false
+        for _, candidate in ipairs({t.mob or "", t.name or "", t.matchedMobName or ""}) do
+            if candidate and snd.utils.mobIdentityMatches(candidate, needle) then
+                matchesTarget = true
+                break
+            end
+        end
+        if matchesTarget and t.activity and not seen[t.activity] then
+            if t.activity == "quest" then
+                if type(mob) == "table" and mob.questTarget == true then
+                    seen[t.activity] = true
+                    markers[#markers+1] = "[Q]"
+                end
+            elseif t.activity == "gq" then
+                seen[t.activity] = true
+                markers[#markers+1] = "[GQ]"
+            elseif t.activity == "cp" then
+                seen[t.activity] = true
+                markers[#markers+1] = "[CP]"
+            end
         end
     end
     return table.concat(markers, "")
@@ -664,7 +773,7 @@ function CW.visibleNameForActivityTarget(targetName, activity)
     for _, m in ipairs(CW.mobs or {}) do
         local mobName = trim(m.name or "")
         if not m.dead and snd.utils.mobIdentityMatches(mobName, needle)
-            and (not marker or CW.activityMarkersForMob(mobName):find(marker, 1, true))
+            and (not marker or CW.activityMarkersForMob(mobName, m):find(marker, 1, true))
         then
             return mobName
         end
@@ -675,7 +784,7 @@ function CW.visibleNameForActivityTarget(targetName, activity)
     local matches = {}
     for _, m in ipairs(CW.mobs or {}) do
         local mobName = trim(m.name or "")
-        if not m.dead and mobName ~= "" and CW.activityMarkersForMob(mobName):find(marker, 1, true) then
+        if not m.dead and mobName ~= "" and CW.activityMarkersForMob(mobName, m):find(marker, 1, true) then
             local selectorMatches = snd.utils.mobSelectorMatchesName(needle, mobName)
             if not selectorMatches then
                 local mobNorm = normalizeMobName(mobName)
@@ -729,12 +838,10 @@ function CW.getActiveEnemyName()
     return ""
 end
 
-function CW.killCommandFor(index)
+function CW.killSelectorFor(index)
     local m = CW.mobs[index]
     if not m then return nil end
     if m.dead then return nil end
-    local base = trim(cfg().killCommand)
-    if base == "" then base = "kill" end
     local aliveNames = {}
     for _, other in ipairs(CW.mobs) do
         if not other.dead and other.name and other.name ~= "" then
@@ -758,9 +865,20 @@ function CW.killCommandFor(index)
     end
     if aliveDupCount > 1 then
         local dupIdx = math.max(1, math.floor(tonumber(aliveDupIndex) or 1))
-        return string.format("%s %d.%s", base, dupIdx, kw)
+        return string.format("%d.%s", dupIdx, kw)
     end
-    return string.format("%s %s", base, kw)
+    return kw
+end
+
+function CW.killCommandFor(index)
+    local selector = CW.killSelectorFor(index)
+    if not selector or selector == "" then return nil end
+    local base = trim(cfg().killCommand)
+    if base == "" then base = "kill" end
+    if snd.utils and type(snd.utils.buildMobTargetCommand) == "function" then
+        return snd.utils.buildMobTargetCommand(base, selector, cfg().targetMode or "auto")
+    end
+    return string.format("%s %s", base, selector)
 end
 
 function CW.noteAttackIntent(mob, source)
@@ -894,11 +1012,14 @@ function CW.trackAttackCommand(command)
     local rest = trim(raw:sub(#base + 1))
     if rest == "" then return end
 
-    local dupIndex, keyword = rest:match("^(%d+)%.(.+)$")
-    if not keyword or keyword == "" then
-        keyword = rest
-        dupIndex = 1
+    local keyword, dupIndex
+    if snd.utils and type(snd.utils.parseMobCommandTarget) == "function" then
+        keyword, dupIndex = snd.utils.parseMobCommandTarget(rest)
+    else
+        dupIndex, keyword = rest:match("^(%d+)%.(.+)$")
+        if not keyword or keyword == "" then keyword = rest end
     end
+    dupIndex = tonumber(dupIndex) or 1
     keyword = trim(keyword)
     if keyword == "" then return end
     CW.noteAttackByKeyword(keyword, dupIndex)
@@ -950,8 +1071,37 @@ local function countAliveByNormalizedName(name)
     return count
 end
 
-function CW.render()
+local function renderSignature()
+    local parts = {
+        tostring(currentPlayerState()),
+        trim(CW.getActiveEnemyName()),
+        tostring(clamp(gmcp_get("char.status.enemypct") or 100, 0, 100)),
+        tostring(CW.currentEnemyMobId or ""),
+        tostring(cfg().fontSize or ""),
+        tostring(cfg().alignTags == true),
+        tostring(cfg().strictFocusIdOnly == true),
+        tostring(cfg().killCommand or ""),
+        tostring(cfg().targetMode or "auto"),
+    }
+    for _, mob in ipairs(CW.mobs or {}) do
+        parts[#parts + 1] = table.concat({
+            tostring(mob.id or ""),
+            trim(mob.name or ""),
+            tostring(mob.color or ""),
+            tostring(mob.range or ""),
+            tostring(mob.dead == true),
+            tostring(mob.alignTag or ""),
+            CW.activityMarkersForMob(mob.name or "", mob),
+        }, "\31")
+    end
+    return table.concat(parts, "\30")
+end
+
+function CW.render(force)
     if not CW.ui or not CW.ui.console then return end
+    local signature = renderSignature()
+    if not force and signature == CW.lastRenderSignature then return false end
+    CW.lastRenderSignature = signature
     local c = CW.ui.console
     c:clear()
     c:setFontSize(cfg().fontSize)
@@ -969,7 +1119,7 @@ function CW.render()
         else
             c:cecho("<dim_gray>(no mobs)\n")
         end
-        return
+        return true
     end
     CW.reindexDuplicates()
     local strictFocus = cfg().strictFocusIdOnly and true or false
@@ -995,7 +1145,7 @@ function CW.render()
     end
 
     for i, m in ipairs(CW.mobs) do
-        local marker = CW.activityMarkersForMob(m.name)
+        local marker = CW.activityMarkersForMob(m.name, m)
         local markerPrefix = formatMarkersColored(marker)
         local sword = ""
         local mobName = normalizeMobName(m.name)
@@ -1039,6 +1189,7 @@ function CW.render()
             c:cechoLink(label, cmd, hint, true)
         end
     end
+    return true
 end
 
 function CW.addMob(name, color, range)
@@ -1052,6 +1203,7 @@ function CW.addMob(name, color, range)
         range = range or "?",
         dead = false,
         alignTag = nil,
+        questTarget = false,
     }
     CW.render()
 end
@@ -1059,12 +1211,28 @@ end
 function CW.startCapture()
     CW.awaiting = true
     CW.resetConsideredMobs(false)
+    local room = snd.room and snd.room.current or {}
+    CW.pendingSightings = {
+        roomId = room.rmid,
+        roomName = room.name or "",
+        zone = room.arid or "",
+        items = {},
+    }
     CW.render()
 end
 
 function CW.finishCapture()
     CW.awaiting = false
     if CW.doneTimer then killTimer(CW.doneTimer) CW.doneTimer = nil end
+    if CW.pendingSightings and snd.db and snd.db.recordMobSeenBatch then
+        local ok = snd.db.recordMobSeenBatch(CW.pendingSightings.items or {})
+        if not ok then snd.utils.debugNote("ConWin manual sighting batch could not be committed") end
+    end
+    CW.pendingSightings = nil
+    CW.applyQuestTargetEvidence(CW.mobs, currentRoomId())
+    if snd.triggers and snd.triggers.registerTargetLineTriggers then
+        snd.triggers.registerTargetLineTriggers()
+    end
     CW.killsSinceRefresh = 0
     CW.render()
     CW.resolveCurrentRoomTargetForNxAction()
@@ -1112,6 +1280,14 @@ function CW.considerLine(name, color, range, prefixHint)
     if not alignTag then
         alignTag = parseAlignTag(prefixHint)
     end
+    local markerText = mobName ~= "" and CW.activityMarkersForMob(mobName) or ""
+    if markerText ~= "" and type(suffix) == "function" and type(cecho) == "function" then
+        local colored = markerText
+            :gsub("%[Q%]", "<red>[Q]<reset>")
+            :gsub("%[CP%]", "<ansiCyan>[CP]<reset>")
+            :gsub("%[GQ%]", "<yellow>[GQ]<reset>")
+        pcall(suffix, " " .. colored, cecho)
+    end
     if flight then
         if mobName ~= "" then
             CW.nextMobId = CW.nextMobId + 1
@@ -1122,6 +1298,7 @@ function CW.considerLine(name, color, range, prefixHint)
                 range = range or "?",
                 dead = false,
                 alignTag = alignTag,
+                questTarget = false,
             }
         end
     else
@@ -1130,13 +1307,25 @@ function CW.considerLine(name, color, range, prefixHint)
             CW.mobs[#CW.mobs].alignTag = alignTag
         end
     end
-    if mobName ~= "" and snd.db and snd.room and snd.room.current and snd.room.current.rmid then
-        snd.db.recordMobSeen(
-            mobName,
-            snd.room.current.name,
-            snd.room.current.rmid,
-            snd.room.current.arid
-        )
+    if mobName ~= "" then
+        local pending = flight or CW.pendingSightings
+        local context = flight and flight.sightingRoom or pending
+        local items = flight and flight.sightings or (pending and pending.items)
+        if context and items and context.roomId then
+            items[#items + 1] = {
+                mob = mobName,
+                roomName = context.roomName,
+                roomId = context.roomId,
+                zone = context.zone,
+            }
+        elseif snd.db and snd.room and snd.room.current and snd.room.current.rmid then
+            -- Compatibility fallback for non-serialized third-party feeds.
+            snd.db.recordMobSeen(
+                mobName,
+                snd.room.current.name,
+                snd.room.current.rmid,
+                snd.room.current.arid)
+        end
     end
     if not flight then
         CW.deferFinish()
@@ -1487,6 +1676,7 @@ function CW.createWindow()
     end
     CW.ui.container = created
     CW.ui.console = Geyser.MiniConsole:new({name="sndConwinConsole", x=0, y=0, width="100%", height="100%"}, CW.ui.container)
+    CW.lastRenderSignature = nil
     CW.ui.console:setColor("black")
     CW.ui.console:setFontSize(c.fontSize)
     CW.ui.console:cecho("<gold>[S&D ConWin]\n")
@@ -1686,6 +1876,24 @@ function CW.setKillCommand(command)
         return false
     end
     cfg().killCommand = cmd
+    CW.render()
+    snd.saveState()
+    return true
+end
+
+function CW.setTargetMode(mode)
+    local normalized
+    if snd.utils and type(snd.utils.normalizeMobTargetMode) == "function" then
+        normalized = snd.utils.normalizeMobTargetMode(mode)
+    else
+        normalized = tostring(mode or ""):lower()
+        if normalized == "pro" then normalized = "raw" end
+        if normalized ~= "auto" and normalized ~= "skill" and normalized ~= "cast" and normalized ~= "raw" then
+            normalized = nil
+        end
+    end
+    if not normalized then return false end
+    cfg().targetMode = normalized
     CW.render()
     snd.saveState()
     return true

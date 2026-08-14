@@ -9,13 +9,33 @@ local function show_window_status(which)
 
   mm.note(string.format("%s status: %s, position=%s,%s size=%s x %s, locked=%s", which, cfg.enabled and "shown" or "hidden", tostring(cfg.x), tostring(cfg.y), tostring(cfg.width), tostring(cfg.height), tostring(cfg.locked)))
   if which == "bigmap" and mm.minimap and mm.minimap.get_bigmap_mode then
-    local mode, radius = mm.minimap.get_bigmap_mode()
+    local mode, radius, _, zoom = mm.minimap.get_bigmap_mode()
     local active = mm.minimap.get_active_bigmap_mode and mm.minimap.get_active_bigmap_mode() or mode
     local suffix = (mode == "local" or mode == "hybrid") and
-      string.format(" radius=%d", tonumber(radius) or 4) or ""
+      string.format(" radius=%d zoom=%d%%", tonumber(radius) or 4, tonumber(zoom) or 100) or ""
     if mode == "hybrid" then suffix = suffix .. " active=" .. tostring(active) end
     mm.note(string.format("bigmap display: %s%s", tostring(mode), suffix))
+    mm.note(mm.native_mapper_preload_status_text())
   end
+end
+
+local function handle_native_preload(option)
+  local requested = tostring(option or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+  if requested == "" then
+    mm.note(mm.native_mapper_preload_status_text())
+    return true
+  end
+  if requested ~= "on" and requested ~= "off" then
+    mm.warn("Usage: mapper native preload [on|off]")
+    return false
+  end
+  local ok, err = mm.set_native_mapper_preload(requested == "on")
+  if not ok then
+    mm.warn("Could not save native map preload setting: " .. tostring(err))
+    return false
+  end
+  mm.note(mm.native_mapper_preload_status_text())
+  return true
 end
 
 local function handle_window_command(which, action, a, b)
@@ -285,6 +305,16 @@ local function handle_command_inline(line)
     return true
   end
 
+  if line == "mapper native preload" or line == "mapper bigmap preload" then
+    return handle_native_preload()
+  end
+
+  local native_preload = line:match("^mapper%s+native%s+preload%s+(%S+)$")
+    or line:match("^mapper%s+bigmap%s+preload%s+(%S+)$")
+  if native_preload then
+    return handle_native_preload(native_preload)
+  end
+
   local help_topic = line:match("^mapper help%s+(.+)$")
   if line == "mapper help" or help_topic then
     mm.show_help(help_topic)
@@ -298,8 +328,32 @@ local function handle_command_inline(line)
   end
 
   local bigmap_arg = line:match("^mapper%s+bigmap%s+(%S+)$") or line:match("^mapper%s+map%s+(%S+)$")
-  if bigmap_arg and (bigmap_arg == "local" or bigmap_arg == "native" or bigmap_arg == "hybrid") then
+  if bigmap_arg and (bigmap_arg == "native" or bigmap_arg == "hybrid") then
     mm.minimap.set_bigmap_mode(bigmap_arg)
+    return true
+  end
+
+  if bigmap_arg == "local" then
+    mm.warn("Local is now the area backend of hybrid mode. Use 'mapper bigmap hybrid'.")
+    return true
+  end
+
+  if line == "mapper bigmap renderstats" or line == "mapper map renderstats" then
+    local stats = mm.minimap.get_local_render_stats and mm.minimap.get_local_render_stats() or {}
+    mm.note(string.format(
+      "Local BigMap: %d renders, %.2f ms average, %.2f ms max, %d drawables created, %d reused, %d peak visible.",
+      tonumber(stats.renders) or 0,
+      tonumber(stats.average_ms) or 0,
+      tonumber(stats.max_ms) or 0,
+      tonumber(stats.created) or 0,
+      tonumber(stats.reused) or 0,
+      tonumber(stats.peak_visible) or 0))
+    return true
+  end
+
+  if line == "mapper bigmap renderstats reset" or line == "mapper map renderstats reset" then
+    if mm.minimap.reset_local_render_stats then mm.minimap.reset_local_render_stats() end
+    mm.note("Local BigMap render measurements reset.")
     return true
   end
 
@@ -335,6 +389,16 @@ local function handle_command_inline(line)
     if mm.minimap and mm.minimap.update_local_map then
       mm.minimap.update_local_map(nil, { force = true })
       mm.note("Bigmap local view refreshed.")
+    end
+    return true
+  end
+
+  local zoom_direction = line:match("^mapper%s+zoom%s+(%S+)$")
+    or line:match("^mapper%s+bigmap%s+zoom%s+(%S+)$")
+    or line:match("^mapper%s+map%s+zoom%s+(%S+)$")
+  if zoom_direction == "in" or zoom_direction == "out" then
+    if mm.minimap and mm.minimap.zoom_bigmap then
+      mm.minimap.zoom_bigmap(zoom_direction)
     end
     return true
   end
@@ -840,6 +904,61 @@ local function handle_command_inline(line)
   local cexit_wait = line:match("^mapper cexit_wait%s+(.+)$")
   if cexit_wait then local ok, err = mm.set_cexit_wait(cexit_wait); if not ok then mm.warn(err) end; return true end
 
+  local delete_cexitkey_row = line:match("^mapper cexitkeys%s+delete%s+(%d+)$")
+  if delete_cexitkey_row then
+    local ok, err = mm.delete_cexit_key_observation(delete_cexitkey_row)
+    if not ok then mm.warn(err) end
+    return true
+  end
+  local cexitkeys_scope = line:match("^mapper cexitkeys%s+(%S+)$")
+  if line == "mapper cexitkeys" or cexitkeys_scope then
+    local ok, err = mm.list_cexit_key_observations(cexitkeys_scope)
+    if not ok then mm.warn(err) end
+    return true
+  end
+  if line:find("^mapper cexitkeys") then
+    mm.warn("Usage: mapper cexitkeys [thisroom] | mapper cexitkeys delete <row>")
+    return true
+  end
+
+  local cexitif_row, cexitif_keyid, cexitif_command = line:match(
+    "^mapper cexitif%s+(%d+)%s+keyid%s+(%d+)%s+do%s+{(.*)}%s*$"
+  )
+  if cexitif_row then
+    local ok, err = mm.set_cexitif_keyid(cexitif_row, cexitif_keyid, cexitif_command)
+    if not ok then mm.warn(err) end
+    return true
+  end
+  local cexitif_keywords
+  cexitif_row, cexitif_keywords, cexitif_command = line:match(
+    "^mapper cexitif%s+(%d+)%s+key%s+{([^}]*)}%s+do%s+{(.*)}%s*$"
+  )
+  if cexitif_row then
+    local ok, err = mm.set_cexitif_keywords(cexitif_row, cexitif_keywords, cexitif_command)
+    if not ok then mm.warn(err) end
+    return true
+  end
+  if line:match("^mapper cexitif%s+%d+%s+keyexists") then
+    mm.warn("Name-only keys are no longer supported; use mapper cexitif <row> keyid <id> do {<alternate command>}")
+    return true
+  end
+  local cexitif_test = line:match("^mapper cexitif%s+(%d+)%s+test$")
+  if cexitif_test then
+    local ok, err = mm.test_cexitif(cexitif_test)
+    if not ok then mm.warn(err) end
+    return true
+  end
+  local cexitif_off = line:match("^mapper cexitif%s+(%d+)%s+off$")
+  if cexitif_off then
+    local ok, err = mm.remove_cexitif(cexitif_off)
+    if not ok then mm.warn(err) end
+    return true
+  end
+  if line:find("^mapper cexitif") then
+    mm.warn("Usage: mapper cexitif <row> keyid <id> do {<alternate command>} | mapper cexitif <row> key {<exact keywords>} do {<alternate command>} | mapper cexitif <row> test | mapper cexitif <row> off")
+    return true
+  end
+
   local cexit_cmd = line:match("^mapper cexit%s+(.+)$")
   if cexit_cmd then
     mm.debug(string.format("CEXIT DEBUG: parsed='%s' from line='%s'", tostring(cexit_cmd), tostring(line)))
@@ -887,7 +1006,7 @@ local function handle_command_inline(line)
     fx_cmd, fx_src, fx_dst, fx_lvl = line:match("^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)%s+quiet$")
     fx_quiet = fx_cmd ~= nil
   end
-  if fx_cmd then local ok, err = mm.add_full_cexit(fx_cmd, fx_src, fx_dst, fx_lvl, fx_quiet); if not ok then mm.warn(err) end; return true end
+  if fx_cmd then local ok, err = mm.add_full_cexit(fx_cmd, fx_src, fx_dst, fx_lvl, fx_quiet, { preserve_command = true }); if not ok then mm.warn(err) end; return true end
 
   local delete_cexit_idx = line:match("^mapper deletecexit%s+(%d+)$")
   if delete_cexit_idx then local ok, err = mm.delete_cexit(delete_cexit_idx); if not ok then mm.warn(err) end; return true end
@@ -1031,8 +1150,9 @@ local function handle_command_inline(line)
     return true
   end
 
-  if line == "mapper delete note" then
-    local ok, err = mm.delete_note()
+  local delete_note_arg = line:match("^mapper delete note%s+(.+)$")
+  if line == "mapper delete note" or delete_note_arg then
+    local ok, err = mm.delete_note(delete_note_arg)
     if not ok then mm.warn(err) end
     return true
   end
@@ -1168,14 +1288,20 @@ mm.alias_specs = {
   {"^mapper cexits area%s+(.+)$", function(m) local ok, err = mm.list_cexits("area " .. m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexits(?:%s+(.+))?$", function(m) local ok, err = mm.list_cexits(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexit_wait%s+(.+)$", function(m) local ok, err = mm.set_cexit_wait(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper cexitkeys%s+delete%s+(%d+)$", function(m) local ok, err = mm.delete_cexit_key_observation(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper cexitkeys%s*(%S*)$", function(m) local ok, err = mm.list_cexit_key_observations(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper cexitif%s+(%d+)%s+keyid%s+(%d+)%s+do%s+{(.*)}$", function(m) local ok, err = mm.set_cexitif_keyid(m[2], m[3], m[4]); if not ok then mm.warn(err) end end},
+  {"^mapper cexitif%s+(%d+)%s+key%s+{([^}]*)}%s+do%s+{(.*)}$", function(m) local ok, err = mm.set_cexitif_keywords(m[2], m[3], m[4]); if not ok then mm.warn(err) end end},
+  {"^mapper cexitif%s+(%d+)%s+test$", function(m) local ok, err = mm.test_cexitif(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper cexitif%s+(%d+)%s+off$", function(m) local ok, err = mm.remove_cexitif(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexit%s+(.+)$", function(m) local ok, err = mm.cexit(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper randomcexits area%s+(.+)$", function(m) local ok, err = mm.list_random_cexits("area " .. m[2]); if not ok then mm.warn(err) end end},
   {"^mapper randomcexits%s+(.+)$", function(m) local ok, err = mm.list_random_cexits(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper randomcexits$", function() local ok, err = mm.list_random_cexits(); if not ok then mm.warn(err) end end},
   {"^mapper deleterandomcexit%s+(%d+)$", function(m) local ok, err = mm.delete_random_cexit(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper randomcexit%s+{(.+)}%s+(%S+)%s+{([^}]+)}%s+(%d+)$", function(m) local ok, err = mm.add_random_cexit(m[2], m[3], m[4], m[5], false); if not ok then mm.warn(err) end end},
-  {"^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)%s+quiet$", function(m) local ok, err = mm.add_full_cexit(m[2], m[3], m[4], m[5], true); if not ok then mm.warn(err) end end},
-  {"^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)$", function(m) local ok, err = mm.add_full_cexit(m[2], m[3], m[4], m[5], false); if not ok then mm.warn(err) end end},
+  {"^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)%s+quiet$", function(m) local ok, err = mm.add_full_cexit(m[2], m[3], m[4], m[5], true, { preserve_command = true }); if not ok then mm.warn(err) end end},
+  {"^mapper fullcexit%s+{(.+)}%s+(%S+)%s+(%S+)%s+(%d+)$", function(m) local ok, err = mm.add_full_cexit(m[2], m[3], m[4], m[5], false, { preserve_command = true }); if not ok then mm.warn(err) end end},
   {"^mapper deletecexit%s+(%d+)$", function(m) local ok, err = mm.delete_cexit(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper deletedcexits$", function() local ok, err = mm.list_deleted_cexits(); if not ok then mm.warn(err) end end},
   {"^mapper restorecexit%s+(.+)$", function(m) local ok, err = mm.restore_cexit(m[2]); if not ok then mm.warn(err) end end},
@@ -1264,6 +1390,7 @@ mm.alias_specs = {
     end},
   {"^mapper addnote%s+(.+)$", function(m) local ok, err = mm.add_note(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper delete note$", function() local ok, err = mm.delete_note(); if not ok then mm.warn(err) end end},
+  {"^mapper delete note%s+(.+)$", function(m) local ok, err = mm.delete_note(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper backups$", function() mm.print_backup_settings() end},
   {"^mapper backups (on|off)$", function(m) mm.state.backups_enabled = mm.bool_arg(m[2], mm.state.backups_enabled); mm.note("backups " .. (mm.state.backups_enabled and "on" or "off")) end},
   {"^mapper backups quiet$", function() mm.state.backups_quiet = not mm.state.backups_quiet; mm.note("backups quiet " .. (mm.state.backups_quiet and "on" or "off")) end},
@@ -1297,6 +1424,10 @@ mm.alias_specs = {
     end},
   {"^mapper native db$", function() mm.note("Native mapper DB: " .. tostring(mm.resolve_native_mapper_db(mm.state.native_mapper_db))) end},
   {"^mapper native db (.+)$", function(m) mm.set_native_mapper_db(m[2]) end},
+  {"^mapper native preload$", function() handle_native_preload() end},
+  {"^mapper native preload (on|off)$", function(m) handle_native_preload(m[2]) end},
+  {"^mapper bigmap preload$", function() handle_native_preload() end},
+  {"^mapper bigmap preload (on|off)$", function(m) handle_native_preload(m[2]) end},
   {"^mapper native load$", function() local ok, err = mm.load_native_mapper_db(); if not ok then mm.warn(err) end end},
   {"^mapper native load (.+)$", function(m) local ok, err = mm.load_native_mapper_db(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper native inspect$", function() run_inspect(mm.state.map_db) end},
@@ -1366,7 +1497,6 @@ mm.stubbed = {
   "mapper findpath", "mapper clearcache",
   "mapper fullportal",
   "mapper areas",
-  "mapper zoom in", "mapper zoom out",
 }
 
 function mm.handle_command(line)

@@ -19,7 +19,7 @@ snd = snd or {}
 -------------------------------------------------------------------------------
 
 snd.version = "7.1.0"
-snd.schemaVersion = 6
+snd.schemaVersion = 7
 snd.fullVersion = "Search & Destroy v" .. snd.version
 
 local function sndFileExists(path)
@@ -93,6 +93,10 @@ local defaultConfig = {
     
     -- Kill command for xkill (default: "kill", can be set with xcmd)
     killCommand = "kill",
+    -- Mob target quoting: auto resolves direct cast commands, skill is the
+    -- normal kill/backstab form, cast quotes the numbered selector as a unit,
+    -- and raw preserves the historical unquoted behavior.
+    killTargetMode = "auto",
     
     -- Auto-noexp settings
     anex = {
@@ -1342,6 +1346,184 @@ local activityPriority = {
     cp = 3,      -- Campaign - third priority (no time limit)
 }
 
+-- Proximity is ordering metadata only. S&D never receives a route from this
+-- layer and never executes mapper steps; the selected target remains locked
+-- while mapper navigation is active.
+snd.proximity = snd.proximity or {
+    dirty = true,
+    generation = 0,
+    source = nil,
+    reason = "initial",
+}
+
+local function normalizedTargetArea(target)
+    local value = snd.scan.targetAreaKey(target)
+    return tostring(value or ""):lower()
+end
+
+local function proximityTargetRoom(target)
+    local roomId = tonumber(target and (target.rmid or target.roomId))
+    if roomId and roomId > 0 then
+        return tostring(math.floor(roomId))
+    end
+    return nil
+end
+
+local function proximityNavigationActive()
+    return (snd.nav and snd.nav.goingToRoom ~= nil)
+        or (snd.mapper and snd.mapper.goingToRoom ~= nil)
+        or (snd.mapper and snd.mapper.pathExecutionActive == true)
+end
+
+function snd.markTargetProximityDirty(reason)
+    snd.proximity = snd.proximity or {}
+    snd.proximity.dirty = true
+    snd.proximity.reason = tostring(reason or "changed")
+end
+
+--- Refresh target and area distances in one mapper traversal.
+-- The annotations are internal and are never displayed as hops.
+function snd.refreshTargetProximity(reason)
+    snd.proximity = snd.proximity or {}
+    snd.markTargetProximityDirty(reason or "refresh")
+
+    if proximityNavigationActive() then
+        return false, "navigation_active"
+    end
+    if not (snd.targets and type(snd.targets.list) == "table") then
+        return false, "no_targets"
+    end
+    if not (snd.mapper and type(snd.mapper.findDistances) == "function") then
+        return false, "mapper_api_unavailable"
+    end
+
+    local sourceNumber = tonumber(snd.room and snd.room.current and snd.room.current.rmid)
+    if not sourceNumber or sourceNumber <= 0 then
+        -- CP/GQ data can arrive before the first Room.Info packet, or while
+        -- recalled to an unmapped home. Remember that this refresh still
+        -- needs a source even if a previous session left a cached source.
+        snd.proximity.awaitingSource = true
+        return false, "source_unmapped"
+    end
+    local source = tostring(math.floor(sourceNumber))
+    local groups = {}
+    local groupOrder = 0
+    local destinations = {}
+    local destinationSeen = {}
+
+    for _, target in ipairs(snd.targets.list) do
+        target._proximityGeneration = nil
+        target._proximityDistance = nil
+        target._proximityAreaDistance = nil
+        target._proximityAreaOrdinal = nil
+        target._proximityAreaKey = nil
+
+        local activity = tostring(target.activity or ""):lower()
+        if (activity == "cp" or activity == "gq") and snd.scan.targetIsAlive(target) then
+            local areaKey = normalizedTargetArea(target)
+            local confidence = (target.lowConfidence == true or target.unlikely == true) and "low" or "high"
+            local groupKey = table.concat({activity, confidence, areaKey}, "|")
+            local group = groups[groupKey]
+            if not group then
+                groupOrder = groupOrder + 1
+                group = {
+                    activity = activity,
+                    areaKey = areaKey,
+                    ordinal = groupOrder,
+                    rooms = {},
+                    roomSeen = {},
+                    targets = {},
+                }
+                groups[groupKey] = group
+            end
+            table.insert(group.targets, target)
+            local roomId = proximityTargetRoom(target)
+            if roomId and not group.roomSeen[roomId] then
+                group.roomSeen[roomId] = true
+                table.insert(group.rooms, roomId)
+            end
+        end
+    end
+
+    -- An area start is only a fallback for an area whose targets have no best
+    -- room. getAreaStartRoom is cache-backed, so this does not add SQL per area.
+    for _, group in pairs(groups) do
+        if #group.rooms == 0 and group.areaKey ~= ""
+            and snd.db and type(snd.db.getAreaStartRoom) == "function"
+        then
+            local ok, startRoom = pcall(snd.db.getAreaStartRoom, group.areaKey)
+            local numeric = ok and tonumber(startRoom) or nil
+            if numeric and numeric > 0 then
+                table.insert(group.rooms, tostring(math.floor(numeric)))
+                group.usesAreaStart = true
+            end
+        end
+        for _, roomId in ipairs(group.rooms) do
+            if not destinationSeen[roomId] then
+                destinationSeen[roomId] = true
+                table.insert(destinations, roomId)
+            end
+        end
+    end
+
+    local distances = {}
+    local metadata = {source = source, requested = 0, found = 0}
+    if #destinations > 0 then
+        local ok, result, details = pcall(snd.mapper.findDistances, source, destinations, {
+            usePortals = true,
+            useRecall = true,
+        })
+        if not ok then
+            if snd.utils and snd.utils.debugNote then
+                snd.utils.debugNote("Target proximity failed: " .. tostring(result))
+            end
+            return false, "mapper_error"
+        end
+        distances = type(result) == "table" and result or {}
+        metadata = type(details) == "table" and details or metadata
+        if metadata.error then
+            return false, metadata.error
+        end
+    end
+
+    local generation = (tonumber(snd.proximity.generation) or 0) + 1
+    for _, group in pairs(groups) do
+        local areaDistance = nil
+        for _, roomId in ipairs(group.rooms) do
+            local distance = tonumber(distances[roomId])
+            if distance and (areaDistance == nil or distance < areaDistance) then
+                areaDistance = distance
+            end
+        end
+        for _, target in ipairs(group.targets) do
+            target._proximityGeneration = generation
+            target._proximityDistance = tonumber(distances[proximityTargetRoom(target) or ""])
+            target._proximityAreaDistance = areaDistance
+            target._proximityAreaOrdinal = group.ordinal
+            target._proximityAreaKey = group.areaKey
+        end
+    end
+
+    snd.proximity.generation = generation
+    snd.proximity.source = source
+    snd.proximity.awaitingSource = false
+    snd.proximity.dirty = false
+    snd.proximity.reason = tostring(reason or "refresh")
+    snd.proximity.metadata = metadata
+    if snd.utils and snd.utils.debugNote then
+        snd.utils.debugNote(string.format(
+            "Target proximity: source=%s destinations=%d found=%d depth=%d cached=%s (%.2fms)",
+            source,
+            tonumber(metadata.requested) or #destinations,
+            tonumber(metadata.found) or 0,
+            tonumber(metadata.depth) or 0,
+            tostring(metadata.cached == true),
+            tonumber(metadata.elapsedMs) or 0
+        ))
+    end
+    return true
+end
+
 --- Get priority value for an activity type
 -- @param activity Activity type string
 -- @return Priority value (lower = higher priority)
@@ -1370,8 +1552,13 @@ end
 
 --- Sort target list by priority (GQ > Quest > CP)
 -- Call this to ensure targets are displayed in priority order
-function snd.sortTargetsByPriority()
+function snd.sortTargetsByPriority(options)
     if not snd.targets or not snd.targets.list then return end
+
+    local opts = type(options) == "table" and options or {}
+    if opts.recalculateProximity == true then
+        snd.refreshTargetProximity(opts.reason or "target_sort")
+    end
 
     for i, target in ipairs(snd.targets.list) do
         target._sortOrdinal = i
@@ -1402,14 +1589,43 @@ function snd.sortTargetsByPriority()
         if lowA ~= lowB then
             return not lowA
         end
-        
-        -- Same activity type, sort by index
-        local indexA = a.sourceIndex or a.campaignIndex or a.index or a._sortOrdinal or 0
-        local indexB = b.sourceIndex or b.campaignIndex or b.index or b._sortOrdinal or 0
-        if indexA ~= indexB then
-            return indexA < indexB
+
+        local proximityReady = snd.proximity and snd.proximity.dirty == false
+        local generation = proximityReady and tonumber(snd.proximity.generation) or nil
+        local proximityA = generation and tonumber(a._proximityGeneration) == generation
+        local proximityB = generation and tonumber(b._proximityGeneration) == generation
+        if proximityA and proximityB then
+            local areaA = tostring(a._proximityAreaKey or "")
+            local areaB = tostring(b._proximityAreaKey or "")
+            if areaA ~= areaB then
+                local areaDistanceA = tonumber(a._proximityAreaDistance)
+                local areaDistanceB = tonumber(b._proximityAreaDistance)
+                if (areaDistanceA ~= nil) ~= (areaDistanceB ~= nil) then
+                    return areaDistanceA ~= nil
+                end
+                if areaDistanceA ~= nil and areaDistanceA ~= areaDistanceB then
+                    return areaDistanceA < areaDistanceB
+                end
+                local areaOrdinalA = tonumber(a._proximityAreaOrdinal) or math.huge
+                local areaOrdinalB = tonumber(b._proximityAreaOrdinal) or math.huge
+                if areaOrdinalA ~= areaOrdinalB then
+                    return areaOrdinalA < areaOrdinalB
+                end
+            else
+                local distanceA = tonumber(a._proximityDistance)
+                local distanceB = tonumber(b._proximityDistance)
+                if (distanceA ~= nil) ~= (distanceB ~= nil) then
+                    return distanceA ~= nil
+                end
+                if distanceA ~= nil and distanceA ~= distanceB then
+                    return distanceA < distanceB
+                end
+            end
+        elseif proximityA ~= proximityB then
+            return proximityA
         end
 
+        -- Preserve the pre-sort relative order for ties and unreachable rooms.
         return (a._sortOrdinal or 0) < (b._sortOrdinal or 0)
     end)
 
@@ -1508,14 +1724,15 @@ function snd.nav.invalidateQuickWhereForTarget(nextTarget)
 end
 
 --- Clear the current target
-function snd.clearTarget()
+function snd.clearTarget(opts)
+    local options = opts or {}
     local activity = snd.targets.current and snd.targets.current.activity or nil
     snd.nav.invalidateQuickWhereForTarget(nil)
     snd.targets.current = nil
     if activity and snd.targets.scoped then
         snd.targets.scoped[activity] = nil
     end
-    if snd.gui and snd.gui.refresh then
+    if options.refresh ~= false and snd.gui and snd.gui.refresh then
         snd.gui.refresh()
     end
 end
@@ -1640,7 +1857,17 @@ function snd.setActiveTab(activity, opts)
     if normalized ~= "auto" and normalized ~= "quest" and normalized ~= "gq" and normalized ~= "cp" then
         normalized = "auto"
     end
+    local changed = tostring(snd.tabs.active or "auto"):lower() ~= normalized
     snd.tabs.active = normalized
+    if changed then
+        snd.markTargetProximityDirty("activity_changed")
+        if options.sort ~= false then
+            snd.sortTargetsByPriority({
+                recalculateProximity = true,
+                reason = "activity_changed",
+            })
+        end
+    end
     if options.save ~= false and snd.saveState then
         snd.saveState()
     end
@@ -1668,6 +1895,13 @@ function snd.onRoomChange()
     end
 
     local wasNavigating = (snd.nav.goingToRoom or snd.mapper.goingToRoom) ~= nil
+        or snd.mapper.pathExecutionActive == true
+    snd.markTargetProximityDirty("room_changed")
+    if snd.triggers and snd.triggers.registerTargetLineTriggers then
+        local area = snd.utils.trim(snd.room and snd.room.current and snd.room.current.arid or ""):lower()
+        local matcherArea = snd.roomChars and tostring(snd.roomChars.targetMatcherArea or "") or ""
+        if area ~= matcherArea then snd.triggers.registerTargetLineTriggers() end
+    end
 
     -- Check if we arrived at destination
     local destination = snd.nav.goingToRoom or snd.mapper.goingToRoom
@@ -1687,12 +1921,24 @@ function snd.onRoomChange()
         end
     end
 
-    -- Skip per-room GUI refresh while mid-route; the 2s periodic timer covers updates during travel.
-    -- Sort/refresh on arrival (wasNavigating=true, now nil) or during manual movement.
+    -- Skip per-room GUI refresh while mid-route. Area-scoped room-character
+    -- matchers above still switch immediately.
+    -- A completed mapper route is a meaningful decision point. Manual movement
+    -- (including recall to an unmapped home) only dirties proximity; the next
+    -- xcp/nx/tab decision refreshes it synchronously.
     local stillNavigating = (snd.nav.goingToRoom or snd.mapper.goingToRoom) ~= nil
+        or snd.mapper.pathExecutionActive == true
     if not (wasNavigating and stillNavigating) then
         if snd.targets and snd.targets.list then
-            snd.sortTargetsByPriority()
+            local currentSource = tonumber(snd.room and snd.room.current and snd.room.current.rmid)
+            local firstMappedSource = currentSource and currentSource > 0
+                and (not snd.proximity
+                    or snd.proximity.source == nil
+                    or snd.proximity.awaitingSource == true)
+            snd.sortTargetsByPriority({
+                recalculateProximity = (wasNavigating and not stillNavigating) or firstMappedSource,
+                reason = firstMappedSource and "initial_room_ready" or "navigation_arrived",
+            })
         end
         if snd.gui and snd.gui.refresh then
             snd.gui.refresh()

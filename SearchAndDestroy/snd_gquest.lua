@@ -303,8 +303,9 @@ function snd.gq.buildMainTargetList()
             roomName = target.loc
         end
         local hasMobData = true
+        local locations = {}
         if snd.gquest.targetType ~= "room" and snd.db and snd.db.getMobLocations then
-            local locations = snd.db.getMobLocations(target.mob, target.arid)
+            locations = snd.db.getMobLocations(target.mob, target.arid) or {}
             hasMobData = #locations > 0
         end
 
@@ -333,6 +334,11 @@ function snd.gq.buildMainTargetList()
         entry.duplicates = duplicateCounts[dk] or 1
         if entry.priority_room and tonumber(entry.priority_room) and tonumber(entry.priority_room) > 0 then
             entry.rmid = tonumber(entry.priority_room)
+        elseif locations[1] and tonumber(locations[1].roomid or locations[1].rmid) then
+            entry.rmid = tonumber(locations[1].roomid or locations[1].rmid)
+            if entry.roomName == "" then
+                entry.roomName = tostring(locations[1].room or locations[1].roomName or "")
+            end
         end
         if snd.express and snd.express.classifyTarget then
             snd.express.classifyTarget(entry)
@@ -411,6 +417,13 @@ function snd.gq.buildMainTargetList()
     for i = #gqEntries, 1, -1 do
         table.insert(snd.targets.list, 1, gqEntries[i])
     end
+
+    if snd.sortTargetsByPriority then
+        snd.sortTargetsByPriority({
+            recalculateProximity = true,
+            reason = "gq_target_list_built",
+        })
+    end
     
     snd.utils.debugNote("Built GQ target list: " .. #snd.gquest.targets .. " targets (priority)")
 end
@@ -440,6 +453,12 @@ function snd.gq.updateTargetStatus()
                 target.dead = true
             end
         end
+    end
+    if snd.sortTargetsByPriority then
+        snd.sortTargetsByPriority({
+            recalculateProximity = true,
+            reason = "gq_target_status_changed",
+        })
     end
 end
 
@@ -532,9 +551,11 @@ function snd.gq.onMobKilled()
         local currentRoom = snd.room and snd.room.current and tostring(snd.room.current.name or "") or ""
         for i, t in ipairs(snd.targets.list) do
             if t.activity == "gq" and not t.dead then
-                local nameMatchesCurrent = (t.mob == snd.targets.current.name)
-                local nameMatchesConfirmedKill = (confirmedKilledMob ~= "" and t.mob == confirmedKilledMob)
-                local nameMatchesActiveCombat = (activeCombatMob ~= "" and t.mob == activeCombatMob)
+                -- ConWin publishes normalized lowercase names, while GQ output
+                -- may preserve capitalization in proper mob names.
+                local nameMatchesCurrent = snd.utils.mobIdentityMatches(t.mob, snd.targets.current.name)
+                local nameMatchesConfirmedKill = snd.utils.mobIdentityMatches(t.mob, confirmedKilledMob)
+                local nameMatchesActiveCombat = snd.utils.mobIdentityMatches(t.mob, activeCombatMob)
                 if nameMatchesCurrent or nameMatchesConfirmedKill or nameMatchesActiveCombat then
                     local score = 5
                     if nameMatchesConfirmedKill then score = score + 8 end
@@ -557,10 +578,17 @@ function snd.gq.onMobKilled()
             if t.remaining == 0 then
                 t.dead = true
                 if t.mob == snd.targets.current.name then
-                    snd.clearTarget()
+                    snd.clearTarget({refresh = false})
                 end
             end
         end
+    end
+
+    if snd.sortTargetsByPriority then
+        snd.sortTargetsByPriority({
+            recalculateProximity = true,
+            reason = "gq_kill",
+        })
     end
     
     -- Trigger gq check to update status (subject to AutoCheck mode)
@@ -570,8 +598,9 @@ function snd.gq.onMobKilled()
         end)
     end
 
-    if snd.gui and snd.gui.refresh then
-        snd.gui.refresh()
+    if snd.gui then
+        if snd.gui.requestRefresh then snd.gui.requestRefresh()
+        elseif snd.gui.refresh then snd.gui.refresh() end
     end
 end
 

@@ -8,7 +8,7 @@
     This module handles SQLite database operations using LuaSQL directly
     to read/write the existing MUSHclient database file.
     
-    Tables (from original schema v6):
+    Tables (schema v7, migrated in place from the original layouts):
     - mobs: mob locations and kill counts
     - area: area information and start rooms
     - mob_keyword_exceptions: custom keywords
@@ -36,7 +36,7 @@ snd.db.killCache = snd.db.killCache or {}
 snd.db.killCacheLastPrune = snd.db.killCacheLastPrune or 0
 snd.db.killCooldownSeconds = 3          -- dedupe duplicate kill events for same mob+room
 snd.db.killCacheMaxAgeSeconds = 30      -- short-lived kill dedupe cache
-snd.db.schemaVersion = 6
+snd.db.schemaVersion = 7
 snd.db.createdEmpty = false
 
 -- Default database path: directly inside the active Mudlet profile.
@@ -46,9 +46,15 @@ local SND_CORE_TABLES = { "area", "mobs", "mob_keyword_exceptions", "history" }
 local SND_LEGACY_CORE_TABLES = { "area", "mobs", "mob_keyword_exceptions" }
 local SND_REQUIRED_COLUMNS = {
     area = { "name", "key", "minlvl", "maxlvl", "lock", "startRoom", "noquest", "vidblain", "userKey" },
-    mobs = { "mob", "room", "roomid", "zone", "seen_count", "kill_count" },
+    mobs = { "mob", "room", "roomid", "zone", "seen_count", "kill_count", "last_seen", "last_killed" },
     mob_keyword_exceptions = { "area_name", "mob_name", "keyword" },
     history = { "id", "type", "level_taken", "start_time", "end_time", "status", "qp_rewards", "tp_rewards", "train_rewards", "prac_rewards", "gold_rewards" },
+}
+local SND_PRE_TIMESTAMP_REQUIRED_COLUMNS = {
+    area = SND_REQUIRED_COLUMNS.area,
+    mobs = { "mob", "room", "roomid", "zone", "seen_count", "kill_count" },
+    mob_keyword_exceptions = SND_REQUIRED_COLUMNS.mob_keyword_exceptions,
+    history = SND_REQUIRED_COLUMNS.history,
 }
 local SND_HISTORY_SCHEMA_SQL = {
     [[CREATE TABLE IF NOT EXISTS history (
@@ -85,6 +91,8 @@ local SND_SCHEMA_SQL = {
         zone TEXT NOT NULL,
         seen_count INTEGER NOT NULL DEFAULT 0,
         kill_count INTEGER NOT NULL DEFAULT 0,
+        last_seen INTEGER,
+        last_killed INTEGER,
         UNIQUE(mob, roomid))]],
     [[CREATE TABLE IF NOT EXISTS mob_keyword_exceptions (
         area_name TEXT NOT NULL,
@@ -244,8 +252,8 @@ local function validate_existing_snd_database(conn)
     return true
 end
 
--- Upgrade the one legacy S&D layout that can be identified without ambiguity:
--- the v5 core tables and columns are intact, but the v6 history table is absent.
+-- Upgrade the legacy S&D layout that can be identified without ambiguity: the
+-- v5 core tables and columns are intact, but the history table is absent.
 -- All DDL is transactional. Every other incomplete or corrupt layout remains
 -- untouched and is rejected by validate_existing_snd_database().
 local function migrate_legacy_history_schema(conn)
@@ -253,13 +261,15 @@ local function migrate_legacy_history_schema(conn)
     if not tables then return false, tables_err end
     if tables.history then return false end
 
+    local legacyMobColumns = nil
     for _, table_name in ipairs(SND_LEGACY_CORE_TABLES) do
         if not tables[table_name] then
             return false
         end
         local columns, columns_err = column_set_from_connection(conn, table_name)
         if not columns then return false, columns_err end
-        for _, column_name in ipairs(SND_REQUIRED_COLUMNS[table_name]) do
+        if table_name == "mobs" then legacyMobColumns = columns end
+        for _, column_name in ipairs(SND_PRE_TIMESTAMP_REQUIRED_COLUMNS[table_name]) do
             if not columns[column_name] then
                 return false
             end
@@ -278,6 +288,12 @@ local function migrate_legacy_history_schema(conn)
             ok, err = execute_on_connection(conn, sql)
             if not ok then break end
         end
+    end
+    if ok and legacyMobColumns and not legacyMobColumns.last_seen then
+        ok, err = execute_on_connection(conn, "ALTER TABLE mobs ADD COLUMN last_seen INTEGER")
+    end
+    if ok and legacyMobColumns and not legacyMobColumns.last_killed then
+        ok, err = execute_on_connection(conn, "ALTER TABLE mobs ADD COLUMN last_killed INTEGER")
     end
     if ok and current_version < snd.db.schemaVersion then
         ok, err = execute_on_connection(conn, "PRAGMA user_version = " .. tostring(snd.db.schemaVersion))
@@ -301,6 +317,63 @@ local function migrate_legacy_history_schema(conn)
     return true
 end
 
+-- v6 already has history, so only add the two unindexed observation timestamps.
+-- Validate the complete pre-v7 core before making any change, then validate the
+-- v7 layout before committing.
+local function migrate_mob_timestamp_schema(conn)
+    local tables, tables_err = table_set_from_connection(conn)
+    if not tables then return false, tables_err end
+    for _, table_name in ipairs(SND_CORE_TABLES) do
+        if not tables[table_name] then return false end
+        local columns, columns_err = column_set_from_connection(conn, table_name)
+        if not columns then return false, columns_err end
+        for _, column_name in ipairs(SND_PRE_TIMESTAMP_REQUIRED_COLUMNS[table_name]) do
+            if not columns[column_name] then return false end
+        end
+    end
+
+    local mobColumns, columns_err = column_set_from_connection(conn, "mobs")
+    if not mobColumns then return false, columns_err end
+    local currentVersion = tonumber(scalar_from_connection(conn, "PRAGMA user_version")) or 0
+    local needsLastSeen = not mobColumns.last_seen
+    local needsLastKilled = not mobColumns.last_killed
+    if not needsLastSeen and not needsLastKilled and currentVersion >= snd.db.schemaVersion then
+        return false
+    end
+
+    local integrity = tostring(scalar_from_connection(conn, "PRAGMA quick_check") or "unknown")
+    if integrity ~= "ok" then
+        return false, "SQLite quick_check: " .. integrity
+    end
+
+    local ok, err = execute_on_connection(conn, "BEGIN IMMEDIATE")
+    if ok and needsLastSeen then
+        ok, err = execute_on_connection(conn, "ALTER TABLE mobs ADD COLUMN last_seen INTEGER")
+    end
+    if ok and needsLastKilled then
+        ok, err = execute_on_connection(conn, "ALTER TABLE mobs ADD COLUMN last_killed INTEGER")
+    end
+    if ok and currentVersion < snd.db.schemaVersion then
+        ok, err = execute_on_connection(conn, "PRAGMA user_version = " .. tostring(snd.db.schemaVersion))
+    end
+    if ok then
+        ok, err = validate_existing_snd_database(conn)
+    end
+    if ok then
+        local committed, commit_err = execute_on_connection(conn, "COMMIT")
+        if not committed then
+            ok, err = false, commit_err
+            pcall(function() conn:execute("ROLLBACK") end)
+        end
+    else
+        pcall(function() conn:execute("ROLLBACK") end)
+    end
+    if not ok then
+        return false, "mob timestamp migration failed: " .. tostring(err)
+    end
+    return true
+end
+
 -------------------------------------------------------------------------------
 -- Database Connection
 -------------------------------------------------------------------------------
@@ -320,7 +393,7 @@ function snd.db.open()
     
     -- Opening a missing SQLite path creates a new file. Existing files are
     -- never removed, replaced, truncated, or recreated here. The single known
-    -- v5 layout is upgraded transactionally by adding its history table.
+    -- supported legacy layouts are upgraded transactionally in place.
     local existed = database_file_exists(snd.db.file)
     if existed and not database_looks_like_sqlite(snd.db.file) then
         snd.db.env:close()
@@ -338,13 +411,23 @@ function snd.db.open()
     end
 
     if existed then
-        local migrated, migration_err = migrate_legacy_history_schema(snd.db.conn)
+        local migratedHistory, migration_err = migrate_legacy_history_schema(snd.db.conn)
         if migration_err then
             snd.db.conn:close()
             snd.db.env:close()
             snd.db.conn = nil
             snd.db.env = nil
             snd.utils.errorNote("Existing database was left untouched: " .. tostring(migration_err))
+            snd.utils.infoNote("Expected S&D database path: " .. tostring(snd.db.file))
+            return false
+        end
+        local migratedTimestamps, timestamp_err = migrate_mob_timestamp_schema(snd.db.conn)
+        if timestamp_err then
+            snd.db.conn:close()
+            snd.db.env:close()
+            snd.db.conn = nil
+            snd.db.env = nil
+            snd.utils.errorNote("Existing database was left untouched: " .. tostring(timestamp_err))
             snd.utils.infoNote("Expected S&D database path: " .. tostring(snd.db.file))
             return false
         end
@@ -359,8 +442,8 @@ function snd.db.open()
             return false
         end
         snd.db.createdEmpty = false
-        if migrated then
-            snd.utils.infoNote("Upgraded legacy S&D database to schema v" .. tostring(snd.db.schemaVersion) .. " (added history table).")
+        if migratedHistory or migratedTimestamps then
+            snd.utils.infoNote("Upgraded S&D database to schema v" .. tostring(snd.db.schemaVersion) .. ".")
         end
     else
         local created, create_err = create_empty_snd_schema(snd.db.conn)
@@ -845,51 +928,87 @@ end
 -- @param roomName Room name
 -- @param roomId Room ID number
 -- @param zone Area key
-function snd.db.recordMobSeen(mobName, roomName, roomId, zone)
-    if not mobName or mobName == "" then return end
-    if not roomId then return end
-    
-    -- Skip certain mobs
-    if mobName:match("%(wounded%)") or mobName:match("%(aimed%)") then
-        return
-    end
-    
-    roomName = roomName or ""
-    zone = zone or snd.room.current.arid or ""
-    roomId = tonumber(roomId) or 0
+local function prepareMobSeenWrite(mobName, roomName, roomId, zone, now)
+    mobName = tostring(mobName or "")
+    if mobName == "" or roomId == nil then return nil end
+    if mobName:match("%(wounded%)") or mobName:match("%(aimed%)") then return nil end
 
-    local now = os.time()
-    local cacheKey = string.format("%s|%d", tostring(mobName):lower(), roomId)
+    roomName = tostring(roomName or "")
+    zone = tostring(zone or (snd.room.current and snd.room.current.arid) or "")
+    roomId = tonumber(roomId) or 0
+    now = tonumber(now) or os.time()
+    local cacheKey = string.format("%s|%d", mobName:lower(), roomId)
     local lastSeen = snd.db.seenCache and snd.db.seenCache[cacheKey] or nil
     local cooldown = tonumber(snd.db.seenCooldownSeconds) or 300
+    if lastSeen and (now - lastSeen) < cooldown then return nil end
 
-    if lastSeen and (now - lastSeen) < cooldown then
-        return
-    end
-
-    local lastPrune = tonumber(snd.db.seenCacheLastPrune) or 0
-    if (now - lastPrune) > 60 then
-        snd.db.pruneSeenCache(now)
-    end
-    
-    -- Ensure row exists before incrementing seen_count.
     local sql = string.format(
-        "INSERT OR IGNORE INTO mobs (mob, room, roomid, zone, seen_count, kill_count) VALUES (%s, %s, %d, %s, 0, 0)",
+        "INSERT INTO mobs (mob, room, roomid, zone, seen_count, kill_count, last_seen, last_killed) " ..
+        "VALUES (%s, %s, %d, %s, 1, 0, %d, NULL) " ..
+        "ON CONFLICT(mob, roomid) DO UPDATE SET " ..
+        "room = excluded.room, zone = excluded.zone, " ..
+        "seen_count = mobs.seen_count + 1, last_seen = excluded.last_seen",
         snd.db.escape(mobName),
         snd.db.escape(roomName),
         roomId,
-        snd.db.escape(zone)
+        snd.db.escape(zone),
+        now
     )
-    snd.db.execute(sql)
+    return {sql = sql, cacheKey = cacheKey, now = now}
+end
 
-    -- Increment seen count when outside cooldown window.
-    sql = string.format(
-        "UPDATE mobs SET seen_count = seen_count + 1 WHERE mob = %s AND roomid = %d",
-        snd.db.escape(mobName), roomId
-    )
-    snd.db.execute(sql)
+function snd.db.recordMobSeen(mobName, roomName, roomId, zone)
+    local now = os.time()
+    local lastPrune = tonumber(snd.db.seenCacheLastPrune) or 0
+    if (now - lastPrune) > 60 then snd.db.pruneSeenCache(now) end
+    local write = prepareMobSeenWrite(mobName, roomName, roomId, zone, now)
+    if not write then return false end
+    if snd.db.execute(write.sql) then
+        snd.db.seenCache[write.cacheKey] = write.now
+        return true
+    end
+    return false
+end
 
-    snd.db.seenCache[cacheKey] = now
+-- Commit a completed consider roster together. The existing seen-cache and
+-- post-combat clearing policy remains authoritative.
+function snd.db.recordMobSeenBatch(sightings)
+    if type(sightings) ~= "table" or #sightings == 0 then return true, 0 end
+    local now = os.time()
+    local lastPrune = tonumber(snd.db.seenCacheLastPrune) or 0
+    if (now - lastPrune) > 60 then snd.db.pruneSeenCache(now) end
+
+    local writes, queued = {}, {}
+    for _, sighting in ipairs(sightings) do
+        local write = prepareMobSeenWrite(
+            sighting.mob or sighting.name,
+            sighting.roomName or sighting.room,
+            sighting.roomId or sighting.rmid,
+            sighting.zone or sighting.arid,
+            now)
+        if write and not queued[write.cacheKey] then
+            queued[write.cacheKey] = true
+            writes[#writes + 1] = write
+        end
+    end
+    if #writes == 0 then return true, 0 end
+    if not snd.db.isOpen and not snd.db.open() then return false, 0 end
+    if not snd.db.execute("BEGIN IMMEDIATE") then return false, 0 end
+
+    for _, write in ipairs(writes) do
+        if not snd.db.execute(write.sql) then
+            pcall(function() snd.db.conn:execute("ROLLBACK") end)
+            return false, 0
+        end
+    end
+    if not snd.db.execute("COMMIT") then
+        pcall(function() snd.db.conn:execute("ROLLBACK") end)
+        return false, 0
+    end
+    for _, write in ipairs(writes) do
+        snd.db.seenCache[write.cacheKey] = write.now
+    end
+    return true, #writes
 end
 
 --- Record killing a mob in a room
@@ -920,20 +1039,21 @@ function snd.db.recordMobKill(mobName, roomId, roomName, zone)
     end
 
     local sql = string.format(
-        "UPDATE mobs SET kill_count = kill_count + 1 WHERE mob = %s AND roomid = %d",
-        snd.db.escape(mobName), roomId
-    )
-    snd.db.execute(sql)
-
-    sql = string.format(
-        "INSERT OR IGNORE INTO mobs (mob, room, roomid, zone, seen_count, kill_count) VALUES (%s, %s, %d, %s, 1, 1)",
+        "INSERT INTO mobs (mob, room, roomid, zone, seen_count, kill_count, last_seen, last_killed) " ..
+        "VALUES (%s, %s, %d, %s, 1, 1, %d, %d) " ..
+        "ON CONFLICT(mob, roomid) DO UPDATE SET " ..
+        "room = excluded.room, zone = excluded.zone, " ..
+        "kill_count = mobs.kill_count + 1, last_killed = excluded.last_killed",
         snd.db.escape(mobName),
         snd.db.escape(roomName),
         roomId,
-        snd.db.escape(zone)
+        snd.db.escape(zone),
+        now,
+        now
     )
-    snd.db.execute(sql)
-    snd.db.killCache[cacheKey] = now
+    if snd.db.execute(sql) then
+        snd.db.killCache[cacheKey] = now
+    end
 end
 
 --- Search for mobs by name

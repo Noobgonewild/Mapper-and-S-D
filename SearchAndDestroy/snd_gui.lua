@@ -89,6 +89,8 @@ snd.gui.targetLabels = {}      -- Dynamic per-target labels
 snd.gui.initialized = false
 snd.gui.minimized = false
 snd.gui.windowState = "max"    -- "max" or "min"
+snd.gui.renderSignatures = {}
+snd.gui.pendingRefreshTimer = nil
 snd.gui.tabOrder = {"quest", "gq", "cp"}
 snd.gui.tabLabels = {quest = "Quest", gq = "GQ", cp = "Campaign"}
 snd.gui.tabColors = {quest = "#9F2A2A", gq = "#2478c8", cp = "#2E8B57"}
@@ -498,6 +500,10 @@ end
 -------------------------------------------------------------------------------
 
 function snd.gui.destroy()
+    if snd.gui.pendingRefreshTimer and type(killTimer) == "function" then
+        pcall(killTimer, snd.gui.pendingRefreshTimer)
+        snd.gui.pendingRefreshTimer = nil
+    end
     -- Kill individual target labels
     snd.gui.clearTargetLabels()
 
@@ -531,6 +537,7 @@ function snd.gui.destroy()
 
     snd.gui.elements = {}
     snd.gui.targetLabels = {}
+    snd.gui.renderSignatures = {}
     snd.gui.initialized = false
 end
 
@@ -569,21 +576,41 @@ end
 -- Called whenever data changes (target list, quest status, room change, etc.)
 -------------------------------------------------------------------------------
 
-function snd.gui.refresh()
+function snd.gui.refresh(force)
     if not snd.gui.initialized or not snd.gui.elements.main then return end
     if snd.gui.minimized then return end
 
-    snd.gui.updateCircle()
-    snd.gui.updateNoexp()
-    snd.gui.updateAutocheck()
-    snd.gui.updateQuestTimer()
-    snd.gui.updateTargetList()
-    snd.gui.applyTabStyles()
+    snd.gui.updateCircle(force)
+    snd.gui.updateAutocheck(force)
+    snd.gui.updateQuestTimer(force)
+    snd.gui.updateTargetList(force)
+    snd.gui.applyTabStyles(force)
 end
 
-function snd.gui.applyTabStyles()
+function snd.gui.requestRefresh()
+    if snd.gui.pendingRefreshTimer then return false end
+    if type(tempTimer) ~= "function" then
+        snd.gui.refresh()
+        return true
+    end
+    snd.gui.pendingRefreshTimer = tempTimer(0, function()
+        snd.gui.pendingRefreshTimer = nil
+        snd.gui.refresh()
+    end)
+    return true
+end
+
+function snd.gui.applyTabStyles(force)
     if not snd.gui.elements or not snd.gui.elements.tabs then return end
     local active = snd.getActiveTab and snd.getActiveTab() or nil
+    local labels = {}
+    for key in pairs(snd.gui.elements.tabs) do
+        labels[#labels + 1] = key .. "=" .. snd.gui.getTabLabel(key)
+    end
+    table.sort(labels)
+    local signature = tostring(active or "") .. "|" .. table.concat(labels, "|")
+    if not force and snd.gui.renderSignatures.tabs == signature then return false end
+    snd.gui.renderSignatures.tabs = signature
     for key, tab in pairs(snd.gui.elements.tabs) do
         local selected = (key == active)
         if tab.echo then
@@ -651,13 +678,16 @@ end
 -- Mirrors draw_circle_readout() from the original
 -------------------------------------------------------------------------------
 
-function snd.gui.updateCircle()
+function snd.gui.updateCircle(force)
     if not snd.gui.elements.circle then return end
 
     local s = snd.gui.styles
     local auto = snd.config.anex and snd.config.anex.automatic
     local cutoff = snd.config.anex and snd.config.anex.tnlCutoff or 0
     local active = auto and cutoff > 0
+    local signature = table.concat({tostring(auto == true), tostring(cutoff), tostring(active)}, "|")
+    if not force and snd.gui.renderSignatures.circle == signature then return false end
+    snd.gui.renderSignatures.circle = signature
     local c1 = active and s.circleGreen1 or s.circleRed1
     local c2 = active and s.circleGreen2 or s.circleRed2
     local text = active and tostring(cutoff) or "off"
@@ -682,9 +712,11 @@ function snd.gui.updateNoexp()
     snd.gui.updateCircle()
 end
 
-function snd.gui.updateAutocheck()
+function snd.gui.updateAutocheck(force)
     if not snd.gui.elements.autocheck then return end
     local mode = snd.getAutocheckMode and snd.getAutocheckMode() or "on"
+    if not force and snd.gui.renderSignatures.autocheck == mode then return false end
+    snd.gui.renderSignatures.autocheck = mode
     local label = "AC:" .. string.upper(mode)
     snd.gui.elements.autocheck:echo(label)
     snd.gui.elements.autocheck:setToolTip("L: cycle AutoCheck mode (ON/SMART/OFF)")
@@ -701,6 +733,7 @@ function snd.gui.applyFontSize()
     s.buttonFontSize = fontSize
     s.statusFontSize = fontSize
     s.titleFontSize = fontSize + 1
+    snd.gui.renderSignatures = {}
 
     if snd.gui.elements.titleBar then
         snd.gui.elements.titleBar:setStyleSheet(cssTitle(s))
@@ -791,7 +824,7 @@ end
 -- Mirrors draw_next_quest_time() and quest_timer_text() from the original
 -------------------------------------------------------------------------------
 
-function snd.gui.updateQuestTimer()
+function snd.gui.updateQuestTimer(force)
     if not snd.gui.elements.questTimer then return end
     local s = snd.gui.styles
     local text = ""
@@ -842,6 +875,9 @@ function snd.gui.updateQuestTimer()
         end
     end
 
+    local signature = tostring(color) .. "|" .. tostring(text)
+    if not force and snd.gui.renderSignatures.questTimer == signature then return false end
+    snd.gui.renderSignatures.questTimer = signature
     snd.gui.elements.questTimer:setStyleSheet(cssQuestTimer(s, color))
     snd.gui.elements.questTimer:echo(text)
 end
@@ -922,11 +958,70 @@ local TC = {
 -- Builds clickable labels for each target
 -------------------------------------------------------------------------------
 
-function snd.gui.updateTargetList()
+local function targetListSignature()
+    local parts = {
+        tostring(snd.getActiveTab and snd.getActiveTab() or ""),
+        tostring(snd.targets and snd.targets.type or ""),
+        tostring(snd.config and snd.config.areaColors ~= false),
+        tostring(snd.config and snd.config.window and snd.config.window.fontSize or ""),
+        tostring(snd.config and snd.config.window and snd.config.window.width or ""),
+        tostring(snd.config and snd.config.window and snd.config.window.height or ""),
+        tostring(math.floor(os.time() / 60)),
+        tostring(gmcp and gmcp.char and gmcp.char.status and
+            (gmcp.char.status.enemy or gmcp.char.status.opponent) or ""),
+    }
+    local quest = snd.quest or {}
+    local questTarget = quest.target or {}
+    parts[#parts + 1] = table.concat({
+        tostring(questTarget.status or ""), tostring(questTarget.mob or ""),
+        tostring(questTarget.room or ""), tostring(questTarget.area or ""),
+        tostring(quest.timer or ""), tostring(quest.nextQuestTime or ""),
+        tostring(quest.available == true), tostring(quest.active == true),
+    }, "\31")
+    local current = snd.targets and snd.targets.current or {}
+    parts[#parts + 1] = table.concat({
+        tostring(current.activity or ""), tostring(current.name or current.mob or ""),
+        tostring(current.roomId or ""), tostring(current.index or ""),
+    }, "\31")
+    for _, target in ipairs(snd.targets and snd.targets.list or {}) do
+        parts[#parts + 1] = table.concat({
+            tostring(target.activity or ""), tostring(target.mob or target.name or ""),
+            tostring(target.arid or target.area or ""), tostring(target.loc or ""),
+            tostring(target.roomId or ""), tostring(target.roomName or ""),
+            tostring(target.dead == true), tostring(target.killed == true),
+            tostring(target.unlikely == true), tostring(target.lowConfidence == true),
+            tostring(target.remaining or target.qty or ""),
+            tostring(target.displayIndex or target.cpListIndex or target.index or ""),
+            tostring(target.duplicates or ""), tostring(target.dupIndex or ""),
+            tostring(target.express == true or target.isExpress == true),
+            tostring(target._proximityDistance or ""),
+        }, "\31")
+    end
+    local cacheStore = snd.nav and snd.nav.quickWhereByActivity or {}
+    local cacheActivities = {}
+    for activity in pairs(cacheStore) do cacheActivities[#cacheActivities + 1] = tostring(activity) end
+    table.sort(cacheActivities)
+    for _, activity in ipairs(cacheActivities) do
+        local cache = cacheStore[activity] or {}
+        local rooms = {}
+        for _, roomId in ipairs(cache.rooms or {}) do rooms[#rooms + 1] = tostring(roomId) end
+        parts[#parts + 1] = table.concat({
+            tostring(activity), tostring(cache.targetKey or ""), tostring(cache.index or ""),
+            table.concat(rooms, ","),
+        }, "\31")
+    end
+    return table.concat(parts, "\30")
+end
+
+function snd.gui.updateTargetList(force)
     if not snd.gui.elements.targetArea then
         snd.utils.debugNote("ABORT: targetArea element is nil")
         return
     end
+
+    local signature = targetListSignature()
+    if not force and snd.gui.renderSignatures.targetList == signature then return false end
+    snd.gui.renderSignatures.targetList = signature
 
     local tc = snd.gui.elements.targetArea
     local targetName = tc.name or "sndTargetArea"
@@ -1711,16 +1806,18 @@ end
 -- Keeps the quest timer and target list up to date
 -------------------------------------------------------------------------------
 
+function snd.gui.isRouteExecutionActive()
+    local mapper = snd.mapper
+    return mapper and (
+        mapper.pathExecutionActive == true
+        or mapper.pathExecutionHasPendingGroups == true
+    ) or false
+end
+
 if snd.gui.refreshTimer then
     killTimer(snd.gui.refreshTimer)
     snd.gui.refreshTimer = nil
 end
-
-snd.gui.refreshTimer = tempTimer(2, function()
-    if snd.gui.initialized then
-        snd.gui.refresh()
-    end
-end, true)
 
 -- Also set up a timer for the quest countdown (every minute)
 if snd.gui.questTimerTick then
@@ -1733,6 +1830,7 @@ snd.gui.questTimerTick = tempTimer(60, function()
         snd.quest.updateCooldownRemaining()
         snd.gui.updateQuestTimer()
         snd.gui.applyTabStyles()
+        snd.gui.updateTargetList()
     end
 end, true)
 

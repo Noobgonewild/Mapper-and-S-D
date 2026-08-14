@@ -113,19 +113,33 @@ local function cancel_native_startup_load()
     pcall(killTimer, mm.runtime.native_startup_timer)
   end
   mm.runtime.native_startup_timer = nil
+  mm.runtime.native_startup_completion = nil
   return mm.runtime.native_startup_generation
 end
 
-local function fallback_hybrid_bigmap_to_local(reason)
+mm.cancel_native_mapper_startup_load = cancel_native_startup_load
+
+local function complete_native_startup_load(generation, loaded, err)
+  mm.runtime = mm.runtime or {}
+  if generation ~= mm.runtime.native_startup_generation then return end
+  local pending = mm.runtime.native_startup_completion
+  mm.runtime.native_startup_completion = nil
+  if not (pending and pending.generation == generation and type(pending.callback) == "function") then
+    return
+  end
+  local called, callback_err = pcall(pending.callback, loaded == true, err)
+  if not called then
+    mm.warn("Native mapper load completion callback failed: " .. tostring(callback_err))
+  end
+end
+
+local function mark_hybrid_native_unavailable(reason)
   local configured_mode = mm.minimap and mm.minimap.get_bigmap_mode and mm.minimap.get_bigmap_mode()
   if configured_mode ~= "hybrid" then return false end
 
   mm.runtime = mm.runtime or {}
   mm.runtime.hybrid_native_unavailable_reason = tostring(reason or "native mapper data unavailable")
-  if mm.minimap and mm.minimap.activate_bigmap_local then
-    mm.minimap.activate_bigmap_local()
-  end
-  mm.warn("Native bigmap unavailable; hybrid mode is using the local bigmap instead (" ..
+  mm.warn("Native continent map unavailable in hybrid mode (" ..
     mm.runtime.hybrid_native_unavailable_reason .. ").")
   return true
 end
@@ -137,37 +151,52 @@ local function native_startup_load(generation, attempt, reason)
 
   local active_mode = mm.minimap and mm.minimap.get_active_bigmap_mode and
     mm.minimap.get_active_bigmap_mode()
-  if active_mode ~= "native" then return end
+  if active_mode ~= "native" then
+    complete_native_startup_load(generation, false, "native BigMap surface is no longer active")
+    return
+  end
 
   local native_path = mm.resolve_native_mapper_db(mm.state.native_mapper_db)
   if not native_path or not mm.path_exists(native_path) then
     local load_err = "native mapper DB not found at " .. tostring(native_path)
-    if not fallback_hybrid_bigmap_to_local(load_err) then
+    if not mark_hybrid_native_unavailable(load_err) then
       mm.warn("Native mapper DB was not auto-loaded: " .. load_err)
     end
+    complete_native_startup_load(generation, false, load_err)
     return
   end
   if mm.looks_like_sqlite(native_path) then
     local load_err = "configured path is the SQLite live mapper DB, not a Mudlet native map export"
-    if not fallback_hybrid_bigmap_to_local(load_err) then
+    if not mark_hybrid_native_unavailable(load_err) then
       mm.warn("Native mapper DB was not auto-loaded: " .. load_err)
     end
+    complete_native_startup_load(generation, false, load_err)
     return
   end
   if mm.runtime.native_mapper_db_loaded_path == native_path then
     if mm.sync_native_bigmap_to_current_room then
       mm.sync_native_bigmap_to_current_room(reason or "native_map_already_loaded")
     end
+    complete_native_startup_load(generation, true)
     return
   end
 
   local window = mm.minimap and mm.minimap.windows and mm.minimap.windows.bigmap
-  local mapper_ready = mm.minimap and mm.minimap.backend == "mudlet_mapper" and window and window.mapper
+  local native_load_ready = mm.minimap and mm.minimap.backend == "mudlet_mapper"
+    and window and window.mapper
   local loaded, err = false, "embedded mapper widget is not open yet"
-  if mapper_ready then
-    loaded, err = mm.load_native_mapper_db()
+  if native_load_ready then
+    local called, result, load_err = pcall(mm.load_native_mapper_db)
+    if called then
+      loaded, err = result, load_err
+    else
+      err = "native mapper load errored: " .. tostring(result)
+    end
   end
-  if loaded then return end
+  if loaded then
+    complete_native_startup_load(generation, true)
+    return
+  end
 
   if attempt < NATIVE_LOAD_MAX_ATTEMPTS and type(tempTimer) == "function" then
     mm.debug(string.format(
@@ -180,14 +209,23 @@ local function native_startup_load(generation, attempt, reason)
   end
 
   local load_err = "load failed after " .. tostring(attempt) .. " attempts: " .. tostring(err)
-  if not fallback_hybrid_bigmap_to_local(load_err) then
+  if not mark_hybrid_native_unavailable(load_err) then
     mm.warn("Native mapper DB was not auto-loaded: " .. load_err)
   end
+  complete_native_startup_load(generation, false, load_err)
 end
 
-function mm.schedule_native_mapper_load(reason)
+function mm.schedule_native_mapper_load(reason, completion, immediate)
   local generation = cancel_native_startup_load()
-  if type(tempTimer) == "function" then
+  if type(completion) == "function" then
+    mm.runtime.native_startup_completion = {
+      generation = generation,
+      callback = completion,
+    }
+  end
+  if immediate == true then
+    native_startup_load(generation, 1, reason)
+  elseif type(tempTimer) == "function" then
     mm.runtime.native_startup_timer = tempTimer(0, function()
       native_startup_load(generation, 1, reason)
     end)
@@ -196,14 +234,42 @@ function mm.schedule_native_mapper_load(reason)
   end
 end
 
+function mm.schedule_native_mapper_preload(reason)
+  mm.runtime = mm.runtime or {}
+  local native_path = mm.resolve_native_mapper_db(mm.state.native_mapper_db)
+  if native_path and mm.runtime.native_mapper_db_loaded_path == native_path then
+    mm.debug("Native mapper preload skipped because the configured map is already loaded.")
+    return false
+  end
+
+  cancel_native_startup_load()
+  if mm.state.native_mapper_preload_enabled ~= true then return false end
+
+  local configured_mode = mm.minimap and mm.minimap.get_bigmap_mode and mm.minimap.get_bigmap_mode()
+  if configured_mode == "native" then
+    mm.schedule_native_mapper_load(reason or "native_preload_native_mode", nil, true)
+    return true
+  end
+  if not (mm.minimap and mm.minimap.begin_native_preload) then
+    mm.warn("Native mapper preload was skipped because the BigMap preload surface is unavailable.")
+    return false
+  end
+
+  local started, preload_err = mm.minimap.begin_native_preload(reason or "native_preload_startup")
+  if not started and preload_err then
+    mm.warn("Native mapper preload was skipped: " .. tostring(preload_err))
+  end
+  return started == true
+end
+
 function mm.initialize()
   if mm and mm.debug then
     mm.debug("initialization begin")
   end
   mm.runtime = mm.runtime or {}
-  -- Retry native hybrid support once on each package/profile load. If it is
-  -- unavailable, the runtime latch prevents every room event from reopening a
-  -- blank native widget; hybrid remains on the working local surface instead.
+  -- Reset the hybrid failure latch on package/profile load. Native map data is
+  -- either preloaded through the normal native surface or loaded lazily when
+  -- hybrid first switches to its continent surface.
   mm.runtime.hybrid_native_unavailable_reason = nil
   safe_step("load_settings_persistence", function()
     if mm.load_settings_persistence then
@@ -250,12 +316,20 @@ function mm.initialize()
 
   if configured_mode == "native" then
     mm.schedule_native_mapper_load("native_startup")
+  elseif mm.state.native_mapper_preload_enabled == true then
+    mm.schedule_native_mapper_preload("native_preload_startup")
   else
     cancel_native_startup_load()
-    mm.debug("Native mapper DB autoload skipped while bigmap local/hybrid mode is active.")
+    mm.debug("Native mapper DB preload is off; hybrid will load it lazily on its first continent.")
   end
 
   if mapper_db_ready then
+    safe_step("load_room_notes_cache", function()
+      if mm.load_room_notes_cache then
+        local ok, notes_err = mm.load_room_notes_cache()
+        if not ok then mm.debug("Room-note cache load deferred: " .. tostring(notes_err)) end
+      end
+    end)
     safe_step("ensure_exits_chaos_column", function()
       if mm.ensure_exits_chaos_column then
         local ok, ensure_err = mm.ensure_exits_chaos_column()
@@ -269,6 +343,22 @@ function mm.initialize()
         local ok, ensure_err = mm.ensure_random_cexits_table()
         if not ok then
           mm.warn("Could not initialize random custom exits: " .. tostring(ensure_err))
+        end
+      end
+    end)
+    safe_step("ensure_cexit_key_alternates_table", function()
+      if mm.ensure_cexit_key_alternates_table then
+        local ok, ensure_err = mm.ensure_cexit_key_alternates_table()
+        if not ok then
+          mm.warn("Could not initialize conditional custom exits: " .. tostring(ensure_err))
+        end
+      end
+    end)
+    safe_step("ensure_cexit_key_observations_table", function()
+      if mm.ensure_cexit_key_observations_table then
+        local ok, ensure_err = mm.ensure_cexit_key_observations_table()
+        if not ok then
+          mm.warn("Could not initialize cexit key observations: " .. tostring(ensure_err))
         end
       end
     end)

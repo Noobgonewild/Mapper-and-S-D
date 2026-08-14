@@ -428,6 +428,8 @@ local function resetSelectedTargetRoomList()
     snd.nav = snd.nav or {}
     snd.nav.xcpLookup = nil
     snd.nav.nxState = nil
+    snd.nav.pendingManualApproachRequest = nil
+    snd.nav.manualApproach = nil
     snd.nav.pendingTargetRoomFallback = nil
     snd.nav.targetAreaFallback = nil
     snd.nav.gotoList = {}
@@ -716,6 +718,27 @@ local function startSelectedTargetLiveLookup(mode, source)
     return false
 end
 
+local function targetAreaTravelText(target, explicitAreaKey)
+    local current = target or (snd.targets and snd.targets.current) or {}
+    local areaKey = snd.utils.trim(explicitAreaKey or currentTargetAreaKey(current))
+    local areaName = xcpMessageText(current.areaName)
+    if areaName == "" then areaName = areaKey end
+    if areaName == "" then areaName = "target" end
+    return areaKey, areaName
+end
+
+local function announceAreaRuntoGuidance(target, areaKey, startRoom)
+    local runtoKey, areaName = targetAreaTravelText(target, areaKey)
+    if runtoKey == "" then runtoKey = areaName end
+    local startText = tonumber(startRoom) and " (room " .. tostring(startRoom) .. ")" or ""
+    snd.utils.infoNote(string.format(
+        "Mapper could not reach %s area start%s. Go to Aylor recall and use 'runto %s', then retry your xcp command.",
+        areaName,
+        startText,
+        runtoKey
+    ))
+end
+
 local function scheduleSelectedTargetLookup(destinationRoom, mode, source, reason)
     local current = snd.targets and snd.targets.current or nil
     local roomId = tonumber(destinationRoom)
@@ -732,15 +755,20 @@ local function scheduleSelectedTargetLookup(destinationRoom, mode, source, reaso
         reason = reason,
     }
 
-    local dispatched = snd.commands.gotoRoomViaAlias(roomId, {
+    local dispatched, routeFailure = snd.commands.gotoRoomViaAlias(roomId, {
         allowManualApproach = false,
+        allowAreaStartFallback = false,
         targetRoom = reason == "xcp_hybrid_best_room",
         source = reason or "xcp_lookup",
+        quietRouteFailure = true,
+        suppressXrtNear = true,
     })
     if dispatched ~= true then
         snd.nav.xcpLookup = nil
-        return false
+        snd.nav.lastXcpRouteFailure = routeFailure
+        return false, routeFailure
     end
+    snd.nav.lastXcpRouteFailure = nil
     return true
 end
 
@@ -756,16 +784,16 @@ local function startAreaBasedTargetLookup(mode, source)
 
     local startRoom = snd.db and snd.db.getAreaStartRoom and snd.db.getAreaStartRoom(targetArea) or nil
     if not startRoom or tonumber(startRoom) <= 0 then
-        snd.utils.infoNote("No start room known for " .. targetArea .. "; using stored rooms if available.")
-        return installStoredFallback("xcpAreaStartMissing")
+        announceAreaRuntoGuidance(current, targetArea, nil)
+        return false
     end
 
     snd.utils.debugNote("XCP: going to " .. targetArea .. " (room " .. tostring(startRoom) .. ") before live lookup")
     if scheduleSelectedTargetLookup(startRoom, mode, source, "xcp_area_start") then
         return true
     end
-    snd.utils.infoNote("Could not reach the target-area start; using stored rooms if available.")
-    return installStoredFallback("xcpAreaTravelFailed")
+    announceAreaRuntoGuidance(current, targetArea, startRoom)
+    return false
 end
 
 local function conwinCanCheckHybridArrival()
@@ -904,13 +932,44 @@ function snd.commands.beginXcpLookup()
                 bestRoom,
                 sightings
             ))
-            if scheduleSelectedTargetLookup(bestRoom, "hybrid", "hybrid", "xcp_hybrid_best_room") then
+            local scheduled, routeFailure = scheduleSelectedTargetLookup(
+                bestRoom,
+                "hybrid",
+                "hybrid",
+                "xcp_hybrid_best_room"
+            )
+            if scheduled then
                 return true
             end
-            snd.utils.infoNote("Could not reach the best stored room; using stored room list.")
-            return installSelectedTargetRoomList(results, "db-fallback", {
-                reason = "xcpHybridTravelFailed",
-            })
+
+            local targetArea, areaName = targetAreaTravelText(current)
+            local hereArea = currentAreaKey()
+            local chaosText = routeFailure and routeFailure.code == "gq_chaos_portal_disabled"
+                and " Its available route uses a chaos portal, disabled during GQ."
+                or ""
+            if targetArea ~= "" and hereArea ~= ""
+                and hereArea:lower() == targetArea:lower()
+            then
+                snd.utils.infoNote(string.format(
+                    "Mapper could not reach the best stored room (%d).%s Already in %s; running exact where.",
+                    bestRoom,
+                    chaosText,
+                    areaName
+                ))
+                return startSelectedTargetLiveLookup("hybrid", "hybrid-area-fallback")
+            end
+
+            local startRoom = snd.db and snd.db.getAreaStartRoom and snd.db.getAreaStartRoom(targetArea) or nil
+            if startRoom and tonumber(startRoom) and tonumber(startRoom) > 0 then
+                snd.utils.infoNote(string.format(
+                    "Mapper could not reach the best stored room (%d).%s Going to %s area start (room %d), then running exact where.",
+                    bestRoom,
+                    chaosText,
+                    areaName,
+                    tonumber(startRoom)
+                ))
+            end
+            return startAreaBasedTargetLookup("hybrid", "hybrid-area-fallback")
         end
         snd.utils.debugNote("XCP hybrid: no stored room; falling back to normal qw")
         announceXcpSearch(current, "qw")
@@ -1191,7 +1250,10 @@ function snd.commands.gotoRoomViaAlias(roomId, options)
 
     if opts.allowAreaStartFallback ~= false and isTargetRoom and current then
         local startRoom, areaKey = targetAreaStartRoom(current)
-        if startRoom and startRoom ~= roomId then
+        local hereArea = currentAreaKey():lower()
+        local targetArea = snd.utils.trim(areaKey or ""):lower()
+        local alreadyInTargetArea = hereArea ~= "" and targetArea ~= "" and hereArea == targetArea
+        if startRoom and startRoom ~= roomId and not alreadyInTargetArea then
             fallbackRequest = {
                 requestedRoom = roomId,
                 startRoom = startRoom,
@@ -1230,7 +1292,15 @@ function snd.commands.gotoRoomViaAlias(roomId, options)
         return false
     end
 
-    local dispatched, travelResult = pcall(travelApi, tostring(roomId))
+    local navigationOptions = {
+        quietFailure = opts.quietRouteFailure == true,
+        suppressXrtNear = opts.suppressXrtNear == true,
+    }
+    local dispatched, travelResult, routeFailure = pcall(
+        travelApi,
+        tostring(roomId),
+        navigationOptions
+    )
     if not dispatched then
         clearPendingRequests()
         snd.utils.errorNote("Mapper navigation failed: " .. tostring(travelResult))
@@ -1238,7 +1308,7 @@ function snd.commands.gotoRoomViaAlias(roomId, options)
     end
     if travelResult == false then
         clearPendingRequests()
-        return false
+        return false, routeFailure or (snd.mapper and snd.mapper.lastRouteFailure)
     end
 
     -- Mapper API dispatch is synchronous. A failed route consumes this
@@ -1331,6 +1401,8 @@ function snd.commands.fallbackToTargetAreaStart(requestedRoom)
         allowManualApproach = false,
         allowAreaStartFallback = false,
         source = "target_area_start_fallback",
+        quietRouteFailure = true,
+        suppressXrtNear = true,
     })
     if dispatched == true then
         clearManualRequest()
@@ -1338,7 +1410,7 @@ function snd.commands.fallbackToTargetAreaStart(requestedRoom)
     end
 
     snd.nav.targetAreaFallback = nil
-    snd.utils.infoNote("Could not reach the target-area start room either.")
+    announceAreaRuntoGuidance(current, pending.areaKey, startRoom)
     return false
 end
 
@@ -1516,6 +1588,22 @@ function snd.commands.conwin(args)
     elseif args == "killcommand" then
         local current = (snd.config and snd.config.conwin and snd.config.conwin.killCommand) or "kill"
         snd.utils.infoNote("ConWin kill command: " .. tostring(current))
+    elseif args:match("^killmode%s+") then
+        local mode = snd.utils.trim(args:match("^killmode%s+(.+)$") or "")
+        if snd.conwin.setTargetMode and snd.conwin.setTargetMode(mode) then
+            local stored = (snd.config and snd.config.conwin and snd.config.conwin.targetMode) or "auto"
+            snd.utils.infoNote("ConWin target syntax set to: " .. stored)
+        else
+            snd.utils.infoNote("Usage: snd conwin killmode <auto|skill|cast|raw>")
+        end
+    elseif args == "killmode" then
+        local current = (snd.config and snd.config.conwin and snd.config.conwin.targetMode) or "auto"
+        local command = (snd.config and snd.config.conwin and snd.config.conwin.killCommand) or "kill"
+        local resolved = current
+        if snd.utils and type(snd.utils.resolveMobTargetMode) == "function" then
+            resolved = snd.utils.resolveMobTargetMode(command, current)
+        end
+        snd.utils.infoNote("ConWin target syntax: " .. tostring(current) .. " (resolves to " .. tostring(resolved) .. ")")
     elseif args:match("^repopulate%s+%d+$") then
         local count = tonumber(args:match("^repopulate%s+(%d+)$"))
         if snd.conwin.setRepopulate and snd.conwin.setRepopulate(count) then
@@ -1607,6 +1695,13 @@ function snd.commands.xcp(args)
             snd.utils.infoNote("Invalid xcp mode. Syntax: xcp mode <db|qw|hybrid|ht>")
         end
         return
+    end
+
+    if snd.sortTargetsByPriority then
+        snd.sortTargetsByPriority({
+            recalculateProximity = true,
+            reason = args == "" and "target_list_requested" or "target_selection_requested",
+        })
     end
     
     if args == "" then
@@ -1750,13 +1845,25 @@ local function manualApproachMatchesCurrent(approach)
     end
 
     local storedKey = tostring(approach.targetKey or "")
-    if storedKey == "" then
-        return true
+    if storedKey ~= "" then
+        local current = snd.targets and snd.targets.current or nil
+        local currentKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
+        if currentKey == "" or currentKey ~= storedKey then
+            return false
+        end
     end
 
-    local current = snd.targets and snd.targets.current or nil
-    local currentKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
-    return currentKey ~= "" and currentKey == storedKey
+    -- A displayed redirect is an offer for the room where the failed route was
+    -- calculated. Once the player moves, nx must retry the real target from the
+    -- live room instead of consuming a stale approach and sending them back.
+    local offeredFromRoom = tostring(approach.offeredFromRoom or "")
+    if offeredFromRoom ~= "" then
+        local liveRoom = tostring(getCurrentRoomUid() or "")
+        if liveRoom == "" or liveRoom ~= offeredFromRoom then
+            return false
+        end
+    end
+    return true
 end
 
 local function manualApproachRoomName(roomId, fallback)
@@ -1823,6 +1930,7 @@ function snd.commands.offerManualApproach(requestedRoom)
         destinationName = destinationName,
         targetKey = currentKey ~= "" and currentKey or pendingKey,
         targetName = targetName,
+        offeredFromRoom = getCurrentRoomUid(),
     }
     snd.nav.manualApproach = approach
     snd.nav.gotoArea = -1
@@ -1952,6 +2060,13 @@ end
 function snd.commands.nx()
     if not canStartNx() then
         return
+    end
+
+    if snd.sortTargetsByPriority then
+        snd.sortTargetsByPriority({
+            recalculateProximity = true,
+            reason = "nx_decision",
+        })
     end
 
     local current = snd.targets.current
@@ -2927,7 +3042,7 @@ function snd.commands.processQuickWhereNoMatch(options)
         return false
     end
 
-    snd.utils.infoNote("\nMob not found. It might be dead, use a different keyword, or be flagged nowhere.")
+    snd.utils.infoNote("Mob not found. It might be dead, use a different keyword, or be flagged nowhere.")
     snd.utils.infoNote("Using stored sightings for " .. mobName .. ":")
     local installed = installSelectedTargetRoomList(results, "db-fallback", {
         reason = string.format(
@@ -3399,7 +3514,8 @@ end
 -------------------------------------------------------------------------------
 
 --- Kill current target using configured kill command
-function snd.commands.xkill()
+function snd.commands.xkill(options)
+    local exactConwinIndex = type(options) == "table" and tonumber(options.conwinIndex) or nil
     local quickWhere = snd.nav and snd.nav.quickWhere or nil
     local nxOverride = snd.nav and snd.nav.nxOverride or nil
     local useAdhocQuickWhere = (nxOverride and nxOverride.mode == "adhoc_qw")
@@ -3455,13 +3571,54 @@ function snd.commands.xkill()
     end
     normalizedKeyword = snd.utils.trim((normalizedKeyword:gsub("%s+", " ")))
 
+    if exactConwinIndex then
+        local row = snd.conwin and snd.conwin.mobs and snd.conwin.mobs[exactConwinIndex] or nil
+        local exactSelector = snd.conwin and snd.conwin.killSelectorFor
+            and snd.conwin.killSelectorFor(exactConwinIndex) or nil
+        exactSelector = snd.utils.trim(exactSelector or "")
+        -- Mobdetect is intentionally fail-closed: if the confirmed ConWin row
+        -- disappeared or can no longer be addressed, never fall back to a
+        -- generic name that could attack an unmarked duplicate.
+        if not row or row.dead or exactSelector == "" then
+            return
+        end
+        normalizedKeyword = exactSelector
+    end
+
+    -- The selector builder excludes bare directions, but retain a final guard
+    -- here for stored/ad-hoc keywords and callers that bypass name-based
+    -- selection. Never emit commands such as "kill up".
+    if snd.utils.isReservedMobCommandSelector
+        and snd.utils.isReservedMobCommandSelector(normalizedKeyword)
+    then
+        snd.utils.infoNote("Refusing to use a movement direction as the xkill target: " .. normalizedKeyword)
+        return
+    end
+
     -- Get the kill command (default: "kill")
     local killCmd = snd.config.killCommand or "kill"
     
-    -- Send the kill command
+    -- Apply command-aware quoting only at the send boundary. Stored target
+    -- names/selectors remain logical and unquoted for matching and DB use.
     local fullCmd = killCmd .. " " .. normalizedKeyword
+    if snd.utils and type(snd.utils.buildMobTargetCommand) == "function" then
+        fullCmd = snd.utils.buildMobTargetCommand(
+            killCmd,
+            normalizedKeyword,
+            snd.config.killTargetMode or "auto"
+        )
+    end
+    if not fullCmd or fullCmd == "" then return end
     snd.utils.debugNote("xkill: " .. fullCmd)
-    if snd.conwin and snd.conwin.noteAttackByKeyword then
+    if exactConwinIndex and snd.conwin and snd.conwin.mobs then
+        local row = snd.conwin.mobs[exactConwinIndex]
+        if row then
+            snd.conwin.currentEnemyMobId = row.id
+            if snd.conwin.noteAttackIntent then
+                snd.conwin.noteAttackIntent(row, "mobdetect")
+            end
+        end
+    elseif snd.conwin and snd.conwin.noteAttackByKeyword then
         snd.conwin.noteAttackByKeyword(normalizedKeyword, 1)
     end
     send(fullCmd)
@@ -3475,15 +3632,52 @@ end
 -- @param args The command to use (e.g., "cast 'lightning bolt'")
 function snd.commands.xcmd(args)
     args = snd.utils.trim(args or "")
+    local configuredMode = snd.config.killTargetMode or "auto"
+    local function normalizeMode(value)
+        if snd.utils and type(snd.utils.normalizeMobTargetMode) == "function" then
+            return snd.utils.normalizeMobTargetMode(value)
+        end
+        local mode = tostring(value or ""):lower()
+        if mode == "pro" then mode = "raw" end
+        if mode == "auto" or mode == "skill" or mode == "cast" or mode == "raw" then
+            return mode
+        end
+        return nil
+    end
+    local function resolvedMode()
+        if snd.utils and type(snd.utils.resolveMobTargetMode) == "function" then
+            return snd.utils.resolveMobTargetMode(snd.config.killCommand or "kill", configuredMode)
+        end
+        return configuredMode == "auto" and "skill" or configuredMode
+    end
     
     if args == "" then
         -- Show current command
         cecho("\n<cyan>Current xkill command:<reset> " .. (snd.config.killCommand or "kill") .. "\n")
-        cecho("<dim_gray>Usage: xcmd <command><reset>\n")
+        cecho("<cyan>Target syntax:<reset> " .. configuredMode .. " <dim_gray>(resolves to " .. resolvedMode() .. ")<reset>\n")
+        cecho("<dim_gray>Usage: xcmd <command> | xcmd mode <auto|skill|cast|raw><reset>\n")
         cecho("<dim_gray>Examples:<reset>\n")
         cecho("  <yellow>xcmd kill<reset>                 - Use 'kill <target>'\n")
         cecho("  <yellow>xcmd cast 'lightning bolt'<reset> - Use 'cast 'lightning bolt' <target>'\n")
         cecho("  <yellow>xcmd backstab<reset>             - Use 'backstab <target>'\n")
+        cecho("  <yellow>xcmd mode cast<reset>            - Force cast-style target quoting for an alias\n")
+        return
+    end
+
+    local lowered = args:lower()
+    if lowered == "mode" then
+        snd.utils.infoNote("xkill target syntax: " .. configuredMode .. " (resolves to " .. resolvedMode() .. ")")
+        return
+    elseif lowered:match("^mode%s+") then
+        local requested = snd.utils.trim(args:match("^%S+%s+(.+)$") or "")
+        local normalized = normalizeMode(requested)
+        if not normalized then
+            snd.utils.infoNote("Usage: xcmd mode <auto|skill|cast|raw>")
+            return
+        end
+        snd.config.killTargetMode = normalized
+        snd.utils.infoNote("xkill target syntax set to: " .. normalized)
+        if snd.saveState then snd.saveState() end
         return
     end
     
@@ -4254,6 +4448,7 @@ function snd.commands.showHelp()
     emitLinkedHelpRow("nx", "nx", "Go to next/current target", "Go to next/current target")
     emitLinkedHelpRow("xkill", "xkill", "Kill current target", "Kill current target with precise temporary selector")
     emitLinkedHelpRow("xcmd <command>", "xcmd", "Show or set xkill command", "Show or set the command used by xkill")
+    emitLinkedHelpRow("xcmd mode <auto|skill|cast|raw>", "xcmd mode", "Set xkill target syntax", "Auto-detect direct casts or force a target quoting style")
 
     emitHelpSection("Navigation & Search")
     emitLinkedHelpRow("qw [mob]", "qw", "Quick where", "Live where + mapper room list")
@@ -4297,8 +4492,9 @@ function snd.commands.showConwinHelp()
     local enabled = (snd.config and snd.config.conwin and snd.config.conwin.enabled) and "on" or "off"
     local repopulate = (snd.config and snd.config.conwin and snd.config.conwin.repopulate) or 3
     local focusMode = ((snd.config and snd.config.conwin and snd.config.conwin.strictFocusIdOnly) and "strict" or "fallback")
+    local targetMode = (snd.config and snd.config.conwin and snd.config.conwin.targetMode) or "auto"
     emitHelpTitle("Search and Destroy - ConWin Commands")
-    cecho(string.format("  <dim_gray>Status:<reset> enabled=<cyan>%s<reset>, mode=<cyan>%s<reset>, repopulate=<cyan>%s<reset>, focusid=<cyan>%s<reset>\n", enabled, mode, tostring(repopulate), focusMode))
+    cecho(string.format("  <dim_gray>Status:<reset> enabled=<cyan>%s<reset>, mode=<cyan>%s<reset>, killmode=<cyan>%s<reset>, repopulate=<cyan>%s<reset>, focusid=<cyan>%s<reset>\n", enabled, mode, targetMode, tostring(repopulate), focusMode))
     emitLinkedHelpRow("snd conwin help", "snd conwin help", "Show conwin help", "Show this help")
     emitLinkedHelpRow("snd conwin on|off|toggle", "snd conwin toggle", "Toggle ConWin", "Enable/disable/toggle ConWin")
     emitLinkedHelpRow("snd conwin refresh", "snd conwin refresh", "Run consider all now", "Run consider all and refresh list")
@@ -4306,11 +4502,12 @@ function snd.commands.showConwinHelp()
     emitLinkedHelpRow("snd conwin mode <consider|off>", "snd conwin mode off", "Set room-action mode", "Action on room change")
     emitLinkedHelpRow("snd conwin fontsize <n>", "snd conwin fontsize 10", "Set ConWin font size", "Set ConWin font size (6-24)")
     emitLinkedHelpRow("snd conwin killcommand <command>", "snd conwin killcommand", "Show current kill command", "Show current kill command; append <command> to set")
+    emitLinkedHelpRow("snd conwin killmode <auto|skill|cast|raw>", "snd conwin killmode", "Set target syntax", "Auto-detect direct casts or force a target quoting style")
     emitLinkedHelpRow("snd conwin repopulate <n>", "snd conwin repopulate 3", "Refresh list after N kills", "Refresh list after N kills; 0 disables")
     emitLinkedHelpRow("snd conwin focusid <strict|fallback>", "snd conwin focusid", "Show current focus-id mode", "Show focus-id mode; strict requires explicit duplicate selection")
     emitLinkedHelpRow("snd conwin aligntags <on|off>", "snd conwin aligntags", "Show alignment tag display setting", "Show alignment tags setting ((G)/(E) prefixes)")
     cecho("\n<dim_gray>Clicking a mob line sends kill command.\n")
-    cecho("<dim_gray>ConWin chooses distinctive kill selectors; duplicate exact names use numbered form (e.g. kill 2.name).<reset>\n")
+    cecho("<dim_gray>ConWin quotes multi-word targets; duplicate exact names use numbered form (e.g. kill 2.'strong guard').<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
@@ -4335,6 +4532,8 @@ function snd.commands.showCommandHelp()
     emitPlainHelpRow("xset sound [on|off|volume <n%>]", "Toggle/query sound alerts")
     emitPlainHelpRow("xset keyword <kw>", "Set mob keyword")
     emitPlainHelpRow("xset startroom", "Set area start room")
+    emitPlainHelpRow("xcmd <command>", "Set the command used by xkill")
+    emitPlainHelpRow("xcmd mode <auto|skill|cast|raw>", "Set xkill target quoting; auto recognizes direct cast commands")
 
     emitHelpSection("History & Reporting")
     emitPlainHelpRow("snd channel", "Show current S&D report channel")
@@ -4473,6 +4672,8 @@ function snd.commands.showConfig()
     cecho(string.format("  <cyan>window<reset>      %s\n", snd.config.window.enabled and "ON" or "OFF"))
     cecho(string.format("  <cyan>sound<reset>       %s (volume=%d%%)\n", snd.config.soundEnabled and "ON" or "OFF", tonumber(snd.config.soundVolume) or 100))
     cecho(string.format("  <cyan>areacolors<reset>  %s\n", snd.config.areaColors ~= false and "ON" or "OFF"))
+    cecho(string.format("  <cyan>xkill<reset>       %s (target syntax=%s)\n",
+        tostring(snd.config.killCommand or "kill"), tostring(snd.config.killTargetMode or "auto")))
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
@@ -5117,7 +5318,7 @@ function snd.commands.showDbInfo()
     local status = snd.db.getStatus and snd.db.getStatus() or {
         state = "STATUS UNAVAILABLE",
         path = snd.db.file,
-        expectedSchema = snd.schemaVersion or 6,
+        expectedSchema = snd.schemaVersion or 7,
     }
     cecho("  <yellow>Required default filename:<reset> SnDdb.db\n")
     cecho("  <yellow>Resolved database path:<reset>\n")

@@ -483,13 +483,51 @@ local commandSelectorRelationWords = {
     ["with"] = true,
 }
 
+-- Bare movement directions are unsafe command selectors. In particular,
+-- targets whose descriptions end in phrases such as "dress-up" must not
+-- produce commands like "kill up"; multi-word selectors such as "dress up"
+-- remain valid candidates.
+local reservedMobCommandSelectors = {
+    ["n"] = true,
+    ["north"] = true,
+    ["ne"] = true,
+    ["northeast"] = true,
+    ["e"] = true,
+    ["east"] = true,
+    ["se"] = true,
+    ["southeast"] = true,
+    ["s"] = true,
+    ["south"] = true,
+    ["sw"] = true,
+    ["southwest"] = true,
+    ["w"] = true,
+    ["west"] = true,
+    ["nw"] = true,
+    ["northwest"] = true,
+    ["u"] = true,
+    ["up"] = true,
+    ["d"] = true,
+    ["down"] = true,
+}
+
+--- Check whether a bare selector is reserved for movement.
+-- Multi-word selectors ending in a direction are intentionally allowed.
+-- @param selector Temporary command selector
+-- @return True when the whole selector is a movement direction
+function snd.utils.isReservedMobCommandSelector(selector)
+    local normalized = snd.utils.trim(tostring(selector or "")):lower()
+    return reservedMobCommandSelectors[normalized] == true
+end
+
 local function rawMobCommandWords(name)
     local text = snd.utils.stripColors(tostring(name or "")):lower()
-    text = text:gsub("'s", "")
     text = text:gsub("[^%w']+", " ")
 
     local words = {}
     for word in text:gmatch("%S+") do
+        -- Remove only a possessive suffix. A global "'s" removal corrupts
+        -- quoted names such as 'Sorr by deleting their initial S.
+        word = word:gsub("'s$", "")
         word = word:gsub("^'+", ""):gsub("'+$", "")
         if word ~= "" then
             table.insert(words, word)
@@ -505,8 +543,9 @@ end
 function snd.utils.mobCommandWords(name)
     local words = {}
     for _, word in ipairs(rawMobCommandWords(name)) do
-        if word ~= "" and not commandSelectorOmitWords[word] then
-            table.insert(words, word)
+        local commandWord = word:gsub("'", "")
+        if commandWord ~= "" and not commandSelectorOmitWords[commandWord] then
+            table.insert(words, commandWord)
         end
     end
     return words
@@ -532,10 +571,52 @@ local function mobCommandHeadWords(name)
     return head
 end
 
+-- Build specific two-word selectors from the grammatical head of a mob
+-- description. Preserve an existing two-word subject ("little girl") and
+-- only pair the subject head with an -ing action when the subject is a single
+-- word ("girl collecting").
+local function mobCommandSubjectSelectors(name)
+    local subjectWords = {}
+    local cleanSubjectWords = {}
+    local actionWord = nil
+
+    for _, word in ipairs(rawMobCommandWords(name)) do
+        if commandSelectorRelationWords[word] and #subjectWords > 0 then
+            break
+        end
+        if word ~= "" and not commandSelectorOmitWords[word] then
+            if #subjectWords > 0 and #word > 4 and word:match("ing$") then
+                actionWord = word
+                break
+            end
+            table.insert(subjectWords, word)
+            -- Interior apostrophes in display names are often not accepted by
+            -- Aardwolf's command parser (Dra'ork -> draork). Prefer a clean
+            -- descriptor/head pair when the description provides one.
+            if not word:find("'", 1, true) then
+                table.insert(cleanSubjectWords, word)
+            end
+        end
+    end
+
+    local selectors = {}
+    if #cleanSubjectWords >= 2 then
+        table.insert(selectors, cleanSubjectWords[#cleanSubjectWords - 1] .. " " .. cleanSubjectWords[#cleanSubjectWords])
+        if actionWord then
+            table.insert(selectors, cleanSubjectWords[#cleanSubjectWords] .. " " .. actionWord)
+        end
+    elseif #cleanSubjectWords == 1 and actionWord then
+        table.insert(selectors, cleanSubjectWords[1] .. " " .. actionWord)
+    end
+    return selectors
+end
+
 local function appendUnique(list, seen, value)
     local text = snd.utils.trim(tostring(value or ""):gsub("%s+", " "))
+    text = text:gsub("'", "")
     if text == "" then return end
     local key = text:lower()
+    if snd.utils.isReservedMobCommandSelector(key) then return end
     if seen[key] then return end
     seen[key] = true
     table.insert(list, text)
@@ -554,6 +635,21 @@ local function appendKillWordCandidates(candidates, seen, words)
             table.insert(chunk, words[i])
         end
         appendUnique(candidates, seen, table.concat(chunk, " "))
+    end
+end
+
+local function appendRelationAnchoredCandidates(candidates, seen, headWords, allWords)
+    if not headWords or #headWords == 0 then return end
+    local anchor = headWords[#headWords]
+    for i = #headWords + 1, #allWords do
+        appendUnique(candidates, seen, anchor .. " " .. allWords[i])
+    end
+    if #allWords > #headWords + 1 then
+        local anchoredPhrase = {anchor}
+        for i = #headWords + 1, #allWords do
+            table.insert(anchoredPhrase, allWords[i])
+        end
+        appendUnique(candidates, seen, table.concat(anchoredPhrase, " "))
     end
 end
 
@@ -621,6 +717,7 @@ function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
     local candidates = {}
     local seen = {}
     local guessedKeyword = nil
+    local killRelationHead = {}
 
     if snd.gmcp and snd.gmcp.guessMobKeyword then
         local ok, guessed = pcall(snd.gmcp.guessMobKeyword, fullName, opts.areaKey)
@@ -652,12 +749,29 @@ function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
                 appendUnique(candidates, seen, table.concat(chunk, " "))
             end
         else
-            appendKillWordCandidates(candidates, seen, mobCommandHeadWords(fullName))
-            appendKillWordCandidates(candidates, seen, words)
+            for _, selector in ipairs(mobCommandSubjectSelectors(fullName)) do
+                appendUnique(candidates, seen, selector)
+            end
+            killRelationHead = mobCommandHeadWords(fullName)
+            appendKillWordCandidates(candidates, seen, killRelationHead)
+            if #killRelationHead > 0 then
+                -- Once a relation such as "with" or "of" establishes the
+                -- subject, never fall back to an object-only selector such as
+                -- "fishing pole". Keep the subject attached when additional
+                -- specificity is required.
+                appendRelationAnchoredCandidates(candidates, seen, killRelationHead, words)
+            else
+                appendKillWordCandidates(candidates, seen, words)
+            end
         end
     end
 
-    appendUnique(candidates, seen, guessedKeyword)
+    -- The generic guesser favors the final two words. For relation-based kill
+    -- descriptions that would reintroduce the very object-only fallback the
+    -- subject boundary is meant to prevent ("fishing pole").
+    if mode ~= "kill" or #killRelationHead == 0 then
+        appendUnique(candidates, seen, guessedKeyword)
+    end
     appendUnique(candidates, seen, snd.utils.findKeyword(fullName))
     appendUnique(candidates, seen, fullName:lower())
 
@@ -670,6 +784,115 @@ function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
     end
 
     return candidates[1] or "", "fallback"
+end
+
+-------------------------------------------------------------------------------
+-- Mob Target Command Formatting
+-------------------------------------------------------------------------------
+
+local validMobTargetModes = {
+    auto = true,
+    skill = true,
+    cast = true,
+    raw = true,
+}
+
+--- Normalize a configured mob-target syntax mode.
+-- "pro" is retained as an alias for the older Consider-window terminology.
+-- @param mode Requested mode: auto, skill, cast, raw/pro
+-- @return Normalized mode, or nil when invalid
+function snd.utils.normalizeMobTargetMode(mode)
+    local normalized = snd.utils.trim(tostring(mode or "")):lower()
+    if normalized == "pro" then normalized = "raw" end
+    if validMobTargetModes[normalized] then return normalized end
+    return nil
+end
+
+--- Resolve automatic target syntax from the command being executed.
+-- Direct cast commands need their numbered selector inside the outer quotes;
+-- attack skills use the index outside the quoted keyword phrase. Aliases that
+-- expand to cast should select cast mode explicitly because their expansion is
+-- not visible here.
+-- @param command Command prefix (for example "kill" or "cast 'magic missile'")
+-- @param requestedMode auto|skill|cast|raw
+-- @return Resolved mode: skill|cast|raw
+function snd.utils.resolveMobTargetMode(command, requestedMode)
+    local mode = snd.utils.normalizeMobTargetMode(requestedMode) or "auto"
+    if mode ~= "auto" then return mode end
+
+    local verb = snd.utils.trim(tostring(command or "")):lower():match("^(%S+)") or ""
+    if verb == "cast" or verb == "c" then
+        return "cast"
+    end
+    return "skill"
+end
+
+local function unwrapMobTargetQuotes(value)
+    local text = snd.utils.trim(tostring(value or ""))
+    if #text >= 2 and text:sub(1, 1) == "'" and text:sub(-1) == "'" then
+        return snd.utils.trim(text:sub(2, -2))
+    end
+    return text
+end
+
+--- Parse any supported Aardwolf mob-target spelling back to logical parts.
+-- Accepts raw selectors (2.strong guard), skill form (2.'strong guard'), and
+-- cast form ('2.strong guard').
+-- @param target Formatted or unformatted target text
+-- @return keyword, optional numeric index
+function snd.utils.parseMobCommandTarget(target)
+    local text = unwrapMobTargetQuotes(target)
+    local indexText, keyword = text:match("^(%d+)%.(.+)$")
+    if indexText then
+        keyword = unwrapMobTargetQuotes(keyword)
+    else
+        keyword = text
+    end
+    keyword = snd.utils.trim(tostring(keyword or ""):gsub("%s+", " "))
+    return keyword, indexText and tonumber(indexText) or nil
+end
+
+--- Format a logical selector for an Aardwolf target-taking command.
+-- Single-word selectors are unchanged. Multi-word selectors are quoted using
+-- the server's distinct skill/cast conventions.
+-- @param selector Logical selector, optionally prefixed with N.
+-- @param requestedMode auto|skill|cast|raw
+-- @param command Optional command prefix used to resolve auto mode
+-- @return Formatted selector, resolved mode
+function snd.utils.formatMobCommandTarget(selector, requestedMode, command)
+    local rawSelector = snd.utils.trim(tostring(selector or ""))
+    if rawSelector == "" then return "", snd.utils.resolveMobTargetMode(command, requestedMode) end
+
+    local resolvedMode = snd.utils.resolveMobTargetMode(command, requestedMode)
+    if resolvedMode == "raw" then
+        return rawSelector, resolvedMode
+    end
+
+    local keyword, index = snd.utils.parseMobCommandTarget(rawSelector)
+    if keyword == "" then return "", resolvedMode end
+
+    local indexedSelector = index and (tostring(index) .. "." .. keyword) or keyword
+    if not keyword:find("%s") then
+        return indexedSelector, resolvedMode
+    end
+
+    if resolvedMode == "cast" then
+        return "'" .. indexedSelector .. "'", resolvedMode
+    end
+    if index then
+        return tostring(index) .. ".'" .. keyword .. "'", resolvedMode
+    end
+    return "'" .. keyword .. "'", resolvedMode
+end
+
+--- Build a complete command using command-aware mob target formatting.
+-- @return Full command, resolved target mode
+function snd.utils.buildMobTargetCommand(command, selector, requestedMode)
+    local base = snd.utils.trim(tostring(command or ""))
+    if base == "" then return "", snd.utils.resolveMobTargetMode(base, requestedMode) end
+    local target, resolvedMode = snd.utils.formatMobCommandTarget(selector, requestedMode, base)
+    if target == "" then return "", resolvedMode end
+    return base .. " " .. target, resolvedMode
 end
 
 -------------------------------------------------------------------------------

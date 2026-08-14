@@ -61,6 +61,7 @@ snd.utils.debugNote = function(msg)
     local text = tostring(msg)
     if type(mm.debug) == "function" then
         mm.debug(text)
+        return
     end
     cecho("<dim_gray>[MMAPPER:DEBUG]<reset> <gray>" .. text .. "<reset>\n")
 end
@@ -202,6 +203,7 @@ function snd.mapper.db.close()
     snd.mapper.committedSectorFingerprint = nil
     snd.mapper.clanAreaCache = nil
     snd.mapper.clanAreaList = nil
+    if mm and mm.invalidate_room_notes_cache then mm.invalidate_room_notes_cache() end
 end
 
 --- Execute a query and return results
@@ -311,6 +313,14 @@ local mapperDirectionAliases = {
     d = "d", down = "d",
 }
 
+local mapperDirectionNames = {
+    n = "north", s = "south", e = "east", w = "west", u = "up", d = "down",
+}
+
+local mapperNativeDirectionIds = {
+    n = 1, e = 4, w = 5, s = 6, u = 9, d = 10,
+}
+
 function snd.mapper.normalizeDirection(dir)
     local key = tostring(dir or ""):lower():match("^%s*(.-)%s*$")
     return mapperDirectionAliases[key]
@@ -405,15 +415,25 @@ function snd.mapper.setExitLock(roomId, dir, level)
         UPDATE exits
         SET level = %d
         WHERE fromuid = %s
-          AND touid IN (
-              SELECT touid
-              FROM exits
-              WHERE fromuid = %s
-                AND LOWER(dir) IN (%s, %s)
+          AND (
+            LOWER(dir) IN (%s, %s)
+            OR (
+              level = 0
+              AND LOWER(dir) NOT IN (%s)
+              AND touid IN (
+                SELECT cardinal.touid
+                FROM exits AS cardinal
+                WHERE cardinal.fromuid = %s
+                  AND LOWER(cardinal.dir) IN (%s, %s)
+              )
+            )
           )
     ]],
         lockLevel,
         snd.mapper.db.escape(roomKey),
+        snd.mapper.db.escape(normalizedDir),
+        snd.mapper.db.escape(canonicalDir),
+        mapperCardinalDirectionsSql,
         snd.mapper.db.escape(roomKey),
         snd.mapper.db.escape(normalizedDir),
         snd.mapper.db.escape(canonicalDir)
@@ -445,14 +465,8 @@ function snd.mapper.clearExitLock(roomId, dir)
         UPDATE exits
         SET level = 0
         WHERE fromuid = %s
-          AND touid IN (
-              SELECT touid
-              FROM exits
-              WHERE fromuid = %s
-                AND LOWER(dir) IN (%s, %s)
-          )
+          AND LOWER(dir) IN (%s, %s)
     ]],
-        snd.mapper.db.escape(roomKey),
         snd.mapper.db.escape(roomKey),
         snd.mapper.db.escape(normalizedDir),
         snd.mapper.db.escape(canonicalDir)
@@ -501,14 +515,299 @@ function snd.mapper.getRoomExitLocks(roomId)
     if not snd.mapper.db.open() then return {} end
 
     local sql = string.format([[
-        SELECT dir, level
+        SELECT dir, touid, level
         FROM exits
         WHERE fromuid = %s
-          AND LOWER(dir) IN ('n','north','s','south','e','east','w','west','u','up','d','down')
           AND level > 0
-        ORDER BY dir
+        ORDER BY LOWER(dir), touid
     ]], snd.mapper.db.escape(roomKey))
     return snd.mapper.db.query(sql) or {}
+end
+
+local nativeExitVisualColors = {
+    restricted = {242, 184, 75},
+    blocked = {255, 77, 93},
+}
+
+local function native_cardinal_is_stub(roomId, dir)
+    local room = tonumber(roomId)
+    local normalizedDir = snd.mapper.normalizeDirection(dir)
+    if not room or not normalizedDir then return false end
+
+    for _, apiName in ipairs({"getExitStubsNames", "getExitStubs"}) do
+        local api = _G[apiName]
+        if type(api) == "function" then
+            local ok, stubs = pcall(api, room)
+            if ok and type(stubs) == "table" then
+                for key, value in pairs(stubs) do
+                    local candidate = value
+                    if type(value) == "boolean" then candidate = key end
+                    local matches = tonumber(candidate) == mapperNativeDirectionIds[normalizedDir]
+                    if not matches then
+                        matches = snd.mapper.normalizeDirection(candidate) == normalizedDir
+                    end
+                    if matches then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
+function snd.mapper.currentExitVisualLevel()
+    local status = gmcp and gmcp.char and gmcp.char.status
+    local level = status and tonumber(status.level) or nil
+    if level == nil then level = tonumber(snd.char and snd.char.level) end
+    return level or 0
+end
+
+function snd.mapper.exitLockVisualState(lockLevel, playerLevel)
+    local required = tonumber(lockLevel) or 0
+    if required <= 0 then return "normal" end
+    local current = tonumber(playerLevel)
+    if current == nil then current = snd.mapper.currentExitVisualLevel() end
+    return current < required and "blocked" or "restricted"
+end
+
+local function native_cardinal_target(roomId, dir)
+    if type(getRoomExits) ~= "function" then return nil end
+    local room = tonumber(roomId)
+    local normalizedDir = snd.mapper.normalizeDirection(dir)
+    if not room or not normalizedDir then return nil end
+    if native_cardinal_is_stub(room, normalizedDir) then return nil end
+
+    local ok, exits = pcall(getRoomExits, room)
+    if not ok or type(exits) ~= "table" then return nil end
+    local nativeId = mapperNativeDirectionIds[normalizedDir]
+    for rawDir, destination in pairs(exits) do
+        local matches = tonumber(rawDir) == nativeId
+        if not matches then
+            matches = snd.mapper.normalizeDirection(rawDir) == normalizedDir
+        end
+        if matches then return tonumber(destination) end
+    end
+    return nil
+end
+
+local function native_visual_key(roomId, dir)
+    local normalizedDir = snd.mapper.normalizeDirection(dir)
+    if not normalizedDir then return nil end
+    return tostring(roomId) .. ":" .. normalizedDir
+end
+
+local function remove_native_exit_visual(roomId, dir)
+    local room = tonumber(roomId)
+    local normalizedDir = snd.mapper.normalizeDirection(dir)
+    if not room or not normalizedDir or type(removeCustomLine) ~= "function" then return false end
+    local ok, result = pcall(removeCustomLine, room, normalizedDir)
+    return ok and result ~= false
+end
+
+local function apply_native_exit_visual(row, playerLevel, force)
+    local room = tonumber(row and row.fromuid)
+    local destination = tonumber(row and row.touid)
+    local dir = snd.mapper.normalizeDirection(row and row.dir)
+    if not room or not dir then return false, false end
+
+    mm.runtime = mm.runtime or {}
+    mm.runtime.native_exit_lock_visuals = mm.runtime.native_exit_lock_visuals or {}
+    local key = native_visual_key(room, dir)
+    local lockLevel = tonumber(row and row.level) or 0
+    if lockLevel <= 0 or not destination or destination <= 0 then
+        local changed = remove_native_exit_visual(room, dir)
+        mm.runtime.native_exit_lock_visuals[key] = nil
+        return true, changed
+    end
+
+    -- A classified non-geometric cardinal is deliberately a Mudlet exit stub.
+    -- Never bridge those pocket layouts with a custom line just for lock color.
+    if native_cardinal_target(room, dir) ~= destination then
+        local changed = remove_native_exit_visual(room, dir)
+        mm.runtime.native_exit_lock_visuals[key] = nil
+        return false, changed
+    end
+    if type(addCustomLine) ~= "function" then return false, false end
+
+    local state = snd.mapper.exitLockVisualState(lockLevel, playerLevel)
+    local previous = mm.runtime.native_exit_lock_visuals[key]
+    if not force and previous and previous.state == state
+        and tonumber(previous.touid) == destination
+        and tonumber(previous.level) == lockLevel
+    then
+        return true, false
+    end
+
+    local color = nativeExitVisualColors[state]
+    local ok, result = pcall(
+        addCustomLine,
+        room,
+        destination,
+        dir,
+        "solid line",
+        {color[1], color[2], color[3]},
+        true
+    )
+    if not ok or result == false then return false, false end
+    mm.runtime.native_exit_lock_visuals[key] = {
+        state = state,
+        fromuid = room,
+        touid = destination,
+        dir = dir,
+        level = lockLevel,
+    }
+    return true, true
+end
+
+local function cardinal_exit_visual_rows(roomId, dir)
+    if not snd.mapper.db.open() then return {} end
+    local where = {
+        "fromuid NOT IN ('*','**')",
+        "LOWER(TRIM(dir)) IN (" .. mapperCardinalDirectionsSql .. ")",
+    }
+    local normalizedDir = snd.mapper.normalizeDirection(dir)
+    if roomId ~= nil then
+        table.insert(where, "fromuid = " .. snd.mapper.db.escape(tostring(roomId)))
+    end
+    if normalizedDir then
+        table.insert(where, string.format(
+            "LOWER(TRIM(dir)) IN (%s, %s)",
+            snd.mapper.db.escape(normalizedDir),
+            snd.mapper.db.escape(mapperDirectionNames[normalizedDir])
+        ))
+    else
+        table.insert(where, "level > 0")
+    end
+
+    local rows = snd.mapper.db.query(
+        "SELECT fromuid, touid, dir, level FROM exits WHERE " .. table.concat(where, " AND ")
+    ) or {}
+    local merged = {}
+    for _, row in ipairs(rows) do
+        local normalized = snd.mapper.normalizeDirection(row.dir)
+        local from = tonumber(row.fromuid)
+        local destination = tonumber(row.touid)
+        if normalized and from and destination and destination > 0 then
+            local key = native_visual_key(from, normalized)
+            local existing = merged[key]
+            local rowLevel = tonumber(row.level) or 0
+            if not existing then
+                merged[key] = {
+                    fromuid = from,
+                    touid = destination,
+                    dir = normalized,
+                    level = rowLevel,
+                    canonical = tostring(row.dir):lower():match("^%s*(.-)%s*$") == normalized,
+                }
+            else
+                existing.level = math.max(tonumber(existing.level) or 0, rowLevel)
+                local canonical = tostring(row.dir):lower():match("^%s*(.-)%s*$") == normalized
+                if canonical and not existing.canonical then
+                    existing.touid = destination
+                    existing.canonical = true
+                end
+            end
+        end
+    end
+
+    local result = {}
+    for _, row in pairs(merged) do table.insert(result, row) end
+    table.sort(result, function(a, b)
+        if a.fromuid ~= b.fromuid then return a.fromuid < b.fromuid end
+        return tostring(a.dir) < tostring(b.dir)
+    end)
+    return result
+end
+
+function snd.mapper.refreshNativeExitLockVisuals(playerLevel, force)
+    if type(getRoomExits) ~= "function" or type(addCustomLine) ~= "function" then
+        return false, {applied = 0, removed = 0}
+    end
+
+    mm.runtime = mm.runtime or {}
+    local previous = mm.runtime.native_exit_lock_visuals or {}
+    local current = {}
+    local applied, removed, changed = 0, 0, false
+    for _, row in ipairs(cardinal_exit_visual_rows()) do
+        local ok, didChange = apply_native_exit_visual(row, playerLevel, force)
+        local key = native_visual_key(row.fromuid, row.dir)
+        if ok and mm.runtime.native_exit_lock_visuals[key] then
+            current[key] = mm.runtime.native_exit_lock_visuals[key]
+            applied = applied + 1
+        end
+        changed = changed or didChange
+    end
+
+    for key in pairs(previous) do
+        if not current[key] then
+            local from, dir = key:match("^(.-):([^:]+)$")
+            if from and dir and remove_native_exit_visual(from, dir) then
+                removed = removed + 1
+                changed = true
+            end
+        end
+    end
+    mm.runtime.native_exit_lock_visuals = current
+    if changed and type(updateMap) == "function" then pcall(updateMap) end
+    return true, {applied = applied, removed = removed}
+end
+
+function snd.mapper.syncExitLockVisual(roomId, dir)
+    local normalizedDir = snd.mapper.normalizeDirection(dir)
+    if not normalizedDir then return false end
+
+    if mm and mm.import and mm.import.invalidate_layout_cache then
+        mm.import.invalidate_layout_cache()
+    end
+    if mm and mm.minimap and mm.minimap.is_local_mode and mm.minimap.is_local_mode()
+        and mm.minimap.update_local_map
+    then
+        mm.minimap.update_local_map(roomId, {force = true})
+    end
+
+    local nativeLoaded = mm and mm.runtime and mm.runtime.native_mapper_db_loaded_path
+    if not nativeLoaded then return true end
+    local rows = cardinal_exit_visual_rows(roomId, normalizedDir)
+    local row = rows[1] or {
+        fromuid = roomId,
+        dir = normalizedDir,
+        level = 0,
+    }
+    local _, changed = apply_native_exit_visual(row, snd.mapper.currentExitVisualLevel(), false)
+    if changed and type(updateMap) == "function" then pcall(updateMap) end
+    return true
+end
+
+function snd.mapper.restyleNativeExitLockVisuals(playerLevel)
+    local cached = mm and mm.runtime and mm.runtime.native_exit_lock_visuals or nil
+    if type(cached) ~= "table" or not next(cached) then return true end
+
+    local rows = {}
+    for _, visual in pairs(cached) do
+        table.insert(rows, {
+            fromuid = visual.fromuid,
+            touid = visual.touid,
+            dir = visual.dir,
+            level = visual.level,
+        })
+    end
+    local changed = false
+    for _, row in ipairs(rows) do
+        local _, didChange = apply_native_exit_visual(row, playerLevel, false)
+        changed = changed or didChange
+    end
+    if changed and type(updateMap) == "function" then pcall(updateMap) end
+    return true
+end
+
+function snd.mapper.refreshExitLockVisualStates()
+    local level = snd.mapper.currentExitVisualLevel()
+    if mm and mm.minimap and mm.minimap.refresh_exit_lock_styles then
+        mm.minimap.refresh_exit_lock_styles()
+    end
+    if mm and mm.runtime and mm.runtime.native_mapper_db_loaded_path then
+        snd.mapper.restyleNativeExitLockVisuals(level)
+    end
+    return true
 end
 
 -------------------------------------------------------------------------------
@@ -1268,6 +1567,9 @@ local function publish_persist_stats(stats)
 end
 
 function snd.mapper.notifyMapperDbUpdated(room_id, invalidate_layout)
+    if invalidate_layout and snd.mapper.clearDistanceCache then
+        snd.mapper.clearDistanceCache("mapper_db_updated")
+    end
     if invalidate_layout and mm and mm.import and mm.import.invalidate_layout_cache then
         mm.import.invalidate_layout_cache()
     end
@@ -1381,37 +1683,70 @@ function snd.mapper.persistDiscoveredRoom(roomInfo, opts)
     if writeExits and type(exits) == "table" then
         local exitsUpdated = 0
         local exitFailures = 0
-        -- Room.Info is authoritative for cardinal exits. Clear the old
-        -- cardinal set once, then insert the normalized live set; custom exits,
-        -- recall edges, and portal edges remain untouched.
-        local deleteOk, deleteResult = snd.mapper.db.execute(string.format(
-            "DELETE FROM exits WHERE fromuid = %s AND LOWER(dir) IN (%s)",
+        -- Room.Info is authoritative for cardinal destinations, but mapper
+        -- lock levels are local metadata. Reconcile the live cardinal set in
+        -- place so surviving directions retain their levels. Only genuinely
+        -- new directions start at level 0; custom, recall, and portal rows are
+        -- never part of this reconciliation.
+        local existingCardinals = snd.mapper.db.query(string.format([[
+            SELECT dir, touid, level
+            FROM exits
+            WHERE fromuid = %s AND LOWER(dir) IN (%s)
+        ]],
             snd.mapper.db.escape(roomId),
             mapperCardinalDirectionsSql
         ))
-        if deleteOk then
-            exitsUpdated = exitsUpdated + (tonumber(deleteResult) or 0)
-        else
+        if existingCardinals == nil then
             exitFailures = exitFailures + 1
-        end
-        for dir, toUid in pairs(exits) do
-            local toRoom = tonumber(toUid)
-            local normalizedDir = snd.mapper.normalizeDirection(dir)
-            if normalizedDir and toRoom and (toRoom > 0 or toRoom == -1) then
-                local storedDir = normalizedDir
+        else
+            local preservedLevels = {}
+            local preservedFromCanonical = {}
+            for _, row in ipairs(existingCardinals) do
+                local normalizedDir = snd.mapper.normalizeDirection(row.dir)
+                if normalizedDir then
+                    local storedDir = tostring(row.dir or ""):lower():match("^%s*(.-)%s*$")
+                    local isCanonical = storedDir == normalizedDir
+                    if preservedLevels[normalizedDir] == nil
+                        or (isCanonical and not preservedFromCanonical[normalizedDir])
+                    then
+                        preservedLevels[normalizedDir] = tonumber(row.level) or 0
+                        preservedFromCanonical[normalizedDir] = isCanonical
+                    end
+                end
+            end
+
+            local liveCardinals = {}
+            for dir, toUid in pairs(exits) do
+                local toRoom = tonumber(toUid)
+                local normalizedDir = snd.mapper.normalizeDirection(dir)
+                if normalizedDir and toRoom and (toRoom > 0 or toRoom == -1) then
+                    liveCardinals[normalizedDir] = tostring(toRoom)
+                end
+            end
+
+            local liveDirections = {}
+            for storedDir in pairs(liveCardinals) do
+                table.insert(liveDirections, storedDir)
+            end
+            table.sort(liveDirections)
+
+            for _, storedDir in ipairs(liveDirections) do
+                local toRoom = liveCardinals[storedDir]
+                local preservedLevel = tonumber(preservedLevels[storedDir]) or 0
                 -- Preserve direction-only maze exits as -1 so map renderers can
                 -- draw arrows even though navigation has no destination room.
                 local insertExitSql = string.format(
-                    "INSERT OR IGNORE INTO exits (dir, fromuid, touid, level) VALUES (%s, %s, %s, 0)",
+                    "INSERT OR IGNORE INTO exits (dir, fromuid, touid, level) VALUES (%s, %s, %s, %d)",
                     snd.mapper.db.escape(storedDir),
                     snd.mapper.db.escape(roomId),
-                    snd.mapper.db.escape(tostring(toRoom))
+                    snd.mapper.db.escape(toRoom),
+                    preservedLevel
                 )
                 local insertExitOk = snd.mapper.db.conn:execute(insertExitSql)
 
                 local updateExitSql = string.format(
                     "UPDATE exits SET touid = %s WHERE fromuid = %s AND dir = %s",
-                    snd.mapper.db.escape(tostring(toRoom)),
+                    snd.mapper.db.escape(toRoom),
                     snd.mapper.db.escape(roomId),
                     snd.mapper.db.escape(storedDir)
                 )
@@ -1421,6 +1756,26 @@ function snd.mapper.persistDiscoveredRoom(roomInfo, opts)
                 else
                     exitFailures = exitFailures + 1
                 end
+            end
+
+            local staleWhere = ""
+            if #liveDirections > 0 then
+                local escapedDirections = {}
+                for _, dir in ipairs(liveDirections) do
+                    table.insert(escapedDirections, snd.mapper.db.escape(dir))
+                end
+                staleWhere = " AND LOWER(dir) NOT IN (" .. table.concat(escapedDirections, ",") .. ")"
+            end
+            local deleteOk, deleteResult = snd.mapper.db.execute(string.format(
+                "DELETE FROM exits WHERE fromuid = %s AND LOWER(dir) IN (%s)%s",
+                snd.mapper.db.escape(roomId),
+                mapperCardinalDirectionsSql,
+                staleWhere
+            ))
+            if deleteOk then
+                exitsUpdated = exitsUpdated + (tonumber(deleteResult) or 0)
+            else
+                exitFailures = exitFailures + 1
             end
         end
 
@@ -2552,6 +2907,265 @@ end
 -- Pathfinding
 -------------------------------------------------------------------------------
 
+-- Keep only the most recent multi-destination result. This is intentionally a
+-- route-result cache, not a second copy of the mapper graph in Lua. The cache
+-- key includes the source, destination set, and the generated policy clauses;
+-- committed mapper changes invalidate it through notifyMapperDbUpdated().
+snd.mapper.distanceCacheRevision = tonumber(snd.mapper.distanceCacheRevision) or 0
+snd.mapper.distanceCache = snd.mapper.distanceCache or nil
+
+function snd.mapper.clearDistanceCache(reason)
+    snd.mapper.distanceCache = nil
+    snd.mapper.distanceCacheRevision = (tonumber(snd.mapper.distanceCacheRevision) or 0) + 1
+    if type(snd.markTargetProximityDirty) == "function" then
+        snd.markTargetProximityDirty(reason or "mapper_distance_cache_cleared")
+    end
+    if reason and snd.utils and snd.utils.debugNote then
+        snd.utils.debugNote("Cleared mapper distance cache: " .. tostring(reason))
+    end
+end
+
+local function normalizeDistanceDestinations(destinations)
+    local normalized = {}
+    local seen = {}
+    for _, value in ipairs(type(destinations) == "table" and destinations or {}) do
+        local numeric = tonumber(value)
+        if numeric and numeric > 0 then
+            local roomId = tostring(math.floor(numeric))
+            if not seen[roomId] then
+                seen[roomId] = true
+                table.insert(normalized, roomId)
+            end
+        end
+    end
+    table.sort(normalized, function(a, b)
+        return tonumber(a) < tonumber(b)
+    end)
+    return normalized
+end
+
+--- Calculate shortest mapper distances from one source to many destinations.
+-- One forward BFS answers the whole set and stops as soon as every reachable
+-- requested room has been found (or maxSearchDepth is reached). It deliberately
+-- returns distances only: route construction and movement remain mapper-owned.
+-- @param src Source room uid
+-- @param destinations Array of destination room uids
+-- @param opts Optional policy overrides matching findPath semantics
+-- @return table<string,number> distances, table metadata
+function snd.mapper.findDistances(src, destinations, opts)
+    opts = type(opts) == "table" and opts or {}
+    local sourceNumber = tonumber(src)
+    local source = sourceNumber and sourceNumber > 0 and tostring(math.floor(sourceNumber)) or ""
+    local requested = normalizeDistanceDestinations(destinations)
+    local metadata = {
+        source = source,
+        requested = #requested,
+        found = 0,
+        depth = 0,
+        visited = 0,
+        queries = 0,
+        cached = false,
+    }
+
+    if source == "" then
+        metadata.error = "invalid_source"
+        return {}, metadata
+    end
+    if #requested == 0 then
+        return {}, metadata
+    end
+    if not snd.mapper.db.open() then
+        metadata.error = "database_unavailable"
+        return {}, metadata
+    end
+
+    local myLevel = tonumber(snd.char and snd.char.level) or 201
+    local myTier = tonumber(snd.char and snd.char.tier) or 0
+    local effectiveLevel = myLevel + (myTier * 10)
+    local ignoreLockedExits = opts.ignoreLockedExits == true
+    local ignoreAreaGuard = opts.ignoreAreaGuard == true
+    local ignoreTravelRestrictions = opts.ignoreTravelRestrictions == true
+    local allowChaosPortals = opts.allowChaosPortals == true
+    local noPortals = opts.noPortals == true
+        or opts.usePortals == false
+        or snd.mapper.config.usePortals == false
+    local noRecalls = opts.noRecalls == true
+        or opts.useRecall == false
+        or snd.mapper.config.useRecall == false
+    local sourceInfo = snd.mapper.getRoomInfo(source)
+    if not ignoreTravelRestrictions then
+        noPortals = noPortals or (sourceInfo and tonumber(sourceInfo.noportal) == 1 or false)
+        noRecalls = noRecalls or (sourceInfo and tonumber(sourceInfo.norecall) == 1 or false)
+    end
+
+    local gqJoined = snd.gquest and tostring(snd.gquest.joined or "-1") or "-1"
+    local gqActive = snd.gquest and (snd.gquest.active == true or gqJoined ~= "-1") or false
+    local levelWhere = ignoreLockedExits and "1=1" or string.format(
+        "((fromuid NOT IN ('*','**') AND level <= %d) OR (fromuid IN ('*','**') AND level <= %d))",
+        myLevel,
+        effectiveLevel
+    )
+    local randomLevelWhere = ignoreLockedExits and "1=1" or string.format("level <= %d", myLevel)
+    local portalGuardWhere = snd.mapper.portalGuardSql("dir", "level", effectiveLevel, ignoreLockedExits)
+    local chaosWhere = (gqActive and not allowChaosPortals)
+        and "(fromuid <> '*' OR ifnull(chaos, 'no') <> 'yes')"
+        or "1=1"
+    local areaFromWhere = snd.mapper.areaGuardRoomSql(
+        "exits.fromuid", source, ignoreLockedExits, ignoreAreaGuard
+    )
+    local areaToWhere = snd.mapper.areaGuardRoomSql(
+        "exits.touid", source, ignoreLockedExits, ignoreAreaGuard
+    )
+    local randomAreaFromWhere = snd.mapper.areaGuardRoomSql(
+        "random_cexits.fromuid", source, ignoreLockedExits, ignoreAreaGuard
+    )
+    local randomAreaToWhere = snd.mapper.areaGuardRoomSql(
+        "random_cexits.touid", source, ignoreLockedExits, ignoreAreaGuard
+    )
+
+    local maxDepth = tonumber(snd.mapper.config.maxSearchDepth) or 100
+    local requestedDepth = tonumber(opts.searchDepthLimit)
+    if requestedDepth then
+        maxDepth = math.max(0, math.min(maxDepth, math.floor(requestedDepth)))
+    end
+
+    local cacheKey = table.concat({
+        tostring(snd.mapper.distanceCacheRevision or 0),
+        source,
+        table.concat(requested, ","),
+        tostring(maxDepth),
+        tostring(noPortals),
+        tostring(noRecalls),
+        tostring(ignoreLockedExits),
+        tostring(ignoreAreaGuard),
+        tostring(ignoreTravelRestrictions),
+        tostring(allowChaosPortals),
+        tostring(myLevel),
+        tostring(myTier),
+        tostring(gqActive),
+        levelWhere,
+        portalGuardWhere,
+        chaosWhere,
+        areaFromWhere,
+        areaToWhere,
+        randomAreaFromWhere,
+        randomAreaToWhere,
+    }, "|")
+    local cached = snd.mapper.distanceCache
+    if cached and cached.key == cacheKey then
+        local cachedMetadata = {}
+        for key, value in pairs(cached.metadata or {}) do cachedMetadata[key] = value end
+        cachedMetadata.cached = true
+        return cached.distances, cachedMetadata
+    end
+
+    local startedAt = os.clock()
+    local distances = {}
+    local remaining = {}
+    local remainingCount = 0
+    for _, roomId in ipairs(requested) do
+        if roomId == source then
+            distances[roomId] = 0
+        else
+            remaining[roomId] = true
+            remainingCount = remainingCount + 1
+        end
+    end
+
+    local visited = {[source] = true}
+    local frontier = {source}
+    if not noPortals then
+        visited["*"] = true
+        table.insert(frontier, "*")
+    end
+    if not noRecalls then
+        visited["**"] = true
+        table.insert(frontier, "**")
+    end
+
+    local randomBySource = {}
+    local randomCexits = snd.mapper.db.query(string.format([[
+        SELECT fromuid, touid, dir, level, 1 AS random_cexit
+        FROM random_cexits
+        WHERE %s AND %s AND %s
+    ]], randomLevelWhere, randomAreaFromWhere, randomAreaToWhere)) or {}
+    metadata.queries = metadata.queries + 1
+    for _, row in ipairs(randomCexits) do
+        local fromId = tostring(row.fromuid or "")
+        randomBySource[fromId] = randomBySource[fromId] or {}
+        table.insert(randomBySource[fromId], row)
+    end
+
+    local depth = 0
+    while remainingCount > 0 and #frontier > 0 and depth < maxDepth do
+        local escapedFrontier = {}
+        for _, roomId in ipairs(frontier) do
+            table.insert(escapedFrontier, snd.mapper.db.escape(roomId))
+        end
+        local results = snd.mapper.db.query(string.format([[
+            SELECT fromuid, touid, dir, chaos
+            FROM exits
+            WHERE fromuid IN (%s)
+              AND %s
+              AND %s
+              AND %s
+              AND %s
+              AND %s
+        ]],
+            table.concat(escapedFrontier, ","),
+            levelWhere,
+            portalGuardWhere,
+            chaosWhere,
+            areaFromWhere,
+            areaToWhere
+        )) or {}
+        metadata.queries = metadata.queries + 1
+        for _, fromId in ipairs(frontier) do
+            for _, row in ipairs(randomBySource[fromId] or {}) do
+                table.insert(results, row)
+            end
+        end
+
+        depth = depth + 1
+        local nextFrontier = {}
+        for _, row in ipairs(results) do
+            local roomId = tostring(row.touid or "")
+            if roomId ~= "" and roomId ~= "-1" and not visited[roomId] then
+                visited[roomId] = true
+                table.insert(nextFrontier, roomId)
+                if remaining[roomId] then
+                    distances[roomId] = depth
+                    remaining[roomId] = nil
+                    remainingCount = remainingCount - 1
+                end
+            end
+        end
+        frontier = nextFrontier
+    end
+
+    local visitedCount = 0
+    for roomId in pairs(visited) do
+        if roomId ~= "*" and roomId ~= "**" then visitedCount = visitedCount + 1 end
+    end
+    local foundCount = 0
+    for _ in pairs(distances) do foundCount = foundCount + 1 end
+    metadata.found = foundCount
+    metadata.depth = depth
+    metadata.visited = visitedCount
+    metadata.elapsedMs = (os.clock() - startedAt) * 1000
+    metadata.unreachable = {}
+    for _, roomId in ipairs(requested) do
+        if distances[roomId] == nil then table.insert(metadata.unreachable, roomId) end
+    end
+
+    snd.mapper.distanceCache = {
+        key = cacheKey,
+        distances = distances,
+        metadata = metadata,
+    }
+    return distances, metadata
+end
+
 --- Find path between two rooms with portal support
 -- @param src Source room uid
 -- @param dst Destination room uid
@@ -2562,6 +3176,7 @@ end
 -- @param ignoreTravelRestrictions If true, ignore source noportal/norecall flags
 -- @param searchDepthLimit Optional per-call BFS depth cap
 -- @param originMode Optional origin filter: "walk", "portal", "recall", or "jump"
+-- @param allowChaosPortals If true, include chaos portals during a diagnostic-only search
 -- @return Path table, depth, or nil if no path
 function snd.mapper.findPath(
     src,
@@ -2572,7 +3187,8 @@ function snd.mapper.findPath(
     ignoreAreaGuard,
     ignoreTravelRestrictions,
     searchDepthLimit,
-    originMode
+    originMode,
+    allowChaosPortals
 )
     if not snd.mapper.db.open() then
         return nil
@@ -2581,7 +3197,7 @@ function snd.mapper.findPath(
     src = tostring(src)
     dst = tostring(dst)
     snd.utils.debugNote(string.format(
-        "findPath start src=%s dst=%s noPortals=%s noRecalls=%s ignoreLocked=%s ignoreAreaGuard=%s depthLimit=%s originMode=%s",
+        "findPath start src=%s dst=%s noPortals=%s noRecalls=%s ignoreLocked=%s ignoreAreaGuard=%s depthLimit=%s originMode=%s allowChaos=%s",
         src,
         dst,
         tostring(noPortals == true),
@@ -2589,7 +3205,8 @@ function snd.mapper.findPath(
         tostring(ignoreLockedExits == true),
         tostring(ignoreAreaGuard == true),
         tostring(searchDepthLimit or "default"),
-        tostring(originMode or "any")
+        tostring(originMode or "any"),
+        tostring(allowChaosPortals == true)
     ))
     
     if src == dst and (originMode == nil or originMode == "walk") then
@@ -2609,7 +3226,10 @@ function snd.mapper.findPath(
     )
     local effectiveLevel = myLevel + (myTier * 10)
     local portalGuardWhere = snd.mapper.portalGuardSql("dir", "level", effectiveLevel, ignoreLockedExits)
-    local chaosWhere = (gqActive and not ignoreTravelRestrictions)
+    -- Chaos portals are excluded before BFS while a GQ is active. The only
+    -- exception is an explicit diagnostic search whose path is never executed.
+    -- Source-room travel restrictions are deliberately independent of this.
+    local chaosWhere = (gqActive and allowChaosPortals ~= true)
         and "(fromuid <> '*' OR ifnull(chaos, 'no') <> 'yes')"
         or "1=1"
     local areaFromWhere, blockedAreaCount = snd.mapper.areaGuardRoomSql(
@@ -2724,7 +3344,7 @@ function snd.mapper.findPath(
         
         -- Query exits leading to rooms in our current set
         local sql = string.format([[
-            SELECT fromuid, touid, dir FROM exits 
+            SELECT fromuid, touid, dir, chaos FROM exits
             WHERE touid IN (%s) 
             AND fromuid NOT IN (%s) 
             AND %s
@@ -2772,6 +3392,7 @@ function snd.mapper.findPath(
                     fromuid = row.fromuid,
                     touid = row.touid,
                     dir = row.dir,
+                    chaos = row.chaos,
                     randomCexit = tonumber(row.random_cexit) == 1,
                 }
             end
@@ -2915,6 +3536,7 @@ function snd.mapper.findPath(
     local firstStep = {
         dir = currentRoom.dir,
         uid = currentRoom.touid,
+        chaos = currentRoom.chaos,
         randomCexit = currentRoom.randomCexit == true,
     }
     if foundFrom == "*" then
@@ -2943,6 +3565,52 @@ function snd.mapper.findPath(
     snd.utils.debugNote(string.format("findPath success steps=%d searchDepth=%d", #path, depth))
     
     return path, depth
+end
+
+function snd.mapper.isGquestActive()
+    local joined = snd.gquest and tostring(snd.gquest.joined or "-1") or "-1"
+    return snd.gquest ~= nil and (snd.gquest.active == true or joined ~= "-1")
+end
+
+--- Find a route that differs from normal GQ routing only by allowing chaos
+-- portals. This is explanation-only: callers must never execute the result.
+function snd.mapper.findGqChaosDiagnosticPath(
+    src,
+    dst,
+    noPortals,
+    noRecalls,
+    ignoreLockedExits,
+    ignoreAreaGuard,
+    searchDepthLimit,
+    originMode
+)
+    if not snd.mapper.isGquestActive()
+        or noPortals == true
+        or (snd.mapper.config and snd.mapper.config.usePortals == false)
+    then
+        return nil
+    end
+
+    local path, depth = snd.mapper.findPath(
+        src,
+        dst,
+        noPortals,
+        noRecalls,
+        ignoreLockedExits,
+        ignoreAreaGuard,
+        nil,
+        searchDepthLimit,
+        originMode,
+        true
+    )
+    if not path then return nil end
+
+    for _, step in ipairs(path) do
+        if step.travelType == "portal" and tostring(step.chaos or "no") == "yes" then
+            return path, depth
+        end
+    end
+    return nil
 end
 
 function snd.mapper.queueRestrictionMark(travelType, roomId)
@@ -2993,6 +3661,10 @@ function snd.mapper.markRoomRestriction(roomId, flag)
     if not updated then
         snd.utils.debugNote("Failed to update room restriction flag: " .. tostring(err))
         return false, false
+    end
+
+    if snd.mapper.clearDistanceCache then
+        snd.mapper.clearDistanceCache("room_restriction_updated")
     end
 
     snd.utils.infoNote(string.format("Marked room %s as %s.", roomKey, safeFlag))
@@ -3977,6 +4649,105 @@ function snd.mapper.notifyBigmapNavigationState(reason)
     end
 end
 
+local function clone_path_slice(path, first, last)
+    local sliced = {}
+    for index = first, last do
+        local original = path[index]
+        if original then
+            local copy = {}
+            for key, value in pairs(original) do copy[key] = value end
+            table.insert(sliced, copy)
+        end
+    end
+    return sliced
+end
+
+--- Coordinate conditional cexits without resolving their DINV state early.
+-- Normal segments use executePath unchanged. Before each conditional step, the
+-- coordinator waits for its recorded source room, resolves the key, replaces
+-- that one step's command, and releases the next segment.
+function snd.mapper.executeConditionalPath(path, conditionalByIndex, opts)
+    opts = opts or {}
+    path = clone_path_slice(path, 1, #path)
+    conditionalByIndex = conditionalByIndex or {}
+
+    if not opts.preserveExecutionSerial then
+        snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or 0) + 1
+    end
+    local executionSerial = snd.mapper.pathExecutionSerial
+    snd.mapper.pathExecutionActive = true
+    snd.mapper.pathExecutionHasPendingGroups = true
+
+    local cursor = 1
+    local function currentExecution()
+        return snd.mapper.pathExecutionSerial == executionSerial
+    end
+
+    local runNextSegment
+    runNextSegment = function()
+        if not currentExecution() then return end
+
+        local conditionalIndex
+        for index = cursor, #path do
+            if conditionalByIndex[index] then
+                conditionalIndex = index
+                break
+            end
+        end
+
+        if not conditionalIndex then
+            local finalSegment = clone_path_slice(path, cursor, #path)
+            if #finalSegment == 0 then
+                snd.mapper.pathExecutionHasPendingGroups = false
+                return
+            end
+            snd.mapper.executePath(finalSegment, {
+                preserveExecutionSerial = true,
+                skipConditionalCexitResolution = true,
+            })
+            return
+        end
+
+        local config = conditionalByIndex[conditionalIndex]
+        local prefix = clone_path_slice(path, cursor, conditionalIndex - 1)
+        local function awaitConditionalSource()
+            if not currentExecution() then return end
+            local currentRoom = tostring(snd.mapper.currentRoomUid(false) or "-1")
+            local wantedRoom = tostring(config.source_room or config.fromuid or "-1")
+            if currentRoom ~= wantedRoom then
+                snd.mapper.pathExecutionActive = true
+                snd.mapper.pathExecutionHasPendingGroups = true
+                tempTimer(0.1, awaitConditionalSource)
+                return
+            end
+
+            local selected, branch = mm.choose_cexit_key_command(config, path[conditionalIndex].dir)
+            path[conditionalIndex].cexitBaseDir = tostring(config.dir or path[conditionalIndex].dir or "")
+            path[conditionalIndex].dir = selected
+            conditionalByIndex[conditionalIndex] = nil
+            cursor = conditionalIndex
+            snd.utils.debugNote(string.format(
+                "conditional cexit released at room %s using %s branch",
+                wantedRoom, tostring(branch)
+            ))
+            runNextSegment()
+        end
+
+        if #prefix > 0 then
+            snd.mapper.executePath(prefix, {
+                preserveExecutionSerial = true,
+                skipConditionalCexitResolution = true,
+            })
+            snd.mapper.pathExecutionActive = true
+            snd.mapper.pathExecutionHasPendingGroups = true
+        end
+        awaitConditionalSource()
+    end
+
+    runNextSegment()
+    return true
+end
+
 --- Execute a path (send commands)
 -- Handles cardinal directions with 'run', special exits with ';;', and wait() with tempTimer
 -- @param path Path table from findPath
@@ -4002,6 +4773,16 @@ function snd.mapper.executePath(path, opts)
     end
     path = terminalPath
 
+    if not opts.skipConditionalCexitResolution
+        and mm and type(mm.cexit_key_alternates_for_path) == "function"
+    then
+        local initialSource = snd.mapper.currentRoomUid(false)
+        local configured = mm.cexit_key_alternates_for_path(path, initialSource)
+        if type(configured) == "table" and next(configured) then
+            return snd.mapper.executeConditionalPath(path, configured, opts)
+        end
+    end
+
     snd.mapper.notifyBigmapNavigationState("path_started")
 
     if not opts.preserveExecutionSerial then
@@ -4010,6 +4791,17 @@ function snd.mapper.executePath(path, opts)
     local executionSerial = snd.mapper.pathExecutionSerial
     snd.mapper.pathExecutionActive = true
     snd.mapper.pathExecutionHasPendingGroups = true
+    if mm and type(mm.track_cexit_key_observation_path) == "function" then
+        local trackOk, trackErr = pcall(
+            mm.track_cexit_key_observation_path,
+            path,
+            snd.mapper.currentRoomUid(false),
+            executionSerial
+        )
+        if not trackOk then
+            snd.utils.debugNote("cexit key observation path tracking failed: " .. tostring(trackErr))
+        end
+    end
     if snd.conwin and type(snd.conwin.onTravelStarted) == "function" then
         snd.conwin.onTravelStarted("mapper-path-started")
     end
@@ -4768,7 +5560,7 @@ end
 -- @param roomId Destination room uid
 -- @param usePortals Whether to use portals (default: true)
 -- @param guardDestination Original xrt destination for area-guard override links
-function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMode, guardDestination)
+function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMode, guardDestination, options)
     if not roomId then
         snd.utils.infoNote("No room specified")
         return false
@@ -4777,6 +5569,8 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     roomId = tostring(roomId)
     usePortals = (usePortals ~= false)  -- Default true
     iterativeMode = (iterativeMode == true)
+    options = type(options) == "table" and options or {}
+    snd.mapper.lastRouteFailure = nil
 
     -- Get current room
     local currentRoom = snd.mapper.currentRoomUid(true)
@@ -4827,7 +5621,9 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
         snd.mapper.goingToRoom = nil
         snd.nav.goingToRoom = nil
         snd.mapper.notifyBigmapNavigationState("area_guard_rejected")
-        return false
+        local failure = {code = "area_guard_rejected", targetRoom = roomId}
+        snd.mapper.lastRouteFailure = failure
+        return false, failure
     end
 
     local pendingBlocked = snd.mapper.pendingBlockedTravel
@@ -4894,7 +5690,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
                         local nowRoom = snd.mapper.currentRoomUid(true)
                         nowRoom = tostring(nowRoom or "")
                         if nowRoom ~= "" and nowRoom ~= "-1" and nowRoom ~= expectedRoom then
-                            snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, true, guardDestination)
+                            snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, true, guardDestination, options)
                             return
                         end
                         if attempt < 2 then
@@ -4940,7 +5736,39 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
             snd.utils.debugNote("Area guard route retry found no unguarded route either.")
         end
 
-        snd.utils.infoNote("You couldn't find a path to " .. roomId .. " from here.")
+        local failure = {
+            code = "path_not_found",
+            targetRoom = roomId,
+            sourceRoom = tostring(currentRoom),
+        }
+        local chaosPath, chaosDepth
+        if type(snd.mapper.findGqChaosDiagnosticPath) == "function" then
+            chaosPath, chaosDepth = snd.mapper.findGqChaosDiagnosticPath(
+                currentRoom,
+                roomId,
+                noPortals,
+                noRecalls,
+                ignoreLockedExits,
+                false
+            )
+        end
+        if chaosPath and #chaosPath > 0 then
+            failure.code = "gq_chaos_portal_disabled"
+            failure.chaosPathLength = #chaosPath
+            failure.chaosPathDepth = tonumber(chaosDepth) or #chaosPath
+        end
+        snd.mapper.lastRouteFailure = failure
+
+        if options.quietFailure ~= true then
+            if failure.code == "gq_chaos_portal_disabled" then
+                snd.utils.infoNote(
+                    "No GQ-safe route to room " .. roomId
+                    .. ". A route exists through a chaos portal, but chaos portals are disabled during GQ."
+                )
+            else
+                snd.utils.infoNote("You couldn't find a path to " .. roomId .. " from here.")
+            end
+        end
         snd.mapper.goingToRoom = nil
         snd.nav.goingToRoom = nil
         snd.mapper.notifyBigmapNavigationState("path_not_found")
@@ -4954,20 +5782,29 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
             end
         end
         if offeredManualApproach then
-            return false
+            return false, failure
         end
 
         if snd.commands and type(snd.commands.fallbackToTargetAreaStart) == "function" then
             local ok, handled = pcall(snd.commands.fallbackToTargetAreaStart, roomId)
             if ok and handled == true then
+                snd.mapper.lastRouteFailure = nil
                 return true
             elseif not ok then
                 snd.utils.debugNote("Target area-start fallback failed: " .. tostring(handled))
             end
         end
 
-        snd.utils.infoNote("Try 'xrtnear " .. roomId .. "' to list reachable boundary rooms. The lookup may take a moment.")
-        return false
+        local pendingAreaFallback = snd.nav and snd.nav.targetAreaFallback or nil
+        local isFailedAreaStart = pendingAreaFallback
+            and tostring(pendingAreaFallback.destinationRoom or "") == roomId
+        if options.suppressXrtNear ~= true
+            and failure.code ~= "gq_chaos_portal_disabled"
+            and not isFailedAreaStart
+        then
+            snd.utils.infoNote("Try 'xrtnear " .. roomId .. "' to list reachable boundary rooms. The lookup may take a moment.")
+        end
+        return false, failure
     end
 end
 
@@ -5430,6 +6267,12 @@ function snd.mapper.setMapperDb(path)
     snd.mapper.db.close()
     snd.mapper.db.file = path
     if snd.mapper.db.open() then
+        if mm and mm.load_room_notes_cache then
+            local loaded, load_err = mm.load_room_notes_cache()
+            if not loaded then
+                snd.utils.debugNote("Room-note cache reload failed after mapper DB switch: " .. tostring(load_err))
+            end
+        end
         snd.utils.infoNote("Mapper database set to: " .. path)
     end
 end
@@ -5481,13 +6324,14 @@ end
 
 --- Navigate to area or room by name/number
 -- @param dest Destination - area name, partial name, or room number
-function snd.mapper.xrt(dest)
+function snd.mapper.xrt(dest, options)
     if not dest or dest == "" then
         cecho("<yellow>[MMAPPER]<reset> Usage: xrt <area|roomid>\n")
         cecho("<dim_gray>Examples: xrt aylor, xrt academy, xrt 32418<reset>\n")
         return false
     end
     
+    options = type(options) == "table" and options or {}
     dest = dest:lower():trim()
     
     -- Check if it's a room number
@@ -5495,7 +6339,7 @@ function snd.mapper.xrt(dest)
     if roomNum then
         cecho("<yellow>[MMAPPER]<reset> Going to room " .. roomNum .. "\n")
         snd.mapper.debugXrtDecision(dest, roomNum, "numeric destination")
-        return snd.mapper.gotoRoom(roomNum, nil, nil, nil, dest)
+        return snd.mapper.gotoRoom(roomNum, nil, nil, nil, dest, options)
     end
     
     -- Try exact match on area key first (prefer snd.db startRoom data)
@@ -5504,7 +6348,7 @@ function snd.mapper.xrt(dest)
         if startRoom > 0 then
             cecho("<yellow>[MMAPPER]<reset> Going to " .. dest .. " (room " .. startRoom .. ")\n")
             snd.mapper.debugXrtDecision(dest, startRoom, "area start room from snd.db.getAreaStartRoom")
-            return snd.mapper.gotoRoom(startRoom, nil, nil, nil, dest)
+            return snd.mapper.gotoRoom(startRoom, nil, nil, nil, dest, options)
         end
 
         if snd.db.query then
@@ -5520,7 +6364,7 @@ function snd.mapper.xrt(dest)
                 if roomId > 0 then
                     cecho("<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. roomId .. ")\n")
                     snd.mapper.debugXrtDecision(dest, roomId, "area match from snd.db area query")
-                    return snd.mapper.gotoRoom(roomId, nil, nil, nil, dest)
+                    return snd.mapper.gotoRoom(roomId, nil, nil, nil, dest, options)
                 end
             end
         end
@@ -5532,7 +6376,7 @@ function snd.mapper.xrt(dest)
         if areaData and areaData.start then
             cecho("<yellow>[MMAPPER]<reset> Going to " .. dest .. " (room " .. areaData.start .. ")\n")
             snd.mapper.debugXrtDecision(dest, areaData.start, "bundled default area start")
-            return snd.mapper.gotoRoom(areaData.start, nil, nil, nil, dest)
+            return snd.mapper.gotoRoom(areaData.start, nil, nil, nil, dest, options)
         end
         
         -- Try partial match on area names
@@ -5540,7 +6384,7 @@ function snd.mapper.xrt(dest)
             if areaKey:lower():find(dest, 1, true) and data.start then
                 cecho("<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. data.start .. ")\n")
                 snd.mapper.debugXrtDecision(dest, data.start, "bundled partial area match")
-                return snd.mapper.gotoRoom(data.start, nil, nil, nil, dest)
+                return snd.mapper.gotoRoom(data.start, nil, nil, nil, dest, options)
             end
         end
     end
@@ -5556,7 +6400,7 @@ function snd.mapper.xrt(dest)
             local roomId = results[1].uid
             cecho("<yellow>[MMAPPER]<reset> Going to area matching '" .. dest .. "' (room " .. roomId .. ")\n")
             snd.mapper.debugXrtDecision(dest, roomId, "mapper db area LIKE fallback")
-            return snd.mapper.gotoRoom(roomId, nil, nil, nil, dest)
+            return snd.mapper.gotoRoom(roomId, nil, nil, nil, dest, options)
         end
     end
     
@@ -5650,6 +6494,7 @@ function snd.mapper.walkTo(dest, opts)
     
     opts = opts or {}
     local embedded = opts.embedded == true
+    snd.mapper.lastRouteFailure = nil
     dest = dest:lower():trim()
     
     -- Get current room
@@ -5761,8 +6606,16 @@ function snd.mapper.walkTo(dest, opts)
                 return false
             end
         end
-        cecho("<red>[MMAPPER]<reset> No walking path found to " .. displayName .. "\n")
-        cecho("<dim_gray>The destination may not be reachable by walking alone.<reset>\n")
+        local failure = {
+            code = "walking_path_not_found",
+            targetRoom = tostring(targetRoom),
+            sourceRoom = tostring(currentRoom),
+        }
+        snd.mapper.lastRouteFailure = failure
+        if opts.quietFailure ~= true then
+            cecho("<red>[MMAPPER]<reset> No walking path found to " .. displayName .. "\n")
+            cecho("<dim_gray>The destination may not be reachable by walking alone.<reset>\n")
+        end
         local offeredManualApproach = false
         if snd.commands and type(snd.commands.offerManualApproach) == "function" then
             local ok, offered = pcall(snd.commands.offerManualApproach, targetRoom)
@@ -5772,20 +6625,23 @@ function snd.mapper.walkTo(dest, opts)
             end
         end
         if offeredManualApproach then
-            return false
+            return false, failure
         end
 
         if snd.commands and type(snd.commands.fallbackToTargetAreaStart) == "function" then
             local ok, handled = pcall(snd.commands.fallbackToTargetAreaStart, targetRoom)
             if ok and handled == true then
+                snd.mapper.lastRouteFailure = nil
                 return true
             elseif not ok then
                 snd.utils.debugNote("Target area-start fallback failed: " .. tostring(handled))
             end
         end
 
-        snd.utils.infoNote("Try 'xrtnear " .. targetRoom .. "' to list reachable boundary rooms. The lookup may take a moment.")
-        return false
+        if opts.suppressXrtNear ~= true then
+            snd.utils.infoNote("Try 'xrtnear " .. targetRoom .. "' to list reachable boundary rooms. The lookup may take a moment.")
+        end
+        return false, failure
     end
 end
 

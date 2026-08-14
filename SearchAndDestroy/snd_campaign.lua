@@ -73,6 +73,42 @@ function snd.cp.requestResolveCheck(delay, reason)
     return snd.cp.requestCheck(delay, reason or "forced CP resolution", true)
 end
 
+--- Request cp info while coalescing startup/history reconciliation callers.
+-- cp check and the following eligibility line can both discover that the
+-- persisted campaign needs its Complete-By identity. They should share one
+-- server request rather than emitting duplicate full campaign tables.
+function snd.cp.requestInfo(delay, reason, force)
+    local now = os.clock()
+    local minInterval = 2.0
+
+    if not force and snd.cp.lastInfoRequestAt and (now - snd.cp.lastInfoRequestAt) < minInterval then
+        return false
+    end
+    if not force and snd.cp.pendingInfoTimer then
+        return false
+    end
+    if force and snd.cp.pendingInfoTimer then
+        pcall(function() killTimer(snd.cp.pendingInfoTimer) end)
+        snd.cp.pendingInfoTimer = nil
+    end
+
+    local wait = tonumber(delay) or 0
+    local debugReason = reason or "unspecified"
+    if wait <= 0 then
+        snd.cp.lastInfoRequestAt = now
+        snd.utils.debugNote(string.format("Sending 'cp info' (reason: %s, delay: %.2f)", debugReason, wait))
+        send("cp info", false)
+        return true
+    end
+    snd.cp.pendingInfoTimer = tempTimer(wait, function()
+        snd.cp.pendingInfoTimer = nil
+        snd.cp.lastInfoRequestAt = os.clock()
+        snd.utils.debugNote(string.format("Sending 'cp info' (reason: %s, delay: %.2f)", debugReason, wait))
+        send("cp info", false)
+    end)
+    return true
+end
+
 -------------------------------------------------------------------------------
 -- Campaign History Session Tracking
 -------------------------------------------------------------------------------
@@ -299,8 +335,8 @@ function snd.cp.closeHistorySession(status, rewards, reason, opts)
                 snd.cp.pendingResetCloseTimer = nil
             end
 
-            snd.utils.debugNote("closeHistorySession: unresolved campaign history id, sending 'cp info' and retrying in 2s")
-            send("cp info", false)
+            snd.utils.debugNote("closeHistorySession: unresolved campaign history id, requesting 'cp info' and retrying in 2s")
+            snd.cp.requestInfo(0, "closeHistorySession:reattach", true)
             snd.cp.pendingResetCloseTimer = tempTimer(2, function()
                 snd.cp.pendingResetCloseTimer = nil
                 local pending = snd.cp.pendingResetClose
@@ -352,7 +388,7 @@ function snd.cp.openHistorySession(levelTaken, completeBy)
     if normalizedCompleteBy == "" then
         snd.utils.debugNote("openHistorySession skipped: Complete-By not captured yet")
         snd.campaign.completeBy = ""
-        send("cp info", false)
+        snd.cp.requestInfo(0, "openHistorySession:missing-complete-by")
         return
     end
 
@@ -1195,6 +1231,12 @@ function snd.cp.buildMainTargetList()
     end
 
     snd.utils.debugNote("Built main target list: " .. #snd.targets.list .. " CP targets (level " .. playerLevel .. ")")
+    if snd.sortTargetsByPriority then
+        snd.sortTargetsByPriority({
+            recalculateProximity = true,
+            reason = "cp_target_list_built",
+        })
+    end
     snd.cp.reconcileSelectionAfterRebuild()
 end
 
@@ -1226,6 +1268,12 @@ function snd.cp.updateTargetStatus()
     snd.targets.list = nonCpList
     for _, target in ipairs(cpList) do
         table.insert(snd.targets.list, target)
+    end
+    if snd.sortTargetsByPriority then
+        snd.sortTargetsByPriority({
+            recalculateProximity = true,
+            reason = "cp_target_status_changed",
+        })
     end
     snd.cp.reconcileSelectionAfterRebuild()
 end
@@ -1354,9 +1402,11 @@ function snd.cp.onMobKilled()
         local currentRoom = snd.room and snd.room.current and tostring(snd.room.current.name or "") or ""
         for i, t in ipairs(snd.targets.list) do
             if t.activity == "cp" and not t.dead then
-                local nameMatchesCurrent = (t.mob == target.name)
-                local nameMatchesConfirmedKill = (confirmedKilledMob ~= "" and t.mob == confirmedKilledMob)
-                local nameMatchesActiveCombat = (activeCombatMob ~= "" and t.mob == activeCombatMob)
+                -- ConWin publishes normalized lowercase names, while CP output
+                -- preserves display casing for proper names such as "Blitzen".
+                local nameMatchesCurrent = snd.utils.mobIdentityMatches(t.mob, target.name)
+                local nameMatchesConfirmedKill = snd.utils.mobIdentityMatches(t.mob, confirmedKilledMob)
+                local nameMatchesActiveCombat = snd.utils.mobIdentityMatches(t.mob, activeCombatMob)
                 if nameMatchesCurrent or nameMatchesConfirmedKill or nameMatchesActiveCombat then
                     local score = 5
                     if nameMatchesConfirmedKill then score = score + 8 end
@@ -1414,7 +1464,7 @@ function snd.cp.onMobKilled()
         end
         
         -- Clear current target
-        snd.clearTarget()
+        snd.clearTarget({refresh = false})
     end
     
     local killedTargetsAfter = 0
@@ -1438,11 +1488,13 @@ function snd.cp.onMobKilled()
         snd.cp.requestCheck(0.1, "cp.onMobKilled")
     end
     
-    if snd.gui and snd.gui.refresh then
-        snd.gui.refresh()
-    end
     if snd.setActiveTab and snd.getPreferredActiveActivity then
-        snd.setActiveTab(snd.getPreferredActiveActivity() or "auto", {save = true, refresh = false})
+        snd.setActiveTab(snd.getPreferredActiveActivity() or "auto", {save = false, refresh = false})
+    end
+    if snd.saveState then snd.saveState() end
+    if snd.gui then
+        if snd.gui.requestRefresh then snd.gui.requestRefresh()
+        elseif snd.gui.refresh then snd.gui.refresh() end
     end
 end
 
@@ -1686,8 +1738,16 @@ function snd.cp.onCanGetNew()
         return
     end
 
+    -- Campaign eligibility only says that this level is allowed to take one;
+    -- it does not prove that a previously accepted campaign has ended. During
+    -- startup, persisted Complete-By state is loaded before the delayed
+    -- `cp check` marks the campaign active, so closing here would split the
+    -- same campaign on every reconnect. Reconcile through `cp info` instead:
+    -- an active campaign reattaches by Complete-By and syncs its rewards,
+    -- while the explicit not-on-campaign response owns any reset closure.
     if snd.db and snd.cp.hasOpenHistorySession() and not snd.campaign.active then
-        snd.cp.closeHistorySession(snd.db.HISTORY_STATUS_RESET, nil, "campaign eligibility indicates prior campaign ended")
+        snd.utils.debugNote("Campaign eligibility arrived before campaign reconciliation; requesting 'cp info'")
+        snd.cp.requestInfo(0, "campaign-eligibility:history-reattach")
     end
     
     if snd.gui and snd.gui.refresh then
