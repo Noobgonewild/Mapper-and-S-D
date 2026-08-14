@@ -708,18 +708,18 @@ function CW.applyQuestTargetEvidence(mobs, roomId)
     local evidence = questEvidenceForRoom(roomId or currentRoomId())
     if not evidence then return nil end
 
-    local matchingOrdinal = 0
-    for index, mob in ipairs(rows) do
-        if not mob.dead and mobMatchesActivityTarget(mob.name, "quest") then
-            matchingOrdinal = matchingOrdinal + 1
-            if matchingOrdinal == tonumber(evidence.markedOrdinal) then
-                mob.questTarget = true
-                mob.questTargetOrdinal = matchingOrdinal
-                return index
-            end
-        end
+    -- RoomChars descriptions can differ from consider names. The server's
+    -- [QUEST] marker therefore identifies an absolute inhabitant position,
+    -- not the Nth row whose text already resembles the stored quest target.
+    local index = math.floor(tonumber(evidence.markedOrdinal) or 0)
+    local mob = rows[index]
+    if not mob or mob.dead or not mobMatchesActivityTarget(mob.name, "quest") then
+        return nil
     end
-    return nil
+
+    mob.questTarget = true
+    mob.questTargetOrdinal = index
+    return index
 end
 
 function CW.onQuestTargetEvidenceUpdated(_evidence)
@@ -809,6 +809,23 @@ function CW.visibleNameForActivityTarget(targetName, activity)
         end
     end
     return ""
+end
+
+function CW.questTargetIndexFor(targetName)
+    local needle = trim(targetName)
+    if needle == "" then return nil end
+
+    for index, mob in ipairs(CW.mobs or {}) do
+        local mobName = trim(mob.name or "")
+        if not mob.dead and mob.questTarget == true and mobName ~= "" then
+            local matches = snd.utils.mobIdentityMatches(mobName, needle)
+            if not matches and snd.utils.mobSelectorMatchesName then
+                matches = snd.utils.mobSelectorMatchesName(needle, mobName)
+            end
+            if matches then return index end
+        end
+    end
+    return nil
 end
 
 local function markerToColorToken(marker)

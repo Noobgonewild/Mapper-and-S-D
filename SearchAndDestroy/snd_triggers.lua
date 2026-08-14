@@ -778,21 +778,24 @@ end
 function snd.triggers.tagCurrentRoomCharsLine()
     if not (snd.roomChars and snd.roomChars.active) then return end
     local line = snd.utils.stripColors(type(getCurrentLine) == "function" and getCurrentLine() or ""):lower()
-    if line == "" then return end
+    if line == "" or line == "{roomchars}" or line == "{/roomchars}" then return end
+
+    -- RoomChars and `consider all` describe the same inhabitants in the same
+    -- order, but they do not necessarily use the same visible description.
+    -- Capture the server's [QUEST] marker by absolute row number so a line such
+    -- as "a half-giant ... [QUEST]" can bind to "a driller" in consider output.
+    local evidence = snd.roomChars.questTargetEvidence
+    if evidence and not evidence.complete then
+        evidence.characterCount = (tonumber(evidence.characterCount) or 0) + 1
+        if line:match("%[quest%]%s*$") then
+            evidence.markedOrdinal = evidence.characterCount
+        end
+    end
+
     local tags = {}
     for _, matcher in ipairs(snd.roomChars.targetMatchers or {}) do
         if matcher.name ~= "" and line:find(matcher.name, 1, true) then
             for activity in pairs(matcher.tags or {}) do tags[activity] = true end
-        end
-    end
-
-    if tags.quest then
-        local evidence = snd.roomChars.questTargetEvidence
-        if evidence and not evidence.complete then
-            evidence.matchingCount = (tonumber(evidence.matchingCount) or 0) + 1
-            if line:match("%[quest%]%s*$") then
-                evidence.markedOrdinal = evidence.matchingCount
-            end
         end
     end
 
@@ -858,7 +861,7 @@ function snd.triggers.roomCharsStart()
     snd.roomChars.active = true
     snd.roomChars.questTargetEvidence = {
         roomId = currentRoomCharsRoomId(),
-        matchingCount = 0,
+        characterCount = 0,
         markedOrdinal = nil,
         complete = false,
     }

@@ -156,6 +156,36 @@ local function save_redirects()
   return true
 end
 
+local function persistence_file_exists(path)
+  local file = io.open(path, "rb")
+  if not file then return false end
+  file:close()
+  return true
+end
+
+local function quarantine_invalid_redirects(path, reason)
+  local stamp = os.date("!%Y%m%d_%H%M%S")
+  local quarantine_path = tostring(path) .. ".invalid." .. stamp
+  local suffix = 1
+  while persistence_file_exists(quarantine_path) do
+    quarantine_path = tostring(path) .. ".invalid." .. stamp .. "_" .. tostring(suffix)
+    suffix = suffix + 1
+  end
+
+  local renamed, rename_err = os.rename(path, quarantine_path)
+  if not renamed then
+    return nil, "redirect persistence file is invalid (" .. tostring(reason) ..
+      ") and could not be quarantined: " .. tostring(rename_err)
+  end
+
+  frontier.quarantinedRedirectFile = quarantine_path
+  if mm and type(mm.warn) == "function" then
+    mm.warn("Invalid boundary redirect state was quarantined to " .. tostring(quarantine_path) ..
+      "; continuing with no manual redirects. Reason: " .. tostring(reason))
+  end
+  return quarantine_path
+end
+
 function frontier.initialize()
   if frontier.redirectsLoaded then return true end
   local started = now_millis()
@@ -164,13 +194,29 @@ function frontier.initialize()
   local path = type(mm.persistence_path) == "function"
     and mm.persistence_path(REDIRECT_PERSIST_FILE)
     or (getMudletHomeDir() .. "/persistence/" .. REDIRECT_PERSIST_FILE)
-  local chunk = loadfile(path)
+  local file_exists = persistence_file_exists(path)
+  local chunk, load_err = loadfile(path)
+  local invalid_reason = nil
+  local data = nil
   if chunk then
-    local ok, data = pcall(chunk)
-    if not ok or type(data) ~= "table" then
-      return false, "redirect persistence file is invalid"
+    local ok, loaded = pcall(chunk)
+    if not ok then
+      invalid_reason = tostring(loaded)
+    elseif type(loaded) ~= "table" then
+      invalid_reason = "file must return a table"
+    elseif loaded.redirects ~= nil and type(loaded.redirects) ~= "table" then
+      invalid_reason = "redirects field must be a table"
+    else
+      data = loaded
     end
+  elseif file_exists then
+    invalid_reason = tostring(load_err or "file could not be loaded")
+  end
 
+  if invalid_reason then
+    local quarantined, quarantine_err = quarantine_invalid_redirects(path, invalid_reason)
+    if not quarantined then return false, quarantine_err end
+  elseif data then
     local seen = {}
     for _, entry in ipairs(data.redirects or {}) do
       local cleaned = sanitize_redirect(entry)

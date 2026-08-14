@@ -43,7 +43,6 @@ snd.db.createdEmpty = false
 snd.db.file = getMudletHomeDir() .. "/SnDdb.db"
 
 local SND_CORE_TABLES = { "area", "mobs", "mob_keyword_exceptions", "history" }
-local SND_LEGACY_CORE_TABLES = { "area", "mobs", "mob_keyword_exceptions" }
 local SND_REQUIRED_COLUMNS = {
     area = { "name", "key", "minlvl", "maxlvl", "lock", "startRoom", "noquest", "vidblain", "userKey" },
     mobs = { "mob", "room", "roomid", "zone", "seen_count", "kill_count", "last_seen", "last_killed" },
@@ -245,120 +244,364 @@ local function validate_existing_snd_database(conn)
     if #missing_columns > 0 then
         return false, "missing core columns: " .. table.concat(missing_columns, ", ")
     end
-    local integrity = tostring(scalar_from_connection(conn, "PRAGMA quick_check") or "unknown")
-    if integrity ~= "ok" then
-        return false, "SQLite quick_check: " .. integrity
+    local integrity, integrity_err = scalar_from_connection(conn, "PRAGMA quick_check")
+    if integrity == nil then
+        return false, "could not verify SQLite integrity: " .. tostring(integrity_err or "unknown error")
+    end
+    if tostring(integrity) ~= "ok" then
+        return false, "SQLite quick_check: " .. tostring(integrity)
     end
     return true
 end
 
--- Upgrade the legacy S&D layout that can be identified without ambiguity: the
--- v5 core tables and columns are intact, but the history table is absent.
--- All DDL is transactional. Every other incomplete or corrupt layout remains
--- untouched and is rejected by validate_existing_snd_database().
-local function migrate_legacy_history_schema(conn)
-    local tables, tables_err = table_set_from_connection(conn)
-    if not tables then return false, tables_err end
-    if tables.history then return false end
+local SND_CLASSIC_AREA_IDENTITY_COLUMNS = {
+    "name", "key", "minlvl", "maxlvl", "lock",
+}
+local SND_CLASSIC_MOB_IDENTITY_COLUMNS = { "mob", "room", "roomid", "zone" }
+local SND_NORMALIZED_TABLE_COLUMNS = {
+    areas = { "key", "name", "minlvl", "maxlvl", "lock", "start_room", "noquest", "vidblain" },
+    mob_sightings = { "mob", "room_name", "roomid", "zone", "seen_count", "last_seen" },
+    mob_kills = { "mob", "roomid", "zone", "kill_count", "last_killed" },
+    mob_keywords = { "id", "char_id", "zone", "mob_name", "keyword" },
+    history = { "id", "char_id", "type", "level_taken", "start_time", "end_time", "status", "qp_base", "qp_bonus", "tp_rewards", "train_rewards", "prac_rewards", "gold_rewards" },
+}
 
-    local legacyMobColumns = nil
-    for _, table_name in ipairs(SND_LEGACY_CORE_TABLES) do
+local function missing_columns(columns, required)
+    local missing = {}
+    for _, column_name in ipairs(required) do
+        if not columns[column_name] then table.insert(missing, column_name) end
+    end
+    return missing
+end
+
+local function verify_snd_integrity(conn)
+    local integrity, integrity_err = scalar_from_connection(conn, "PRAGMA quick_check")
+    if integrity == nil then
+        return false, "could not verify SQLite integrity: " .. tostring(integrity_err or "unknown error")
+    end
+    if tostring(integrity) ~= "ok" then
+        return false, "SQLite quick_check: " .. tostring(integrity)
+    end
+    return true
+end
+
+local function detect_snd_schema(conn)
+    local integrity_ok, integrity_err = verify_snd_integrity(conn)
+    if not integrity_ok then return nil, integrity_err end
+
+    local tables, tables_err = table_set_from_connection(conn)
+    if not tables then return nil, tables_err end
+    local version = tonumber(scalar_from_connection(conn, "PRAGMA user_version")) or 0
+
+    -- The current Mudlet layout may still need a version stamp or extension
+    -- tables, but its core data can already be validated without conversion.
+    local current_core = true
+    local current_columns = {}
+    for table_name, required in pairs(SND_PRE_TIMESTAMP_REQUIRED_COLUMNS) do
         if not tables[table_name] then
-            return false
+            current_core = false
+            break
         end
         local columns, columns_err = column_set_from_connection(conn, table_name)
-        if not columns then return false, columns_err end
-        if table_name == "mobs" then legacyMobColumns = columns end
-        for _, column_name in ipairs(SND_PRE_TIMESTAMP_REQUIRED_COLUMNS[table_name]) do
-            if not columns[column_name] then
-                return false
+        if not columns then return nil, columns_err end
+        current_columns[table_name] = columns
+        if #missing_columns(columns, required) > 0 then
+            current_core = false
+            break
+        end
+    end
+    if current_core then
+        local mobs = current_columns.mobs
+        local extensions_missing = not tables.campaign_history_identity or not tables.mob_tags
+        if tables.mob_tags then
+            local tag_columns, columns_err = column_set_from_connection(conn, "mob_tags")
+            if not tag_columns then return nil, columns_err end
+            extensions_missing = extensions_missing
+                or not tag_columns.nowhere
+                or not tag_columns.nohunt
+                or not tag_columns.priority_room
+        end
+        return {
+            kind = "classic",
+            from_version = version,
+            tables = tables,
+            area_columns = current_columns.area,
+            mobs_columns = mobs,
+            history_columns = current_columns.history,
+            needs_migration = version < snd.db.schemaVersion
+                or not mobs.last_seen
+                or not mobs.last_killed
+                or extensions_missing,
+        }
+    end
+
+    -- Newer MUSHclient builds use a normalized layout. Converting it requires
+    -- combining sightings/kills and reshaping history, not merely adding tables.
+    local normalized = true
+    local normalized_columns = {}
+    for table_name, required in pairs(SND_NORMALIZED_TABLE_COLUMNS) do
+        if not tables[table_name] then
+            normalized = false
+            break
+        end
+        local columns, columns_err = column_set_from_connection(conn, table_name)
+        if not columns then return nil, columns_err end
+        normalized_columns[table_name] = columns
+        if #missing_columns(columns, required) > 0 then
+            normalized = false
+            break
+        end
+    end
+    if normalized then
+        if tables.area or tables.mobs or tables.mob_keyword_exceptions or tables._mush_normalized_history then
+            return nil, "normalized MUSH schema has conflicting compatibility tables; existing file was left untouched"
+        end
+        return {
+            kind = "normalized_mush",
+            from_version = version,
+            tables = tables,
+            normalized_columns = normalized_columns,
+            needs_migration = true,
+        }
+    end
+
+    -- Classic MUSHclient schemas v0-v5 have area+mobs, with either the old
+    -- count column or the later seen_count/kill_count pair. Missing history and
+    -- keyword tables are known historical states and are safe to create.
+    if tables.area and tables.mobs then
+        local area_columns, area_err = column_set_from_connection(conn, "area")
+        if not area_columns then return nil, area_err end
+        local mobs_columns, mobs_err = column_set_from_connection(conn, "mobs")
+        if not mobs_columns then return nil, mobs_err end
+        local missing_area = missing_columns(area_columns, SND_CLASSIC_AREA_IDENTITY_COLUMNS)
+        local missing_mobs = missing_columns(mobs_columns, SND_CLASSIC_MOB_IDENTITY_COLUMNS)
+        local has_old_counts = mobs_columns.count ~= nil
+        local has_split_counts = mobs_columns.seen_count ~= nil and mobs_columns.kill_count ~= nil
+        if #missing_area == 0 and #missing_mobs == 0 and (has_old_counts or has_split_counts) then
+            local history_columns = nil
+            if tables.history then
+                local history_err
+                history_columns, history_err = column_set_from_connection(conn, "history")
+                if not history_columns then return nil, history_err end
+                local missing_history = missing_columns(history_columns, SND_PRE_TIMESTAMP_REQUIRED_COLUMNS.history)
+                if #missing_history > 0 then
+                    return nil, "unrecognized classic history schema; missing columns: " .. table.concat(missing_history, ", ")
+                end
             end
+            if tables.mob_keyword_exceptions then
+                local keyword_columns, keyword_err = column_set_from_connection(conn, "mob_keyword_exceptions")
+                if not keyword_columns then return nil, keyword_err end
+                local missing_keywords = missing_columns(keyword_columns, SND_REQUIRED_COLUMNS.mob_keyword_exceptions)
+                if #missing_keywords > 0 then
+                    return nil, "unrecognized keyword schema; missing columns: " .. table.concat(missing_keywords, ", ")
+                end
+            end
+            if tables.mobs_mudlet_v7 then
+                return nil, "legacy migration staging table already exists; existing file was left untouched"
+            end
+            return {
+                kind = "classic",
+                from_version = version,
+                tables = tables,
+                area_columns = area_columns,
+                mobs_columns = mobs_columns,
+                history_columns = history_columns,
+                needs_migration = true,
+            }
         end
     end
 
-    local integrity = tostring(scalar_from_connection(conn, "PRAGMA quick_check") or "unknown")
-    if integrity ~= "ok" then
-        return false, "SQLite quick_check: " .. integrity
-    end
+    return nil, "unrecognized S&D schema; expected a supported classic or normalized MUSHclient database"
+end
 
-    local current_version = tonumber(scalar_from_connection(conn, "PRAGMA user_version")) or 0
-    local ok, err = execute_on_connection(conn, "BEGIN IMMEDIATE")
-    if ok then
-        for _, sql in ipairs(SND_HISTORY_SCHEMA_SQL) do
-            ok, err = execute_on_connection(conn, sql)
-            if not ok then break end
-        end
+local function ensure_snd_backup_directory(path)
+    local ok, lfs = pcall(require, "lfs")
+    if ok and lfs and type(lfs.attributes) == "function" and type(lfs.mkdir) == "function" then
+        if lfs.attributes(path, "mode") == "directory" then return true end
+        if lfs.mkdir(path) or lfs.attributes(path, "mode") == "directory" then return true end
     end
-    if ok and legacyMobColumns and not legacyMobColumns.last_seen then
-        ok, err = execute_on_connection(conn, "ALTER TABLE mobs ADD COLUMN last_seen INTEGER")
-    end
-    if ok and legacyMobColumns and not legacyMobColumns.last_killed then
-        ok, err = execute_on_connection(conn, "ALTER TABLE mobs ADD COLUMN last_killed INTEGER")
-    end
-    if ok and current_version < snd.db.schemaVersion then
-        ok, err = execute_on_connection(conn, "PRAGMA user_version = " .. tostring(snd.db.schemaVersion))
-    end
-    if ok then
-        ok, err = validate_existing_snd_database(conn)
-    end
-    if ok then
-        local committed, commit_err = execute_on_connection(conn, "COMMIT")
-        if not committed then
-            ok, err = false, commit_err
-            pcall(function() conn:execute("ROLLBACK") end)
-        end
-    else
-        pcall(function() conn:execute("ROLLBACK") end)
-    end
+    local is_windows = package.config:sub(1, 1) == "\\"
+    local command = is_windows
+        and string.format('mkdir "%s"', tostring(path))
+        or string.format('mkdir -p "%s"', tostring(path))
+    local result = os.execute(command)
+    return result == true or result == 0
+end
 
-    if not ok then
-        return false, "legacy history migration failed: " .. tostring(err)
+local function snd_sql_quote(value)
+    return "'" .. tostring(value or ""):gsub("'", "''") .. "'"
+end
+
+local function create_snd_migration_backup(conn)
+    local directory = getMudletHomeDir() .. "/db_backups"
+    if not ensure_snd_backup_directory(directory) then
+        return nil, "unable to create backup directory: " .. tostring(directory)
+    end
+    local base = tostring(snd.db.file or "SnDdb.db"):match("([^/\\]+)$") or "SnDdb.db"
+    base = base:gsub("[/\\:*?\"<>|]", "_")
+    local stamp = os.date("!%Y%m%d_%H%M%S")
+    local path = string.format("%s/%s.pre-migration.%s.bak", directory, base, stamp)
+    local suffix = 1
+    while database_file_exists(path) do
+        path = string.format("%s/%s.pre-migration.%s_%d.bak", directory, base, stamp, suffix)
+        suffix = suffix + 1
+    end
+    local ok, err = execute_on_connection(conn, "VACUUM INTO " .. snd_sql_quote(path))
+    if not ok then return nil, "transactional SQLite backup failed: " .. tostring(err) end
+    return path
+end
+
+local function run_snd_schema_sql(conn)
+    for _, sql in ipairs(SND_SCHEMA_SQL) do
+        -- Case-only duplicate mob tags are normalized during initialize().
+        -- Delay this one unique index until that data cleanup has run.
+        if not sql:find("idx_mob_tags_key_nocase", 1, true) then
+            local ok, err = execute_on_connection(conn, sql)
+            if not ok then return false, err end
+        end
     end
     return true
 end
 
--- v6 already has history, so only add the two unindexed observation timestamps.
--- Validate the complete pre-v7 core before making any change, then validate the
--- v7 layout before committing.
-local function migrate_mob_timestamp_schema(conn)
-    local tables, tables_err = table_set_from_connection(conn)
-    if not tables then return false, tables_err end
-    for _, table_name in ipairs(SND_CORE_TABLES) do
-        if not tables[table_name] then return false end
-        local columns, columns_err = column_set_from_connection(conn, table_name)
-        if not columns then return false, columns_err end
-        for _, column_name in ipairs(SND_PRE_TIMESTAMP_REQUIRED_COLUMNS[table_name]) do
-            if not columns[column_name] then return false end
+local function add_column_if_missing(conn, table_name, columns, column_name, definition)
+    if columns[column_name] then return true end
+    local ok, err = execute_on_connection(conn,
+        "ALTER TABLE " .. table_name .. " ADD COLUMN " .. definition)
+    if ok then columns[column_name] = true end
+    return ok, err
+end
+
+local function migrate_classic_snd(conn, plan)
+    local ok, err = add_column_if_missing(conn, "area", plan.area_columns, "startRoom", "startRoom INTEGER")
+    if ok then ok, err = add_column_if_missing(conn, "area", plan.area_columns, "noquest", "noquest TEXT") end
+    if ok then ok, err = add_column_if_missing(conn, "area", plan.area_columns, "vidblain", "vidblain TEXT") end
+    if ok then ok, err = add_column_if_missing(conn, "area", plan.area_columns, "userKey", "userKey TEXT") end
+    if not ok then return false, err end
+
+    if plan.mobs_columns.count and not plan.mobs_columns.seen_count then
+        ok, err = execute_on_connection(conn, SND_SCHEMA_SQL[3])
+        if ok and plan.mobs_columns.keyword then
+            ok, err = execute_on_connection(conn, [[
+                INSERT OR IGNORE INTO mob_keyword_exceptions(area_name, mob_name, keyword)
+                SELECT zone, mob, keyword FROM mobs
+                WHERE keyword IS NOT NULL AND trim(keyword) <> ''
+                ORDER BY zone, mob]])
+        end
+        if ok then
+            ok, err = execute_on_connection(conn, [[
+                CREATE TABLE mobs_mudlet_v7 (
+                    mob TEXT NOT NULL COLLATE NOCASE,
+                    room TEXT NOT NULL COLLATE NOCASE,
+                    roomid INTEGER NOT NULL,
+                    zone TEXT NOT NULL,
+                    seen_count INTEGER NOT NULL DEFAULT 0,
+                    kill_count INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER,
+                    last_killed INTEGER,
+                    UNIQUE(mob, roomid))]])
+        end
+        if ok then
+            ok, err = execute_on_connection(conn, [[
+                INSERT INTO mobs_mudlet_v7(mob, room, roomid, zone, seen_count, kill_count)
+                SELECT mob COLLATE NOCASE, MAX(room) COLLATE NOCASE, roomid, MAX(zone),
+                       SUM(COALESCE(count, 0)), 0
+                FROM mobs GROUP BY lower(mob), roomid]])
+        end
+        if ok then ok, err = execute_on_connection(conn, "DROP TABLE mobs") end
+        if ok then ok, err = execute_on_connection(conn, "ALTER TABLE mobs_mudlet_v7 RENAME TO mobs") end
+    else
+        ok, err = add_column_if_missing(conn, "mobs", plan.mobs_columns, "last_seen", "last_seen INTEGER")
+        if ok then
+            ok, err = add_column_if_missing(conn, "mobs", plan.mobs_columns, "last_killed", "last_killed INTEGER")
         end
     end
+    if not ok then return false, err end
+    return run_snd_schema_sql(conn)
+end
 
-    local mobColumns, columns_err = column_set_from_connection(conn, "mobs")
-    if not mobColumns then return false, columns_err end
-    local currentVersion = tonumber(scalar_from_connection(conn, "PRAGMA user_version")) or 0
-    local needsLastSeen = not mobColumns.last_seen
-    local needsLastKilled = not mobColumns.last_killed
-    if not needsLastSeen and not needsLastKilled and currentVersion >= snd.db.schemaVersion then
-        return false
+local function migrate_normalized_snd(conn)
+    local ok, err = execute_on_connection(conn, SND_SCHEMA_SQL[1])
+    if ok then
+        ok, err = execute_on_connection(conn, [[
+            INSERT INTO area(name, key, minlvl, maxlvl, lock, startRoom, noquest, vidblain, userKey)
+            SELECT name, key, minlvl, maxlvl, lock, start_room,
+                   CASE WHEN CAST(noquest AS INTEGER) <> 0 THEN 'yes' ELSE '' END,
+                   CASE WHEN CAST(vidblain AS INTEGER) <> 0 THEN 'yes' ELSE '' END,
+                   NULL
+            FROM areas]])
     end
+    if ok then ok, err = execute_on_connection(conn, SND_SCHEMA_SQL[2]) end
+    if ok then
+        ok, err = execute_on_connection(conn, [[
+            INSERT OR IGNORE INTO mobs(mob, room, roomid, zone, seen_count, kill_count, last_seen, last_killed)
+            SELECT s.mob, s.room_name, s.roomid, s.zone, COALESCE(s.seen_count, 0),
+                   COALESCE(k.kill_count, 0), s.last_seen, k.last_killed
+            FROM mob_sightings AS s
+            LEFT JOIN mob_kills AS k
+              ON lower(k.mob) = lower(s.mob) AND k.roomid = s.roomid]])
+    end
+    if ok then
+        ok, err = execute_on_connection(conn, [[
+            INSERT OR IGNORE INTO mobs(mob, room, roomid, zone, seen_count, kill_count, last_seen, last_killed)
+            SELECT k.mob, '', k.roomid, k.zone, 0, COALESCE(k.kill_count, 0), NULL, k.last_killed
+            FROM mob_kills AS k
+            WHERE NOT EXISTS (
+              SELECT 1 FROM mob_sightings AS s
+              WHERE lower(s.mob) = lower(k.mob) AND s.roomid = k.roomid)]])
+    end
+    if ok then ok, err = execute_on_connection(conn, SND_SCHEMA_SQL[3]) end
+    if ok then
+        ok, err = execute_on_connection(conn, [[
+            INSERT OR IGNORE INTO mob_keyword_exceptions(area_name, mob_name, keyword)
+            SELECT zone, mob_name, keyword FROM mob_keywords
+            ORDER BY CASE WHEN char_id IS NULL THEN 0 ELSE 1 END, id]])
+    end
+    if ok then ok, err = execute_on_connection(conn, "ALTER TABLE history RENAME TO _mush_normalized_history") end
+    if ok then ok, err = execute_on_connection(conn, SND_HISTORY_SCHEMA_SQL[1]) end
+    if ok then
+        ok, err = execute_on_connection(conn, [[
+            INSERT INTO history(id, type, level_taken, start_time, end_time, status,
+                                qp_rewards, tp_rewards, train_rewards, prac_rewards, gold_rewards)
+            SELECT id, type, level_taken, start_time, end_time, status,
+                   COALESCE(qp_base, 0) + COALESCE(qp_bonus, 0),
+                   tp_rewards, train_rewards, prac_rewards, gold_rewards
+            FROM _mush_normalized_history]])
+    end
+    if not ok then return false, err end
+    return run_snd_schema_sql(conn)
+end
 
-    local integrity = tostring(scalar_from_connection(conn, "PRAGMA quick_check") or "unknown")
-    if integrity ~= "ok" then
-        return false, "SQLite quick_check: " .. integrity
+local function ensure_mob_tag_columns(conn)
+    local tables, tables_err = table_set_from_connection(conn)
+    if not tables then return false, tables_err end
+    if not tables.mob_tags then return true end
+    local columns, columns_err = column_set_from_connection(conn, "mob_tags")
+    if not columns then return false, columns_err end
+    local ok, err = add_column_if_missing(conn, "mob_tags", columns, "nowhere", "nowhere INTEGER NOT NULL DEFAULT 0")
+    if ok then ok, err = add_column_if_missing(conn, "mob_tags", columns, "nohunt", "nohunt INTEGER NOT NULL DEFAULT 0") end
+    if ok then ok, err = add_column_if_missing(conn, "mob_tags", columns, "priority_room", "priority_room INTEGER DEFAULT NULL") end
+    return ok, err
+end
+
+local function migrate_snd_database(conn, plan)
+    local backup_path, backup_err = create_snd_migration_backup(conn)
+    if not backup_path then
+        return false, "automatic migration was not started because the backup failed: " .. tostring(backup_err)
     end
 
     local ok, err = execute_on_connection(conn, "BEGIN IMMEDIATE")
-    if ok and needsLastSeen then
-        ok, err = execute_on_connection(conn, "ALTER TABLE mobs ADD COLUMN last_seen INTEGER")
+    if ok then
+        if plan.kind == "normalized_mush" then
+            ok, err = migrate_normalized_snd(conn)
+        else
+            ok, err = migrate_classic_snd(conn, plan)
+        end
     end
-    if ok and needsLastKilled then
-        ok, err = execute_on_connection(conn, "ALTER TABLE mobs ADD COLUMN last_killed INTEGER")
-    end
-    if ok and currentVersion < snd.db.schemaVersion then
+    if ok then ok, err = ensure_mob_tag_columns(conn) end
+    if ok then
         ok, err = execute_on_connection(conn, "PRAGMA user_version = " .. tostring(snd.db.schemaVersion))
     end
-    if ok then
-        ok, err = validate_existing_snd_database(conn)
-    end
+    if ok then ok, err = validate_existing_snd_database(conn) end
     if ok then
         local committed, commit_err = execute_on_connection(conn, "COMMIT")
         if not committed then
@@ -368,10 +611,12 @@ local function migrate_mob_timestamp_schema(conn)
     else
         pcall(function() conn:execute("ROLLBACK") end)
     end
+
     if not ok then
-        return false, "mob timestamp migration failed: " .. tostring(err)
+        return false, "automatic S&D migration failed and was rolled back: " .. tostring(err) ..
+            ". Pre-migration backup: " .. tostring(backup_path)
     end
-    return true
+    return true, backup_path
 end
 
 -------------------------------------------------------------------------------
@@ -391,9 +636,9 @@ function snd.db.open()
         return false
     end
     
-    -- Opening a missing SQLite path creates a new file. Existing files are
-    -- never removed, replaced, truncated, or recreated here. The single known
-    -- supported legacy layouts are upgraded transactionally in place.
+    -- Opening a missing SQLite path creates a new file. Existing recognized
+    -- MUSHclient/Mudlet layouts are backed up and upgraded transactionally.
+    -- Corrupt, incomplete, and unrelated SQLite files are never rewritten.
     local existed = database_file_exists(snd.db.file)
     if existed and not database_looks_like_sqlite(snd.db.file) then
         snd.db.env:close()
@@ -411,25 +656,31 @@ function snd.db.open()
     end
 
     if existed then
-        local migratedHistory, migration_err = migrate_legacy_history_schema(snd.db.conn)
-        if migration_err then
+        local plan, detection_err = detect_snd_schema(snd.db.conn)
+        if not plan then
             snd.db.conn:close()
             snd.db.env:close()
             snd.db.conn = nil
             snd.db.env = nil
-            snd.utils.errorNote("Existing database was left untouched: " .. tostring(migration_err))
+            snd.utils.errorNote("Existing database was left untouched: " .. tostring(detection_err))
             snd.utils.infoNote("Expected S&D database path: " .. tostring(snd.db.file))
             return false
         end
-        local migratedTimestamps, timestamp_err = migrate_mob_timestamp_schema(snd.db.conn)
-        if timestamp_err then
-            snd.db.conn:close()
-            snd.db.env:close()
-            snd.db.conn = nil
-            snd.db.env = nil
-            snd.utils.errorNote("Existing database was left untouched: " .. tostring(timestamp_err))
-            snd.utils.infoNote("Expected S&D database path: " .. tostring(snd.db.file))
-            return false
+        local migrated = false
+        local migration_backup = nil
+        if plan.needs_migration then
+            local migration_ok, migration_result = migrate_snd_database(snd.db.conn, plan)
+            if not migration_ok then
+                snd.db.conn:close()
+                snd.db.env:close()
+                snd.db.conn = nil
+                snd.db.env = nil
+                snd.utils.errorNote(tostring(migration_result))
+                snd.utils.infoNote("Expected S&D database path: " .. tostring(snd.db.file))
+                return false
+            end
+            migrated = true
+            migration_backup = migration_result
         end
         local valid, validation_err = validate_existing_snd_database(snd.db.conn)
         if not valid then
@@ -442,8 +693,13 @@ function snd.db.open()
             return false
         end
         snd.db.createdEmpty = false
-        if migratedHistory or migratedTimestamps then
-            snd.utils.infoNote("Upgraded S&D database to schema v" .. tostring(snd.db.schemaVersion) .. ".")
+        if migrated then
+            local source_label = plan.kind == "normalized_mush"
+                and "normalized MUSHclient schema"
+                or ("schema v" .. tostring(plan.from_version or 0))
+            snd.utils.infoNote("Automatically upgraded S&D database from " .. source_label ..
+                " to schema v" .. tostring(snd.db.schemaVersion) .. ".")
+            snd.utils.infoNote("Pre-migration backup: " .. tostring(migration_backup))
         end
     else
         local created, create_err = create_empty_snd_schema(snd.db.conn)

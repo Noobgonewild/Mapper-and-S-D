@@ -3516,6 +3516,7 @@ end
 --- Kill current target using configured kill command
 function snd.commands.xkill(options)
     local exactConwinIndex = type(options) == "table" and tonumber(options.conwinIndex) or nil
+    local exactConwinSource = exactConwinIndex and "mobdetect" or nil
     local quickWhere = snd.nav and snd.nav.quickWhere or nil
     local nxOverride = snd.nav and snd.nav.nxOverride or nil
     local useAdhocQuickWhere = (nxOverride and nxOverride.mode == "adhoc_qw")
@@ -3530,6 +3531,22 @@ function snd.commands.xkill(options)
 
     local currentTarget = snd.targets.current
     local keyword = ""
+
+    -- A server-marked quest row is instance-specific. Preserve its ConWin
+    -- position for ordinary/manual xkill just as mobdetect already does, so
+    -- duplicate quest mobs produce selectors such as 3.driller.
+    if not exactConwinIndex and currentTarget
+        and tostring(currentTarget.activity or ""):lower() == "quest"
+        and snd.conwin and snd.conwin.questTargetIndexFor
+    then
+        local targetName = snd.utils.trim(
+            currentTarget.name or currentTarget.mob or currentTarget.matchedMobName or ""
+        )
+        if targetName ~= "" then
+            exactConwinIndex = tonumber(snd.conwin.questTargetIndexFor(targetName))
+            if exactConwinIndex then exactConwinSource = "manual-quest" end
+        end
+    end
 
     -- xkill should always prioritize the selected current target and only
     -- consider quest fallback when no current target exists.
@@ -3576,9 +3593,9 @@ function snd.commands.xkill(options)
         local exactSelector = snd.conwin and snd.conwin.killSelectorFor
             and snd.conwin.killSelectorFor(exactConwinIndex) or nil
         exactSelector = snd.utils.trim(exactSelector or "")
-        -- Mobdetect is intentionally fail-closed: if the confirmed ConWin row
-        -- disappeared or can no longer be addressed, never fall back to a
-        -- generic name that could attack an unmarked duplicate.
+        -- Exact instance selection is intentionally fail-closed: if the
+        -- confirmed ConWin row disappeared or can no longer be addressed,
+        -- never attack an unmarked duplicate through a generic fallback.
         if not row or row.dead or exactSelector == "" then
             return
         end
@@ -3615,7 +3632,7 @@ function snd.commands.xkill(options)
         if row then
             snd.conwin.currentEnemyMobId = row.id
             if snd.conwin.noteAttackIntent then
-                snd.conwin.noteAttackIntent(row, "mobdetect")
+                snd.conwin.noteAttackIntent(row, exactConwinSource or "exact-xkill")
             end
         end
     elseif snd.conwin and snd.conwin.noteAttackByKeyword then

@@ -1966,8 +1966,37 @@ local MAPPER_REQUIRED_COLUMNS = {
   areas = { "uid", "name", "texture", "color", "flags" },
   environments = { "uid", "name", "color" },
   rooms = { "uid", "name", "area", "building", "terrain", "info", "notes", "x", "y", "z", "norecall", "noportal", "ignore_exits_mismatch" },
-  -- chaos is intentionally migrated additively after validation for older DBs.
+  -- chaos is a managed extension and is added during automatic migration.
   exits = { "dir", "fromuid", "touid", "level" },
+}
+local MAPPER_LEGACY_IDENTITY_COLUMNS = {
+  areas = { "uid", "name" },
+  environments = { "uid", "name" },
+  rooms = { "uid", "name", "area" },
+  exits = { "dir", "fromuid", "touid" },
+}
+local MAPPER_ADDITIVE_COLUMNS = {
+  { table_name = "areas", column_name = "texture", definition = "texture TEXT" },
+  { table_name = "areas", column_name = "color", definition = "color TEXT" },
+  { table_name = "areas", column_name = "flags", definition = "flags TEXT NOT NULL DEFAULT ''" },
+  { table_name = "environments", column_name = "color", definition = "color INTEGER" },
+  { table_name = "rooms", column_name = "building", definition = "building TEXT" },
+  { table_name = "rooms", column_name = "terrain", definition = "terrain TEXT" },
+  { table_name = "rooms", column_name = "info", definition = "info TEXT" },
+  { table_name = "rooms", column_name = "notes", definition = "notes TEXT" },
+  { table_name = "rooms", column_name = "x", definition = "x INTEGER" },
+  { table_name = "rooms", column_name = "y", definition = "y INTEGER" },
+  { table_name = "rooms", column_name = "z", definition = "z INTEGER" },
+  { table_name = "rooms", column_name = "norecall", definition = "norecall INTEGER" },
+  { table_name = "rooms", column_name = "noportal", definition = "noportal INTEGER" },
+  { table_name = "rooms", column_name = "ignore_exits_mismatch", definition = "ignore_exits_mismatch INTEGER NOT NULL DEFAULT 0" },
+  { table_name = "exits", column_name = "level", definition = "level STRING NOT NULL DEFAULT '0'" },
+  { table_name = "exits", column_name = "chaos", definition = "chaos TEXT NOT NULL DEFAULT 'no'" },
+}
+local MAPPER_MANAGED_TABLES = {
+  "areas", "environments", "rooms", "exits", "random_cexits",
+  "cexit_key_alternates", "cexit_key_observations", "bookmarks",
+  "storage", "terrain", "mapper_area_bookmarks", "rooms_lookup",
 }
 local MAPPER_SCHEMA_SQL = {
   [[CREATE TABLE IF NOT EXISTS areas(
@@ -2073,7 +2102,8 @@ function mm.resolve_mapper_db(path)
 end
 
 local function close_cursor(cursor)
-  if type(cursor) == "userdata" and type(cursor.close) == "function" then
+  local cursor_type = type(cursor)
+  if (cursor_type == "userdata" or cursor_type == "table") and type(cursor.close) == "function" then
     pcall(function() cursor:close() end)
   end
 end
@@ -2088,7 +2118,8 @@ end
 local function fetch_scalar(conn, sql)
   local cursor, err = conn:execute(sql)
   if not cursor then return nil, tostring(err) end
-  if type(cursor) ~= "userdata" or type(cursor.fetch) ~= "function" then
+  local cursor_type = type(cursor)
+  if (cursor_type ~= "userdata" and cursor_type ~= "table") or type(cursor.fetch) ~= "function" then
     return cursor
   end
   local row = cursor:fetch({}, "n")
@@ -2121,6 +2152,174 @@ local function mapper_column_set(conn, table_name)
   end
   close_cursor(cursor)
   return found
+end
+
+local function sql_quote(value)
+  return "'" .. tostring(value or ""):gsub("'", "''") .. "'"
+end
+
+local function next_mapper_migration_backup_path(source)
+  local dir = backup_dir_path()
+  if not mm.ensure_dir(dir) then
+    return nil, "unable to create backup directory: " .. tostring(dir)
+  end
+
+  local base = tostring(source or "Aardwolf.db"):match("([^/\\]+)$") or "Aardwolf.db"
+  base = base:gsub("[/\\:*?\"<>|]", "_")
+  local stamp = os.date("!%Y%m%d_%H%M%S")
+  local path = string.format("%s/%s.pre-migration.%s.bak", dir, base, stamp)
+  local suffix = 1
+  while mm.path_exists(path) do
+    path = string.format("%s/%s.pre-migration.%s_%d.bak", dir, base, stamp, suffix)
+    suffix = suffix + 1
+  end
+  return path
+end
+
+local function create_mapper_migration_backup(conn, source)
+  local backup_path, path_err = next_mapper_migration_backup_path(source)
+  if not backup_path then return nil, path_err end
+  local ok, err = execute_statement(conn, "VACUUM INTO " .. sql_quote(backup_path))
+  if not ok then
+    return nil, "transactional SQLite backup failed: " .. tostring(err)
+  end
+  return backup_path
+end
+
+local function mapper_migration_plan(conn)
+  local tables, tables_err = mapper_table_set(conn)
+  if not tables then return nil, tables_err end
+
+  local integrity, integrity_err = fetch_scalar(conn, "PRAGMA quick_check")
+  if integrity == nil then
+    return nil, "could not verify SQLite integrity: " .. tostring(integrity_err or "unknown error")
+  end
+  if tostring(integrity) ~= "ok" then
+    return nil, "SQLite quick_check: " .. tostring(integrity)
+  end
+
+  local missing_core = {}
+  for _, table_name in ipairs(MAPPER_CORE_TABLES) do
+    if not tables[table_name] then table.insert(missing_core, table_name) end
+  end
+  if #missing_core > 0 then
+    return nil, "unrecognized mapper schema; missing core tables: " .. table.concat(missing_core, ", ")
+  end
+
+  local columns_by_table = {}
+  local missing_identity = {}
+  for table_name, required_columns in pairs(MAPPER_LEGACY_IDENTITY_COLUMNS) do
+    local columns, columns_err = mapper_column_set(conn, table_name)
+    if not columns then return nil, columns_err end
+    columns_by_table[table_name] = columns
+    for _, column_name in ipairs(required_columns) do
+      if not columns[column_name] then
+        table.insert(missing_identity, table_name .. "." .. column_name)
+      end
+    end
+  end
+  if #missing_identity > 0 then
+    return nil, "unrecognized mapper schema; missing identity columns: " .. table.concat(missing_identity, ", ")
+  end
+
+  local plan = {
+    from_version = tonumber(fetch_scalar(conn, "PRAGMA user_version")) or 0,
+    additions = {},
+    missing_managed_tables = {},
+    rooms_lookup_missing = not tables.rooms_lookup,
+  }
+  for _, addition in ipairs(MAPPER_ADDITIVE_COLUMNS) do
+    local columns = columns_by_table[addition.table_name]
+    if not columns then
+      columns = mapper_column_set(conn, addition.table_name)
+      columns_by_table[addition.table_name] = columns
+    end
+    if not columns or not columns[addition.column_name] then
+      table.insert(plan.additions, addition)
+    end
+  end
+  for _, table_name in ipairs(MAPPER_MANAGED_TABLES) do
+    if not tables[table_name] then
+      table.insert(plan.missing_managed_tables, table_name)
+    end
+  end
+  plan.needed = plan.from_version < MAPPER_SCHEMA_VERSION
+    or #plan.additions > 0
+    or #plan.missing_managed_tables > 0
+  return plan
+end
+
+local function validate_mapper_connection(conn)
+  local tables, tables_err = mapper_table_set(conn)
+  if not tables then return false, tables_err end
+  for _, table_name in ipairs(MAPPER_CORE_TABLES) do
+    if not tables[table_name] then
+      return false, "missing core table after migration: " .. table_name
+    end
+  end
+  for table_name, required_columns in pairs(MAPPER_REQUIRED_COLUMNS) do
+    local columns, columns_err = mapper_column_set(conn, table_name)
+    if not columns then return false, columns_err end
+    for _, column_name in ipairs(required_columns) do
+      if not columns[column_name] then
+        return false, "missing core column after migration: " .. table_name .. "." .. column_name
+      end
+    end
+  end
+  local integrity, integrity_err = fetch_scalar(conn, "PRAGMA quick_check")
+  if integrity == nil then return false, tostring(integrity_err or "SQLite quick_check failed") end
+  if tostring(integrity) ~= "ok" then return false, "SQLite quick_check: " .. tostring(integrity) end
+  return true
+end
+
+local function migrate_mapper_database(conn, source, plan)
+  local backup_path, backup_err = create_mapper_migration_backup(conn, source)
+  if not backup_path then
+    return false, "automatic migration was not started because the backup failed: " .. tostring(backup_err)
+  end
+
+  local ok, err = execute_statement(conn, "BEGIN IMMEDIATE")
+  if ok then
+    for _, addition in ipairs(plan.additions) do
+      ok, err = execute_statement(conn, string.format(
+        "ALTER TABLE %s ADD COLUMN %s",
+        addition.table_name,
+        addition.definition
+      ))
+      if not ok then break end
+    end
+  end
+  if ok then
+    for _, sql in ipairs(MAPPER_SCHEMA_SQL) do
+      ok, err = execute_statement(conn, sql)
+      if not ok then break end
+    end
+  end
+  if ok and plan.rooms_lookup_missing then
+    ok, err = execute_statement(conn,
+      "INSERT INTO rooms_lookup(uid, name) SELECT uid, COALESCE(name, '') FROM rooms")
+  end
+  if ok then
+    ok, err = execute_statement(conn, "PRAGMA user_version = " .. tostring(MAPPER_SCHEMA_VERSION))
+  end
+  if ok then
+    ok, err = validate_mapper_connection(conn)
+  end
+  if ok then
+    local committed, commit_err = execute_statement(conn, "COMMIT")
+    if not committed then
+      ok, err = false, commit_err
+      pcall(function() conn:execute("ROLLBACK") end)
+    end
+  else
+    pcall(function() conn:execute("ROLLBACK") end)
+  end
+
+  if not ok then
+    return false, "automatic mapper migration failed and was rolled back: " .. tostring(err) ..
+      ". Pre-migration backup: " .. tostring(backup_path)
+  end
+  return true, backup_path
 end
 
 function mm.inspect_mapper_database(path)
@@ -2177,7 +2376,9 @@ function mm.inspect_mapper_database(path)
     end
   end
   status.schema_version = tonumber(fetch_scalar(conn, "PRAGMA user_version")) or 0
-  status.integrity = tostring(fetch_scalar(conn, "PRAGMA quick_check") or "unknown")
+  local integrity, integrity_err = fetch_scalar(conn, "PRAGMA quick_check")
+  status.integrity = tostring(integrity or "unknown")
+  status.integrity_error = integrity == nil and integrity_err or nil
   if tables.rooms then status.rooms = tonumber(fetch_scalar(conn, "SELECT COUNT(*) FROM rooms")) or 0 end
   if tables.exits then status.exits = tonumber(fetch_scalar(conn, "SELECT COUNT(*) FROM exits")) or 0 end
   conn:close(); env:close()
@@ -2188,6 +2389,9 @@ function mm.inspect_mapper_database(path)
   elseif #status.missing_columns > 0 then
     status.state = "FOUND BUT INVALID"
     status.error = "missing core columns: " .. table.concat(status.missing_columns, ", ")
+  elseif status.integrity_error then
+    status.state = "FOUND BUT INVALID"
+    status.error = "could not verify SQLite integrity: " .. tostring(status.integrity_error)
   elseif status.integrity ~= "ok" then
     status.state = "FOUND BUT INVALID"
     status.error = "SQLite quick_check: " .. status.integrity
@@ -2197,17 +2401,47 @@ function mm.inspect_mapper_database(path)
   return status
 end
 
--- Create a complete, empty mapper database only when no file exists.  An
--- existing file is validated and returned untouched by this function.
+-- Create a complete empty database when no file exists. Recognized legacy
+-- mapper schemas are backed up and migrated transactionally; corrupt,
+-- incomplete, and unrelated SQLite files remain untouched.
 function mm.ensure_mapper_database(path)
   local source = mm.resolve_mapper_db(path)
   if not source then return false, "mapper database path is empty" end
 
   if mm.path_exists(source) then
+    if not mm.looks_like_sqlite(source) then
+      return false, "existing mapper database was left untouched: file is not a SQLite database"
+    end
+    local env, conn, open_err = open_mapper_db(source)
+    if not conn then
+      return false, "existing mapper database was left untouched: " .. tostring(open_err)
+    end
+    local plan, plan_err = mapper_migration_plan(conn)
+    if not plan then
+      conn:close(); env:close()
+      return false, "existing mapper database was left untouched: " .. tostring(plan_err)
+    end
+
+    local migrated = false
+    local backup_path = nil
+    if plan.needed then
+      local migration_ok, migration_result = migrate_mapper_database(conn, source, plan)
+      if not migration_ok then
+        conn:close(); env:close()
+        return false, tostring(migration_result)
+      end
+      migrated = true
+      backup_path = migration_result
+    end
+    conn:close(); env:close()
+
     local existing = mm.inspect_mapper_database(path)
     if existing.state ~= "FOUND" then
-      return false, "existing mapper database was left untouched: " .. tostring(existing.error or existing.state)
+      return false, "mapper database did not validate after initialization: " .. tostring(existing.error or existing.state)
     end
+    existing.migrated = migrated
+    existing.migration_backup = backup_path
+    existing.previous_schema_version = plan.from_version
     return true, existing
   end
 
