@@ -251,6 +251,22 @@ local function activeActivityLabel(target)
     return nil
 end
 
+local function targetIdentityMatchesMob(target, mobName)
+    local needle = trim(mobName)
+    if not target or needle == "" then return false end
+
+    for _, candidate in ipairs({target.name or "", target.mob or "", target.matchedMobName or ""}) do
+        if candidate ~= "" then
+            if snd and snd.utils and type(snd.utils.mobIdentityMatches) == "function" then
+                if snd.utils.mobIdentityMatches(candidate, needle) then return true end
+            elseif normalizeMobName(candidate) == normalizeMobName(needle) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 function CW.detectActiveTargetInRoom()
     local roomId = currentRoomId()
     if roomId == "" or roomId ~= tostring(CW.lastRoomId or "") then return false end
@@ -269,12 +285,10 @@ function CW.detectActiveTargetInRoom()
     local activityLabel = activeActivityLabel(current)
     if not activityLabel then return false end
 
-    local targetName = normalizeMobName(current.name or current.mob or current.matchedMobName or "")
-    if targetName == "" then return false end
     local matchedMob = nil
     local matchedIndex = nil
     for index, m in ipairs(CW.mobs or {}) do
-        if not m.dead and normalizeMobName(m.name) == targetName
+        if not m.dead and targetIdentityMatchesMob(current, m.name)
             and (activityLabel ~= "quest" or m.questTarget == true)
         then
             matchedMob = m
@@ -295,17 +309,28 @@ end
 
 function CW.resolveCurrentRoomTargetForNxAction()
     local targetHere = CW.detectActiveTargetInRoom()
+    local pendingAction = snd and snd.scan and snd.scan.pendingNxAction
+        and tostring(snd.scan.pendingNxAction.action or ""):lower() or ""
 
-    if not targetHere then
-        if snd and snd.scan and snd.scan.runPendingNxAction then
+    if pendingAction == "smartscan" then
+        if targetHere then
+            if snd and snd.scan and snd.scan.cancelPendingNxAction then
+                -- A confirmed current-room target makes any arrival smartscan stale,
+                -- even if its stored room ID came from an earlier same-event handler.
+                snd.scan.cancelPendingNxAction(nil, "target-found")
+            end
+        elseif snd and snd.scan and snd.scan.runPendingNxAction then
             snd.scan.runPendingNxAction(CW.lastRoomId, "target-not-found")
         end
+    elseif pendingAction ~= "" and snd and snd.scan and snd.scan.runPendingNxAction then
+        -- Only smartscan is suppressed by a current-room target. Explicit qs
+        -- remains an unfiltered scan after ConWin completes.
+        snd.scan.runPendingNxAction(CW.lastRoomId, "conwin-complete")
+    end
+
+    if not targetHere then
         return false
     else
-        if snd and snd.scan and snd.scan.cancelPendingNxAction then
-            snd.scan.cancelPendingNxAction(targetHere.roomId, "target-found")
-        end
-
         return true
     end
 end
@@ -547,6 +572,9 @@ function CW.onCaptureMarker(serial)
 
     if flight.failed then
         CW.refreshDirty = true
+        if snd and snd.scan and snd.scan.runPendingNxAction then
+            snd.scan.runPendingNxAction(nil, "conwin-failed")
+        end
         if currentPlayerState() == "3" and trim(gmcp_get("char.status.enemy") or "") == "" then
             CW.armRoomRefresh()
         end

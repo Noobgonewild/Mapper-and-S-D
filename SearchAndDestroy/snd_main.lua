@@ -828,12 +828,13 @@ function snd.scan.deferNxActionUntilConwin(action, roomId)
     if type(tempTimer) == "function" then
         pending.timer = tempTimer(0.8, function()
             if snd.scan and snd.scan.pendingNxAction == pending then
+                pending.timer = nil
                 snd.scan.runPendingNxAction(roomId, "conwin-timeout")
             end
         end)
     end
 
-    snd.utils.debugNote("Deferring nxAction " .. action .. " until ConWin consider resolves.")
+    snd.utils.debugNote("Deferring nxAction " .. action .. " for up to 0.8 seconds while ConWin consider resolves.")
     return true
 end
 
