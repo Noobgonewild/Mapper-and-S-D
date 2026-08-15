@@ -1,31 +1,8 @@
---[[
-    Search and Destroy - Utility Functions
-    Mudlet Port
-    
-    Original MUSHclient plugin by Crowley
-    Ported to Mudlet
-    
-    This module contains utility functions for:
-    - Aardwolf color code conversion
-    - String manipulation
-    - SQL helpers
-    - Time formatting
-    - Level calculations
-]]
-
 snd = snd or {}
 snd.utils = snd.utils or {}
 
--------------------------------------------------------------------------------
--- Aardwolf Color Code Conversion
--------------------------------------------------------------------------------
-
--- Aardwolf uses @ codes: @R = bold red, @g = green, @x123 = xterm color
--- Mudlet uses cecho format: <red>, <green>, or decho/hecho
-
--- Map Aardwolf color codes to Mudlet cecho color names
+-- Convert Aardwolf @ color codes to Mudlet colors.
 snd.utils.aardColorMap = {
-    -- Normal colors (lowercase)
     ["k"] = "<black>",
     ["r"] = "<maroon>",
     ["g"] = "<green>",
@@ -34,7 +11,6 @@ snd.utils.aardColorMap = {
     ["m"] = "<purple>",
     ["c"] = "<turquoise>",
     ["w"] = "<light_gray>",
-    -- Bold colors (uppercase)
     ["D"] = "<gray>",
     ["R"] = "<red>",
     ["G"] = "<ansi_light_green>",
@@ -45,13 +21,9 @@ snd.utils.aardColorMap = {
     ["W"] = "<white>",
 }
 
--- Convert xterm 256 color number to hex for Mudlet
--- This is a simplified version - full xterm palette
 snd.utils.xtermToHex = {}
 
--- Initialize xterm color table (standard 256 color palette)
 local function initXtermColors()
-    -- Colors 0-15: Standard colors (handled by aardColorMap mostly)
     local basic16 = {
         "000000", "800000", "008000", "808000", "000080", "800080", "008080", "c0c0c0",
         "808080", "ff0000", "00ff00", "ffff00", "0000ff", "ff00ff", "00ffff", "ffffff"
@@ -60,7 +32,6 @@ local function initXtermColors()
         snd.utils.xtermToHex[i] = basic16[i + 1]
     end
     
-    -- Colors 16-231: 6x6x6 color cube
     local levels = {0, 95, 135, 175, 215, 255}
     local i = 16
     for r = 1, 6 do
@@ -73,7 +44,6 @@ local function initXtermColors()
         end
     end
     
-    -- Colors 232-255: Grayscale
     for i = 232, 255 do
         local gray = 8 + (i - 232) * 10
         snd.utils.xtermToHex[i] = string.format("%02x%02x%02x", gray, gray, gray)
@@ -82,16 +52,11 @@ end
 
 initXtermColors()
 
---- Convert Aardwolf @-color codes to Mudlet cecho format
--- @param str String with Aardwolf color codes
--- @return String with Mudlet cecho color codes
 function snd.utils.aardColorsToMudlet(str)
     if not str or str == "" then return "" end
     
-    -- Handle @@ (literal @)
     str = str:gsub("@@", "\001") -- temporary placeholder
     
-    -- Handle xterm colors @x000-@x255
     str = str:gsub("@x(%d%d?%d?)", function(num)
         local n = tonumber(num)
         if n and n >= 0 and n <= 255 then
@@ -103,26 +68,19 @@ function snd.utils.aardColorsToMudlet(str)
         return ""
     end)
     
-    -- Handle standard color codes
     str = str:gsub("@([krgybmcwDRGYBMCW])", function(code)
         return snd.utils.aardColorMap[code] or ""
     end)
     
-    -- Handle @- (tilde, historical)
     str = str:gsub("@%-", "~")
     
-    -- Remove any remaining invalid @ codes
     str = str:gsub("@[^@]", "")
     
-    -- Restore literal @
     str = str:gsub("\001", "@")
     
     return str
 end
 
---- Strip all Aardwolf color codes from a string
--- @param str String with color codes
--- @return Plain string without color codes
 function snd.utils.stripColors(str)
     if not str then return "" end
 
@@ -138,34 +96,19 @@ function snd.utils.stripColors(str)
     return str
 end
 
---- Escape a string for use in regex patterns
--- @param str String to escape
--- @return Escaped string safe for regex
 function snd.utils.escapeRegex(str)
     if not str then return "" end
     return tostring(str):gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
 end
 
---- Echo text with Aardwolf color codes to Mudlet
--- @param str String with Aardwolf @ color codes
 function snd.utils.aardEcho(str)
     cecho(snd.utils.aardColorsToMudlet(str))
 end
 
---- Echo text with Aardwolf color codes + newline
--- @param str String with Aardwolf @ color codes
 function snd.utils.aardEchoLine(str)
     cecho(snd.utils.aardColorsToMudlet(str) .. "\n")
 end
 
--------------------------------------------------------------------------------
--- SQL Helpers
--------------------------------------------------------------------------------
-
---- Escape a string for SQL queries (handles single quotes)
--- @param sql String to escape
--- @param likeOperator Optional: "left", "right", or "both" for LIKE wildcards
--- @return Escaped and quoted string
 function snd.utils.fixsql(sql, likeOperator)
     if sql == nil then
         return "NULL"
@@ -187,13 +130,6 @@ function snd.utils.fixsql(sql, likeOperator)
     end
 end
 
--------------------------------------------------------------------------------
--- String Utilities
--------------------------------------------------------------------------------
-
---- Convert string to Pascal Case (capitalize each word)
--- @param str Input string
--- @return Pascal cased string
 function snd.utils.toPascalCase(str)
     if not str then return "" end
     return str:gsub("(%a)([%w_']*)", function(first, rest)
@@ -201,27 +137,16 @@ function snd.utils.toPascalCase(str)
     end)
 end
 
---- Capitalize first letter of string
--- @param str Input string
--- @return Capitalized string
 function snd.utils.capitalize(str)
     if not str or str == "" then return "" end
     return str:sub(1, 1):upper() .. str:sub(2):lower()
 end
 
---- Join table elements with delimiter
--- @param delimiter String to join with
--- @param list Table of strings
--- @return Joined string
 function snd.utils.strjoin(delimiter, list)
     if not list or #list == 0 then return "" end
     return table.concat(list, delimiter)
 end
 
---- Wrap text to specified width
--- @param line String to wrap
--- @param length Maximum line length (default 80)
--- @return Table of wrapped lines
 function snd.utils.wrap(line, length)
     local lines = {}
     length = length or 80
@@ -229,7 +154,6 @@ function snd.utils.wrap(line, length)
     while #line > length do
         local col = line:sub(1, length):find("[%s,][^%s,]*$")
         if col and col > 2 then
-            -- Found a good break point
         else
             col = length
         end
@@ -242,26 +166,16 @@ function snd.utils.wrap(line, length)
     return lines
 end
 
---- Trim whitespace from right side of string
--- @param str Input string
--- @return Trimmed string
 function snd.utils.trimr(str)
     if not str then return "" end
     return str:find("^%s*$") and "" or str:match("^(.*%S)")
 end
 
---- Trim whitespace from both sides of string
--- @param str Input string
--- @return Trimmed string
 function snd.utils.trim(str)
     if not str then return "" end
     return str:match("^%s*(.-)%s*$")
 end
 
---- Format a number into readable format (K, M, B, T)
--- @param num Number to format
--- @param places Decimal places (default 0)
--- @return Formatted string
 function snd.utils.readableNumber(num, places)
     if not num then return "0" end
     
@@ -280,13 +194,6 @@ function snd.utils.readableNumber(num, places)
     end
 end
 
--------------------------------------------------------------------------------
--- Time Formatting
--------------------------------------------------------------------------------
-
---- Format seconds into human readable duration
--- @param seconds Number of seconds
--- @return Formatted string (e.g., "1h 23m 45s")
 function snd.utils.formatSeconds(seconds)
     if not tonumber(seconds) then return tostring(seconds) end
     
@@ -316,9 +223,6 @@ function snd.utils.formatSeconds(seconds)
     return snd.utils.trim(duration)
 end
 
---- Format a duration table or seconds for display
--- @param duration Either seconds or table with h, m, s keys
--- @return Formatted string
 function snd.utils.formatDuration(duration)
     if type(duration) == "number" then
         return snd.utils.formatSeconds(duration)
@@ -338,16 +242,6 @@ function snd.utils.formatDuration(duration)
     return ""
 end
 
--------------------------------------------------------------------------------
--- Level Calculations (Aardwolf-specific)
--------------------------------------------------------------------------------
-
---- Calculate actual total level from tier/remort/level
--- @param level Current level (1-201)
--- @param remorts Number of remorts (1-7)
--- @param tier Current tier (0-9)
--- @param redos Number of redo tiers (0+)
--- @return Actual total level
 function snd.utils.getActualLevel(level, remorts, tier, redos)
     if not level then return -1 end
     
@@ -362,9 +256,6 @@ function snd.utils.getActualLevel(level, remorts, tier, redos)
     end
 end
 
---- Convert actual level back to tier/remort/level components
--- @param actualLevel Total actual level
--- @return Table with tier, redos, remort, level keys
 function snd.utils.convertLevel(actualLevel)
     if not actualLevel or actualLevel < 1 then
         return {tier = -1, redos = -1, remort = -1, level = -1}
@@ -393,13 +284,6 @@ function snd.utils.convertLevel(actualLevel)
     return {tier = tier, redos = redos, remort = remort, level = level}
 end
 
--------------------------------------------------------------------------------
--- Mob Keyword Guessing
--------------------------------------------------------------------------------
-
---- Find a keyword for an item/mob name (skip articles)
--- @param item Full name of item/mob
--- @return Best keyword to use
 function snd.utils.findKeyword(item)
     if not item then return "" end
     
@@ -420,12 +304,7 @@ function snd.utils.findKeyword(item)
     return item:lower()
 end
 
---- Normalize a mob name for identity comparison only.
--- This intentionally keeps articles and punctuation; it just removes colors,
--- collapses whitespace, and ignores case.
--- @param name Mob name
--- @param maxLen Optional maximum length, used for fixed-width where output
--- @return Normalized identity string
+-- Identity normalization intentionally retains articles and punctuation.
 function snd.utils.normalizeMobIdentity(name, maxLen)
     local text = snd.utils.stripColors(tostring(name or ""))
     if maxLen then
@@ -436,11 +315,6 @@ function snd.utils.normalizeMobIdentity(name, maxLen)
     return snd.utils.trim(text)
 end
 
---- Compare two mob names as identities.
--- @param a First mob name
--- @param b Second mob name
--- @param maxLen Optional maximum length
--- @return True if both normalize to the same non-empty identity
 function snd.utils.mobIdentityMatches(a, b, maxLen)
     local left = snd.utils.normalizeMobIdentity(a, maxLen)
     local right = snd.utils.normalizeMobIdentity(b, maxLen)
@@ -483,10 +357,8 @@ local commandSelectorRelationWords = {
     ["with"] = true,
 }
 
--- Bare movement directions are unsafe command selectors. In particular,
--- targets whose descriptions end in phrases such as "dress-up" must not
--- produce commands like "kill up"; multi-word selectors such as "dress up"
--- remain valid candidates.
+-- Never emit a bare movement direction such as "kill up"; multi-word selectors
+-- ending in a direction remain valid.
 local reservedMobCommandSelectors = {
     ["n"] = true,
     ["north"] = true,
@@ -510,10 +382,6 @@ local reservedMobCommandSelectors = {
     ["down"] = true,
 }
 
---- Check whether a bare selector is reserved for movement.
--- Multi-word selectors ending in a direction are intentionally allowed.
--- @param selector Temporary command selector
--- @return True when the whole selector is a movement direction
 function snd.utils.isReservedMobCommandSelector(selector)
     local normalized = snd.utils.trim(tostring(selector or "")):lower()
     return reservedMobCommandSelectors[normalized] == true
@@ -525,8 +393,7 @@ local function rawMobCommandWords(name)
 
     local words = {}
     for word in text:gmatch("%S+") do
-        -- Remove only a possessive suffix. A global "'s" removal corrupts
-        -- quoted names such as 'Sorr by deleting their initial S.
+        -- Only remove suffix "'s"; global removal corrupts names such as 'Sorr.
         word = word:gsub("'s$", "")
         word = word:gsub("^'+", ""):gsub("'+$", "")
         if word ~= "" then
@@ -536,10 +403,7 @@ local function rawMobCommandWords(name)
     return words
 end
 
---- Split a mob name into command-selector words.
 -- This is only for temporary MUD commands, never for storage or DB lookup.
--- @param name Mob name
--- @return List of lowercase selector words
 function snd.utils.mobCommandWords(name)
     local words = {}
     for _, word in ipairs(rawMobCommandWords(name)) do
@@ -571,10 +435,7 @@ local function mobCommandHeadWords(name)
     return head
 end
 
--- Build specific two-word selectors from the grammatical head of a mob
--- description. Preserve an existing two-word subject ("little girl") and
--- only pair the subject head with an -ing action when the subject is a single
--- word ("girl collecting").
+-- Preserve two-word subjects; pair an -ing action only with a single-word subject.
 local function mobCommandSubjectSelectors(name)
     local subjectWords = {}
     local cleanSubjectWords = {}
@@ -590,9 +451,8 @@ local function mobCommandSubjectSelectors(name)
                 break
             end
             table.insert(subjectWords, word)
-            -- Interior apostrophes in display names are often not accepted by
-            -- Aardwolf's command parser (Dra'ork -> draork). Prefer a clean
-            -- descriptor/head pair when the description provides one.
+            -- Aardwolf may reject interior apostrophes (Dra'ork -> draork), so
+            -- prefer a clean descriptor/head pair when available.
             if not word:find("'", 1, true) then
                 table.insert(cleanSubjectWords, word)
             end
@@ -638,6 +498,35 @@ local function appendKillWordCandidates(candidates, seen, words)
     end
 end
 
+-- Subtract an ambiguous selector from the activity target, then keep its noun
+-- anchor: "bonded student" + "junior" becomes "junior student".
+local function appendDiscriminatorAnchorCandidates(candidates, seen, words, baselineSelector)
+    if not words or #words < 2 then return end
+
+    local baselineWords = snd.utils.mobCommandWords(baselineSelector)
+    if #baselineWords == 0 then return end
+
+    local remainingCounts = {}
+    for _, word in ipairs(baselineWords) do
+        remainingCounts[word] = (remainingCounts[word] or 0) + 1
+    end
+
+    local discriminatorWords = {}
+    for _, word in ipairs(words) do
+        local count = remainingCounts[word] or 0
+        if count > 0 then
+            remainingCounts[word] = count - 1
+        else
+            table.insert(discriminatorWords, word)
+        end
+    end
+
+    local anchor = baselineWords[#baselineWords]
+    for i = #discriminatorWords, 1, -1 do
+        appendUnique(candidates, seen, discriminatorWords[i] .. " " .. anchor)
+    end
+end
+
 local function appendRelationAnchoredCandidates(candidates, seen, headWords, allWords)
     if not headWords or #headWords == 0 then return end
     local anchor = headWords[#headWords]
@@ -653,10 +542,6 @@ local function appendRelationAnchoredCandidates(candidates, seen, headWords, all
     end
 end
 
---- Check whether a command selector could name a mob.
--- @param selector Temporary command selector
--- @param name Full mob name
--- @return True if all selector words appear in the mob name
 function snd.utils.mobSelectorMatchesName(selector, name)
     local selectorWords = snd.utils.mobCommandWords(selector)
     if #selectorWords == 0 then return false end
@@ -699,12 +584,7 @@ local function selectorUniquelyNamesTarget(selector, targetName, knownNames)
     return matches == 1 and targetMatched
 end
 
---- Build a temporary selector for MUD commands.
 -- The returned value is not suitable for storage or DB lookup.
--- @param targetName Full target name
--- @param knownNames Optional list of visible/active full mob names
--- @param options Optional table: mode = "where" or "kill"
--- @return selector, reason
 function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
     local fullName = snd.utils.trim(targetName or "")
     if fullName == "" then
@@ -753,12 +633,18 @@ function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
                 appendUnique(candidates, seen, selector)
             end
             killRelationHead = mobCommandHeadWords(fullName)
+            if #killRelationHead == 0 then
+                appendDiscriminatorAnchorCandidates(
+                    candidates,
+                    seen,
+                    words,
+                    opts.preferredSelector or guessedKeyword
+                )
+            end
             appendKillWordCandidates(candidates, seen, killRelationHead)
             if #killRelationHead > 0 then
-                -- Once a relation such as "with" or "of" establishes the
-                -- subject, never fall back to an object-only selector such as
-                -- "fishing pole". Keep the subject attached when additional
-                -- specificity is required.
+                -- After a relation establishes the subject, never fall back to
+                -- an object-only selector such as "fishing pole".
                 appendRelationAnchoredCandidates(candidates, seen, killRelationHead, words)
             else
                 appendKillWordCandidates(candidates, seen, words)
@@ -766,9 +652,7 @@ function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
         end
     end
 
-    -- The generic guesser favors the final two words. For relation-based kill
-    -- descriptions that would reintroduce the very object-only fallback the
-    -- subject boundary is meant to prevent ("fishing pole").
+    -- Skip the final-word guess when it would cross a relation boundary.
     if mode ~= "kill" or #killRelationHead == 0 then
         appendUnique(candidates, seen, guessedKeyword)
     end
@@ -786,10 +670,6 @@ function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
     return candidates[1] or "", "fallback"
 end
 
--------------------------------------------------------------------------------
--- Mob Target Command Formatting
--------------------------------------------------------------------------------
-
 local validMobTargetModes = {
     auto = true,
     skill = true,
@@ -797,10 +677,7 @@ local validMobTargetModes = {
     raw = true,
 }
 
---- Normalize a configured mob-target syntax mode.
 -- "pro" is retained as an alias for the older Consider-window terminology.
--- @param mode Requested mode: auto, skill, cast, raw/pro
--- @return Normalized mode, or nil when invalid
 function snd.utils.normalizeMobTargetMode(mode)
     local normalized = snd.utils.trim(tostring(mode or "")):lower()
     if normalized == "pro" then normalized = "raw" end
@@ -808,14 +685,8 @@ function snd.utils.normalizeMobTargetMode(mode)
     return nil
 end
 
---- Resolve automatic target syntax from the command being executed.
--- Direct cast commands need their numbered selector inside the outer quotes;
--- attack skills use the index outside the quoted keyword phrase. Aliases that
--- expand to cast should select cast mode explicitly because their expansion is
--- not visible here.
--- @param command Command prefix (for example "kill" or "cast 'magic missile'")
--- @param requestedMode auto|skill|cast|raw
--- @return Resolved mode: skill|cast|raw
+-- Cast numbers go inside quotes; skill numbers go outside. Cast aliases must
+-- select cast mode because their expansion is not visible here.
 function snd.utils.resolveMobTargetMode(command, requestedMode)
     local mode = snd.utils.normalizeMobTargetMode(requestedMode) or "auto"
     if mode ~= "auto" then return mode end
@@ -835,11 +706,7 @@ local function unwrapMobTargetQuotes(value)
     return text
 end
 
---- Parse any supported Aardwolf mob-target spelling back to logical parts.
--- Accepts raw selectors (2.strong guard), skill form (2.'strong guard'), and
--- cast form ('2.strong guard').
--- @param target Formatted or unformatted target text
--- @return keyword, optional numeric index
+-- Accept raw, skill, and cast forms: 2.strong guard, 2.'strong guard', '2.strong guard'.
 function snd.utils.parseMobCommandTarget(target)
     local text = unwrapMobTargetQuotes(target)
     local indexText, keyword = text:match("^(%d+)%.(.+)$")
@@ -852,13 +719,7 @@ function snd.utils.parseMobCommandTarget(target)
     return keyword, indexText and tonumber(indexText) or nil
 end
 
---- Format a logical selector for an Aardwolf target-taking command.
--- Single-word selectors are unchanged. Multi-word selectors are quoted using
--- the server's distinct skill/cast conventions.
--- @param selector Logical selector, optionally prefixed with N.
--- @param requestedMode auto|skill|cast|raw
--- @param command Optional command prefix used to resolve auto mode
--- @return Formatted selector, resolved mode
+-- Multi-word selectors use the server's distinct skill/cast quoting rules.
 function snd.utils.formatMobCommandTarget(selector, requestedMode, command)
     local rawSelector = snd.utils.trim(tostring(selector or ""))
     if rawSelector == "" then return "", snd.utils.resolveMobTargetMode(command, requestedMode) end
@@ -885,8 +746,6 @@ function snd.utils.formatMobCommandTarget(selector, requestedMode, command)
     return "'" .. keyword .. "'", resolvedMode
 end
 
---- Build a complete command using command-aware mob target formatting.
--- @return Full command, resolved target mode
 function snd.utils.buildMobTargetCommand(command, selector, requestedMode)
     local base = snd.utils.trim(tostring(command or ""))
     if base == "" then return "", snd.utils.resolveMobTargetMode(base, requestedMode) end
@@ -895,15 +754,6 @@ function snd.utils.buildMobTargetCommand(command, selector, requestedMode)
     return base .. " " .. target, resolvedMode
 end
 
--------------------------------------------------------------------------------
--- Conditional Helper
--------------------------------------------------------------------------------
-
---- Inline conditional (ternary operator helper)
--- @param condition Boolean condition
--- @param trueVal Value if true
--- @param falseVal Value if false
--- @return trueVal or falseVal based on condition
 function snd.utils.ifc(condition, trueVal, falseVal)
     if condition then
         return trueVal
@@ -911,10 +761,6 @@ function snd.utils.ifc(condition, trueVal, falseVal)
         return falseVal
     end
 end
-
--------------------------------------------------------------------------------
--- Note/Echo Helpers (styled output)
--------------------------------------------------------------------------------
 
 snd.utils.NOTE_COLORS = {
     INFO = "#FF5000",
@@ -929,7 +775,6 @@ snd.utils.NOTE_COLORS = {
     DEBUG_HIGHLIGHT = "#FFD700",
 }
 
---- Output an info note
 function snd.utils.infoNote(...)
     if snd and snd.config and snd.config.silentMode then
         return
@@ -939,14 +784,12 @@ function snd.utils.infoNote(...)
     cecho("\n<orange>[S&D]<reset> <cyan>" .. msg .. "<reset>\n")
 end
 
---- Output an error note
 function snd.utils.errorNote(...)
     local args = {...}
     local msg = table.concat(args, "")
     cecho("<red>[S&D ERROR]<reset> <yellow>" .. msg .. "<reset>\n")
 end
 
---- Output a debug note (only if debug mode is on)
 function snd.utils.debugNote(...)
     if snd.config and snd.config.debugMode then
         local args = {...}
@@ -955,7 +798,6 @@ function snd.utils.debugNote(...)
     end
 end
 
---- Output a quick-where debug note (only if debug mode is on)
 function snd.utils.qwDebugNote(...)
     if snd.config and snd.config.debugMode then
         local args = {...}
@@ -964,9 +806,6 @@ function snd.utils.qwDebugNote(...)
     end
 end
 
---- Build plain text label for history/event output by type
--- @param eventType quest|campaign|gquest|gold|history|general
--- @return prefix label and cecho color name
 function snd.utils.getReportTypeStyle(eventType)
     local t = tostring(eventType or "general"):lower()
     local map = {
@@ -980,9 +819,6 @@ function snd.utils.getReportTypeStyle(eventType)
     return map[t] or map.general
 end
 
---- Convert a style type to Aard color code for outbound channel text
--- @param eventType quest|campaign|gquest|gold|history|general
--- @return Aard color code like @R
 function snd.utils.getReportAardColor(eventType)
     local t = tostring(eventType or "general"):lower()
     -- Use bright Aard @ codes because reports are stored with color codes; Mudlet tags may not survive.
@@ -997,19 +833,13 @@ function snd.utils.getReportAardColor(eventType)
     return map[t] or map.general
 end
 
---- True when report channel should render as local echo output
--- @param channel string configured report channel
--- @return boolean
 function snd.utils.isDefaultReportChannel(channel)
     channel = snd.utils.trim(channel or ""):lower()
     return channel == "" or channel == "default" or channel == "echo"
 end
 
 
---- True when configured report channel is a direct MUD channel command.
 -- Non-MUD channels are treated as local aliases/macros and sent via expandAlias.
--- @param channel string configured report channel command
--- @return boolean
 function snd.utils.isMudReportChannel(channel)
     local raw = snd.utils.trim(channel or "")
     if raw == "" then return false end
@@ -1040,11 +870,7 @@ function snd.utils.isMudReportChannel(channel)
     return mudChannels[cmd] == true
 end
 
---- Dispatch report payload through configured channel.
 -- Mud channels go directly to game; virtual/custom channels go through expandAlias.
--- @param channel string configured report channel command
--- @param payload string report text payload
--- @return boolean true when dispatch function ran without error
 function snd.utils.dispatchReportChannel(channel, payload)
     channel = snd.utils.trim(channel or "")
     payload = snd.utils.trim(payload or "")
@@ -1070,11 +896,6 @@ function snd.utils.dispatchReportChannel(channel, payload)
     return false
 end
 
---- Route a formatted report line to default echo or configured channel
--- @param text string Text to report
--- @param eventType string semantic type for color coding
--- @param channelOverride optional explicit report channel
--- @return true if delivered, false otherwise
 function snd.utils.reportLine(text, eventType, channelOverride)
     text = snd.utils.trim(text or "")
     if text == "" then
@@ -1096,9 +917,6 @@ function snd.utils.reportLine(text, eventType, channelOverride)
     return snd.utils.dispatchReportChannel(channel, payload)
 end
 
---- Format quest duration for completion output as H/M/S with minutes included.
--- @param seconds number Duration in seconds
--- @return string Formatted duration (e.g., "0m 11s", "1h 3m 4s")
 function snd.utils.formatQuestCompletionDuration(seconds)
     local totalSeconds = tonumber(seconds)
     if not totalSeconds then
@@ -1117,11 +935,6 @@ function snd.utils.formatQuestCompletionDuration(seconds)
     return string.format("%dm %ds", mins, secs)
 end
 
---- Report quest completion with segmented colors (matches history reward colors)
--- @param qp number Total QP reward
--- @param gold number Gold reward
--- @param durationSeconds number|nil Optional completion duration in seconds
--- @return true if delivered, false otherwise
 function snd.utils.reportQuestCompletion(qp, gold, durationSeconds, tp, trains, pracs)
     qp = tonumber(qp) or 0
     gold = tonumber(gold) or 0
@@ -1163,10 +976,6 @@ function snd.utils.reportQuestCompletion(qp, gold, durationSeconds, tp, trains, 
     return snd.utils.dispatchReportChannel(channel, payload)
 end
 
---- Report campaign completion with rewards and duration from history.
--- @param rewards table|nil Reward table with qp, gold, tp, trains, pracs fields
--- @param durationSeconds number|nil Optional completion duration in seconds
--- @return true if delivered, false otherwise
 function snd.utils.reportCampaignCompletion(rewards, durationSeconds)
     rewards = rewards or {}
     local qp = tonumber(rewards.qp) or 0
@@ -1229,13 +1038,6 @@ function snd.utils.reportCampaignCompletion(rewards, durationSeconds)
     return snd.utils.dispatchReportChannel(channel, payload)
 end
 
--------------------------------------------------------------------------------
--- Table Utilities
--------------------------------------------------------------------------------
-
---- Deep copy a table
--- @param orig Original table
--- @return Copy of table
 function snd.utils.deepcopy(orig)
     local copy
     if type(orig) == "table" then
@@ -1250,10 +1052,6 @@ function snd.utils.deepcopy(orig)
     return copy
 end
 
---- Check if table contains value
--- @param tbl Table to search
--- @param val Value to find
--- @return true if found, false otherwise
 function snd.utils.tableContains(tbl, val)
     if not tbl then return false end
     for _, v in pairs(tbl) do
@@ -1262,9 +1060,6 @@ function snd.utils.tableContains(tbl, val)
     return false
 end
 
---- Get table length (works for non-sequential tables)
--- @param tbl Table to count
--- @return Number of elements
 function snd.utils.tableLength(tbl)
     if not tbl then return 0 end
     local count = 0
@@ -1272,4 +1067,3 @@ function snd.utils.tableLength(tbl)
     return count
 end
 
--- Search and Destroy: Utilities module loaded silently

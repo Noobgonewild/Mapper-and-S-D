@@ -1,33 +1,9 @@
---[[
-    Search and Destroy - GUI Module
-    Mudlet Port
-    
-    Original MUSHclient plugin by Crowley
-    Ported to Mudlet by Gizmmo
-    
-    This module creates the visual target tracking window
-    using Mudlet's Geyser framework, faithfully replicating
-    the original plugin's miniwindow:
-      - Draggable title bar with version and quest timer
-      - Action buttons (xcp, go, kk, nx, qs, qw, ht, ref)
-      - Circle status readout (cp level / gq / init / off)
-      - Noexp readout
-      - Clickable, color-coded target list (CP/GQ/Quest)
-      - Resize handle
-      - Minimize/maximize toggle
-      - Right-click context menu
-]]
-
 snd = snd or {}
 snd.gui = snd.gui or {}
 
--------------------------------------------------------------------------------
--- GUI Configuration & Color Theme
--- Colors ported directly from the original plugin's TEXT_COLOR_DETAILS
--------------------------------------------------------------------------------
+-- Colors mirror the original plugin's TEXT_COLOR_DETAILS.
 
 snd.gui.styles = {
-    -- Window chrome
     bgColor        = "#000000",      -- Window background (black, like original)
     titleBarBg     = "#0a0a0a",      -- Title bar background
     titleBarBorder = "#4a4a4a",      -- Title bar border
@@ -35,7 +11,6 @@ snd.gui.styles = {
     innerBorder    = "#000000",      -- Inner border line
     titleText      = "#A0FFFF",      -- Title text (light cyan-yellow from original)
 
-    -- Target text colors (from TEXT_COLOR_DETAILS in original)
     normal          = "#E0E0E0",     -- Normal mobs
     targeted        = "#FF4000",     -- Currently targeted mob
     dead            = "#484848",     -- Dead mobs
@@ -49,7 +24,6 @@ snd.gui.styles = {
     alternatingRow  = "#000040",     -- Alternating row background
     express         = "#FF4000",     -- Express target tag
 
-    -- Button colors
     btnBg           = "#000000",
     btnBorder1      = "#E0E0E0",     -- Light border (top/left)
     btnBorder2      = "#808080",     -- Dark border (bottom/right)
@@ -57,7 +31,6 @@ snd.gui.styles = {
     btnPressedBorder1 = "#808080",   -- Inverted when pressed
     btnPressedBorder2 = "#E0E0E0",
 
-    -- Circle readout colors
     circleGreen1    = "#00C030",
     circleGreen2    = "#004000",
     circleRed1      = "#F04000",
@@ -69,7 +42,6 @@ snd.gui.styles = {
     circleText1     = "#A0FFFF",
     circleText2     = "#0C1830",
 
-    -- Fonts
     titleFont       = "Consolas",
     titleFontSize   = 10,
     buttonFont      = "Consolas",
@@ -80,9 +52,6 @@ snd.gui.styles = {
     statusFontSize  = 9,
 }
 
--------------------------------------------------------------------------------
--- GUI State
--------------------------------------------------------------------------------
 
 snd.gui.elements = {}          -- All Geyser elements
 snd.gui.targetLabels = {}      -- Dynamic per-target labels
@@ -95,7 +64,6 @@ snd.gui.tabOrder = {"quest", "gq", "cp"}
 snd.gui.tabLabels = {quest = "Quest", gq = "GQ", cp = "Campaign"}
 snd.gui.tabColors = {quest = "#9F2A2A", gq = "#2478c8", cp = "#2E8B57"}
 
--- Default window geometry
 local DEFAULT_WIDTH  = 380
 local DEFAULT_HEIGHT = 300
 local MIN_WIDTH      = 340
@@ -120,26 +88,19 @@ local AREA_BAND_COLORS = {
     "<orange_red>",
 }
 
--------------------------------------------------------------------------------
 -- Action Button Definitions
--- Mirrors button_1_list from the original plugin
--------------------------------------------------------------------------------
 
 local actionButtons = {
     {id = "xcp", text = "xcp", cmd = "xcp",      rcmd = "xcp 0",    tip = "L: get target | R: clear target"},
     {id = "go",  text = "go",  cmd = "snd_go",    rcmd = "snd_go_area", tip = "L: go to target | R: go to area start"},
     {id = "kk",  text = "kk",  cmd = "xkill",     rcmd = "xkill",    tip = "L: kill target | R: kill target"},
     {id = "nx",  text = "nx",  cmd = "nx",         rcmd = "nx",       tip = "L: select next & go | R: same"},
-    {id = "qs",  text = "qs",  cmd = "snd_qs",     rcmd = "snd_qs",   tip = "Quick-scan for current target"},
+    {id = "qs",  text = "qs",  cmd = "snd_qs",     rcmd = "snd_qs",   tip = "Run a regular unfiltered scan"},
     {id = "qw",  text = "qw",  cmd = "qw",         rcmd = "qw",       tip = "L: quick-where | R: quick-where"},
     {id = "ht",  text = "ht",  cmd = "ht",         rcmd = "ht cancel", tip = "L: hunt trick | R: cancel hunt"},
     {id = "ref", text = "ref", cmd = "snd_ref",    rcmd = "snd_rel",  tip = "L: refresh status | R: force target/location reload"},
 }
 
--------------------------------------------------------------------------------
--- CSS Helpers
--- Build inline stylesheet strings for Geyser labels
--------------------------------------------------------------------------------
 
 local function cssButton(styles, pressed)
     local b1 = pressed and styles.btnPressedBorder1 or styles.btnBorder1
@@ -289,19 +250,13 @@ local function isRightButton(...)
     return false
 end
 
--------------------------------------------------------------------------------
--- Create the Main Window
--------------------------------------------------------------------------------
-
 function snd.gui.createWindow()
-    -- Prevent double-creation
     if snd.gui.initialized and snd.gui.elements.main then
         snd.utils.debugNote("GUI already exists, refreshing")
         snd.gui.refresh()
         return
     end
 
-    -- Destroy any stale remnants
     snd.gui.destroy()
 
     local cfg = snd.config.window
@@ -316,9 +271,6 @@ function snd.gui.createWindow()
     local px = cfg.posX or 50
     local py = cfg.posY or 50
 
-    -----------------------------------------------------------------------
-    -- Main container (Adjustable = draggable + resizable)
-    -----------------------------------------------------------------------
     snd.gui.elements.main = Adjustable.Container:new({
         name = "sndMain",
         x = px, y = py,
@@ -330,9 +282,6 @@ function snd.gui.createWindow()
         titleTxtColor = "white",
     })
 
-    -----------------------------------------------------------------------
-    -- Title Bar
-    -----------------------------------------------------------------------
     snd.gui.elements.titleBar = Geyser.Label:new({
         name = "sndTitleBar",
         x = 0, y = 0,
@@ -340,12 +289,8 @@ function snd.gui.createWindow()
     }, snd.gui.elements.main)
     snd.gui.elements.titleBar:setStyleSheet(cssTitle(s))
     snd.gui.elements.titleBar:echo(snd.fullVersion or "Search & Destroy")
-    -- Enable drag (title bar moves the whole container)
     snd.gui.elements.titleBar:setClickCallback("snd.gui.onTitleRightClick")
 
-    -----------------------------------------------------------------------
-    -- Minimize / Maximize button (top-right)
-    -----------------------------------------------------------------------
     snd.gui.elements.minBtn = Geyser.Label:new({
         name = "sndMinBtn",
         x = -22, y = 0,
@@ -355,9 +300,6 @@ function snd.gui.createWindow()
     snd.gui.elements.minBtn:echo("▬")
     snd.gui.elements.minBtn:setClickCallback("snd.gui.toggleMinimize")
 
-    -----------------------------------------------------------------------
-    -- Quest Timer (in title bar, right-aligned)
-    -----------------------------------------------------------------------
     snd.gui.elements.questTimer = Geyser.Label:new({
         name = "sndQuestTimer",
         x = "40%", y = 0,
@@ -366,9 +308,6 @@ function snd.gui.createWindow()
     snd.gui.elements.questTimer:setStyleSheet(cssQuestTimer(s, s.questWaiting))
     snd.gui.elements.questTimer:echo("")
 
-    -----------------------------------------------------------------------
-    -- Circle Status Readout (activity indicator)
-    -----------------------------------------------------------------------
     snd.gui.elements.circle = Geyser.Label:new({
         name = "sndCircle",
         x = 5, y = BUTTON_ROW_Y,
@@ -378,9 +317,6 @@ function snd.gui.createWindow()
     snd.gui.elements.circle:echo("init")
     snd.gui.elements.circle:setClickCallback("snd.gui.onNoexpMouse")
 
-    -----------------------------------------------------------------------
-    -- Action Buttons
-    -----------------------------------------------------------------------
     local btnX = 44
     local btnW = 35
     local btnGap = 3
@@ -396,22 +332,15 @@ function snd.gui.createWindow()
         label:setStyleSheet(cssButton(s, false))
         label:echo(btn.text)
         label:setClickCallback("snd.gui.onButtonClick", btn.id)
-        -- Store tooltip info for later
         label:setToolTip(btn.tip)
         snd.gui.elements.buttons[btn.id] = label
     end
-	--- Quick Scan - mirrors quick_scan() from original plugin
-	-- Sends "scan <keyword>" if target selected, plain "scan" otherwise
 	function snd.gui.quickScan()
-		if snd.targets.current and snd.targets.current.keyword and snd.targets.current.keyword ~= "" then
-			send("scan " .. snd.targets.current.keyword, false)
-		else
-			send("scan", false)
+		if snd.scan and snd.scan.quickScan then
+			return snd.scan.quickScan()
 		end
+		send("scan", false)
 	end
-    -----------------------------------------------------------------------
-    -- AutoCheck Readout (right of buttons)
-    -----------------------------------------------------------------------
     snd.gui.elements.autocheck = Geyser.Label:new({
         name = "sndAutocheck",
         x = -55, y = BUTTON_ROW_Y + 3,
@@ -422,9 +351,6 @@ function snd.gui.createWindow()
     snd.gui.elements.autocheck:setToolTip("L: cycle AutoCheck mode (ON/SMART/OFF)")
     snd.gui.elements.autocheck:setClickCallback("snd.gui.onAutocheckClick")
 
-    -----------------------------------------------------------------------
-    -- Target List Area (MiniConsole for proper multi-line colored text)
-    -----------------------------------------------------------------------
     snd.gui.elements.targetArea = Geyser.MiniConsole:new({
         name = "sndTargetArea",
         x = 0, y = TARGET_START_Y,
@@ -457,9 +383,6 @@ function snd.gui.createWindow()
         snd.gui.elements.tabs[key] = tab
     end
 
-    -----------------------------------------------------------------------
-    -- Resize Handle (bottom-right corner)
-    -----------------------------------------------------------------------
     snd.gui.elements.resizeHandle = Geyser.Label:new({
         name = "sndResizeHandle",
         x = -16, y = -16,
@@ -469,9 +392,6 @@ function snd.gui.createWindow()
     snd.gui.elements.resizeHandle:echo("◢")
     snd.gui.elements.resizeHandle:setToolTip("Drag to resize (use xset win width/height)")
 
-    -----------------------------------------------------------------------
-    -- Final setup
-    -----------------------------------------------------------------------
     snd.gui.initialized = true
     snd.gui.minimized = false
     if snd.gui.bindNoexpCallbacks then
@@ -484,7 +404,6 @@ function snd.gui.createWindow()
         snd.gui.show()
     end
 
-    -- Initial draw
     snd.gui.refresh()
     if snd.quest
         and snd.quest.requestCooldownStatus
@@ -495,34 +414,25 @@ function snd.gui.createWindow()
     snd.utils.debugNote("GUI window created")
 end
 
--------------------------------------------------------------------------------
--- Destroy GUI (clean teardown)
--------------------------------------------------------------------------------
-
 function snd.gui.destroy()
     if snd.gui.pendingRefreshTimer and type(killTimer) == "function" then
         pcall(killTimer, snd.gui.pendingRefreshTimer)
         snd.gui.pendingRefreshTimer = nil
     end
-    -- Kill individual target labels
     snd.gui.clearTargetLabels()
 
-    -- Kill all named elements
     for name, el in pairs(snd.gui.elements) do
         if type(el) == "table" then
-            -- It might be a sub-table (like buttons)
             if el.hide then
                 pcall(function() el:hide() end)
             end
         end
     end
 
-    -- Kill the main container
     if snd.gui.elements.main then
         pcall(function() snd.gui.elements.main:hide() end)
     end
 
-    -- Clean up Geyser references
     if Geyser and Geyser.Label then
         for _, name in ipairs({
             "sndMain", "sndBorder", "sndTitleBar", "sndMinBtn",
@@ -540,10 +450,6 @@ function snd.gui.destroy()
     snd.gui.renderSignatures = {}
     snd.gui.initialized = false
 end
-
--------------------------------------------------------------------------------
--- Clear dynamic target labels
--------------------------------------------------------------------------------
 
 function snd.gui.clearTargetLabels()
     for _, lbl in ipairs(snd.gui.targetLabels) do
@@ -571,10 +477,6 @@ function snd.gui.bindNoexpCallbacks()
     end
 end
 
--------------------------------------------------------------------------------
--- Refresh Entire GUI
--- Called whenever data changes (target list, quest status, room change, etc.)
--------------------------------------------------------------------------------
 
 function snd.gui.refresh(force)
     if not snd.gui.initialized or not snd.gui.elements.main then return end
@@ -673,10 +575,6 @@ function snd.gui.onTabClick(tabKey, _, button)
     end
 end
 
--------------------------------------------------------------------------------
--- Update the Circle Status Readout
--- Mirrors draw_circle_readout() from the original
--------------------------------------------------------------------------------
 
 function snd.gui.updateCircle(force)
     if not snd.gui.elements.circle then return end
@@ -703,10 +601,6 @@ function snd.gui.updateCircle(force)
     snd.gui.elements.circle:setToolTip(tip)
 end
 
--------------------------------------------------------------------------------
--- Update Noexp Readout
--- Mirrors draw_noexp_readout() from the original
--------------------------------------------------------------------------------
 
 function snd.gui.updateNoexp()
     snd.gui.updateCircle()
@@ -767,8 +661,6 @@ function snd.gui.applyFontSize()
     snd.gui.updateTargetList()
 end
 
---- Refresh target links - mirrors xgui_RefreshLinks() from original
--- Sends cp check or gq check depending on current activity
 function snd.gui.refreshTargets()
     local activeTab = snd.getActiveTab and snd.getActiveTab() or "quest"
     if activeTab == "gq" then
@@ -782,15 +674,11 @@ function snd.gui.refreshTargets()
     else
         send("quest info", false)
     end
-    -- Maximize window if minimized
     if snd.gui.minimized then
         snd.gui.maximize()
     end
 end
 
---- Reload target data - mirrors xgui_ReloadLinks() from original
---- Like refreshTargets but uses the heavier `gq info` payload on the GQ tab
---- so reward/metadata parsing (handled by the gq-info parser) runs.
 function snd.gui.reloadTargets()
     local activeTab = snd.getActiveTab and snd.getActiveTab() or "quest"
     if activeTab == "gq" then
@@ -819,10 +707,6 @@ function snd.gui.onAutocheckClick()
     end
     snd.gui.updateAutocheck()
 end
--------------------------------------------------------------------------------
--- Update Quest Timer (in title bar)
--- Mirrors draw_next_quest_time() and quest_timer_text() from the original
--------------------------------------------------------------------------------
 
 function snd.gui.updateQuestTimer(force)
     if not snd.gui.elements.questTimer then return end
@@ -833,7 +717,6 @@ function snd.gui.updateQuestTimer(force)
     if snd.quest then
         local qstat = snd.quest.target and snd.quest.target.status or "1"
         if qstat == "2" then
-            -- Active quest, show time remaining
             color = s.targeted
             if snd.quest.timer and snd.quest.timer > 0 then
                 local mins = math.max(0, math.ceil((snd.quest.timer - os.time()) / 60))
@@ -842,11 +725,9 @@ function snd.gui.updateQuestTimer(force)
                 text = "Quest active"
             end
         elseif qstat == "3" then
-            -- Quest complete, turn it in
             color = s.questComplete
             text = "Quest done!"
         elseif qstat == "0" then
-            -- Quest available (or waiting)
             if snd.quest.nextQuestTime and snd.quest.nextQuestTime > 0 then
                 local mins, cooldownText = snd.quest.getNextQuestStatus()
                 if mins > 0 then
@@ -861,7 +742,6 @@ function snd.gui.updateQuestTimer(force)
                 text = "Quest ready"
             end
         else
-            -- Waiting for quest
             if snd.quest.nextQuestTime and snd.quest.nextQuestTime > 0 then
                 local mins, cooldownText = snd.quest.getNextQuestStatus()
                 if mins > 0 then
@@ -932,9 +812,6 @@ function snd.gui.startQuestTimer()
 
     tick()
 end
--------------------------------------------------------------------------------
--- Named color map for cecho (Mudlet named colors)
--------------------------------------------------------------------------------
 local TC = {
     normal      = "<light_gray>",
     targeted    = "<orange_red>",
@@ -952,11 +829,7 @@ local TC = {
     cpTab       = "<sea_green>",
     reset       = "<reset>",
 }
--------------------------------------------------------------------------------
--- Update Target List
--- Mirrors xg_show_target_links() and xg_show_quest_target_link()
--- Builds clickable labels for each target
--------------------------------------------------------------------------------
+-- Target list
 
 local function targetListSignature()
     local parts = {
@@ -1056,7 +929,6 @@ function snd.gui.updateTargetList(force)
         return writeTargetText(text)
     end
 
-    -- Try clearing
     local ok, err = clearTargetArea()
     if not ok then
         snd.utils.debugNote("clear() ok=false err=" .. tostring(err))
@@ -1064,10 +936,7 @@ function snd.gui.updateTargetList(force)
 
     local targetCount = snd.targets and snd.targets.list and #snd.targets.list or 0
 
-    -- Measure the actual rendered line height and the MiniConsole's pixel height
-    -- so the displayed target count adapts to real geometry (window resizes,
-    -- font-size changes) instead of relying on hardcoded constants that left
-    -- visible empty space at the bottom of the window.
+    -- Rendered geometry avoids phantom rows after resizing or font changes.
     local lineHeight = 13
     if type(calcFontSize) == "function" then
         local ok, fw, fh = pcall(calcFontSize, "sndTargetArea")
@@ -1118,9 +987,6 @@ function snd.gui.updateTargetList(force)
             or currentEnemyName:find(mobName, 1, true) ~= nil
     end
 
-    ---------------------------------------------------------------------------
-    -- Quest Target Line
-    ---------------------------------------------------------------------------
     if (activeTab == nil or activeTab == "quest") and snd.quest then
         local qstat = snd.quest.target and snd.quest.target.status or "1"
 
@@ -1248,9 +1114,6 @@ function snd.gui.updateTargetList(force)
         snd.utils.debugNote("snd.quest is nil/false")
     end
 
-    ---------------------------------------------------------------------------
-    -- CP / GQ Target Lines
-    ---------------------------------------------------------------------------
     if snd.targets and snd.targets.list then
         local gqDisplayIndex = 0
         local areaColorMap = {}
@@ -1273,7 +1136,6 @@ function snd.gui.updateTargetList(force)
             end
 
             if v.activity ~= "quest" and (activeTab == nil or v.activity == activeTab) then
-                -- Determine color
                 local color = TC.normal
                 local isTargeted = snd.gui.isCurrentTarget(v, index)
 
@@ -1393,9 +1255,6 @@ function snd.gui.updateTargetList(force)
         snd.triggers.registerTargetLineTriggers()
     end
 
-    ---------------------------------------------------------------------------
-    -- Empty state
-    ---------------------------------------------------------------------------
     if lineCount == 0 then
         if activeTab == "gq" then
             writeTargetText(TC.gray .. "You are not on a global campaign.\n")
@@ -1435,10 +1294,6 @@ function snd.gui.updateTargetList(force)
     end
 end
 
--------------------------------------------------------------------------------
--- Check if a target entry matches the current selected target
--- Mirrors target_matches_current_target() from the original
--------------------------------------------------------------------------------
 
 function snd.gui.isCurrentTarget(target, index)
     local ct = snd.targets.current
@@ -1455,19 +1310,12 @@ function snd.gui.isCurrentTarget(target, index)
     return target.mob == ct.name and (not ct.activity or target.activity == ct.activity)
 end
 
--------------------------------------------------------------------------------
--- Check if a target qualifies for express mode
--- Mirrors is_express_target() from the original
--------------------------------------------------------------------------------
 
 function snd.gui.isExpressTarget(target)
     if not snd.config.express or not snd.config.express.enabled then return false end
     return type(target) == "table" and target.express == true
 end
 
--------------------------------------------------------------------------------
--- Button Click Handler
--------------------------------------------------------------------------------
 
 local function isRightClick(button)
     if type(button) == "number" then
@@ -1498,7 +1346,6 @@ function snd.gui.onButtonClick(btnId, _, button)
     end
     if not btn then return end
 
-    -- Handle special commands that map to Lua functions
     local cmd = btn.cmd
     if isRightClick(button) and btn.rcmd then
         cmd = btn.rcmd
@@ -1550,12 +1397,10 @@ function snd.gui.onButtonClick(btnId, _, button)
     end
 end
 
---- Title bar right-click handler (opens context menu)
 function snd.gui.onTitleRightClick()
     snd.gui.showContextMenu()
 end
 
---- Noexp click handler
 function snd.gui.onNoexpClick()
     local anex = snd.config and snd.config.anex
     if not anex then
@@ -1577,7 +1422,6 @@ function snd.gui.onNoexpClick()
     snd.gui.updateNoexp()
 end
 
---- Noexp right-click handler
 function snd.gui.onNoexpRightClick()
     local anex = snd.config and snd.config.anex
     if not anex then
@@ -1599,7 +1443,6 @@ function snd.gui.onNoexpRightClick()
     snd.gui.updateNoexp()
 end
 
---- Unified noexp mouse handler (works even if right-click callback is unavailable)
 function snd.gui.onNoexpMouse(...)
     if isRightButton(...) then
         snd.gui.onNoexpRightClick()
@@ -1607,10 +1450,6 @@ function snd.gui.onNoexpMouse(...)
         snd.gui.onNoexpClick()
     end
 end
--------------------------------------------------------------------------------
--- Toggle Minimize / Maximize
--- Mirrors mouseup_drag hsMinimize from the original
--------------------------------------------------------------------------------
 
 function snd.gui.toggleMinimize()
     if snd.gui.minimized then
@@ -1625,7 +1464,6 @@ function snd.gui.minimize()
     snd.gui.minimized = true
     snd.gui.windowState = "min"
 
-    -- Hide everything except title bar
     local keep = {main = true, border = true, titleBar = true, minBtn = true, questTimer = true}
     for name, el in pairs(snd.gui.elements) do
         if not keep[name] and type(el) == "table" and el.hide then
@@ -1633,11 +1471,9 @@ function snd.gui.minimize()
         end
     end
 
-    -- Collapse height
     snd.gui.elements.main:resize(snd.config.window.width or DEFAULT_WIDTH, TITLE_HEIGHT + 2)
     snd.gui.elements.minBtn:echo("▼")
 
-    -- Also hide button sub-elements
     for _, el in pairs(snd.gui.elements.buttons or {}) do
         if el and el.hide then pcall(function() el:hide() end) end
     end
@@ -1648,12 +1484,10 @@ function snd.gui.maximize()
     snd.gui.minimized = false
     snd.gui.windowState = "max"
 
-    -- Restore height
     snd.gui.elements.main:resize(
         snd.config.window.width or DEFAULT_WIDTH,
         snd.config.window.height or DEFAULT_HEIGHT)
 
-    -- Show everything
     for name, el in pairs(snd.gui.elements) do
         if type(el) == "table" and el.show then
             pcall(function() el:show() end)
@@ -1667,9 +1501,6 @@ function snd.gui.maximize()
     snd.gui.refresh()
 end
 
--------------------------------------------------------------------------------
--- Show / Hide / Toggle
--------------------------------------------------------------------------------
 
 function snd.gui.show()
     if not snd.gui.elements.main then
@@ -1710,9 +1541,6 @@ function snd.gui.toggle()
     end
 end
 
--------------------------------------------------------------------------------
--- Resize (called by xset commands)
--------------------------------------------------------------------------------
 
 function snd.gui.resize(width, height)
     width = math.max(width or DEFAULT_WIDTH, MIN_WIDTH)
@@ -1733,14 +1561,9 @@ function snd.gui.move(x, y)
     end
 end
 
--------------------------------------------------------------------------------
--- Context Menu (right-click on title bar)
--- Mirrors right_click_menu() from the original
--------------------------------------------------------------------------------
 
 function snd.gui.showContextMenu()
-    -- Mudlet doesn't have native popup menus like MUSHclient.
-    -- We echo a clickable text menu to the main console instead.
+    -- Mudlet has no native popup menu, so render clickable console text.
     local divider = string.rep("─", 40)
 
     cecho("\n<DimGray>" .. divider .. "\n")
@@ -1787,13 +1610,9 @@ function snd.gui.showContextMenu()
     cecho("<DimGray>" .. divider .. "\n")
 end
 
--------------------------------------------------------------------------------
--- Cleanup
--------------------------------------------------------------------------------
 
 function snd.gui.cleanup()
     if snd.gui.elements.main then
-        -- Save position
         snd.config.window.posX = snd.gui.elements.main.get_x and snd.gui.elements.main:get_x() or 0
         snd.config.window.posY = snd.gui.elements.main.get_y and snd.gui.elements.main:get_y() or 0
     end
@@ -1801,10 +1620,6 @@ function snd.gui.cleanup()
     snd.gui.destroy()
 end
 
--------------------------------------------------------------------------------
--- Periodic Refresh Timer
--- Keeps the quest timer and target list up to date
--------------------------------------------------------------------------------
 
 function snd.gui.isRouteExecutionActive()
     local mapper = snd.mapper
@@ -1819,7 +1634,6 @@ if snd.gui.refreshTimer then
     snd.gui.refreshTimer = nil
 end
 
--- Also set up a timer for the quest countdown (every minute)
 if snd.gui.questTimerTick then
     killTimer(snd.gui.questTimerTick)
     snd.gui.questTimerTick = nil
@@ -1834,7 +1648,3 @@ snd.gui.questTimerTick = tempTimer(60, function()
     end
 end, true)
 
--------------------------------------------------------------------------------
--- Module loaded
--------------------------------------------------------------------------------
--- (silent load, no output)

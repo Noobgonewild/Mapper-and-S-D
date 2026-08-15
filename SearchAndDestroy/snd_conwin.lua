@@ -1,10 +1,3 @@
---[[
-    Search and Destroy - Consider Window Module
-    Mudlet Port
-
-    Tracks consider output in a dedicated window and supports click-to-kill.
-]]
-
 snd = snd or {}
 snd.conwin = snd.conwin or {}
 
@@ -41,6 +34,7 @@ CW.roomRefreshSerial = tonumber(CW.roomRefreshSerial) or 0
 CW.captureSerial = tonumber(CW.captureSerial) or 0
 CW.captureInFlight = nil -- A reload invalidates any marker from the old code.
 CW.pendingSightings = nil
+CW.emptyRoomEvidence = nil -- RoomChars evidence is one-shot and reload-local.
 CW.lastRenderSignature = nil
 CW.suppressConsiderLines = false
 CW.refreshDirty = CW.refreshDirty == true
@@ -56,8 +50,7 @@ CW.ATTACK_INTENT_TTL = 2.0
 CW.ESCAPE_INTENT_TTL = 2.0
 CW.SAME_NAME_RESET_MIN_JUMP = 20
 CW.SAME_NAME_RESET_MAX_LOW = 50
--- Combat observations are session-local; a script reload invalidates their
--- ordering relative to future CP/GQ kill messages.
+-- Combat observations are session-local; reload invalidates event ordering.
 CW.deathEvents = {}
 CW.deathEventSerial = tonumber(CW.deathEventSerial) or 0
 CW.lastReturnedDeathSerial = nil
@@ -79,16 +72,13 @@ CW.combat = {
     pendingEndTimer = nil,
     pendingEndSerial = tonumber(CW.combat.pendingEndSerial) or 0,
 }
--- RoomChars includes players and every visible inhabitant. Retire the old
--- provisional integration so only parsed consider output can populate ConWin.
+-- RoomChars never populates ConWin; only parsed consider output may do so.
 CW.provisionalLines = nil
 CW.provisionalRoomId = nil
 CW.onRoomcharsStart = nil
 CW.onRoomcharsLine = nil
 
--- Retire any callback created by an older copy of this file. The new timer is
--- only a quiet-room debounce; GMCP state and the single-flight marker remain
--- the source of truth.
+-- Retire legacy callbacks; GMCP and the single-flight marker remain authoritative.
 if CW.roomRefreshTimer and type(killTimer) == "function" then
     pcall(killTimer, CW.roomRefreshTimer)
 end
@@ -156,9 +146,7 @@ local function gmcp_get(path)
 end
 
 local function currentRoomId()
-    -- Read the live GMCP packet first. Anonymous handlers for the same event do
-    -- not have a guaranteed execution order, so snd.room.current may still be
-    -- the room we just left when ConWin's room.info handler runs.
+    -- Same-event handlers are unordered, so read live GMCP before snd.room.current.
     local roomInfo = gmcp_get("room.info")
     if type(roomInfo) == "table" and type(mm) == "table" and type(mm.canonical_room_uid) == "function" then
         local ok, roomId = pcall(mm.canonical_room_uid, roomInfo)
@@ -182,11 +170,16 @@ local function currentPlayerState()
 end
 
 local function mapperHasPendingTravel(_roomId)
-    -- A selected destination records navigation intent, not live execution.
-    -- It may deliberately survive a stopped/failed route so the target remains
-    -- selected. Only unreleased mapper command groups should suppress a manual
-    -- room-change refresh; GMCP state separately guards a running character.
+    -- A destination is intent, not execution. Only unreleased mapper command
+    -- groups suppress refresh; GMCP separately guards actual movement.
     return snd and snd.mapper and snd.mapper.pathExecutionHasPendingGroups == true
+end
+
+local function mapperTraversalActive()
+    return snd and snd.mapper and (
+        snd.mapper.pathExecutionActive == true
+        or snd.mapper.pathExecutionHasPendingGroups == true
+    )
 end
 
 local function trim(s) return (tostring(s or ""):gsub("^%s+",""):gsub("%s+$","")) end
@@ -225,7 +218,6 @@ local function hpTintedName(name, fgColor, bgColor, pct, enabled)
         return string.format("<%s>%s<reset>", fgColor, mobName)
     end
 
-    -- The highlighted section shrinks from right-to-left as HP goes down.
     local aliveChars = math.floor((hpPct / 100) * total + 0.5)
     aliveChars = clamp(aliveChars, 0, total)
 
@@ -399,8 +391,7 @@ function CW.isRefreshEligible(roomId)
         return false
     end
 
-    -- Do not gate on goingToRoom here. A combat stop or failed route may keep
-    -- that destination selected after execution has ended.
+    -- Do not gate on goingToRoom; stopped/failed routes may retain the destination.
     return true
 end
 
@@ -457,6 +448,23 @@ function CW.startSerializedCapture(roomId)
         },
     }
     CW.awaiting = true
+
+    local emptyEvidence = CW.emptyRoomEvidence
+    CW.emptyRoomEvidence = nil
+    local canUseEmptyEvidence = cfg().clearOnEmptyRoomchars == true
+        and CW.forceRefreshPending ~= true
+        and CW.combatSessionActive ~= true
+        and CW.combatRefreshQueued ~= true
+        and type(emptyEvidence) == "table"
+        and emptyEvidence.complete == true
+        and tonumber(emptyEvidence.characterCount) == 0
+        and tostring(emptyEvidence.roomId or "") == tostring(CW.captureInFlight.requestRoom or "")
+        and tonumber(emptyEvidence.generation) == tonumber(CW.captureInFlight.generation)
+    if canUseEmptyEvidence then
+        CW.captureInFlight.observedRoom = tostring(CW.captureInFlight.requestRoom)
+        return CW.onCaptureMarker(serial)
+    end
+
     send("consider all", false)
     send("echo " .. CW.MARKER .. ":" .. tostring(serial), false)
     return true
@@ -550,8 +558,7 @@ function CW.onCaptureMarker(serial)
         if not ok then snd.utils.debugNote("ConWin sighting batch could not be committed") end
     end
 
-    -- Keep the previous rows visible while the server produces consider output,
-    -- then replace the list immediately before the completed result is rendered.
+    -- Keep old rows visible until a complete replacement roster is ready.
     CW.resetConsideredMobs(false)
     CW.mobs = flight.mobs or {}
     CW.applyQuestTargetEvidence(CW.mobs, completedRoom)
@@ -570,9 +577,7 @@ function CW.onCaptureMarker(serial)
         CW.forceRefreshPending = false
     end
 
-    -- The consider and marker are sent adjacently, so live GMCP at marker time
-    -- identifies the room whose output we just captured. It supersedes the
-    -- Room.Info packet that originally requested this flight.
+    -- Marker-time GMCP identifies the captured room more reliably than request-time Room.Info.
     CW.latestRoomId = completedRoom
     CW.lastRoomId = completedRoom
     CW.refreshDirty = false
@@ -584,9 +589,7 @@ function CW.onCaptureMarker(serial)
     end
 
     CW.render()
-    -- Hybrid XCP uses the completed consider roster only to decide whether QW
-    -- is necessary. This remains navigation behavior; this variant has no
-    -- automatic xkill side effects.
+    -- Hybrid navigation consumes the roster without automatic xkill side effects.
     if snd and snd.commands and type(snd.commands.handleXcpHybridConsiderResult) == "function" then
         local targetHere = CW.detectActiveTargetInRoom()
         snd.commands.handleXcpHybridConsiderResult(
@@ -602,6 +605,7 @@ function CW.onCaptureMarker(serial)
 end
 
 function CW.onTravelStarted(reason)
+    CW.emptyRoomEvidence = nil
     if CW.travelActive then return false end
 
     CW.travelGeneration = (tonumber(CW.travelGeneration) or 0) + 1
@@ -685,11 +689,34 @@ local function mobMatchesActivityTarget(name, activity)
     return false
 end
 
+local function questEvidenceOrdinals(evidence)
+    local ordinals = {}
+    local seen = {}
+
+    if type(evidence) == "table" and type(evidence.markedOrdinals) == "table" then
+        for _, value in ipairs(evidence.markedOrdinals) do
+            local ordinal = math.floor(tonumber(value) or 0)
+            if ordinal >= 1 and not seen[ordinal] then
+                seen[ordinal] = true
+                ordinals[#ordinals + 1] = ordinal
+            end
+        end
+    end
+
+    -- Accept legacy evidence shapes during live reload.
+    if #ordinals == 0 and type(evidence) == "table" then
+        local ordinal = math.floor(tonumber(evidence.markedOrdinal) or 0)
+        if ordinal >= 1 then ordinals[1] = ordinal end
+    end
+
+    table.sort(ordinals)
+    return ordinals
+end
+
 local function questEvidenceForRoom(roomId)
     local evidence = snd and snd.roomChars and snd.roomChars.questTargetEvidence or nil
     if type(evidence) ~= "table" or evidence.complete ~= true then return nil end
-    local markedOrdinal = tonumber(evidence.markedOrdinal)
-    if not markedOrdinal or markedOrdinal < 1 then return nil end
+    if #questEvidenceOrdinals(evidence) == 0 then return nil end
     if tostring(evidence.roomId or "") == ""
         or tostring(evidence.roomId) ~= tostring(roomId or "")
     then
@@ -708,21 +735,35 @@ function CW.applyQuestTargetEvidence(mobs, roomId)
     local evidence = questEvidenceForRoom(roomId or currentRoomId())
     if not evidence then return nil end
 
-    -- RoomChars descriptions can differ from consider names. The server's
-    -- [QUEST] marker therefore identifies an absolute inhabitant position,
-    -- not the Nth row whose text already resembles the stored quest target.
-    local index = math.floor(tonumber(evidence.markedOrdinal) or 0)
-    local mob = rows[index]
-    if not mob or mob.dead or not mobMatchesActivityTarget(mob.name, "quest") then
-        return nil
+    -- [QUEST] identifies an absolute inhabitant row because descriptions can differ.
+    local markedIndices = {}
+    for _, index in ipairs(questEvidenceOrdinals(evidence)) do
+        local mob = rows[index]
+        if mob and not mob.dead and mobMatchesActivityTarget(mob.name, "quest") then
+            mob.questTarget = true
+            mob.questTargetOrdinal = index
+            markedIndices[#markedIndices + 1] = index
+        end
     end
 
-    mob.questTarget = true
-    mob.questTargetOrdinal = index
-    return index
+    return markedIndices[1], markedIndices
 end
 
-function CW.onQuestTargetEvidenceUpdated(_evidence)
+function CW.onQuestTargetEvidenceUpdated(evidence)
+    CW.emptyRoomEvidence = nil
+    if type(evidence) == "table" and evidence.complete == true
+        and tostring(evidence.roomId or "") == currentRoomId()
+        and not CW.captureInFlight
+        and CW.hasPendingRefresh()
+        and not mapperTraversalActive()
+    then
+        CW.emptyRoomEvidence = {
+            roomId = tostring(evidence.roomId),
+            characterCount = tonumber(evidence.characterCount),
+            complete = true,
+            generation = tonumber(CW.travelGeneration) or 0,
+        }
+    end
     local markedIndex = CW.applyQuestTargetEvidence(CW.mobs, currentRoomId())
     CW.render()
     return markedIndex
@@ -1356,11 +1397,27 @@ function CW.refresh(source)
     return CW.requestRefresh(source, true, delay)
 end
 
+function CW.onSafeRoomFlagChanged(roomId, value)
+    roomId = tostring(roomId or "")
+    if roomId == "" or roomId ~= currentRoomId() then return false end
+
+    CW.emptyRoomEvidence = nil
+    if value ~= false then
+        CW.cancelTravel()
+        CW.clear("safe-flag-on")
+        CW.lastSuccessfulAutomaticKey = automaticRefreshKey(roomId)
+        CW.lastServedForceRevision = tonumber(CW.forceRefreshRevision) or 0
+        return true
+    end
+
+    CW.lastSuccessfulAutomaticKey = nil
+    return CW.requestRefresh("safe-flag-off", true, 0)
+end
+
 local function requestRepopulateRefresh()
     local requested = CW.refresh("repopulate")
     if requested then
-        -- A combat-issued stop may leave a stale mapper destination. Only the
-        -- threshold-approved refresh should bypass that stale destination.
+        -- Only threshold-approved refresh may bypass a combat-stale destination.
         CW.combatSessionActive = true
         CW.combatRefreshQueued = true
     end
@@ -1639,15 +1696,14 @@ function CW.onRoomInfo()
     if moved then
         CW.latestRoomId = roomId
         CW.onTravelStarted("room-changed")
-        -- Debounce rapid Room.Info bursts. The callback still requires GMCP
-        -- state 3 and no mapper continuation before it may send anything.
+        -- Debounce Room.Info bursts; callback still requires idle GMCP and mapper.
         CW.requestRefresh("room-arrived", false)
     end
 end
 
 function CW.onRoomcharsEnd()
     if not cfg().clearOnEmptyRoomchars then return end
-    -- RoomChars may clear stale considered rows, but never contributes rows.
+    -- RoomChars may clear stale rows but never contributes new ones.
     if CW.awaiting and #CW.mobs == 0 then
         CW.clear("empty-roomchars")
     end
@@ -1721,16 +1777,14 @@ function CW.onCharStatus()
         CW.onTravelStarted("running")
     elseif playerState == "3" then
         if CW.combatSessionActive and CW.combatRefreshQueued then
-            -- The timer may have fired while combat still made the refresh
-            -- ineligible, or a later combat packet may have cancelled it.
+            -- Combat may invalidate the timer after it fires.
             if not CW.captureInFlight and not CW.roomRefreshTimer and CW.hasPendingRefresh() then
                 CW.armRoomRefresh()
             end
         elseif CW.combatSessionActive and CW.hasPendingRefresh() then
             CW.combatRefreshQueued = CW.requestRefresh("post-combat-retry", false) == true
         else
-            -- Ordinary combat completion is handled by the kill counter below.
-            -- Do not refresh here or the configured repopulate threshold is bypassed.
+            -- Do not refresh here; the kill counter owns the repopulate threshold.
             CW.combatSessionActive = false
             CW.combatRefreshQueued = false
             CW.maybeRefreshStoppedRoom(previousPlayerState == "8" and "post-combat-ready" or "player-ready")
@@ -1793,11 +1847,11 @@ function CW.clearRecentKilledMobName()
 end
 
 function CW.getCurrentCombatMobName()
-    -- A target is authoritative only while GMCP also says the player is fighting.
+    -- A combat target is authoritative only while GMCP says fighting.
     if currentPlayerState() ~= "8" then return "" end
     local activeEnemy = normalizeMobName(CW.getActiveEnemyName())
     if activeEnemy == "" then return "" end
-    -- ID match is preferred for precision, but only when it agrees with GMCP.
+    -- Prefer ID only when it agrees with GMCP.
     if CW.currentEnemyMobId then
         for _, m in ipairs(CW.mobs) do
             if m.id == CW.currentEnemyMobId and not m.dead and normalizeMobName(m.name) == activeEnemy then
@@ -1805,14 +1859,12 @@ function CW.getCurrentCombatMobName()
             end
         end
     end
-    -- Name-only fallback (handles case where ID was stale or never set)
     for _, m in ipairs(CW.mobs) do
         if not m.dead and normalizeMobName(m.name) == activeEnemy then
             return activeEnemy
         end
     end
-    -- GMCP remains authoritative even when an aggressive joiner was not part
-    -- of the last consider snapshot; the UI shows it as a combat-only row.
+    -- Show GMCP-only aggressive joiners as combat-only rows.
     return activeEnemy
 end
 
@@ -1975,7 +2027,6 @@ function CW.install()
     end)
     CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^You see no one here but yourself!$", "snd.conwin.onEmptyConsiderResult")
     CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^Not while you are fighting!$", "snd.conwin.onConsiderRejected")
-    -- TODO: do repop/sense life in the future.
 
     for _, id in ipairs(CW.ids.events) do pcall(killAnonymousEventHandler, id) end
     CW.ids.events = {}

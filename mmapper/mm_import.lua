@@ -308,8 +308,7 @@ local function new_weighted_constraint_solver(area, dimensions, prevent_overlap)
     if prevent_overlap then members[room_id] = { [room_id] = true } end
   end
 
-  -- Deliberately avoid path compression: previews must not mutate either
-  -- solver until both the layer and horizontal constraints are accepted.
+  -- No path compression: previews must not mutate either solver before acceptance.
   local function find_root(room_id)
     if not parent[room_id] then return nil, nil end
     local node = room_id
@@ -401,8 +400,7 @@ local function accept_layout_exit(graph, area, exit)
   graph.direct_cardinal_exits = (graph.direct_cardinal_exits or 0) + 1
   table.insert(area.layout_exits, { from = exit.from, to = exit.to, dir = exit.dir })
   add_layout_edge(graph, exit.from, exit.to, exit.dir)
-  -- Reverse traversal is a layout constraint only. It does not add a reverse
-  -- Mudlet exit that is absent from the source database.
+  -- Reverse traversal constrains layout only; it never creates a reverse map exit.
   add_layout_edge(graph, exit.to, exit.from, exit_def.inverse)
 end
 
@@ -519,9 +517,7 @@ local function load_layout_graph(source_path, opts)
       if #area_rows > 0 then
         selected_area = area_rows[1].area
       elseif selected_room_id then
-        -- A numeric room may already have usable exits before its metadata row
-        -- reaches rooms.  A direct cardinal neighbour is enough to infer which
-        -- area should be rebuilt.
+        -- A direct cardinal neighbor can identify a room whose metadata has not arrived.
         local neighbour_sql =
           "SELECT DISTINCT neighbour.area AS area FROM exits e " ..
           "JOIN rooms neighbour ON neighbour.uid = e.touid " ..
@@ -606,8 +602,7 @@ local function load_layout_graph(source_path, opts)
       compiled_layout_cache = compiled_cache ~= nil,
     }
 
-    -- The local graphical map uses the same terrain palette as the imported
-    -- native map.  Index by both sector name and uid for older databases.
+    -- Index terrain by name and UID for older databases.
     local environment_rows = sqlite_query(conn, "SELECT uid, name, color FROM environments")
     for _, row in ipairs(environment_rows or {}) do
       local rgb = ansi_to_rgb[tonumber(row.color)] or ansi_to_rgb[7]
@@ -714,10 +709,8 @@ local function load_layout_graph(source_path, opts)
       end
     end
 
-    -- Some mapper databases contain fully usable numeric rooms in exits.fromuid
-    -- before a metadata row exists in rooms.  Infer only those source-room IDs;
-    -- destination-only frontier IDs remain reported as missing.  Area inference
-    -- must be unambiguous and never writes back to the SQLite database.
+    -- Infer only unambiguous numeric source rooms missing metadata; never infer
+    -- destination-only frontiers or write the inference back to SQLite.
     local orphan_parent = {}
     for room_id in pairs(orphan_sources) do orphan_parent[room_id] = room_id end
     local function find_orphan(room_id)
@@ -788,9 +781,7 @@ local function load_layout_graph(source_path, opts)
       for _, room_id in ipairs(area.rooms) do table.insert(graph.room_order, room_id) end
     end
 
-    -- A bare long direction is geometrically parseable, but aliases occupy the
-    -- same visual slot.  Merge aliases that agree, and turn maze sentinels or
-    -- multiple destinations for one canonical direction into a single arrow.
+    -- Merge agreeing direction aliases; ambiguous/maze destinations become one arrow.
     local slot_groups = {}
     for _, raw in ipairs(raw_cardinal_exits) do
       local key = tostring(raw.from) .. ":" .. tostring(raw.dir)
@@ -906,8 +897,7 @@ local function load_layout_graph(source_path, opts)
                   accept_layout_exit(graph, source_area, map_exit)
                 end
               else
-                -- New or changed exits remain immediately visible.  Their
-                -- definitive classification is refreshed by the next rebuild.
+                -- New exits stay visible until the next rebuild classifies them.
                 map_exit.uncompiled = true
                 accept_layout_exit(graph, source_area, map_exit)
               end
@@ -919,8 +909,7 @@ local function load_layout_graph(source_path, opts)
             source_area.outside_exits = source_area.outside_exits + 1
           end
         elseif selected_area_known and raw.target_exists then
-          -- An area-scoped load intentionally does not load destination rooms
-          -- in other areas.
+          -- Area-scoped loads intentionally omit cross-area destinations.
           graph.direct_cardinal_exits = graph.direct_cardinal_exits + 1
           source_area.outside_exits = source_area.outside_exits + 1
         else
@@ -1101,10 +1090,8 @@ local function calculate_area_layout(graph, area)
     if #list < diagnostic_limit then table.insert(list, detail) end
   end
 
-  -- Solve the Z axis separately from X/Y placement.  Up/down relations are
-  -- hard constraints and are accepted before horizontal same-layer
-  -- constraints.  This prevents a room reached horizontally first from
-  -- incorrectly keeping an upstairs/downstairs destination on the same layer.
+  -- Solve vertical constraints before horizontal placement so traversal order
+  -- cannot collapse upstairs/downstairs rooms onto one layer.
   local parent, weight = {}, {}
   for _, room_id in ipairs(area.rooms) do
     parent[room_id] = room_id
@@ -1166,11 +1153,8 @@ local function calculate_area_layout(graph, area)
     z_by_room[room_id] = z
   end
 
-  -- X/Y belongs to a plane, not to the route used to reach that plane.  Up and
-  -- down only constrain the cumulative Z index; they must never make east/west
-  -- or north/south movement on different planes cancel each other.  Build each
-  -- same-plane horizontal section locally, then pack sections independently on
-  -- their already-solved Z plane.
+  -- X/Y is plane-local; vertical routes constrain only Z, so independently pack
+  -- same-plane horizontal sections after Z is solved.
   local coords = {}
   local components, collisions = 0, 0
   local next_component_x_by_z = {}
@@ -1265,8 +1249,7 @@ local function calculate_area_layout(graph, area)
     local is_conflict = false
     if from_coord and to_coord then
       if is_vertical then
-        -- A vertical exit changes only the plane index.  X/Y positions on the
-        -- two planes are intentionally independent.
+        -- Vertical exits change only Z; the two planes have independent X/Y.
         is_conflict = to_coord.z ~= from_coord.z + def.dz
       else
         is_conflict = to_coord.x ~= from_coord.x + def.dx or
@@ -2214,7 +2197,7 @@ function mm.import.update_room_colors_from_sqlite(source_path)
     if not envRows then error("failed loading environments: " .. tostring(envErr)) end
     if #envRows == 0 then error("no environments found in sqlite DB") end
 
-    -- Match legacy aardwolf.xml behavior: Mudlet env ids are sqlite uid + 16.
+    -- Compatibility: Mudlet environment ID is SQLite UID + 16.
     local envOffset = 16
     local terrainToEnv = {}
     local envColorCode = {}
@@ -2316,16 +2299,13 @@ function mm.import.rebuild_layout_from(start_room, opts)
   if not start then return false, "start room must be a number" end
   if mm.import._active_map_job then return false, "another map rebuild operation is already running" end
 
-  -- The room id selects an area; placement within that area is always rooted
-  -- deterministically by sorted UID so manual, automatic, and full rebuilds
-  -- produce the same result.
+  -- Sorted-UID roots keep manual, automatic, and full rebuilds deterministic.
   local graph, graph_err = load_layout_graph(opts.source_path or mm.state.map_db, { room_id = start })
   if not graph then return false, graph_err end
   local area = graph.area_list[1]
   if not area then return false, "no rooms found for room " .. tostring(start) end
 
-  -- Area-only rebuilds also repair rooms inferred from exits.fromuid and refresh
-  -- cardinal map exits before applying the shared layout.
+  -- Area rebuilds repair inferred source rooms and cardinal exits before layout.
   local preparation = prepare_area_for_layout(graph, area)
   local stats = apply_area_layout(graph, area)
   local save_ok, save_err = save_native_map()

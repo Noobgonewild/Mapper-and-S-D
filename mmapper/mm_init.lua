@@ -267,9 +267,7 @@ function mm.initialize()
     mm.debug("initialization begin")
   end
   mm.runtime = mm.runtime or {}
-  -- Reset the hybrid failure latch on package/profile load. Native map data is
-  -- either preloaded through the normal native surface or loaded lazily when
-  -- hybrid first switches to its continent surface.
+  -- Reset hybrid failure on load; native data may preload or load lazily.
   mm.runtime.hybrid_native_unavailable_reason = nil
   safe_step("load_settings_persistence", function()
     if mm.load_settings_persistence then

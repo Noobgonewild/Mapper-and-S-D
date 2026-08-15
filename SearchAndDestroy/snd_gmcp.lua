@@ -1,17 +1,3 @@
---[[
-    Search and Destroy - GMCP Module
-    Mudlet Port
-    
-    Original MUSHclient plugin by Crowley
-    Ported to Mudlet
-    
-    This module handles all GMCP events:
-    - char.status (player state)
-    - room.info (room changes)
-    - comm.quest (quest events)
-    - config (noexp settings)
-]]
-
 if type(mm) ~= "table" or type(mm.canonical_room_uid) ~= "function" or type(mm.nav) ~= "table" then
     error("Search and Destroy requires MMapper to be fully loaded first (missing mm.canonical_room_uid or mm.nav).")
 end
@@ -37,51 +23,38 @@ local function stopQuestReadyReminder()
     end
 end
 
--- Store event handler IDs so we can unregister them
 snd.gmcp.handlers = snd.gmcp.handlers or {}
 
--------------------------------------------------------------------------------
--- GMCP Handler Registration
--------------------------------------------------------------------------------
-
---- Register all GMCP event handlers
 function snd.gmcp.registerHandlers()
     snd.utils.debugNote("Registering GMCP handlers...")
     
-    -- Unregister any existing handlers first
     snd.gmcp.unregisterHandlers()
     
-    -- char.status - player state changes
     snd.gmcp.handlers.charStatus = registerAnonymousEventHandler(
         "gmcp.char.status",
         snd.gmcp.onCharStatus
     )
     
-    -- char.base - base character info (name, class, etc)
     snd.gmcp.handlers.charBase = registerAnonymousEventHandler(
         "gmcp.char.base",
         snd.gmcp.onCharBase
     )
 
-    -- char.vitals - live vitals (hp/mana/moves), useful login-ready signal
     snd.gmcp.handlers.charVitals = registerAnonymousEventHandler(
         "gmcp.char.vitals",
         snd.gmcp.onCharVitals
     )
     
-    -- room.info - room changes
     snd.gmcp.handlers.roomInfo = registerAnonymousEventHandler(
         "gmcp.room.info",
         snd.gmcp.onRoomInfo
     )
     
-    -- comm.quest - quest events
     snd.gmcp.handlers.commQuest = registerAnonymousEventHandler(
         "gmcp.comm.quest",
         snd.gmcp.onCommQuest
     )
     
-    -- config - configuration changes (like noexp)
     snd.gmcp.handlers.config = registerAnonymousEventHandler(
         "gmcp.config",
         snd.gmcp.onConfig
@@ -90,7 +63,6 @@ function snd.gmcp.registerHandlers()
     snd.utils.debugNote("GMCP handlers registered")
 end
 
---- Unregister all GMCP event handlers
 function snd.gmcp.unregisterHandlers()
     for name, handler in pairs(snd.gmcp.handlers) do
         if handler then
@@ -100,10 +72,6 @@ function snd.gmcp.unregisterHandlers()
     snd.gmcp.handlers = {}
 end
 
--------------------------------------------------------------------------------
--- char.status Handler
--------------------------------------------------------------------------------
-
 function snd.gmcp.onCharStatus()
     if not gmcp or not gmcp.char or not gmcp.char.status then
         return
@@ -111,7 +79,6 @@ function snd.gmcp.onCharStatus()
     
     local status = gmcp.char.status
     
-    -- Update character state
     local oldState = snd.char.state
     local oldLevel = snd.char.level
     snd.char.state = tostring(status.state or "0")
@@ -133,7 +100,6 @@ function snd.gmcp.onCharStatus()
         end
     end
     
-    -- Check for state change
     if oldState ~= snd.char.state then
         snd.onStateChange()
     end
@@ -142,17 +108,12 @@ function snd.gmcp.onCharStatus()
         snd.tryAutoOpenWindow()
     end
     
-    -- Auto noexp check (if below level 200)
     if snd.char.level < 200 and snd.config.anex.automatic then
         snd.gmcp.checkAutoNoexp()
     end
     
     snd.utils.debugNote("char.status - state: " .. snd.char.state .. ", level: " .. snd.char.level)
 end
-
--------------------------------------------------------------------------------
--- char.base Handler
--------------------------------------------------------------------------------
 
 function snd.gmcp.onCharBase()
     if not gmcp or not gmcp.char or not gmcp.char.base then
@@ -170,10 +131,6 @@ function snd.gmcp.onCharBase()
     snd.utils.debugNote("char.base - name: " .. snd.char.name .. ", class: " .. snd.char.class)
 end
 
-
--------------------------------------------------------------------------------
--- char.vitals Handler
--------------------------------------------------------------------------------
 
 function snd.gmcp.onCharVitals()
     if not gmcp or not gmcp.char or not gmcp.char.vitals then
@@ -197,10 +154,6 @@ function snd.gmcp.onCharVitals()
     )
 end
 
--------------------------------------------------------------------------------
--- room.info Handler
--------------------------------------------------------------------------------
-
 function snd.gmcp.onRoomInfo()
     if not gmcp or not gmcp.room or not gmcp.room.info then
         return
@@ -208,10 +161,8 @@ function snd.gmcp.onRoomInfo()
     
     local ri = gmcp.room.info
     
-    -- Store previous room
     snd.room.previous = snd.utils.deepcopy(snd.room.current)
     
-    -- Parse maze flag from details
     local isMaze = 0
     if ri.details and type(ri.details) == "string" then
         if ri.details:match("maze") then
@@ -219,7 +170,6 @@ function snd.gmcp.onRoomInfo()
         end
     end
     
-    -- Update current room
     snd.room.current = {
         rmid = mm.canonical_room_uid(ri) or "-1",
         arid = ri.zone or "",
@@ -239,8 +189,7 @@ function snd.gmcp.onRoomInfo()
                 snd.mapper.bufferRoomPersist(ri)
             end
         else
-            -- A manual arrival is still persisted immediately, but joins any
-            -- orphaned navigation buffer so there is one commit/notification.
+            -- Manual arrival joins any orphaned nav buffer for one commit/notification.
             if snd.mapper.bufferRoomPersist and snd.mapper.flushPendingPersists then
                 local hadOrphanedBuffer = snd.mapper.hasPendingPersistence
                     and snd.mapper.hasPendingPersistence()
@@ -252,21 +201,8 @@ function snd.gmcp.onRoomInfo()
         end
     end
 
-    -- Only process if room actually changed
     if roomChanged then
-        -- Defensive init in case state restore or load order omits room history.
         snd.room.history = snd.room.history or {}
-        -- Room history tracking is intentionally disabled for now.
-        -- Keep original logic commented so it can be re-enabled quickly if needed.
-        -- if #snd.room.history >= 300 then
-        --     table.remove(snd.room.history, 300)
-        -- end
-        -- table.insert(snd.room.history, 1, {
-        --     rmid = snd.room.previous.rmid,
-        --     arid = snd.room.previous.arid,
-        -- })
-
-        -- Notify main module of room change
         snd.onRoomChange()
         
         snd.utils.debugNote("room.info - room: " .. snd.room.current.rmid .. 
@@ -274,10 +210,6 @@ function snd.gmcp.onRoomInfo()
                           ", name: " .. snd.room.current.name)
     end
 end
-
--------------------------------------------------------------------------------
--- comm.quest Handler
--------------------------------------------------------------------------------
 
 function snd.gmcp.onCommQuest()
     if not gmcp or not gmcp.comm or not gmcp.comm.quest then
@@ -329,39 +261,30 @@ function snd.gmcp.onCommQuest()
     end
     
     if action == "start" then
-        -- New quest started
         snd.gmcp.onQuestStart(q)
         
     elseif action == "killed" then
-        -- Quest target killed
         snd.gmcp.onQuestKilled(q)
         
     elseif action == "comp" then
-        -- Quest completed
         snd.gmcp.onQuestComplete(q)
         
     elseif action == "fail" then
-        -- Quest failed
         snd.gmcp.onQuestFail(q)
         
     elseif action == "timeout" then
-        -- Quest timed out
         snd.gmcp.onQuestTimeout(q)
         
     elseif action == "ready" then
-        -- Can quest again
         snd.gmcp.onQuestReady(q)
         
     elseif action == "reset" then
-        -- Quest reset (qreset)
         snd.gmcp.onQuestReset(q)
         
     elseif action == "status" then
-        -- Response to "request quest"
         snd.gmcp.onQuestStatus(q)
         
     elseif action == "warning" then
-        -- Quest time warning
         snd.gmcp.onQuestWarning(q)
 
     elseif status == "available" or status == "ready" then
@@ -369,9 +292,6 @@ function snd.gmcp.onCommQuest()
     end
 end
 
---- Returns cooldown wait minutes from a quest payload if present.
--- @param q GMCP comm.quest payload table
--- @return number|nil wait minutes if present and valid
 function snd.gmcp.getQuestWaitMinutes(q)
     if not q then
         return nil
@@ -385,7 +305,6 @@ function snd.gmcp.getQuestWaitMinutes(q)
     return nil
 end
 
---- Quest started
 function snd.gmcp.onQuestStart(q)
     if snd.db then
         snd.db.historyStart(snd.db.HISTORY_TYPE_QUEST, snd.char.level or 0)
@@ -409,7 +328,6 @@ function snd.gmcp.onQuestStart(q)
         snd.quest.target.arid = snd.db.getAreaKeyFromName(snd.quest.target.area) or ""
     end
     
-    -- Guess keyword for the target
     if snd.quest.target.mob ~= "" then
         snd.quest.target.keyword = snd.gmcp.guessMobKeyword(
             snd.quest.target.mob,
@@ -417,7 +335,6 @@ function snd.gmcp.onQuestStart(q)
         )
     end
     
-    -- Add quest target to target list for xcp display
     snd.gmcp.addQuestToTargetList()
     snd.gmcp.registerQuestTargetTrigger()
 
@@ -429,29 +346,24 @@ function snd.gmcp.onQuestStart(q)
         snd.setActiveTab(snd.getPreferredActiveActivity() or "quest", {save = true, refresh = false})
     end
     
-    -- Refresh GUI
     if snd.gui and snd.gui.refresh then
         snd.gui.refresh()
     end
 end
 
---- Add current quest to target list
 function snd.gmcp.addQuestToTargetList()
     if not snd.quest.active or not snd.quest.target.mob or snd.quest.target.mob == "" then
         return
     end
     
-    -- Remove any existing quest targets first
     snd.gmcp.removeQuestFromTargetList()
     
-    -- Look up area key from area name
     local areaKey = snd.quest.target.arid or ""
     if areaKey == "" and snd.quest.target.area and snd.quest.target.area ~= "" then
         areaKey = snd.db.getAreaKeyFromName(snd.quest.target.area) or ""
         snd.quest.target.arid = areaKey
     end
     
-    -- Create target entry
     local target = {
         mob = snd.quest.target.mob,
         loc = snd.quest.target.area,
@@ -466,8 +378,6 @@ function snd.gmcp.addQuestToTargetList()
         snd.express.classifyTarget(target)
     end
     
-    -- Find insertion position: after GQ targets, before CP targets
-    -- Priority: GQ > Quest > CP
     local insertPos = 1
     for i, t in ipairs(snd.targets.list) do
         if t.activity == "gq" then
@@ -479,7 +389,6 @@ function snd.gmcp.addQuestToTargetList()
     
     table.insert(snd.targets.list, insertPos, target)
     
-    -- Auto-select quest target (unless GQ is active)
     if not snd.gquest.active then
         if snd.nav and snd.nav.invalidateQuickWhereForTarget then
             snd.nav.invalidateQuickWhereForTarget(target)
@@ -490,7 +399,6 @@ function snd.gmcp.addQuestToTargetList()
     snd.utils.debugNote("Added quest target to list at position " .. insertPos .. ": " .. target.mob)
 end
 
---- Register a trigger to tag quest target lines
 function snd.gmcp.registerQuestTargetTrigger()
     snd.gmcp.unregisterQuestTargetTrigger()
     if not snd.quest or not snd.quest.target or snd.quest.target.mob == "" then
@@ -505,7 +413,6 @@ function snd.gmcp.registerQuestTargetTrigger()
     end)
 end
 
---- Unregister quest target line trigger
 function snd.gmcp.unregisterQuestTargetTrigger()
     if snd.quest and snd.quest.targetTriggerId then
         killTrigger(snd.quest.targetTriggerId)
@@ -513,7 +420,6 @@ function snd.gmcp.unregisterQuestTargetTrigger()
     end
 end
 
---- Remove quest targets from list
 function snd.gmcp.removeQuestFromTargetList()
     local i = 1
     while i <= #snd.targets.list do
@@ -525,9 +431,7 @@ function snd.gmcp.removeQuestFromTargetList()
     end
 end
 
---- Mark every cached representation of the current quest target as killed.
--- Current/scoped targets are copies of the list row, so updating only the list
--- can leave mobdetect and xkill holding an apparently live quest target.
+-- Update copied current/scoped rows too, or mobdetect/xkill can retain a live quest target.
 function snd.gmcp.markQuestTargetKilled()
     local canonical = snd.quest and snd.quest.target or nil
     if canonical then
@@ -563,7 +467,6 @@ function snd.gmcp.markQuestTargetKilled()
     end
 end
 
---- Quest target killed
 function snd.gmcp.onQuestKilled(q)
     snd.quest.available = false
     stopQuestReadyReminder()
@@ -579,7 +482,6 @@ function snd.gmcp.onQuestKilled(q)
     end
 end
 
---- Quest completed
 function snd.gmcp.onQuestComplete(q)
     local qp = tonumber(q.qp) or 0
     local gold = tonumber(q.gold) or 0
@@ -600,10 +502,8 @@ function snd.gmcp.onQuestComplete(q)
     snd.quest.setCooldown(q.wait)
     clearQuestQuickWhereCache()
     
-    -- Remove quest from target list
     snd.gmcp.removeQuestFromTargetList()
     
-    -- Clear current target if it was the quest
     if snd.targets.current and snd.targets.current.activity == "quest" then
         snd.clearTarget()
     end
@@ -618,7 +518,6 @@ function snd.gmcp.onQuestComplete(q)
     end
 end
 
---- Queue quest completion reward output (accounts for tier/blessing bonuses)
 function snd.gmcp.queueQuestReward(qp, gold, tp, trains, pracs)
     local tierBonus = snd.char and snd.char.tier or 0
     snd.quest.blessingBonus = 0
@@ -646,7 +545,6 @@ function snd.gmcp.queueQuestReward(qp, gold, tp, trains, pracs)
     end)
 end
 
---- Emit quest reward output with any pending bonuses
 function snd.gmcp.emitQuestReward()
     if not snd.quest.pendingReward then
         return
@@ -687,7 +585,6 @@ function snd.gmcp.emitQuestReward()
     snd.quest.extraBonus = 0
 end
 
---- Quest failed
 function snd.gmcp.onQuestFail(q)
     snd.utils.infoNote("Quest failed!")
     if snd.db then
@@ -705,7 +602,6 @@ function snd.gmcp.onQuestFail(q)
     snd.quest.setCooldown(q.wait)
     clearQuestQuickWhereCache()
     
-    -- Remove quest from target list
     snd.gmcp.removeQuestFromTargetList()
     
     if snd.targets.current and snd.targets.current.activity == "quest" then
@@ -722,7 +618,6 @@ function snd.gmcp.onQuestFail(q)
     end
 end
 
---- Quest timed out
 function snd.gmcp.onQuestTimeout(q)
     snd.utils.infoNote("Quest timed out!")
     if snd.db then
@@ -740,7 +635,6 @@ function snd.gmcp.onQuestTimeout(q)
     snd.quest.setCooldown(q.wait)
     clearQuestQuickWhereCache()
     
-    -- Remove quest from target list
     snd.gmcp.removeQuestFromTargetList()
     
     if snd.targets.current and snd.targets.current.activity == "quest" then
@@ -757,7 +651,6 @@ function snd.gmcp.onQuestTimeout(q)
     end
 end
 
---- Can quest again
 function snd.gmcp.onQuestReady(q)
     snd.quest.setCooldown(0)
     snd.quest.nextQuestText = "Quest Available"
@@ -775,7 +668,6 @@ function snd.gmcp.onQuestReady(q)
     end
 end
 
---- Quest reset
 function snd.gmcp.onQuestReset(q)
     if snd.db then
         snd.db.historyEnd(snd.db.HISTORY_TYPE_QUEST, snd.db.HISTORY_STATUS_RESET)
@@ -795,7 +687,6 @@ function snd.gmcp.onQuestReset(q)
     end
 end
 
---- Quest status (response to request quest)
 function snd.gmcp.onQuestStatus(q)
     local waitMinutes = snd.gmcp.getQuestWaitMinutes(q)
     local status = type(q.status) == "string" and q.status:lower() or q.status
@@ -839,7 +730,6 @@ function snd.gmcp.onQuestStatus(q)
         end
         snd.gmcp.unregisterQuestTargetTrigger()
     elseif q.targ == "missing" then
-        -- On quest but target is missing
         snd.quest.active = true
         snd.quest.available = false
         stopQuestReadyReminder()
@@ -847,7 +737,6 @@ function snd.gmcp.onQuestStatus(q)
         snd.quest.timer = tonumber(q.timer) or 0
         snd.quest.setCooldown(0)
     elseif q.target == "killed" then
-        -- On quest, target killed, waiting to return
         snd.quest.active = true
         snd.quest.available = false
         stopQuestReadyReminder()
@@ -856,7 +745,6 @@ function snd.gmcp.onQuestStatus(q)
         snd.quest.setCooldown(0)
         snd.gmcp.markQuestTargetKilled()
     elseif q.targ then
-        -- Currently on a quest
         snd.quest.active = true
         snd.quest.available = false
         stopQuestReadyReminder()
@@ -874,7 +762,6 @@ function snd.gmcp.onQuestStatus(q)
             snd.quest.target.arid = snd.db.getAreaKeyFromName(snd.quest.target.area) or ""
         end
         
-        -- Guess keyword
         if snd.quest.target.mob ~= "" then
             snd.quest.target.keyword = snd.gmcp.guessMobKeyword(
                 snd.quest.target.mob,
@@ -882,7 +769,6 @@ function snd.gmcp.onQuestStatus(q)
             )
         end
         
-        -- Add quest to target list
         snd.gmcp.addQuestToTargetList()
         snd.gmcp.registerQuestTargetTrigger()
         snd.gmcp.showQuestTargetDetails()
@@ -896,15 +782,10 @@ function snd.gmcp.onQuestStatus(q)
     end
 end
 
---- Quest time warning
 function snd.gmcp.onQuestWarning(q)
     local time = tonumber(q.time) or 5
     snd.utils.infoNote("Quest warning: " .. time .. " minutes remaining!")
 end
-
--------------------------------------------------------------------------------
--- Quest Target Display
--------------------------------------------------------------------------------
 
 function snd.gmcp.showQuestTargetDetails()
     if not snd.quest.active or not snd.quest.target.mob or snd.quest.target.mob == "" then
@@ -937,10 +818,6 @@ function snd.gmcp.showQuestTargetDetails()
     end
 end
 
--------------------------------------------------------------------------------
--- config Handler
--------------------------------------------------------------------------------
-
 function snd.gmcp.onConfig()
     if not gmcp or not gmcp.config then
         return
@@ -948,7 +825,6 @@ function snd.gmcp.onConfig()
     
     local config = gmcp.config
     
-    -- Check noexp setting
     if config.noexp then
         snd.char.noexp = (config.noexp == "YES")
         snd.char.noexpPending = nil
@@ -960,13 +836,7 @@ function snd.gmcp.onConfig()
     end
 end
 
--------------------------------------------------------------------------------
--- Auto Noexp Check
--------------------------------------------------------------------------------
-
---- Return whether S&D is currently allowed to manage noexp.
--- A cutoff of 0 (shown as "off" in the window) leaves the player's manual
--- noexp setting untouched.
+-- Cutoff 0 intentionally leaves the player's manual noexp setting untouched.
 function snd.gmcp.isAutoNoexpEnabled()
     local anex = snd.config and snd.config.anex
     return anex ~= nil
@@ -1021,15 +891,12 @@ function snd.gmcp.checkAutoNoexp()
         campaignStatus = "unknown"
     end
 
-    -- Joining a global quest intentionally enables noexp. Character-status
-    -- updates continue during the GQ, so do not let the normal TNL cutoff
-    -- immediately undo that setting.
+    -- GQ owns noexp; status updates must not undo it through the TNL cutoff.
     if snd.gquest and snd.gquest.active then
         snd.gmcp.setNoexp(true, "Search and Destroy: Turning noexp ON (global quest active)", true)
         return
     end
 
-    -- While auto-noexp is enabled, levels 200+ should have noexp off.
     if level >= 200 then
         snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (you have reached level " .. level .. ")", false)
         return
@@ -1061,7 +928,6 @@ function snd.gmcp.checkAutoNoexp()
     end
 end
 
---- Release noexp after a campaign is accepted and re-check eligibility next time.
 function snd.gmcp.setCampaignActiveForAutoNoexp()
     if not snd.char then
         return
@@ -1077,7 +943,6 @@ function snd.gmcp.setCampaignActiveForAutoNoexp()
     snd.gmcp.setNoexp(false, "Search and Destroy: Turning noexp OFF (campaign accepted)", false)
 end
 
---- Clear legacy active campaign eligibility state.
 function snd.gmcp.clearCampaignActiveForAutoNoexp()
     if not snd.char then
         return
@@ -1089,15 +954,12 @@ function snd.gmcp.clearCampaignActiveForAutoNoexp()
     end
 end
 
---- Request campaign eligibility confirmation for auto-noexp logic.
 function snd.gmcp.requestCampaignEligibilityCheck()
     snd.char.autoNoexpCampaignStatus = "pending"
     snd.char.autoNoexpCampaignLevel = tonumber(snd.char.level) or 0
     send("cp today", false)
 end
 
---- Set campaign eligibility state used by auto-noexp logic.
--- @param canTakeCampaign boolean True when campaign can be taken at this level.
 function snd.gmcp.setCampaignEligibility(canTakeCampaign)
     local level = tonumber(snd.char.level) or 0
     snd.char.autoNoexpCampaignLevel = level
@@ -1112,14 +974,6 @@ function snd.gmcp.setCampaignEligibility(canTakeCampaign)
     end
 end
 
--------------------------------------------------------------------------------
--- Mob Keyword Guessing
--------------------------------------------------------------------------------
-
---- Guess the best keyword for a mob
--- @param mobName Full mob name
--- @param areaKey Area key (optional, for area-specific exceptions)
--- @return Best keyword to use
 function snd.gmcp.guessMobKeyword(mobName, areaKey)
     if not mobName or mobName == "" then
         return ""
@@ -1127,9 +981,7 @@ function snd.gmcp.guessMobKeyword(mobName, areaKey)
     
     areaKey = areaKey or snd.room.current.arid
 
-    -- Prefer proper-name prefix for titles like:
-    -- "Devlin, the Queen's bodyguard" -> "devlin"
-    -- "Meilath, the elven ranger" -> "meilath"
+    -- Prefer proper-name prefixes: "Devlin, the ..." becomes "devlin".
     local prefix = mobName:match("^%s*([^,]+),")
     if prefix and prefix ~= "" then
         local prefixWords = {}
@@ -1148,7 +1000,6 @@ function snd.gmcp.guessMobKeyword(mobName, areaKey)
         end
     end
     
-    -- Check for area-specific exceptions first
     if areaKey and snd.data.mobKeywordExceptions[areaKey] then
         local function findMobException(name)
             if not name or name == "" then
@@ -1182,7 +1033,6 @@ function snd.gmcp.guessMobKeyword(mobName, areaKey)
         end
     end
     
-    -- Check for area-specific filters
     if areaKey and snd.data.mobKeywordFilters[areaKey] then
         for _, filter in ipairs(snd.data.mobKeywordFilters[areaKey]) do
             local result = mobName:lower():gsub(filter.f, filter.g)
@@ -1193,50 +1043,37 @@ function snd.gmcp.guessMobKeyword(mobName, areaKey)
         end
     end
     
-    -- Default keyword guessing
     local words = {}
     for word in mobName:gmatch("%S+") do
-        -- Clean up the word (keep interior apostrophes)
         word = word:gsub("[^%w'%-]", "")
         word = word:gsub("'s$", "")
         word = word:gsub("^'+", "")
         word = word:gsub("'+$", "")
         word = word:lower()
         
-        -- Skip common articles/words
         if not snd.data.keywordOmitWords[word] and word ~= "" then
             table.insert(words, word)
         end
     end
     
-    -- Return last two significant words as keyword
     if #words >= 2 then
         return words[#words - 1] .. " " .. words[#words]
     elseif #words == 1 then
         return words[1]
     else
-        -- Fallback to first significant part of name
         return snd.utils.findKeyword(mobName)
     end
 end
 
--------------------------------------------------------------------------------
--- Request GMCP Data
--------------------------------------------------------------------------------
-
---- Request character data
 function snd.gmcp.requestChar()
     sendGMCP("request char")
 end
 
---- Request room data
 function snd.gmcp.requestRoom()
     sendGMCP("request room")
 end
 
---- Request quest status
 function snd.gmcp.requestQuest()
     sendGMCP("request quest")
 end
 
--- Module loaded silently

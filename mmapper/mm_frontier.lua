@@ -85,10 +85,7 @@ local function active_redirect(targetUid)
   return nil
 end
 
---- Return the active redirect explicitly saved for a requested room.
--- Boundary candidates calculated by xrtnear are never stored in this table,
--- so callers cannot accidentally treat a calculated suggestion as a manual
--- redirect. Return a copy so external consumers cannot mutate persistence.
+-- xrtnear suggestions are never persisted as manual redirects; return a copy.
 function frontier.get_manual_redirect(targetUid)
   if not frontier.redirectsLoaded then return nil end
 
@@ -334,8 +331,7 @@ local function target_boundary_distance(nav, target, candidateUid)
   local path, depth = path_between(nav, target, candidateUid, true, true, true, true)
   if path then return #path, tonumber(depth) or #path end
 
-  -- Some map edges are one-way. Reverse reachability is still useful as a
-  -- proximity hint, but walk-only so portals/recalls do not skew "near".
+  -- Reverse one-way reachability is a walk-only proximity hint.
   path, depth = path_between(nav, candidateUid, target, true, true, true, true)
   if path then return #path, tonumber(depth) or #path end
 
@@ -355,11 +351,8 @@ local function graph_boundary_evidence(edge, candidateUid, towardTargetUid)
   return string.format("mapped adjacency toward %d", towardTargetUid)
 end
 
--- Walk outward from an unreachable target over the database graph without
--- assuming exit direction. The first layer containing a room that the real
--- directed router can reach is the reachability cut nearest to the target.
--- This lets xrtnear use an incoming one-way edge as proximity evidence while
--- leaving normal navigation conservative about reverse traversal.
+-- Walk outward without assuming direction; the first layer reachable by the
+-- real router is the nearest conservative one-way boundary.
 local function nearest_reachable_graph_boundaries(nav, area, source, target)
   local edgeRows = nav.db.query(string.format([[
     SELECT source.uid AS fromuid,
@@ -521,8 +514,7 @@ function frontier.find_boundaries(scope, options)
     elseif candidate.uid == source then
       path, depth = {}, 0
     else
-      -- Boundary discovery is display-only; use an unguarded route lookup
-      -- rather than xrt's movement guards.
+      -- Boundary discovery is display-only, so ignore movement guards.
       path, depth = path_between(nav, source, candidate.uid, nil, nil, true, true)
     end
     if path then

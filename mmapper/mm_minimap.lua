@@ -1250,8 +1250,7 @@ local function new_local_drawable(window, kind, x, y, width, height, stylesheet,
     if mm and mm.bump_stats then mm.bump_stats("local_drawables_reused") end
   end
 
-  -- Keep these fields accurate for lightweight test doubles and for useful
-  -- inspection in Mudlet; Geyser's move/resize methods remain authoritative.
+  -- Mirror geometry for test doubles; Geyser remains authoritative.
   label.x, label.y, label.width, label.height = px, py, pw, ph
 
   if stylesheet and label.setStyleSheet then label:setStyleSheet(stylesheet) end
@@ -1328,8 +1327,7 @@ local function draw_local_direction_marker(window, layout, source_pos, dir, colo
   local center_x = sx + screen_dx * distance
   local center_y = sy + screen_dy * distance
 
-  -- Build a filled arrowhead from small solid rectangles.  This avoids the
-  -- font-dependent alignment and shape of Unicode triangle glyphs.
+  -- Rectangles avoid font-dependent Unicode arrowheads.
   for offset = 0, half do
     local cross_size = math.max(1, size - offset * 2)
     local axis_offset = -half + offset * 2

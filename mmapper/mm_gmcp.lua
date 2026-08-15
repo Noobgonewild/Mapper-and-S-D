@@ -29,7 +29,7 @@ function mm.get_room_info()
     return packet.info
   end
 
-  -- Fallbacks for clients that flatten keys differently.
+  -- Compatibility with clients that flatten GMCP keys differently.
   if gmcp and gmcp.room and gmcp.room.info then
     return gmcp.room.info
   end
@@ -331,8 +331,7 @@ local function sync_to_room_id(room_id, reason)
     return false
   end
 
-  -- Mudlet uses centerview() to set both the mapper's player room and view.
-  -- There is no separate setPlayerRoom() mapper API.
+  -- centerview() sets both player room and view; Mudlet has no setPlayerRoom().
   local ok, result = pcall(centerview, room_id)
   if not ok or result == false then
     local detail = ok and "centerview() returned false" or tostring(result)
@@ -462,8 +461,7 @@ function mm.show_room_note(room_id, info, source)
     ))
   end
 
-  -- Defer briefly so the room title line is already printed, avoiding the
-  -- note being concatenated onto the same row as the room name.
+  -- Defer so this note cannot join the room-title line.
   mm.runtime = mm.runtime or {}
   mm.runtime.room_note_serial = (tonumber(mm.runtime.room_note_serial) or 0) + 1
   local note_serial = mm.runtime.room_note_serial
@@ -502,8 +500,7 @@ function mm.show_room_note(room_id, info, source)
   return true
 end
 function mm.on_room_exits()
-  -- Minimap updates are intentionally limited to copied ASCII map lines between
-  -- <MAPSTART>/<MAPEND>; this hook remains for debug/event parity only.
+  -- Minimap consumes only MAPSTART/MAPEND lines; this hook is debug compatibility.
   return
 end
 
@@ -621,7 +618,7 @@ function mm.on_tag_line()
 end
 
 function mm.on_room_packet()
-  -- Keep for debug compatibility only. Specific room handlers process updates.
+  -- Debug compatibility only; specific room handlers own updates.
 end
 
 local continent_area_keys = {
@@ -683,7 +680,6 @@ function mm.on_room_info_event()
   mm.on_room_info()
   if switched and continent then raiseWindow("mapper") end
   if type(raiseEvent) == "function" then
-    -- Integration surface: external scripts can listen to "mm.room.changed"
     raiseEvent("mm.room.changed", room_num, room_area)
   end
 end
@@ -758,8 +754,7 @@ function mm.on_room_sectors_event()
   end
 end
 
--- Compatibility shim for sessions that still have the removed auto-rebuild
--- event handler registered from an older script load.
+-- Remove stale auto-rebuild handlers left by older script loads.
 function mm.schedule_auto_layout_rebuild()
   return false
 end
@@ -866,13 +861,11 @@ function mm.register_events()
     registerAnonymousEventHandler("DINV.identifyComplete", "mm.on_cexitif_key_identify_complete"),
   }
 
-  -- Capture every line while the map block is active; Aardwolf map lines contain
-  -- braces/tags and not just line-art symbols.
+  -- Capture all active map-block lines; they may contain braces/tags.
   mm._map_start_trigger = tempTrigger("<MAPSTART>", "mm.on_map_start_tag()")
   mm._map_line_trigger = tempRegexTrigger("^(.*)$", "mm.on_map_ascii_line()")
   mm._map_end_trigger = tempTrigger("<MAPEND>", "mm.on_map_end_tag()")
-  -- Disabled: this generic pattern also matches combat lines like "[1] ...",
-  -- which can cause incorrect room sync. Prefer gmcp.room.info as source of truth.
+  -- Keep generic room matching disabled; it confuses combat lines with room sync.
   mm._room_vnum_trigger = nil
   mm._coords_trigger = tempRegexTrigger("^\\{coords\\}(.*)$", "mm.on_coords_line()")
   mm._roomchars_open_trigger = tempTrigger("{roomchars}", "mm.on_tag_line()")

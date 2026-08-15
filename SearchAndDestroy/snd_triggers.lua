@@ -1,13 +1,3 @@
---[[
-    Search and Destroy - Triggers Module
-    Mudlet Port
-    
-    Original MUSHclient plugin by Crowley
-    Ported to Mudlet
-    
-    This module contains all trigger callback functions
-]]
-
 snd = snd or {}
 snd.triggers = snd.triggers or {}
 
@@ -86,39 +76,29 @@ local function scheduleGqInfoEnd()
     end)
 end
 
--------------------------------------------------------------------------------
 -- Campaign Triggers
--------------------------------------------------------------------------------
 
---- Campaign info line trigger
--- Matches: "Find and kill 1 * mob name (Location)"
 function snd.triggers.cpInfoLine(matches)
     if not matches or not matches[2] then return end
     
-    -- Start parsing if not already
     if not snd.cp.parsing.infoActive then
         snd.cp.startCpInfo()
     end
     
     snd.cp.processCpInfoLine(matches[2])
     
-    -- Reset end timer on each line (ends when lines stop coming)
     scheduleCpInfoEnd()
 end
 
---- Campaign check line trigger
--- Matches: "You still have to kill * mob name (Location)"
 function snd.triggers.cpCheckLine(matches)
     if not matches or not matches[2] then return end
     
-    -- Start parsing if not already
     if not snd.cp.parsing.checkActive then
         snd.cp.startCpCheck()
     end
     
     snd.cp.processCpCheckLine(matches[2])
     
-    -- Reset end timer on each line (ends when lines stop coming)
     if snd.cp.parsing.endTimer then
         killTimer(snd.cp.parsing.endTimer)
     end
@@ -130,10 +110,7 @@ function snd.triggers.cpCheckLine(matches)
     end)
 end
 
---- Campaign time remaining trigger (explicit end marker for cp info/check)
--- Matches: "You have X days, Y hours..." 
 function snd.triggers.cpTimeRemaining(matches)
-    -- This signals end of cp info or cp check output
     if snd.cp.parsing.infoActive then
         if snd.cp.parsing.infoEndTimer then
             killTimer(snd.cp.parsing.infoEndTimer)
@@ -151,8 +128,6 @@ function snd.triggers.cpTimeRemaining(matches)
     end
 end
 
---- Campaign info footer trigger
--- Matches: "Use 'cp check' to see only targets that you still need to kill."
 function snd.triggers.cpInfoFooter()
     if snd.cp.parsing.infoActive then
         if snd.cp.parsing.infoEndTimer then
@@ -163,7 +138,6 @@ function snd.triggers.cpInfoFooter()
     end
 end
 
---- Campaign mob killed trigger
 function snd.triggers.cpMobKilled()
     if snd.conwin and snd.conwin.confirmPendingCombatDeath then
         snd.conwin.confirmPendingCombatDeath("campaign-kill-message")
@@ -171,15 +145,12 @@ function snd.triggers.cpMobKilled()
     snd.cp.onMobKilled()
 end
 
---- Campaign complete trigger
 function snd.triggers.cpComplete()
     if snd.cp and snd.cp.startCompletionPending then
         snd.cp.startCompletionPending()
     end
 end
 
---- First campaign of the day bonus trigger
--- Matches: "You receive 13 quest points bonus for your first campaign completed today."
 function snd.triggers.cpFirstDailyBonus(matches)
     if not matches or not matches[2] then return end
     if snd.cp and snd.cp.applyFirstDailyBonus then
@@ -187,18 +158,14 @@ function snd.triggers.cpFirstDailyBonus(matches)
     end
 end
 
---- Campaign completion separator trigger
 function snd.triggers.cpCompleteSeparator()
-    -- Completion now finalizes from the daily-bonus trigger or a short timer.
-    -- Keep this trigger as a harmless no-op for compatibility.
+    -- Intentional compatibility no-op; completion finalizes elsewhere.
 end
 
---- Campaign quit/cleared trigger
 function snd.triggers.cpQuit()
     snd.cp.onQuit()
 end
 
---- Can get new campaign trigger
 function snd.triggers.cpCanGetNew()
     snd.cp.onCanGetNew()
     if snd.gmcp and snd.gmcp.setCampaignEligibility then
@@ -215,14 +182,10 @@ function snd.triggers.cpAccepted()
     end
 end
 
---- Not on campaign trigger
 function snd.triggers.cpNotOn()
     snd.cp.onNotOnCampaign()
 end
 
---- Campaign completed-today count trigger
--- Matches: "You have completed 1 campaign today."
---          "You have completed 2 campaigns today."
 function snd.triggers.cpCompletedToday(matches)
     if not matches or not matches[2] then return end
     local completedToday = tonumber(matches[2]) or 0
@@ -231,7 +194,6 @@ function snd.triggers.cpCompletedToday(matches)
     end
 end
 
---- Auto-noexp manual OFF trigger
 function snd.triggers.noexpManualOff()
     local recentAutoEcho = snd.char
         and snd.char.noexpCommandEcho == "on"
@@ -254,7 +216,6 @@ function snd.triggers.noexpManualOff()
     end
 end
 
---- Auto-noexp manual ON trigger
 function snd.triggers.noexpManualOn()
     local recentAutoEcho = snd.char
         and snd.char.noexpCommandEcho == "off"
@@ -279,7 +240,6 @@ function snd.triggers.noexpManualOn()
     end
 end
 
---- Auto-noexp xp gain trigger
 function snd.triggers.noexpXpGain()
     if snd.gmcp and snd.gmcp.checkAutoNoexp then
         tempTimer(0.1, function()
@@ -288,7 +248,6 @@ function snd.triggers.noexpXpGain()
     end
 end
 
---- Auto-noexp must level trigger
 function snd.triggers.noexpMustLevelBeforeCampaign()
     snd.campaign.canGetNew = false
 
@@ -310,32 +269,22 @@ function snd.triggers.noexpMustLevelBeforeCampaign()
     end
 end
 
--------------------------------------------------------------------------------
 -- Global Quest Triggers
--------------------------------------------------------------------------------
 
---- GQ joined trigger
--- Matches: "You have now joined Global Quest # 123..."
 function snd.triggers.gqJoined(matches)
     if not matches or not matches[2] then return end
     snd.gq.onJoined(matches[2])
 end
 
---- GQ started trigger
--- Matches: "Global Quest: Global quest # 123 for levels 1 to 201 has now started."
 function snd.triggers.gqStarted(matches)
     if not matches or #matches < 4 then return end
     snd.gq.onStarted(matches[2], matches[3], matches[4])
 end
 
---- GQ info line trigger
--- Matches: "Kill at least 3 * mob name (Location)."
 function snd.triggers.gqInfoLine(matches)
     if not matches or #matches < 3 then return end
     
-    -- Start parsing if not already
     if not snd.gq.parsing.infoActive then
-        -- Try to get GQ ID from somewhere, or use a placeholder
         snd.gq.startGqInfo(snd.gquest.joined or "0")
     end
     
@@ -343,8 +292,6 @@ function snd.triggers.gqInfoLine(matches)
     scheduleGqInfoEnd()
 end
 
---- GQ details header line with explicit quest number.
--- Matches: "Quest Name.........: [ Global quest # 9554 ]"
 function snd.triggers.gqQuestName(matches)
     if not matches or not matches[2] then return end
     local gqId = tostring(matches[2])
@@ -356,8 +303,6 @@ function snd.triggers.gqQuestName(matches)
     scheduleGqInfoEnd()
 end
 
---- GQ level range line in details.
--- Matches: "Level range........: [ 109 ] - [ 120 ]"
 function snd.triggers.gqLevelRange(matches)
     if not matches or #matches < 3 then return end
     if not snd.gq.parsing.infoActive then
@@ -398,19 +343,11 @@ function snd.triggers.gqInfoRewardGold(matches)
     scheduleGqInfoEnd()
 end
 
---- GQ per-kill bonus line.
--- Matches: "3 quest points awarded."
 function snd.triggers.gqKillBonus(matches)
     if not matches or not matches[2] then return end
     snd.gq.applyKillBonus(matches[2])
 end
 
---- GQ completion reward lines.
--- Matches:
--- "Reward of 28 quest points added."
--- "Reward of 1 trivia point added."
--- "Reward of 2 practice sessions added."
--- "Reward of 10900 gold coins added."
 function snd.triggers.gqCompletionRewardQp(matches)
     if not matches or not matches[2] then return end
     snd.gq.captureInfoReward("qp", matches[2])
@@ -436,12 +373,9 @@ function snd.triggers.gqCompletionRewardGold(matches)
     snd.gq.captureInfoReward("gold", matches[2])
 end
 
---- GQ check line trigger
--- Matches: "You still have to kill 3 * mob name (Location)"
 function snd.triggers.gqCheckLine(matches)
     if not matches or #matches < 3 then return end
     
-    -- Start parsing if not already
     if not snd.gq.parsing.checkActive then
         snd.gq.startGqCheck()
     end
@@ -457,7 +391,6 @@ function snd.triggers.gqCheckLine(matches)
     end)
 end
 
---- GQ mob killed trigger
 function snd.triggers.gqMobKilled()
     if snd.conwin and snd.conwin.confirmPendingCombatDeath then
         snd.conwin.confirmPendingCombatDeath("gquest-kill-message")
@@ -465,42 +398,31 @@ function snd.triggers.gqMobKilled()
     snd.gq.onMobKilled()
 end
 
---- GQ winner trigger
--- Matches: "Global Quest: Global Quest # 123 has been won by PlayerName - 1st win."
 function snd.triggers.gqWinner(matches)
     if not matches or #matches < 3 then return end
     snd.gq.onWinner(matches[2], matches[3])
 end
 
---- GQ may-win-more trigger
 function snd.triggers.gqMayWinMore()
     snd.gq.onMayWinMore()
 end
 
---- GQ ended trigger
 function snd.triggers.gqEnded(matches)
     if not matches or not matches[2] then return end
     snd.gq.onEnded(matches[2])
 end
 
---- GQ quit trigger
--- Matches: "You are no longer part of Global Quest # 123 and will be unable to rejoin."
 function snd.triggers.gqQuit(matches)
     if not matches or not matches[2] then return end
     snd.gq.onQuit(matches[2])
 end
 
---- Not on GQ trigger
 function snd.triggers.gqNotOn()
     snd.gq.onNotOnGquest()
 end
 
--------------------------------------------------------------------------------
 -- Quest Triggers
--------------------------------------------------------------------------------
 
---- Quest blessing bonus trigger
--- Matches: "You receive 29 bonus quest points from your daily blessing."
 function snd.triggers.questBlessing(matches)
     if not matches or not matches[2] then return end
     local bonus = tonumber(matches[2]) or 0
@@ -516,9 +438,7 @@ function snd.triggers.questBlessing(matches)
     end)
 end
 
---- Quest reward line fallback trigger
--- Matches: "An old MacBook tells you 'As a reward, I am giving you 10 quest points and 3175 gold.'"
--- Used when GMCP completion packets are missing; seeds pending reward so blessing/extra triggers can still emit.
+-- Fallback when GMCP omits completion; seeds rewards for later bonus triggers.
 function snd.triggers.questRewardLine(matches)
     if not matches or not matches[2] or not matches[3] then
         return
@@ -540,8 +460,6 @@ function snd.triggers.questRewardLine(matches)
     })
 end
 
---- Quest extra qp trigger
--- Matches: "You get lucky and gain an extra 2 quest points."
 function snd.triggers.questExtraQp(matches)
     if not matches or not matches[2] then return end
     local bonus = tonumber(matches[2]) or 0
@@ -643,7 +561,6 @@ end
 function snd.triggers.gqAboutToStart(matches)
     playConfiguredSound("SearchAndDestroy/GQ about to start.wav")
 
-    -- Browse the announced quest's details without joining it.
     if matches and matches[2] then
         send("gq i " .. tostring(matches[2]), false)
     end
@@ -667,7 +584,6 @@ function snd.triggers.questReady()
     end
 end
 
---- Quest target line tagger
 function snd.triggers.questTargetLine()
     if not snd.quest or not snd.quest.target or snd.quest.target.mob == "" then
         return
@@ -676,9 +592,6 @@ function snd.triggers.questTargetLine()
     return
 end
 
--------------------------------------------------------------------------------
--- Current Target Line Tagger (CP)
--------------------------------------------------------------------------------
 
 local function appendTargetTag(tag, color)
     if not snd.roomChars or not snd.roomChars.active then
@@ -692,19 +605,16 @@ local function appendTargetTag(tag, color)
 
     local tagText = " " .. color .. tag .. "<white>"
 
-    -- Suffix the matched line in place so room-char colors stay intact.
     if type(suffix) == "function" and type(cecho) == "function" then
         suffix(tagText, cecho)
         return
     end
 
-    -- Fallback for older Mudlet builds without suffix().
     if type(cecho) == "function" then
         cecho(tagText)
         return
     end
 
-    -- Fallback if colored echo is unavailable.
     if type(replaceLine) == "function" then
         replaceLine(line .. " " .. tag)
     end
@@ -719,8 +629,7 @@ function snd.triggers.tagGqTargetLine()
 end
 
 function snd.triggers.tagQuestTargetLine()
-    -- The server already identifies the real quest instance with a trailing
-    -- [QUEST]. Keep room output authoritative and reserve [Q] for ConWin.
+    -- Room output owns [QUEST]; reserve [Q] for ConWin.
     return false
 end
 
@@ -780,15 +689,15 @@ function snd.triggers.tagCurrentRoomCharsLine()
     local line = snd.utils.stripColors(type(getCurrentLine) == "function" and getCurrentLine() or ""):lower()
     if line == "" or line == "{roomchars}" or line == "{/roomchars}" then return end
 
-    -- RoomChars and `consider all` describe the same inhabitants in the same
-    -- order, but they do not necessarily use the same visible description.
-    -- Capture the server's [QUEST] marker by absolute row number so a line such
-    -- as "a half-giant ... [QUEST]" can bind to "a driller" in consider output.
+    -- RoomChars and consider rows share ordering, not necessarily descriptions;
+    -- retain every absolute [QUEST] row so multiple instances bind correctly.
     local evidence = snd.roomChars.questTargetEvidence
     if evidence and not evidence.complete then
         evidence.characterCount = (tonumber(evidence.characterCount) or 0) + 1
         if line:match("%[quest%]%s*$") then
             evidence.markedOrdinal = evidence.characterCount
+            evidence.markedOrdinals = evidence.markedOrdinals or {}
+            evidence.markedOrdinals[#evidence.markedOrdinals + 1] = evidence.characterCount
         end
     end
 
@@ -833,8 +742,7 @@ function snd.triggers.registerTargetLineTriggers()
         end
     end
 
-    -- A successfully parsed consider roster can contribute the exact visible
-    -- description when it already resolves unambiguously to an activity target.
+    -- Only let an unambiguous consider row supply the visible description.
     if snd.conwin and snd.conwin.activityMarkersForMob then
         for _, mob in ipairs(snd.conwin.mobs or {}) do
             local markerText = snd.conwin.activityMarkersForMob(mob.name or "")
@@ -852,9 +760,7 @@ function snd.triggers.registerTargetLineTriggers()
     snd.roomChars.targetMatcherArea = currentArea
 end
 
--------------------------------------------------------------------------------
 -- Room Character Tag Boundaries
--------------------------------------------------------------------------------
 
 function snd.triggers.roomCharsStart()
     snd.roomChars = snd.roomChars or {}
@@ -863,10 +769,10 @@ function snd.triggers.roomCharsStart()
         roomId = currentRoomCharsRoomId(),
         characterCount = 0,
         markedOrdinal = nil,
+        markedOrdinals = {},
         complete = false,
     }
-    -- Clean up a line-capture trigger left by an older plugin version. ConWin
-    -- must only consume consider output, never the broad RoomChars stream.
+    -- Remove the legacy line capture; ConWin must consume only consider output.
     if snd.roomChars.lineCaptureId then
         pcall(killTrigger, snd.roomChars.lineCaptureId)
         snd.roomChars.lineCaptureId = nil
@@ -1058,12 +964,8 @@ function snd.triggers.unregisterTargetLineTriggers()
     snd.roomChars.targetMatcherArea = nil
 end
 
--------------------------------------------------------------------------------
 -- Quick Where Triggers
--------------------------------------------------------------------------------
 
---- Quick where match trigger
--- Matches formatted mob name and room
 function snd.triggers.qwMatch(matches)
     if not matches then return end
     if not snd.nav.quickWhere or snd.nav.quickWhere.processed ~= false then
@@ -1136,8 +1038,7 @@ function snd.triggers.qwMatch(matches)
             return false
         end
 
-        -- Non-exact quick-where follows original addon flow: accept the first
-        -- valid where row and process it immediately.
+        -- Non-exact quick-where intentionally accepts the first valid row.
         return true
     end
 
@@ -1268,7 +1169,6 @@ function snd.triggers.qwMatch(matches)
     end
 end
 
---- Quick where no match trigger
 function snd.triggers.qwNoMatch()
     snd.utils.debugNote("QW: No match found")
     snd.utils.qwDebugNote("QW DEBUG: server returned 'There is no ... around here.'")
@@ -1305,28 +1205,21 @@ function snd.triggers.qwNoMatch()
     end
 end
 
--------------------------------------------------------------------------------
 -- Output Gags
--------------------------------------------------------------------------------
 
 function snd.triggers.gagCurrentLine()
     selectCurrentLine()
     deleteLine()
 end
 
--------------------------------------------------------------------------------
 -- Hunt Triggers
--------------------------------------------------------------------------------
 
---- Hunt direction trigger
--- Matches: "You are certain that mob is north from here."
 function snd.triggers.huntDirection(matches)
     if not matches or not matches[2] then return end
     
     local direction = matches[2]
     snd.utils.debugNote("Hunt direction: " .. direction)
     
-    -- Store for hunt trick / auto hunt
     if snd.nav.autoHunt then
         snd.nav.autoHunt.direction = direction
     end
@@ -1341,8 +1234,6 @@ function snd.triggers.huntDirection(matches)
     end
 end
 
---- Hunt here trigger
--- Matches: "Mob is here!"
 function snd.triggers.huntHere()
     snd.utils.debugNote("Hunt: Target is here!")
     
@@ -1360,7 +1251,6 @@ function snd.triggers.huntHere()
     end
 end
 
---- Hunt trick complete trigger
 function snd.triggers.huntComplete()
     if snd.nav and snd.nav.autoHunt and snd.nav.autoHunt.active and snd.commands and snd.commands.autoHuntComplete then
         snd.commands.autoHuntComplete()
@@ -1371,7 +1261,6 @@ function snd.triggers.huntComplete()
     end
 end
 
---- Hunt trick fail trigger
 function snd.triggers.huntFail()
     if snd.nav and snd.nav.autoHunt and snd.nav.autoHunt.active and snd.commands and snd.commands.stopAutoHunt then
         snd.commands.stopAutoHunt(true)
@@ -1382,7 +1271,6 @@ function snd.triggers.huntFail()
     end
 end
 
---- Hunt trick abort trigger
 function snd.triggers.huntAbort()
     if snd.nav and snd.nav.autoHunt and snd.nav.autoHunt.active and snd.commands and snd.commands.stopAutoHunt then
         snd.commands.stopAutoHunt(true)
@@ -1393,11 +1281,8 @@ function snd.triggers.huntAbort()
     end
 end
 
--------------------------------------------------------------------------------
 -- Reward Tracking Triggers
--------------------------------------------------------------------------------
 
---- Campaign info QP reward trigger
 function snd.triggers.cpInfoRewardQP(matches)
     if not matches or not matches[2] then return end
     if snd.cp and snd.cp.parsing and not snd.cp.parsing.infoActive and snd.cp.startCpInfo then
@@ -1408,7 +1293,6 @@ function snd.triggers.cpInfoRewardQP(matches)
     scheduleCpInfoEnd()
 end
 
---- Campaign info complete-by trigger
 function snd.triggers.cpInfoCompleteBy(matches)
     if not matches or not matches[2] then return end
     if snd.cp and snd.cp.parsing and not snd.cp.parsing.infoActive and snd.cp.startCpInfo then
@@ -1420,7 +1304,6 @@ function snd.triggers.cpInfoCompleteBy(matches)
     scheduleCpInfoEnd()
 end
 
---- Campaign info time-left trigger
 function snd.triggers.cpInfoTimeLeft(matches)
     if not matches or not matches[2] then return end
     if snd.cp and snd.cp.parsing and not snd.cp.parsing.infoActive and snd.cp.startCpInfo then
@@ -1432,7 +1315,6 @@ function snd.triggers.cpInfoTimeLeft(matches)
     scheduleCpInfoEnd()
 end
 
---- Campaign info gold reward trigger
 function snd.triggers.cpInfoRewardGold(matches)
     if not matches or not matches[2] then return end
     if snd.gq and snd.gq.parsing and snd.gq.parsing.infoActive then return end
@@ -1445,7 +1327,6 @@ function snd.triggers.cpInfoRewardGold(matches)
     scheduleCpInfoEnd()
 end
 
---- Campaign info TP reward trigger
 function snd.triggers.cpInfoRewardTP(matches)
     if not matches or not matches[2] then return end
     if snd.cp and snd.cp.parsing and not snd.cp.parsing.infoActive and snd.cp.startCpInfo then
@@ -1456,7 +1337,6 @@ function snd.triggers.cpInfoRewardTP(matches)
     scheduleCpInfoEnd()
 end
 
---- Campaign info training reward trigger
 function snd.triggers.cpInfoRewardTrain(matches)
     if not matches or not matches[2] then return end
     if snd.gq and snd.gq.parsing and snd.gq.parsing.infoActive then return end
@@ -1468,7 +1348,6 @@ function snd.triggers.cpInfoRewardTrain(matches)
     scheduleCpInfoEnd()
 end
 
---- Campaign info practice reward trigger
 function snd.triggers.cpInfoRewardPrac(matches)
     if not matches or not matches[2] then return end
     if snd.gq and snd.gq.parsing and snd.gq.parsing.infoActive then return end
@@ -1480,24 +1359,13 @@ function snd.triggers.cpInfoRewardPrac(matches)
     scheduleCpInfoEnd()
 end
 
--------------------------------------------------------------------------------
--- Scan/Consider Triggers (Placeholder)
--------------------------------------------------------------------------------
 
---- Process scan output
 function snd.triggers.scanLine(matches)
-    -- Placeholder for scan processing
-    -- Would parse scan output to find mobs
 end
 
---- Process consider output
 function snd.triggers.considerLine(matches)
-    -- Placeholder for consider processing
 end
 
--------------------------------------------------------------------------------
--- Level Up Trigger
--------------------------------------------------------------------------------
 
 function snd.triggers.levelUp()
     snd.campaign.canGetNew = true
@@ -1507,9 +1375,7 @@ function snd.triggers.levelUp()
     end
 end
 
--------------------------------------------------------------------------------
 -- Dynamic Trigger Management
--------------------------------------------------------------------------------
 
 
 local function quickWhereTriggerRefs(name)
@@ -1616,7 +1482,6 @@ function snd.triggers.disableQuickWhereTriggers()
     ))
 end
 
---- Enable a trigger group
 function snd.triggers.enableGroup(groupName)
     if groupName == "QuickWhere" then
         snd.triggers.enableQuickWhereTriggers()
@@ -1626,7 +1491,6 @@ function snd.triggers.enableGroup(groupName)
     snd.utils.debugNote("Enabled trigger group: " .. groupName)
 end
 
---- Disable a trigger group
 function snd.triggers.disableGroup(groupName)
     if groupName == "QuickWhere" then
         snd.triggers.disableQuickWhereTriggers()
@@ -1636,7 +1500,6 @@ function snd.triggers.disableGroup(groupName)
     snd.utils.debugNote("Disabled trigger group: " .. groupName)
 end
 
---- Create a temporary trigger for cp info end
 function snd.triggers.createCpInfoEndTrigger()
     if snd.cp.parsing.infoEndTimer then
         pcall(function() killTimer(snd.cp.parsing.infoEndTimer) end)
@@ -1649,7 +1512,6 @@ function snd.triggers.createCpInfoEndTrigger()
     end)
 end
 
---- Create a temporary trigger for gq info end
 function snd.triggers.createGqInfoEndTrigger()
     if snd.gq.parsing.infoEndTimer then
         pcall(function() killTimer(snd.gq.parsing.infoEndTimer) end)
@@ -1662,4 +1524,3 @@ function snd.triggers.createGqInfoEndTrigger()
     end)
 end
 
--- Module loaded silently

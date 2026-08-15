@@ -1,26 +1,3 @@
---[[
-    Search and Destroy - Navigation Module
-    Mudlet Port
-    
-    This module provides portal-aware pathfinding by querying the
-    Aardwolf.db mapper database directly.
-    
-    Features:
-    - Portal navigation (fromuid='*' exits)
-    - Recall navigation (fromuid='**' exits)
-    - Norecall/noportal room flag handling
-    - Bounce portal/recall for restricted rooms
-    - Custom exit support
-    - Integration with Mudlet's gotoRoom()
-    
-    Database: Aardwolf.db (mapper database, NOT snd.db)
-    
-    Schema used:
-    - rooms: uid, name, area, norecall, noportal
-    - exits: dir, fromuid, touid, level
-    - Portals: fromuid='*' (any room) or '**' (recall-based)
-]]
-
 mm = mm or {}
 snd = snd or {}
 snd.mapper = snd.mapper or {}
@@ -109,14 +86,9 @@ end
 
 ensureAreaReferencesLoaded()
 
--- Load LuaSQL for Aardwolf.db access
 local luasql = require "luasql.sqlite3"
 
 mm.nav = snd.mapper
-
--------------------------------------------------------------------------------
--- Database Connection (Aardwolf.db - mapper database)
--------------------------------------------------------------------------------
 
 snd.mapper.db = {
     env = nil,
@@ -125,10 +97,7 @@ snd.mapper.db = {
     file = nil,  -- Will be set to Aardwolf.db path
 }
 
---- Get the Aardwolf.db path
--- Mudlet stores map data in the profile directory
 function snd.mapper.db.getMapperDbPath()
-    -- Try common locations
     local profile_dir = getMudletHomeDir()
     local possible_paths = {
         profile_dir .. "/Aardwolf.db",
@@ -144,22 +113,18 @@ function snd.mapper.db.getMapperDbPath()
         end
     end
     
-    -- Default fallback
     return profile_dir .. "/Aardwolf.db"
 end
 
---- Open connection to Aardwolf.db
 function snd.mapper.db.open()
     if snd.mapper.db.isOpen then
         return true
     end
     
-    -- Get database path
     if not snd.mapper.db.file then
         snd.mapper.db.file = snd.mapper.db.getMapperDbPath()
     end
     
-    -- Check if file exists
     local f = io.open(snd.mapper.db.file, "r")
     if not f then
         snd.utils.debugNote("Mapper database not found: " .. snd.mapper.db.file)
@@ -167,14 +132,12 @@ function snd.mapper.db.open()
     end
     f:close()
     
-    -- Create environment
     snd.mapper.db.env = luasql.sqlite3()
     if not snd.mapper.db.env then
         snd.utils.errorNote("Failed to create LuaSQL environment for mapper DB")
         return false
     end
     
-    -- Open connection
     local err
     snd.mapper.db.conn, err = snd.mapper.db.env:connect(snd.mapper.db.file)
     if not snd.mapper.db.conn then
@@ -187,7 +150,6 @@ function snd.mapper.db.open()
     return true
 end
 
---- Close database connection
 function snd.mapper.db.close()
     if snd.mapper.db.conn then
         snd.mapper.db.conn:close()
@@ -206,7 +168,6 @@ function snd.mapper.db.close()
     if mm and mm.invalidate_room_notes_cache then mm.invalidate_room_notes_cache() end
 end
 
---- Execute a query and return results
 function snd.mapper.db.query(sql)
     if not snd.mapper.db.isOpen then
         if not snd.mapper.db.open() then
@@ -235,7 +196,6 @@ function snd.mapper.db.query(sql)
     return results
 end
 
---- Escape string for SQL
 function snd.mapper.db.escape(str)
     if str == nil then return "NULL" end
     str = tostring(str)
@@ -243,9 +203,6 @@ function snd.mapper.db.escape(str)
     return "'" .. str .. "'"
 end
 
---- Execute a non-query mapper DB statement.
--- @param sql SQL statement
--- @return boolean, result_or_error
 function snd.mapper.db.execute(sql)
     if not snd.mapper.db.isOpen then
         if not snd.mapper.db.open() then
@@ -283,10 +240,6 @@ function snd.mapper.db.columnExists(tableName, columnName)
     return cols[tostring(columnName or "")] == true
 end
 
--------------------------------------------------------------------------------
--- Portal Configuration
--------------------------------------------------------------------------------
-
 snd.mapper.config = {
     usePortals = true,          -- Use portal exits
     useRecall = true,           -- Use recall-based portals
@@ -299,9 +252,7 @@ snd.mapper.config = {
 snd.mapper.pendingRestrictionMarks = snd.mapper.pendingRestrictionMarks or {}
 snd.mapper.restrictionTriggerIds = snd.mapper.restrictionTriggerIds or {}
 snd.mapper.pendingBlockedTravel = snd.mapper.pendingBlockedTravel or nil
--- Discard continuation state left by builds that issued an unconfigured
--- default recall and waited for GMCP before replanning. Navigation now uses
--- only mapped recall/home commands and configured bounce recalls.
+-- Discard legacy continuation state; only mapped/configured recalls are valid now.
 snd.mapper.pendingRecallReplan = nil
 
 local mapperDirectionAliases = {
@@ -619,8 +570,7 @@ local function apply_native_exit_visual(row, playerLevel, force)
         return true, changed
     end
 
-    -- A classified non-geometric cardinal is deliberately a Mudlet exit stub.
-    -- Never bridge those pocket layouts with a custom line just for lock color.
+    -- Non-geometric cardinals intentionally remain exit stubs, not custom lines.
     if native_cardinal_target(room, dir) ~= destination then
         local changed = remove_native_exit_visual(room, dir)
         mm.runtime.native_exit_lock_visuals[key] = nil
@@ -810,13 +760,6 @@ function snd.mapper.refreshExitLockVisualStates()
     return true
 end
 
--------------------------------------------------------------------------------
--- Room Information
--------------------------------------------------------------------------------
-
---- Get room info from mapper database
--- @param roomId Room UID
--- @return Table with room data or nil
 function snd.mapper.getRoomInfo(roomId)
     if not roomId then return nil end
     
@@ -852,8 +795,7 @@ function snd.mapper.getLiveRoomInfo()
     return nil
 end
 
--- GMCP is the source of truth at the moment a route is planned. A valid-looking
--- cached nomap UID must not override a newer mapped Room.Info packet.
+-- Live GMCP is authoritative over a cached nomap UID when planning.
 function snd.mapper.currentRoomUid(syncCache)
     local liveInfo = snd.mapper.getLiveRoomInfo()
     local liveUid = liveInfo and mm.canonical_room_uid(liveInfo) or nil
@@ -879,6 +821,45 @@ local function room_info_details(roomInfo)
     if roomInfo.details ~= nil then return tostring(roomInfo.details or "") end
     if roomInfo.info ~= nil then return tostring(roomInfo.info or "") end
     return nil
+end
+
+local function tokenize_room_info(info)
+    local tokens = {}
+    local value = tostring(info or "")
+    if value == "" then return tokens end
+    for item in value:gmatch("[^,]+") do
+        local clean = item:gsub("^%s+", ""):gsub("%s+$", "")
+        if clean ~= "" then table.insert(tokens, clean) end
+    end
+    return tokens
+end
+
+local function room_info_contains_token(info, wanted)
+    wanted = tostring(wanted or ""):lower()
+    for _, token in ipairs(tokenize_room_info(info)) do
+        if token:lower() == wanted then return true end
+    end
+    return false
+end
+
+local function room_info_with_safe(info, value)
+    local tokens = tokenize_room_info(info)
+    local updated = {}
+    for _, token in ipairs(tokens) do
+        if token:lower() ~= "safe" then table.insert(updated, token) end
+    end
+    if value ~= false then table.insert(updated, "safe") end
+    return table.concat(updated, ",")
+end
+
+local function preserve_stored_safe(incoming, stored)
+    if incoming == nil then return nil end
+    if room_info_contains_token(stored, "safe")
+        and not room_info_contains_token(incoming, "safe")
+    then
+        return room_info_with_safe(incoming, true)
+    end
+    return tostring(incoming)
 end
 
 function snd.mapper.refreshRoomLookup(roomId, roomName)
@@ -1090,16 +1071,10 @@ function snd.mapper.persistSectors(sectorsPacket, opts)
     return false, err
 end
 
--- Retained as a compatibility surface for older callers.  Live Room.Info is
--- not a metadata-discovery trigger: area and sector packets are consumed when
--- they arrive, while explicit map build/repair workflows own any requests.
+-- Compatibility only: live Room.Info never initiates metadata discovery.
 function snd.mapper.requestMetadataForRoom(roomInfo)
     return false
 end
-
--------------------------------------------------------------------------------
--- Area Level Guard
--------------------------------------------------------------------------------
 
 local AREA_GUARD_DEFAULT_ALLOWANCE = 30
 
@@ -1107,8 +1082,7 @@ local function normalizeAreaKey(value)
     return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
 end
 
--- Clan membership is area metadata. Load it once so route validation does not
--- issue a room/area join for every step in every candidate path.
+-- Cache clan-area metadata so route validation avoids per-step joins.
 function snd.mapper.loadClanAreaCache()
     if type(snd.mapper.clanAreaCache) == "table"
         and type(snd.mapper.clanAreaList) == "table"
@@ -1213,9 +1187,7 @@ function snd.mapper.areaGuardEnabled()
         or snd.mapper.areaGuardConfig().enabled == true
 end
 
--- Temporarily force AreaGuard on for synchronous, read-only route planning.
--- The persisted setting is never changed, and the previous runtime depth is
--- restored even if the callback raises an error.
+-- Temporary AreaGuard planning must restore runtime depth even on callback error.
 function snd.mapper.withAreaGuardForced(callback)
     if type(callback) ~= "function" then
         error("withAreaGuardForced expects a function", 2)
@@ -1437,11 +1409,7 @@ function snd.mapper.areaGuardRoomSql(roomExpression, sourceRoom, ignoreLockedExi
     return sql, blockedCount
 end
 
--- Validate a concrete route against the ordinary area policy. Clan rooms are
--- locally exempt, but that exemption never carries into the next non-clan
--- room. Thus a clan cexit landing in a dangerous area is still rejected.
--- The current source area remains escapable and unknown areas fail open,
--- matching areaGuardRoomSql.
+-- Clan exemption is room-local; source remains escapable and unknown areas fail open.
 function snd.mapper.pathMeetsAreaGuard(sourceRoom, path)
     if not snd.mapper.areaGuardEnabled() then return true, nil, false end
 
@@ -1466,13 +1434,8 @@ function snd.mapper.pathMeetsAreaGuard(sourceRoom, path)
     return true, nil, usedClanExemption
 end
 
--- Inspect the ordinary shortest route with AreaGuard excluded from route
--- selection. Clan rooms are exempt only for their own room checks; they never
--- authorize earlier or later non-clan rooms. If this candidate is rejected,
--- gotoRoom performs the usual guarded search for the shortest valid fallback.
--- Since acceptance is now a room-local property, that filtered search is
--- equivalent to rejecting unsafe candidates in cost order; no clan-biased
--- pathfinder or Aylor anchor is required.
+-- Validate the unrestricted shortest route first; if unsafe, normal guarded
+-- search finds the shortest valid fallback under room-local clan exemption.
 function snd.mapper.planAreaGuardRoute(
     currentRoom,
     destination,
@@ -1535,8 +1498,6 @@ function snd.mapper.planAreaGuardRoute(
     }
 end
 
---- Persist a discovered room + exits from GMCP room.info into Aardwolf.db
--- @param roomInfo GMCP room.info table
 local PERSIST_STATS_FIELDS = { "rooms_updated", "exits_updated", "failed" }
 
 local function new_persist_stats()
@@ -1577,10 +1538,8 @@ function snd.mapper.notifyMapperDbUpdated(room_id, invalidate_layout)
         mm.minimap.is_local_mode()
     local room_already_rendered = mm and mm.runtime and
         tostring(mm.runtime.last_room_num or "") == tostring(room_id or "")
-    -- Mudlet can invoke the S&D and MMapper Room.Info handlers in either order.
-    -- If the normal render is still coming, invalidating the cache is enough;
-    -- that render will consume the committed data. If it already ran, rebuild
-    -- only when committed geometry made the active local view stale.
+    -- Room.Info handlers are unordered; rebuild only if committed geometry made
+    -- an already-rendered local view stale.
     if invalidate_layout and local_mode and room_already_rendered and
         mm and mm.minimap and mm.minimap.update_local_map then
         mm.minimap.update_local_map(room_id)
@@ -1616,11 +1575,22 @@ function snd.mapper.persistDiscoveredRoom(roomInfo, opts)
     local areaKey = tostring(roomInfo.zone or roomInfo.area or "")
     local roomName = (mm and mm.strip_ansi) and mm.strip_ansi(roomInfo.name) or tostring(roomInfo.name or "")
     local terrain = tostring(roomInfo.terrain or "")
-    local details = room_info_details(roomInfo)
+    local details = opts.info_override
+    if details == nil then details = room_info_details(roomInfo) end
     local writeRoom = opts.write_room ~= false
     local writeLookup = opts.write_lookup ~= false
     local writeExits = opts.write_exits ~= false
     local roomCols = writeRoom and snd.mapper.db.tableColumns("rooms") or {}
+
+    -- The safe token can be added locally and is not echoed by Aardwolf GMCP.
+    -- Preserve it when a later Room.Info refreshes the other room metadata.
+    if writeRoom and roomCols.info and details ~= nil and opts.info_override == nil then
+        local storedRows = snd.mapper.db.query(string.format(
+            "SELECT info FROM rooms WHERE uid = %s LIMIT 1",
+            snd.mapper.db.escape(roomId)
+        ))
+        details = preserve_stored_safe(details, storedRows and storedRows[1] and storedRows[1].info)
+    end
 
     if writeRoom then
         local insertCols = { "uid", "name", "area", "terrain" }
@@ -1683,11 +1653,8 @@ function snd.mapper.persistDiscoveredRoom(roomInfo, opts)
     if writeExits and type(exits) == "table" then
         local exitsUpdated = 0
         local exitFailures = 0
-        -- Room.Info is authoritative for cardinal destinations, but mapper
-        -- lock levels are local metadata. Reconcile the live cardinal set in
-        -- place so surviving directions retain their levels. Only genuinely
-        -- new directions start at level 0; custom, recall, and portal rows are
-        -- never part of this reconciliation.
+        -- Reconcile live cardinal destinations while retaining local lock levels;
+        -- custom, recall, and portal rows are outside this set.
         local existingCardinals = snd.mapper.db.query(string.format([[
             SELECT dir, touid, level
             FROM exits
@@ -1733,8 +1700,7 @@ function snd.mapper.persistDiscoveredRoom(roomInfo, opts)
             for _, storedDir in ipairs(liveDirections) do
                 local toRoom = liveCardinals[storedDir]
                 local preservedLevel = tonumber(preservedLevels[storedDir]) or 0
-                -- Preserve direction-only maze exits as -1 so map renderers can
-                -- draw arrows even though navigation has no destination room.
+                -- Keep direction-only maze exits as -1 so renderers can draw arrows.
                 local insertExitSql = string.format(
                     "INSERT OR IGNORE INTO exits (dir, fromuid, touid, level) VALUES (%s, %s, %s, %d)",
                     snd.mapper.db.escape(storedDir),
@@ -1890,7 +1856,10 @@ function snd.mapper.planRoomPersist(roomInfo, dbState)
     local roomName = (mm and mm.strip_ansi) and mm.strip_ansi(roomInfo.name) or tostring(roomInfo.name or "")
     local areaKey = tostring(roomInfo.zone or roomInfo.area or "")
     local terrain = tostring(roomInfo.terrain or "")
-    local details = room_info_details(roomInfo)
+    local details = preserve_stored_safe(
+        room_info_details(roomInfo),
+        stored and stored.info or nil
+    )
     local isNew = stored == nil
 
     local nameChanged = isNew or tostring(stored.name or "") ~= roomName
@@ -1915,6 +1884,7 @@ function snd.mapper.planRoomPersist(roomInfo, dbState)
         write_exits = exitsChanged,
         layout_changed = isNew or areaChanged or terrainChanged or exitsChanged,
         changed = roomChanged or exitsChanged,
+        info = details,
     }
 end
 
@@ -2021,6 +1991,7 @@ function snd.mapper.flushPendingPersists(opts)
                     persistOpts.write_lookup = persistPlan.write_lookup
                     persistOpts.write_exits = persistPlan.write_exits
                     persistOpts.layout_changed = persistPlan.layout_changed
+                    persistOpts.info_override = persistPlan.info
                 end
                 local ok, delta = snd.mapper.persistDiscoveredRoom(ri, persistOpts)
                 add_persist_stats(totals, delta)
@@ -2058,8 +2029,7 @@ function snd.mapper.flushPendingPersists(opts)
             sectorCount = tonumber(result) or 0
             sectorFingerprint = fingerprint
             databaseChanged = databaseChanged or changed == true
-            -- Environment colors are visual, but an identical packet does not
-            -- invalidate or redraw the local graph.
+            -- Identical visual metadata must not invalidate the local graph.
             totals.layout_changed = totals.layout_changed or changed == true
         end
     end
@@ -2077,8 +2047,7 @@ function snd.mapper.flushPendingPersists(opts)
         return false, commitErr
     end
 
-    -- Clear only after a successful commit so interrupted/failed routes can be
-    -- retried by the existing orphan-buffer path.
+    -- Clear only after commit; failed routes retry through the orphan buffer.
     snd.mapper.pendingPersists = {}
     snd.mapper.pendingAreaPersists = {}
     snd.mapper.pendingSectorsPersist = nil
@@ -2115,21 +2084,11 @@ function snd.mapper.schedulePendingPersistFlush()
 end
 
 local function tokenizeInfo(info)
-    local tokens = {}
-    local v = tostring(info or "")
-    if v == "" then return tokens end
-    for item in v:gmatch("[^,]+") do
-        local clean = item:gsub("^%s+", ""):gsub("%s+$", "")
-        if clean ~= "" then table.insert(tokens, clean) end
-    end
-    return tokens
+    return tokenize_room_info(info)
 end
 
 function snd.mapper.infoContainsSafe(info)
-    for _, token in ipairs(tokenizeInfo(info)) do
-        if token:lower() == "safe" then return true end
-    end
-    return false
+    return room_info_contains_token(info, "safe")
 end
 
 function snd.mapper.isSafeRoom(roomId)
@@ -2148,47 +2107,52 @@ function snd.mapper.markRoomSafe(roomId, value)
     for _, t in ipairs(tokens) do
         if t:lower() == "safe" then has = true; break end
     end
-    local newTokens = {}
-    if value == false then
-        if not has then return true end
-        for _, t in ipairs(tokens) do
-            if t:lower() ~= "safe" then table.insert(newTokens, t) end
+    local desired = value ~= false
+    local changed = has ~= desired
+    local newInfo = room_info_with_safe(room.info, desired)
+    if changed then
+        local ok, err = snd.mapper.db.conn:execute(string.format(
+            "UPDATE rooms SET info = %s WHERE uid = %s",
+            snd.mapper.db.escape(newInfo),
+            snd.mapper.db.escape(tostring(roomId))
+        ))
+        if not ok then
+            snd.utils.debugNote("Failed to update info flag: " .. tostring(err))
+            return false
         end
-    else
-        if has then return true end
-        for _, t in ipairs(tokens) do table.insert(newTokens, t) end
-        table.insert(newTokens, "safe")
     end
-    local newInfo = table.concat(newTokens, ",")
-    local ok, err = snd.mapper.db.conn:execute(string.format(
-        "UPDATE rooms SET info = %s WHERE uid = %s",
-        snd.mapper.db.escape(newInfo),
-        snd.mapper.db.escape(tostring(roomId))
-    ))
-    if not ok then
-        snd.utils.debugNote("Failed to update info flag: " .. tostring(err))
-        return false
+
+    -- A buffered Room.Info packet must not undo a manual safe-room change.
+    local pending = snd.mapper.pendingPersists
+        and snd.mapper.pendingPersists[tostring(roomId)] or nil
+    if type(pending) == "table" then
+        if pending.details ~= nil then
+            pending.details = room_info_with_safe(pending.details, desired)
+        elseif pending.info ~= nil then
+            pending.info = room_info_with_safe(pending.info, desired)
+        end
     end
-    return true
+
+    if snd.mapper.notifyMapperDbUpdated then
+        snd.mapper.notifyMapperDbUpdated(roomId, false)
+    end
+    if snd.conwin and type(snd.conwin.onSafeRoomFlagChanged) == "function" then
+        snd.conwin.onSafeRoomFlagChanged(roomId, desired)
+    end
+    return true, changed
 end
 
---- Check if room allows portals
 function snd.mapper.canPortalTo(roomId)
     local room = snd.mapper.getRoomInfo(roomId)
     if not room then return true end  -- Unknown room, assume ok
     return tonumber(room.noportal) ~= 1
 end
 
---- Check if room allows recall
 function snd.mapper.canRecallFrom(roomId)
     local room = snd.mapper.getRoomInfo(roomId)
     if not room then return true end
     return tonumber(room.norecall) ~= 1
 end
-
--------------------------------------------------------------------------------
--- Room Search (Quest/XCP support)
--------------------------------------------------------------------------------
 
 local function ellipsify(text, maxLen)
     if not text then return "" end
@@ -2808,13 +2772,6 @@ function snd.mapper.onConfirmedRoomVisit(roomId)
     return
 end
 
--------------------------------------------------------------------------------
--- Portal Management
--------------------------------------------------------------------------------
-
---- Get all portals from database
--- @param filter Optional area filter
--- @return Table of portal records
 function snd.mapper.getPortals(filter)
     filter = filter or "%"
     
@@ -2830,9 +2787,6 @@ function snd.mapper.getPortals(filter)
     return snd.mapper.db.query(sql) or {}
 end
 
---- Get portals to a specific room
--- @param roomId Destination room
--- @return Table of portal records
 function snd.mapper.getPortalsToRoom(roomId)
     local sql = string.format([[
         SELECT dir, fromuid, touid, level 
@@ -2843,10 +2797,6 @@ function snd.mapper.getPortalsToRoom(roomId)
     return snd.mapper.db.query(sql) or {}
 end
 
---- Set bounce portal (for norecall rooms)
--- @param portalDir Portal command
--- @param portalDestUid Destination room uid
--- @param level Optional portal level
 function snd.mapper.setBouncePortal(portalDir, portalDestUid, level)
     snd.mapper.config.bouncePortal = {
         dir = portalDir,
@@ -2857,10 +2807,6 @@ function snd.mapper.setBouncePortal(portalDir, portalDestUid, level)
     snd.utils.infoNote("Bounce portal set: " .. portalDir)
 end
 
---- Set bounce recall (for noportal rooms)
--- @param recallDir Recall command
--- @param recallDestUid Destination room uid
--- @param level Optional portal level
 function snd.mapper.setBounceRecall(recallDir, recallDestUid, level)
     snd.mapper.config.bounceRecall = {
         dir = recallDir,
@@ -2871,8 +2817,7 @@ function snd.mapper.setBounceRecall(recallDir, recallDestUid, level)
     snd.utils.infoNote("Bounce recall set: " .. recallDir)
 end
 
--- Prefer the portal subsystem's persisted ID-based setting.  The config copy
--- remains as a compatibility fallback for standalone S&D use and tests.
+-- Prefer persisted portal IDs; config remains a standalone/test fallback.
 function snd.mapper.getConfiguredBounce(travelType)
     if mm and type(mm.get_configured_bounce_step) == "function" then
         local resolved = mm.get_configured_bounce_step(travelType)
@@ -2885,8 +2830,7 @@ function snd.mapper.getConfiguredBounce(travelType)
             return resolved
         end
 
-        -- When the portal subsystem owns a settings table, a missing result is
-        -- authoritative (cleared, deleted, or invalid), not a stale config hit.
+        -- Missing portal settings are authoritative, not a stale config fallback.
         if mm.portals and mm.portals.settings then
             if travelType == "recall" then
                 snd.mapper.config.bounceRecall = nil
@@ -2903,14 +2847,7 @@ function snd.mapper.getConfiguredBounce(travelType)
     return snd.mapper.config.bouncePortal
 end
 
--------------------------------------------------------------------------------
--- Pathfinding
--------------------------------------------------------------------------------
-
--- Keep only the most recent multi-destination result. This is intentionally a
--- route-result cache, not a second copy of the mapper graph in Lua. The cache
--- key includes the source, destination set, and the generated policy clauses;
--- committed mapper changes invalidate it through notifyMapperDbUpdated().
+-- Cache one multi-destination result, never a second Lua copy of the mapper graph.
 snd.mapper.distanceCacheRevision = tonumber(snd.mapper.distanceCacheRevision) or 0
 snd.mapper.distanceCache = snd.mapper.distanceCache or nil
 
@@ -2944,14 +2881,7 @@ local function normalizeDistanceDestinations(destinations)
     return normalized
 end
 
---- Calculate shortest mapper distances from one source to many destinations.
--- One forward BFS answers the whole set and stops as soon as every reachable
--- requested room has been found (or maxSearchDepth is reached). It deliberately
--- returns distances only: route construction and movement remain mapper-owned.
--- @param src Source room uid
--- @param destinations Array of destination room uids
--- @param opts Optional policy overrides matching findPath semantics
--- @return table<string,number> distances, table metadata
+-- One bounded forward BFS returns distances only; routing remains mapper-owned.
 function snd.mapper.findDistances(src, destinations, opts)
     opts = type(opts) == "table" and opts or {}
     local sourceNumber = tonumber(src)
@@ -3166,18 +3096,6 @@ function snd.mapper.findDistances(src, destinations, opts)
     return distances, metadata
 end
 
---- Find path between two rooms with portal support
--- @param src Source room uid
--- @param dst Destination room uid
--- @param noPortals If true, don't use portals
--- @param noRecalls If true, don't use recall
--- @param ignoreLockedExits If true, ignore exit-level locks
--- @param ignoreAreaGuard If true, ignore only the area guard
--- @param ignoreTravelRestrictions If true, ignore source noportal/norecall flags
--- @param searchDepthLimit Optional per-call BFS depth cap
--- @param originMode Optional origin filter: "walk", "portal", "recall", or "jump"
--- @param allowChaosPortals If true, include chaos portals during a diagnostic-only search
--- @return Path table, depth, or nil if no path
 function snd.mapper.findPath(
     src,
     dst,
@@ -3214,7 +3132,6 @@ function snd.mapper.findPath(
         return {}, 0
     end
     
-    -- Get player level for level-locked exits
     local myLevel = snd.char.level or 201
     local myTier = snd.char.tier or 0
     local gqJoined = snd.gquest and tostring(snd.gquest.joined or "-1") or "-1"
@@ -3226,9 +3143,7 @@ function snd.mapper.findPath(
     )
     local effectiveLevel = myLevel + (myTier * 10)
     local portalGuardWhere = snd.mapper.portalGuardSql("dir", "level", effectiveLevel, ignoreLockedExits)
-    -- Chaos portals are excluded before BFS while a GQ is active. The only
-    -- exception is an explicit diagnostic search whose path is never executed.
-    -- Source-room travel restrictions are deliberately independent of this.
+    -- Active GQ excludes chaos portals except for non-executable diagnostics.
     local chaosWhere = (gqActive and allowChaosPortals ~= true)
         and "(fromuid <> '*' OR ifnull(chaos, 'no') <> 'yes')"
         or "1=1"
@@ -3272,7 +3187,6 @@ function snd.mapper.findPath(
         ))
     end
     
-    -- Check for direct one-room path first
     local directPath = snd.mapper.checkDirectPath(
         src, dst, myLevel, ignoreLockedExits, ignoreAreaGuard, randomCexits
     )
@@ -3281,7 +3195,6 @@ function snd.mapper.findPath(
         return directPath, 1
     end
     
-    -- BFS pathfinding (backwards from destination)
     local depth = 0
     local maxDepth = tonumber(snd.mapper.config.maxSearchDepth) or 100
     local requestedDepth = tonumber(searchDepthLimit)
@@ -3298,7 +3211,6 @@ function snd.mapper.findPath(
     local foundFrom = nil
     local srcRoomInfo = snd.mapper.getRoomInfo(src)
     
-    -- Build initial visited set.
     local visitedList = {}
     if noPortals then
         table.insert(visitedList, snd.mapper.db.escape("*"))
@@ -3331,7 +3243,6 @@ function snd.mapper.findPath(
             break
         end
         
-        -- Update visited.
         local newVisited = table.concat(roomsList, ",")
         if newVisited ~= "" then
             if visited == "" then
@@ -3342,7 +3253,6 @@ function snd.mapper.findPath(
         end
         for roomId in pairs(frontierSet) do visitedSet[roomId] = true end
         
-        -- Query exits leading to rooms in our current set
         local sql = string.format([[
             SELECT fromuid, touid, dir, chaos FROM exits
             WHERE touid IN (%s) 
@@ -3385,7 +3295,7 @@ function snd.mapper.findPath(
         }
 
         for idx, row in ipairs(results) do
-            -- Prefer custom cexit commands over bare cardinal exits from the same room.
+            -- Prefer custom cexits over bare cardinals from the same room.
             local existingStep = roomSets[depth][row.fromuid]
             if snd.mapper.shouldPreferExitDir(row.dir, existingStep and existingStep.dir) then
                 roomSets[depth][row.fromuid] = {
@@ -3397,7 +3307,6 @@ function snd.mapper.findPath(
                 }
             end
 
-            -- Track whether this depth can connect from source/portal/recall
             if row.fromuid == src then
                 depthCandidates.src = true
             elseif row.fromuid == "*" then
@@ -3419,11 +3328,7 @@ function snd.mapper.findPath(
             end
         end
 
-        -- One backwards BFS sees walking, portal, and recall origins together.
-        -- Do not launch a second walk-only search. At the same depth the real
-        -- walking source wins; otherwise the first origin reached is already
-        -- the strictly shorter route. Callers that require an immediate jump
-        -- can filter the accepted origin without calculating a walking rival.
+        -- One reverse BFS compares walk, portal, and recall origins; walking wins ties.
         if originMode == "walk" then
             foundFrom = depthCandidates.src and src or nil
         elseif originMode == "portal" then
@@ -3467,11 +3372,9 @@ function snd.mapper.findPath(
         return nil
     end
     
-    -- Reconstruct path
     local path = {}
     local currentRoom = roomSets[foundDepth][foundFrom]
     
-    -- Handle portal/recall from restricted rooms
     if foundFrom == "*" or foundFrom == "**" then
         local srcRoom = srcRoomInfo
         if srcRoom then
@@ -3481,10 +3384,7 @@ function snd.mapper.findPath(
             if not ignoreTravelRestrictions
                 and ((foundFrom == "*" and srcNoPortal) or (foundFrom == "**" and srcNoRecall))
             then
-                -- Repair the selected jump without replanning its suffix.  A
-                -- bouncerecall is only a command prepended to a blocked '*'
-                -- route; a bounceportal is only prepended to a blocked '**'
-                -- route.
+                -- Repair only the blocked jump; never replan its suffix.
                 local bounceRecall = (foundFrom == "*" and not srcNoRecall
                     and snd.mapper.getConfiguredBounce("recall")) or nil
                 local bouncePortal = (foundFrom == "**" and not srcNoPortal
@@ -3515,16 +3415,11 @@ function snd.mapper.findPath(
                         return path, foundDepth
                     end
                 elseif srcNoPortal and srcNoRecall then
-                    -- Both-flags recovery is owned by the explicit bounded
-                    -- nearby -> area-start ladder. Never start an implicit,
-                    -- unbounded nearest-room search during reconstruction.
+                    -- Both-flags recovery uses only the bounded nearby -> area-start ladder.
                     snd.utils.debugNote("findPath restricted source has both flags; deferring to bounded fallback policy.")
                     return nil
                 else
-                    -- A one-flag room must use the opposite jump where it is,
-                    -- never walk outward implicitly. The caller may retry with
-                    -- that legal origin forced; nearby probing is reserved for
-                    -- rooms carrying both restrictions.
+                    -- One-flag rooms must use the opposite jump in place, never walk outward.
                     snd.utils.debugNote("findPath restricted source has no configured bounce; refusing implicit nearby search.")
                     return nil
                 end
@@ -3532,7 +3427,6 @@ function snd.mapper.findPath(
         end
     end
     
-    -- Build path from found room to destination
     local firstStep = {
         dir = currentRoom.dir,
         uid = currentRoom.touid,
@@ -3543,8 +3437,7 @@ function snd.mapper.findPath(
         firstStep.travelType = "portal"
     elseif foundFrom == "**" then
         firstStep.travelType = "recall"
-        -- Preserve the recorded landing metadata used by configured routes.
-        -- Execution still requires live GMCP confirmation before the suffix.
+        -- Preserve landing metadata, but require live GMCP before releasing suffix.
         firstStep.trustedLanding = true
     end
     table.insert(path, firstStep)
@@ -3572,8 +3465,7 @@ function snd.mapper.isGquestActive()
     return snd.gquest ~= nil and (snd.gquest.active == true or joined ~= "-1")
 end
 
---- Find a route that differs from normal GQ routing only by allowing chaos
--- portals. This is explanation-only: callers must never execute the result.
+-- Diagnostic chaos route only; callers must never execute it.
 function snd.mapper.findGqChaosDiagnosticPath(
     src,
     dst,
@@ -3677,9 +3569,7 @@ function snd.mapper.hasActiveNavigation()
         or snd.mapper.pathExecutionActive == true
 end
 
--- A definitive server-side route failure must also flush commands already
--- queued by the MUD. This is deliberately separate from combat autostop,
--- which preserves navigation state by design.
+-- Route failure flushes queued MUD commands; combat autostop intentionally does not.
 function snd.mapper.abortFailedNavigation(reason)
     if not snd.mapper.hasActiveNavigation() then
         return false
@@ -3754,9 +3644,7 @@ function snd.mapper.pathStartsWithTravel(path)
     return false
 end
 
--- Returns true when the ordinary walking prefix crosses out of sourceArea
--- before its first recall/portal command. Post-jump rooms are intentionally
--- ignored: those are not evidence of a panic walk out of the source area.
+-- Detect cross-area walking only before the first jump; post-jump rooms do not count.
 function snd.mapper.pathLeavesAreaBeforeJump(path, sourceArea)
     local wantedArea = snd.utils.trim(sourceArea or ""):lower()
     if wantedArea == "" then return false end
@@ -3893,8 +3781,7 @@ function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blocked
         originMode = "recall"
     end
 
-    -- The area start is already a late fallback. Find its first usable jump in
-    -- the ordinary BFS instead of running separate portal and recall searches.
+    -- Area-start fallback uses one BFS for its first usable jump.
     local jumpLeg = originMode and snd.mapper.findPath(
         startRoom,
         destination,
@@ -3908,9 +3795,7 @@ function snd.mapper.buildAreaStartFallbackRoute(sourceRoom, destination, blocked
     ) or nil
     local jumpType = jumpLeg and jumpLeg[1] and jumpLeg[1].travelType or nil
 
-    -- If the designated start has learned that both jump methods are blocked,
-    -- make one bounded nearby attempt from the start itself. This remains part
-    -- of the area-start fallback and therefore precedes a cross-area long walk.
+    -- If both jumps are blocked at area start, try one bounded nearby recovery.
     if not jumpLeg and type(snd.mapper.buildOutwardJumpRoute) == "function" then
         local outwardLeg, outwardType, outwardRoom = snd.mapper.buildOutwardJumpRoute(
             startRoom,
@@ -4064,10 +3949,7 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
         expectedBlocked = currentNoRecall
     end
 
-    -- The opposite jump is legal in the current room: calculate that jump once,
-    -- execute it immediately, and do not look for walking, nearby, or area-start
-    -- competitors. originMode prevents a shorter walking origin from replacing
-    -- the explicitly requested recovery method.
+    -- A legal opposite jump executes in place; originMode prevents walking substitution.
     if not expectedBlocked then
         local directJump = snd.mapper.findPath(
             currentRoom,
@@ -4086,9 +3968,7 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
             return true
         end
 
-        -- Without a configured bounce, the combined jump search may reject a
-        -- blocked winning origin. Retry only the legal opposite origin; never
-        -- substitute walking or a nearby-room search.
+        -- Without a bounce, retry only the legal opposite origin—never walking/nearby.
         local forcedJump = snd.mapper.findPath(
             currentRoom,
             destination,
@@ -4109,9 +3989,7 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
         return false
     end
 
-    -- Nearby and area-start recovery are only meaningful when neither jump can
-    -- be used in the current room. The nearby probe has a hard walking radius;
-    -- once exhausted, the designated area start is the next fallback.
+    -- When both jumps fail: bounded nearby, then designated area start.
     if currentNoPortal and currentNoRecall then
         local nearbyRadius = tonumber(snd.mapper.config.nearbyJumpRadius) or 10
         local nearbyPath, nearbyRoom = snd.mapper.findNearestAlternateRoute(
@@ -4155,8 +4033,7 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
             return true
         end
 
-        -- A long walk is genuinely last: both immediate jumps, the bounded
-        -- nearby search, and the area-start route have already failed.
+        -- Long walking is last after jumps, bounded nearby, and area start.
         local walkingPath = snd.mapper.findPath(
             currentRoom,
             destination,
@@ -4180,7 +4057,6 @@ function snd.mapper.handleBlockedTravel(blockedType, ignoreLockedExits)
     return false
 end
 
---- Check for direct one-room path
 function snd.mapper.checkDirectPath(src, dst, level, ignoreLockedExits, ignoreAreaGuard, randomCexits)
     local where = ignoreLockedExits and "" or string.format(" AND level <= %d", level)
     local areaFromWhere = snd.mapper.areaGuardRoomSql("exits.fromuid", src, ignoreLockedExits, ignoreAreaGuard)
@@ -4326,7 +4202,6 @@ function snd.mapper.buildOutwardJumpRoute(sourceRoom, destination, ignoreLockedE
     return combined, chosenType, closestRoom
 end
 
---- Find nearest room that allows portal/recall
 function snd.mapper.findNearestRoomWithoutFlag(src, restrictionFlag, ignoreLockedExits, searchDepthLimit)
     if not src then return nil, nil end
     local safeFlag = (restrictionFlag == "norecall") and "norecall" or "noportal"
@@ -4637,10 +4512,6 @@ function snd.mapper.findNearestAlternateRoute(
     return nil
 end
 
--------------------------------------------------------------------------------
--- Navigation Execution
--------------------------------------------------------------------------------
-
 function snd.mapper.notifyBigmapNavigationState(reason)
     if not (mm and mm.minimap and mm.minimap.on_navigation_state_changed) then return end
     local ok, err = pcall(mm.minimap.on_navigation_state_changed, reason)
@@ -4662,10 +4533,7 @@ local function clone_path_slice(path, first, last)
     return sliced
 end
 
---- Coordinate conditional cexits without resolving their DINV state early.
--- Normal segments use executePath unchanged. Before each conditional step, the
--- coordinator waits for its recorded source room, resolves the key, replaces
--- that one step's command, and releases the next segment.
+-- Conditional cexits resolve only after reaching their recorded source room.
 function snd.mapper.executeConditionalPath(path, conditionalByIndex, opts)
     opts = opts or {}
     path = clone_path_slice(path, 1, #path)
@@ -4748,10 +4616,6 @@ function snd.mapper.executeConditionalPath(path, conditionalByIndex, opts)
     return true
 end
 
---- Execute a path (send commands)
--- Handles cardinal directions with 'run', special exits with ';;', and wait() with tempTimer
--- @param path Path table from findPath
--- @param opts Optional execution controls; preserveExecutionSerial keeps an outer path alive
 function snd.mapper.executePath(path, opts)
     if snd.mapper.persistenceArrivalSettling and snd.mapper.flushPendingPersists then
         snd.mapper.flushPendingPersists()
@@ -4762,10 +4626,7 @@ function snd.mapper.executePath(path, opts)
 
     opts = opts or {}
 
-    -- A random cexit is always terminal for this invocation. Its recorded
-    -- destination is only a pathfinding possibility, never a landing promise.
-    -- Drop the suffix before command groups are built so nothing can be queued
-    -- after the random command.
+    -- Random cexits are terminal; their destinations are possibilities, not promises.
     local terminalPath = {}
     for _, step in ipairs(path) do
         table.insert(terminalPath, step)
@@ -4810,13 +4671,11 @@ function snd.mapper.executePath(path, opts)
         return snd.mapper.pathExecutionSerial == executionSerial
     end
     
-    -- Cardinal directions that can use 'run'
     local cardinalDirs = {
         n = true, s = true, e = true, w = true,
         u = true, d = true,
     }
     
-    -- Helper: compress consecutive cardinal directions (s,s,e,e,e → 2s3e)
     local function compressCardinals(dirs)
         if #dirs == 0 then return "" end
         
@@ -4857,8 +4716,6 @@ function snd.mapper.executePath(path, opts)
         return enemy ~= "" and enemy:find(t, 1, true) ~= nil
     end
 
-    -- Build command groups (separated by waits)
-    -- Each group is {commands = {{text="cmd1", travelType=nil}, ...}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil}
     local groups = {}
     local currentGroup = {commands = {}, delayAfter = 0, waitRoomId = nil, executeRoomId = nil, trustedSource = false}
     local cardinalBuffer = {}
@@ -4867,10 +4724,8 @@ function snd.mapper.executePath(path, opts)
     local function flushCardinals()
         if #cardinalBuffer > 0 then
             if #cardinalBuffer == 1 then
-                -- Single cardinal: no 'run' prefix needed
                 table.insert(currentGroup.commands, {text = cardinalBuffer[1]})
             else
-                -- Multiple cardinals: compress and use 'run'
                 local compressed = compressCardinals(cardinalBuffer)
                 table.insert(currentGroup.commands, {text = "run " .. compressed})
             end
@@ -4878,10 +4733,8 @@ function snd.mapper.executePath(path, opts)
         end
     end
     
-    -- Split a string on ';' (single semicolon), ignoring empty parts
 	local function splitSemis(s)
 	  local out = {}
-	  -- treat one or more ';' as separators; ignore empty tokens
 	  for part in tostring(s):gmatch("[^;]+") do
 		part = part:match("^%s*(.-)%s*$") -- trim
 		if part ~= "" then
@@ -4910,8 +4763,7 @@ function snd.mapper.executePath(path, opts)
             end
         end
 
-        -- Unlike regular mapped cexits, never queue a random command behind a
-        -- trusted prefix. Hold it until GMCP confirms its recorded source room.
+        -- Hold random cexits until GMCP confirms their source room.
         if isRandomCexit then
             flushCardinals()
             if #currentGroup.commands > 0 then
@@ -4927,9 +4779,7 @@ function snd.mapper.executePath(path, opts)
             }
         end
 
-        -- Keep jumps in their own command groups, but do not impose a GMCP
-        -- barrier when the preceding mapped edge already declares its room ID.
-        -- Restriction markers use the simulated mapped source room in that case.
+        -- A mapped predecessor supplies the simulated source for jump restrictions.
         if isTravelStep then
             flushCardinals()
             if #currentGroup.commands > 0 then
@@ -4949,9 +4799,7 @@ function snd.mapper.executePath(path, opts)
             }
         end
 
-        -- A cexit containing mapper walkto must itself wait until the outer
-        -- path reaches the cexit source. Otherwise the nested walk would be
-        -- calculated from the room occupied before the approach run finishes.
+        -- Nested walkto must wait for the outer path to reach the cexit source.
         if stepHasMapperWalkto then
             flushCardinals()
             if #currentGroup.commands > 0 then
@@ -4977,7 +4825,6 @@ function snd.mapper.executePath(path, opts)
 			local dirLower = dir:lower()
 			local walktoTarget = mm and mm.mapper_walkto_target and mm.mapper_walkto_target(dir) or nil
 
-			-- Check if this is a wait() command
 			local waitTime = dir:match("^wait%((%d+%.?%d*)%)$")
 				if waitTime then
 					flushCardinals()
@@ -4990,13 +4837,10 @@ function snd.mapper.executePath(path, opts)
                     encounteredWait = true
 
 			elseif cardinalDirs[dirLower] then
-				-- cardinal movement token (n/s/e/w/u/d)
 				table.insert(cardinalBuffer, dirLower)
 
                 elseif walktoTarget then
-                    -- A nested mapper walk starts its own asynchronous path.
-                    -- End this group at the walk command and hold everything
-                    -- after it until GMCP confirms the requested room.
+                    -- Nested mapper walks are async; hold the suffix until GMCP arrival.
 					flushCardinals()
                     walktoTarget = tostring(walktoTarget)
                     table.insert(currentGroup.commands, {
@@ -5013,7 +4857,6 @@ function snd.mapper.executePath(path, opts)
                     }
 
                 else
-                    -- normal command token (e.g. "open d", "kill hidden", "o n", "enter")
 					flushCardinals()
                     if stepHasWait and (not encounteredWait)
                         and (not currentGroup.executeRoomId or currentGroup.executeRoomId == "-1") then
@@ -5045,18 +4888,13 @@ function snd.mapper.executePath(path, opts)
             simulatedRoom = tostring(step.uid)
         end
 
-        -- A mapped cardinal/cexit is a trusted graph edge. The next command can
-        -- be queued against its recorded destination without waiting for GMCP.
-        -- Nested mapper walkto remains asynchronous and keeps its explicit room
-        -- barrier.
+        -- Mapped edges can queue through; nested walkto keeps its GMCP barrier.
         if hasKnownLanding and not isTravelStep and not stepHasMapperWalkto then
             currentGroup.trustedSource = true
         end
 
-        -- A registered recall/portal edge tells us where the jump should land,
-        -- not whether the MUD accepted it. Hold every suffix until live GMCP
-        -- confirms the expected room; a blocked-travel trigger invalidates the
-        -- execution serial and prevents that suffix from ever being released.
+        -- Recall/portal landing metadata is not acceptance; release suffix only
+        -- after GMCP confirmation, and invalidate it on blocked travel.
         if isTravelStep then
             flushCardinals()
             if #currentGroup.commands > 0 then
@@ -5073,13 +4911,11 @@ function snd.mapper.executePath(path, opts)
 	end
 
     
-    -- Flush remaining cardinals and add final group
     flushCardinals()
     if #currentGroup.commands > 0 then
         table.insert(groups, currentGroup)
     end
     
-    -- Execute groups with proper timing
     if #groups == 0 then
         snd.mapper.pathExecutionActive = false
         snd.mapper.pathExecutionHasPendingGroups = false
@@ -5140,8 +4976,7 @@ function snd.mapper.executePath(path, opts)
         return true
     end
     
-    -- Execute path groups sequentially so wait() never races ahead of queued actions.
-    -- If a wait expires while in combat, hold execution until combat clears.
+    -- Execute groups serially; combat may hold an expired wait.
     local heldGroupNotices = {}
     local function finishRandomCexit()
         snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or executionSerial) + 1
@@ -5170,8 +5005,7 @@ function snd.mapper.executePath(path, opts)
                 return
             end
 
-            -- True means another client-side command group still has to be
-            -- released. State 3 between groups is not a genuine travel stop.
+            -- Pending client groups mean state 3 is not a genuine travel stop.
             snd.mapper.pathExecutionHasPendingGroups = index < #groups
 
             if snd.mapper.canSendCommands and not snd.mapper.canSendCommands() then
@@ -5247,11 +5081,7 @@ function snd.mapper.executePath(path, opts)
                         return snd.mapper.isInCombat and snd.mapper.isInCombat()
                     end
 
-                    -- Early-exit listener: if this group followed a kill command
-                    -- and we observed the enemy enter and leave combat, advance
-                    -- the moment the gmcp.char.status event reports state != 8.
-                    -- The handler is a no-op for non-combat waits (no kill
-                    -- token), so those always run their full duration.
+                    -- Kill waits may end on combat exit; other waits run their full duration.
                     if killToken ~= "" then
                         local function onCharStatus()
                             if advanced then return end
@@ -5269,13 +5099,11 @@ function snd.mapper.executePath(path, opts)
                             end
                         end
                         statusHandlerId = registerAnonymousEventHandler("gmcp.char.status", onCharStatus)
-                        -- Catch a transition that already happened between sending
-                        -- the kill and registering the handler.
+                        -- Catch combat exit that raced handler registration.
                         onCharStatus()
                     end
 
-                    -- Countdown timer: when the user's wait() expires, advance
-                    -- unconditionally. Combat state is irrelevant at this point.
+                    -- An expired user wait advances regardless of combat state.
                     tempTimer(delaySeconds, function()
                         if advanced then return end
                         if not isExecutionCurrent() then
@@ -5286,9 +5114,7 @@ function snd.mapper.executePath(path, opts)
                     end)
                 end
 
-                -- User intent: once wait() is reached/sent, the countdown must
-                -- start immediately and release the next path group exactly when
-                -- it expires, regardless of room/combat state.
+                -- User wait() starts immediately and owns its release time.
                 beginWaitTimer()
                 return
             end
@@ -5300,9 +5126,7 @@ function snd.mapper.executePath(path, opts)
     runFrom(1)
 end
 
--- Build the route used by gotoRoom. Ordinary navigation performs one combined
--- shortest-path search; restricted-room recovery follows the explicit nearby
--- then area-start hierarchy. This function only plans and never sends commands.
+-- Plan only: combined shortest path, then restricted nearby -> area-start recovery.
 function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreLockedExits)
     currentRoom = tostring(currentRoom or "")
     roomId = tostring(roomId or "")
@@ -5333,11 +5157,7 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
         }
     end
 
-    -- A room with both restrictions normally follows a strict recovery ladder.
-    -- A known same-area destination is different: inspect the unrestricted
-    -- shortest route first. If it walks, the room flags are irrelevant. If its
-    -- first step is a blocked jump, compare the complete walk-only route with
-    -- the nearby-jump recovery route before choosing either one.
+    -- Same-area destinations may compare a complete walk with nearby-jump recovery.
     if usePortals and currentNoPortal and currentNoRecall then
         local sameKnownArea = sourceArea ~= ""
             and destinationArea ~= ""
@@ -5476,8 +5296,7 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
         return walkingCandidate, details(nil, walkingCandidate)
     end
 
-    -- Ordinary xrt performs one combined shortest-path search. Walking is not
-    -- searched separately; findPath itself prefers it only on an equal-depth tie.
+    -- Ordinary xrt uses one combined search; walking wins only equal-depth ties.
     local areaGuardPlan = snd.mapper.planAreaGuardRoute(
         currentRoom,
         roomId,
@@ -5501,9 +5320,7 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
             noRecalls,
             ignoreLockedExits
         )
-        -- If the globally shortest jump was blocked and no configured bounce
-        -- could repair it, retry only the other jump that is legal in this room.
-        -- This is not a walking comparison and never invokes nearby recovery.
+        -- If bounce repair fails, retry only the other legal jump—not walking/nearby.
         if (not path or #path == 0) and usePortals then
             if currentNoRecall and not currentNoPortal and not noPortals then
                 path, depth = snd.mapper.findPath(
@@ -5537,9 +5354,7 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
     end
 
     local normalBypassesStart = path and snd.mapper.pathLeavesAreaBeforeJump(path, sourceArea) or false
-    -- An immediate portal/recall never reaches this branch. If the only normal
-    -- result walks out of the source area before jumping, try the designated
-    -- start first; only use the long walking route when that fallback fails.
+    -- Prefer designated area start over a route that walks cross-area before jumping.
     if usePortals and crossingAreas and (not path or normalBypassesStart) then
         local areaPath, areaKey, startRoom, jumpType = snd.mapper.buildAreaStartFallbackRoute(
             currentRoom,
@@ -5584,9 +5399,7 @@ function snd.mapper.planNavigationRoute(currentRoom, roomId, usePortals, ignoreL
     return selectedRoute, details(areaGuardPlan, selectedRoute)
 end
 
--- Preview gotoRoom's route with AreaGuard forced on for this calculation only.
--- Per-portal guards, locked exits, and portal/recall settings remain exactly as
--- they are for normal xrt navigation.
+-- Preview forces AreaGuard only; all other routing policy remains unchanged.
 function snd.mapper.previewGuardedRoute(currentRoom, roomId, usePortals)
     local source = tostring(currentRoom or "")
     local destination = tostring(roomId or "")
@@ -5622,10 +5435,6 @@ function snd.mapper.previewGuardedRoute(currentRoom, roomId, usePortals)
     end)
 end
 
---- Go to a room using portal-aware pathfinding
--- @param roomId Destination room uid
--- @param usePortals Whether to use portals (default: true)
--- @param guardDestination Original xrt destination for area-guard override links
 function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMode, guardDestination, options)
     if not roomId then
         snd.utils.infoNote("No room specified")
@@ -5638,7 +5447,6 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     options = type(options) == "table" and options or {}
     snd.mapper.lastRouteFailure = nil
 
-    -- Get current room
     local currentRoom = snd.mapper.currentRoomUid(true)
 
     if not currentRoom or currentRoom == "-1" then
@@ -5647,7 +5455,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     end
 
     if currentRoom:match("^nomap_") then
-        -- Clan room: allow navigation only when cexit exits have been mapped from here.
+        -- Clan rooms require mapped cexits.
         local hasClanExits = false
         if snd.mapper.db.open() then
             local rows = snd.mapper.db.query(string.format(
@@ -5725,11 +5533,9 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     if path and #path > 0 then
         snd.utils.debugNote("Found path with " .. #path .. " steps (depth " .. depth .. ")")
 
-        -- Store destination for arrival detection
         snd.mapper.goingToRoom = roomId
         snd.nav.goingToRoom = roomId
 
-        -- Execute full path or one adaptive step (xrt iterative mode)
         if iterativeMode then
             local closestPortalRoom, portalWalk = snd.mapper.findNearestRoomWithoutFlag(currentRoom, "noportal", ignoreLockedExits)
             local closestRecallRoom, recallWalk = snd.mapper.findNearestRoomWithoutFlag(currentRoom, "norecall", ignoreLockedExits)
@@ -5874,7 +5680,6 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     end
 end
 
---- Go to current target's area/room
 function snd.mapper.gotoTarget()
     if not snd.targets.current then
         snd.utils.infoNote("No target selected")
@@ -5883,22 +5688,18 @@ function snd.mapper.gotoTarget()
     
     local target = snd.targets.current
     
-    -- If we have a specific room, go there
     if target.roomId and target.roomId ~= "" then
         return snd.mapper.gotoRoom(target.roomId)
     end
     
-    -- If we have an area, go to area start room
     local areaKey = target.area or target.arid
     if areaKey and areaKey ~= "" then
-        -- Look up start room from snd.data
         local areaData = snd.data.areaDefaultStartRooms[areaKey]
         if areaData and areaData.start then
             snd.utils.infoNote("Going to " .. areaKey .. " (room " .. areaData.start .. ")")
             return snd.mapper.gotoRoom(areaData.start)
         end
         
-        -- Try database lookup
         if snd.db and snd.db.getAreaStartRoom then
             local startRoom = snd.db.getAreaStartRoom(areaKey)
             if startRoom and startRoom > 0 then
@@ -5915,11 +5716,6 @@ function snd.mapper.gotoTarget()
     return false
 end
 
--------------------------------------------------------------------------------
--- Utility Commands
--------------------------------------------------------------------------------
-
---- List available portals
 function snd.mapper.listPortals(filter)
     if not snd.mapper.db.open() then
         snd.utils.errorNote("Cannot open mapper database")
@@ -5955,8 +5751,6 @@ function snd.mapper.listPortals(filter)
     cecho("<dim_gray>Commands: mapper portal <cmd> level <n> | mapper bounceportal <#|cmd><reset>\n")
 end
 
---- Search portals relative to current location
--- @param scope "here" (current room) or "area" (current room area)
 function snd.mapper.searchPortals(scope)
     scope = snd.utils.trim((scope or "here"):lower())
     if scope ~= "here" and scope ~= "area" then
@@ -6024,9 +5818,6 @@ function snd.mapper.searchPortals(scope)
     cecho("<yellow>══════════════════════════════<reset>\n")
 end
 
---- Add a portal to current room
--- @param command Portal command (e.g., "hold amulet;enter")
--- @param level Optional minimum level (default 0)
 function snd.mapper.addPortal(command, level)
     if not command or command == "" then
         snd.utils.infoNote("Usage: mapper portal <command> level <number>")
@@ -6046,21 +5837,18 @@ function snd.mapper.addPortal(command, level)
         return false
     end
     
-    -- Check if room exists in database
     local roomInfo = snd.mapper.getRoomInfo(currentRoom)
     if not roomInfo then
         snd.utils.errorNote("Room " .. currentRoom .. " not found in mapper database")
         return false
     end
     
-    -- Ensure special "from anywhere" room exists
     local sql = "SELECT uid FROM rooms WHERE uid = '*'"
     local result = snd.mapper.db.query(sql)
     if not result or #result == 0 then
         snd.mapper.db.conn:execute("INSERT OR REPLACE INTO rooms (uid, name, area) VALUES ('*', '___HERE___', '___EVERYWHERE___')")
     end
     
-    -- Insert portal
     sql = string.format(
         "INSERT OR REPLACE INTO exits (dir, fromuid, touid, level) VALUES (%s, '*', %s, %d)",
         snd.mapper.db.escape(command),
@@ -6078,9 +5866,6 @@ function snd.mapper.addPortal(command, level)
     end
 end
 
---- Add a recall-based portal to current room
--- @param command Recall command (e.g., "recall" or "home")
--- @param level Optional minimum level (default 0)
 function snd.mapper.addRecallPortal(command, level)
     if not command or command == "" then
         snd.utils.infoNote("Usage: mapper portal <command> level <number>")
@@ -6100,21 +5885,18 @@ function snd.mapper.addRecallPortal(command, level)
         return false
     end
     
-    -- Check if room exists
     local roomInfo = snd.mapper.getRoomInfo(currentRoom)
     if not roomInfo then
         snd.utils.errorNote("Room " .. currentRoom .. " not found in mapper database")
         return false
     end
     
-    -- Ensure special "recall" room exists
     local sql = "SELECT uid FROM rooms WHERE uid = '**'"
     local result = snd.mapper.db.query(sql)
     if not result or #result == 0 then
         snd.mapper.db.conn:execute("INSERT OR REPLACE INTO rooms (uid, name, area) VALUES ('**', '___RECALL___', '___EVERYWHERE___')")
     end
     
-    -- Insert recall portal
     sql = string.format(
         "INSERT OR REPLACE INTO exits (dir, fromuid, touid, level) VALUES (%s, '**', %s, %d)",
         snd.mapper.db.escape(command),
@@ -6132,8 +5914,6 @@ function snd.mapper.addRecallPortal(command, level)
     end
 end
 
---- Delete a portal by index
--- @param index Portal index from listPortals
 function snd.mapper.deletePortal(index)
     index = tonumber(index)
     if not index then
@@ -6165,8 +5945,6 @@ function snd.mapper.deletePortal(index)
     end
 end
 
---- Delete a portal by command string
--- @param command Portal command (exact match)
 function snd.mapper.deletePortalByCommand(command)
     local portalCommand = snd.utils.trim(command or "")
     if portalCommand == "" then
@@ -6200,8 +5978,6 @@ function snd.mapper.deletePortalByCommand(command)
     return true
 end
 
---- Set bounce portal by index
--- @param index Portal index from listPortals
 function snd.mapper.setBouncePortalByIndex(index)
     index = tonumber(index)
     if not index then
@@ -6232,8 +6008,6 @@ function snd.mapper.setBouncePortalByIndex(index)
     return true
 end
 
---- Set bounce portal by command (regular portal only)
--- @param command Portal command
 function snd.mapper.setBouncePortalByCommand(command)
     local portalCommand = snd.utils.trim(command or "")
     if portalCommand == "" then
@@ -6258,8 +6032,6 @@ function snd.mapper.setBouncePortalByCommand(command)
     return false
 end
 
---- Set bounce recall by index
--- @param index Portal index from listPortals
 function snd.mapper.setBounceRecallByIndex(index)
     index = tonumber(index)
     if not index then
@@ -6290,13 +6062,11 @@ function snd.mapper.setBounceRecallByIndex(index)
     return true
 end
 
---- Show navigation help (deprecated; use S&D help + mapper help)
 function snd.mapper.help()
     cecho("\n<yellow>[MMAPPER]<reset> navhelp is deprecated.\n")
     cecho("<dim_gray>Use 'snd help' for xrt/xrtforce/walkto guidance, and 'mapper help' for mapper-owned portal/database commands.<reset>\n")
 end
 
---- Show navigation database info
 function snd.mapper.showDbInfo()
     cecho("\n<yellow>═══ Navigation Database Info ═══<reset>\n")
     
@@ -6328,7 +6098,6 @@ function snd.mapper.showDbInfo()
     cecho("<yellow>════════════════════════════════<reset>\n")
 end
 
---- Set database path manually
 function snd.mapper.setMapperDb(path)
     snd.mapper.db.close()
     snd.mapper.db.file = path
@@ -6342,10 +6111,6 @@ function snd.mapper.setMapperDb(path)
         snd.utils.infoNote("Mapper database set to: " .. path)
     end
 end
-
--------------------------------------------------------------------------------
--- XRT Command - Quick Navigation
--------------------------------------------------------------------------------
 
 function snd.mapper.debugXrtDecision(destInput, resolvedRoom, reason)
     if not (mm and mm.state and mm.state.debug) then
@@ -6388,8 +6153,6 @@ function snd.mapper.debugXrtDecision(destInput, resolvedRoom, reason)
     end
 end
 
---- Navigate to area or room by name/number
--- @param dest Destination - area name, partial name, or room number
 function snd.mapper.xrt(dest, options)
     if not dest or dest == "" then
         cecho("<yellow>[MMAPPER]<reset> Usage: xrt <area|roomid>\n")
@@ -6400,7 +6163,6 @@ function snd.mapper.xrt(dest, options)
     options = type(options) == "table" and options or {}
     dest = dest:lower():trim()
     
-    -- Check if it's a room number
     local roomNum = tonumber(dest)
     if roomNum then
         cecho("<yellow>[MMAPPER]<reset> Going to room " .. roomNum .. "\n")
@@ -6408,7 +6170,6 @@ function snd.mapper.xrt(dest, options)
         return snd.mapper.gotoRoom(roomNum, nil, nil, nil, dest, options)
     end
     
-    -- Try exact match on area key first (prefer snd.db startRoom data)
     if snd.db and snd.db.getAreaStartRoom then
         local startRoom = tonumber(snd.db.getAreaStartRoom(dest)) or -1
         if startRoom > 0 then
@@ -6436,7 +6197,6 @@ function snd.mapper.xrt(dest, options)
         end
     end
 
-    -- Fall back to bundled defaults
     if snd.data and snd.data.areaDefaultStartRooms then
         local areaData = snd.data.areaDefaultStartRooms[dest]
         if areaData and areaData.start then
@@ -6445,7 +6205,6 @@ function snd.mapper.xrt(dest, options)
             return snd.mapper.gotoRoom(areaData.start, nil, nil, nil, dest, options)
         end
         
-        -- Try partial match on area names
         for areaKey, data in pairs(snd.data.areaDefaultStartRooms) do
             if areaKey:lower():find(dest, 1, true) and data.start then
                 cecho("<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. data.start .. ")\n")
@@ -6455,7 +6214,6 @@ function snd.mapper.xrt(dest, options)
         end
     end
     
-    -- Try looking up in database by area name
     if snd.mapper.db.open() then
         local sql = string.format(
             "SELECT uid FROM rooms WHERE area LIKE %s LIMIT 1",
@@ -6546,11 +6304,7 @@ function snd.mapper.xrtforce(dest)
     return false
 end
 
---- Walk to a room or area WITHOUT using portals (pure walking)
--- Uses snd.db for area lookup and Aardwolf.db for pathfinding
--- Does NOT use Mudlet's internal map for navigation
--- @param dest Destination - room number or area name
--- @param opts Optional controls; embedded avoids replacing an outer route destination
+-- Walk-only routing uses Aardwolf.db, never Mudlet's internal map.
 function snd.mapper.walkTo(dest, opts)
     if not dest or dest == "" then
         cecho("<yellow>[MMAPPER]<reset> Usage: walkto <roomid|areaname>\n")
@@ -6563,7 +6317,6 @@ function snd.mapper.walkTo(dest, opts)
     snd.mapper.lastRouteFailure = nil
     dest = dest:lower():trim()
     
-    -- Get current room
     local currentRoom = nil
     if snd.room and snd.room.current and snd.room.current.rmid then
         currentRoom = snd.room.current.rmid
@@ -6582,13 +6335,11 @@ function snd.mapper.walkTo(dest, opts)
     local targetRoom = nil
     local displayName = dest
     
-    -- Check if it's a room number
     local roomNum = tonumber(dest)
     if roomNum then
         targetRoom = tostring(roomNum)
         displayName = "room " .. roomNum
     else
-        -- Look up area in snd.db first (the mob/area database)
         if snd.db and snd.db.getAreaStartRoom then
             local startRoom = snd.db.getAreaStartRoom(dest)
             if startRoom and startRoom > 0 then
@@ -6597,16 +6348,13 @@ function snd.mapper.walkTo(dest, opts)
             end
         end
         
-        -- Try snd.data.areaDefaultStartRooms
         if not targetRoom and snd.data and snd.data.areaDefaultStartRooms then
-            -- Exact match
             local areaData = snd.data.areaDefaultStartRooms[dest]
             if areaData and areaData.start then
                 targetRoom = tostring(areaData.start)
                 displayName = dest .. " (room " .. areaData.start .. ")"
             end
             
-            -- Partial match
             if not targetRoom then
                 for areaKey, data in pairs(snd.data.areaDefaultStartRooms) do
                     if areaKey:lower():find(dest, 1, true) and data.start then
@@ -6618,7 +6366,6 @@ function snd.mapper.walkTo(dest, opts)
             end
         end
         
-        -- Try database lookup by area name in Aardwolf.db
         if not targetRoom and snd.mapper.db.open() then
             local sql = string.format(
                 "SELECT uid FROM rooms WHERE LOWER(area) LIKE %s LIMIT 1",
@@ -6646,7 +6393,6 @@ function snd.mapper.walkTo(dest, opts)
         return false
     end
     
-    -- Use snd.mapper.findPath with portals DISABLED
     cecho("<yellow>[MMAPPER]<reset> Walking to " .. displayName .. " (no portals)...\n")
     
     local path, depth = snd.mapper.findPath(currentRoom, targetRoom, true, true)  -- noPortals=true, noRecalls=true
@@ -6711,11 +6457,6 @@ function snd.mapper.walkTo(dest, opts)
     end
 end
 
--------------------------------------------------------------------------------
--- Alias Registration
--------------------------------------------------------------------------------
-
--- Register xrt alias
 if snd.mapper.xrtAlias then
     killAlias(snd.mapper.xrtAlias)
 end
@@ -6754,8 +6495,7 @@ for _, eventId in ipairs(snd.mapper.recallResumeEventIds or {}) do
         killAnonymousEventHandler(eventId)
     end
 end
--- Older builds registered GMCP handlers for blind-recall continuation. Kill
--- those handlers during an upgrade, but do not register replacements.
+-- Remove legacy blind-recall GMCP handlers without replacing them.
 snd.mapper.recallResumeEventIds = {}
 
 if snd.mapper.xrtForceAlias then
@@ -6766,7 +6506,6 @@ snd.mapper.xrtForceAlias = tempAlias("^xrtforce(?:\\s+(.*))?$", function()
     snd.mapper.xrtforce(dest)
 end)
 
--- Register walkto alias (no portals)
 if snd.mapper.walkToAlias then
     killAlias(snd.mapper.walkToAlias)
 end
@@ -6775,23 +6514,9 @@ snd.mapper.walkToAlias = tempAlias("^walkto(?:\\s+(.*))?$", function()
     snd.mapper.walkTo(dest)
 end)
 
--- Deprecated command aliases removed:
---   navhelp
---   mapper/snd portals
---   mapper portal
---   mapper searchportal
---   mapper/snd navdb
---   mapper/snd import
-
--------------------------------------------------------------------------------
--- Database Import - Import from Aardwolf.db to Mudlet Internal Map
--------------------------------------------------------------------------------
-
---- Import all data from Aardwolf.db into Mudlet's internal map
--- WARNING: This clears the existing Mudlet map first!
+-- WARNING: Legacy import clears the existing Mudlet map first.
 function snd.mapper.importFromDb()
-    -- Retain the legacy API name, but always prefer the shared importer whose
-    -- room positions are derived from cardinal exits.
+    -- Legacy API delegates to the shared cardinal-exit layout importer.
     if mm and mm.import and type(mm.import.convert_sqlite_to_mudlet) == "function" then
         return mm.import.convert_sqlite_to_mudlet(mm.state and mm.state.map_db or "Aardwolf.db")
     end
@@ -6803,7 +6528,6 @@ function snd.mapper.importFromDb()
     
     cecho("\n<yellow>═══ Starting Map Import from Aardwolf.db ═══<reset>\n")
     
-    -- Step 1: Count what we're importing
     local roomCount = snd.mapper.db.query("SELECT COUNT(*) as cnt FROM rooms")
     local exitCount = snd.mapper.db.query("SELECT COUNT(*) as cnt FROM exits")
     local areaCount = snd.mapper.db.query("SELECT COUNT(DISTINCT area) as cnt FROM rooms")
@@ -6819,7 +6543,6 @@ function snd.mapper.importFromDb()
         return false
     end
     
-    -- Step 2: Clear existing Mudlet map
     cecho("  <yellow>Clearing existing Mudlet map...<reset>\n")
     
     local existingRooms = getRooms()
@@ -6830,7 +6553,6 @@ function snd.mapper.importFromDb()
     end
     cecho(string.format("  <dim_gray>Cleared %d rooms from Mudlet map<reset>\n", cleared))
     
-    -- Also clear areas (except default -1)
     local existingAreas = getAreaTable()
     for name, id in pairs(existingAreas) do
         if id ~= -1 then
@@ -6838,7 +6560,6 @@ function snd.mapper.importFromDb()
         end
     end
     
-    -- Step 3: Create areas
     cecho("  <yellow>Creating areas...<reset>\n")
     
     local areaResults = snd.mapper.db.query("SELECT DISTINCT area FROM rooms WHERE area IS NOT NULL AND area != ''")
@@ -6857,7 +6578,6 @@ function snd.mapper.importFromDb()
     end
     cecho(string.format("  <green>Created %d areas<reset>\n", areasCreated))
     
-    -- Step 4: Import rooms in batches
     cecho("  <yellow>Importing rooms...<reset>\n")
     
     local batchSize = 1000
@@ -6881,17 +6601,14 @@ function snd.mapper.importFromDb()
             if roomId and roomId > 0 then
                 local created = addRoom(roomId)
                 if created then
-                    -- Set room name
                     if room.name then
                         setRoomName(roomId, room.name)
                     end
                     
-                    -- Set room area
                     if room.area and areaMap[room.area] then
                         setRoomArea(roomId, areaMap[room.area])
                     end
                     
-                    -- Set room character for special flags
                     if tonumber(room.noportal) == 1 then
                         setRoomChar(roomId, "P")  -- Mark as no-portal
                     elseif tonumber(room.norecall) == 1 then
@@ -6907,7 +6624,6 @@ function snd.mapper.importFromDb()
         
         offset = offset + batchSize
         
-        -- Progress update every batch
         if offset % 5000 == 0 then
             cecho(string.format("  <dim_gray>Progress: %d rooms...<reset>\n", roomsCreated))
         end
@@ -6919,14 +6635,12 @@ function snd.mapper.importFromDb()
     end
     echo("\n")
     
-    -- Step 5: Import exits in batches
     cecho("  <yellow>Importing exits...<reset>\n")
     
     offset = 0
     local exitsCreated = 0
     local exitErrors = 0
     
-    -- Direction mapping for Mudlet
     local dirMap = {
         n = "north", s = "south", e = "east", w = "west",
         u = "up", d = "down",
@@ -6949,10 +6663,8 @@ function snd.mapper.importFromDb()
             local dir = exit.dir
             
             if fromId and toId and dir then
-                -- Check if it's a standard direction
                 local mudletDir = dirMap[dir:lower()]
                 if mudletDir then
-                    -- Standard exit
                     local success = setExit(fromId, toId, mudletDir)
                     if success then
                         exitsCreated = exitsCreated + 1
@@ -6960,7 +6672,6 @@ function snd.mapper.importFromDb()
                         exitErrors = exitErrors + 1
                     end
                 else
-                    -- Special exit (custom command)
                     local success = addSpecialExit(fromId, toId, dir)
                     if success then
                         exitsCreated = exitsCreated + 1
@@ -6973,7 +6684,6 @@ function snd.mapper.importFromDb()
         
         offset = offset + batchSize
         
-        -- Progress update
         if offset % 10000 == 0 then
             cecho(string.format("  <dim_gray>Progress: %d exits...<reset>\n", exitsCreated))
         end
@@ -6985,19 +6695,16 @@ function snd.mapper.importFromDb()
     end
     echo("\n")
     
-    -- The compatibility fallback also derives room positions from exits. It
-    -- must never copy Aardwolf's continent coordinates into Mudlet rooms.
+    -- Compatibility import derives geometry from exits, never continent coordinates.
     local layoutOk, layoutErr = snd.mapper.calculateCoordinates()
     if not layoutOk then
         snd.utils.errorNote("Cannot calculate native map layout: " .. tostring(layoutErr or "unknown error"))
         return false
     end
 
-    -- Step 6: Save the map
     cecho("  <yellow>Saving map...<reset>\n")
     saveMap()
     
-    -- Summary
     cecho("\n<green>═══ Import Complete ═══<reset>\n")
     cecho(string.format("  <cyan>Rooms:<reset> %d created\n", roomsCreated))
     cecho(string.format("  <cyan>Exits:<reset> %d created\n", exitsCreated))
@@ -7008,7 +6715,6 @@ function snd.mapper.importFromDb()
     return true
 end
 
---- Quick check of import status
 function snd.mapper.checkImport()
     local mudletRooms = 0
     local mudletAreas = 0
@@ -7039,15 +6745,6 @@ function snd.mapper.checkImport()
     cecho("<yellow>══════════════════<reset>\n")
 end
 
--- Deprecated command aliases removed:
---   mapper/snd checkimport
---   mapper/snd calccoords
-
--------------------------------------------------------------------------------
--- Coordinate Calculation - Build visual map from exits
--------------------------------------------------------------------------------
-
--- Direction to coordinate offset mapping
 snd.mapper.dirOffsets = {
     n  = { x = 0,  y = 1,  z = 0 },
     s  = { x = 0,  y = -1, z = 0 },
@@ -7063,12 +6760,8 @@ snd.mapper.dirOffsets = {
     down  = { x = 0,  y = 0,  z = -1 },
 }
 
---- Calculate coordinates for all rooms using BFS from exits
--- @param startRoom Optional starting room (default: 32418 Aylor)
 function snd.mapper.calculateCoordinates(startRoom)
-    -- Keep the legacy API as a compatibility entry point, but route it through
-    -- the shared database-driven, per-area layout engine used by mapper
-    -- calccoords, mapper rebuild map, and mapper rebuild layout.
+    -- Legacy API delegates to the shared per-area layout engine.
     if mm and mm.import and type(mm.import.recalculate_all_layouts) == "function" then
         return mm.import.recalculate_all_layouts(mm.state and mm.state.map_db or "Aardwolf.db")
     end
@@ -7083,13 +6776,11 @@ function snd.mapper.calculateCoordinates(startRoom)
     cecho("\n<yellow>═══ Calculating Room Coordinates ═══<reset>\n")
     cecho(string.format("  <cyan>Starting room:<reset> %d\n", startRoom))
     
-    -- Check if start room exists
     if not roomExists(startRoom) then
         snd.utils.errorNote("Start room " .. startRoom .. " doesn't exist in Mudlet map")
         return false
     end
     
-    -- Get all exits from database (excluding portals)
     cecho("  <yellow>Loading exits from database...<reset>\n")
     local exitQuery = snd.mapper.db.query([[
         SELECT fromuid, touid, dir FROM exits 
@@ -7106,7 +6797,6 @@ function snd.mapper.calculateCoordinates(startRoom)
     
     cecho(string.format("  <cyan>Exits loaded:<reset> %d\n", #exitQuery))
     
-    -- Build adjacency list
     local exits = {}  -- exits[fromuid] = { {touid, dir}, ... }
     for _, exit in ipairs(exitQuery) do
         local from = tonumber(exit.fromuid)
@@ -7119,7 +6809,6 @@ function snd.mapper.calculateCoordinates(startRoom)
         end
     end
     
-    -- BFS to calculate coordinates
     cecho("  <yellow>Calculating coordinates via BFS...<reset>\n")
     
     local coords = {}  -- coords[roomid] = {x, y, z}
@@ -7128,12 +6817,10 @@ function snd.mapper.calculateCoordinates(startRoom)
     local processed = 0
     local totalRooms = 0
     
-    -- Count total rooms for progress
     for _ in pairs(getRooms()) do
         totalRooms = totalRooms + 1
     end
     
-    -- Start BFS from startRoom at (0, 0, 0)
     coords[startRoom] = { x = 0, y = 0, z = 0 }
     table.insert(queue, startRoom)
     visited[startRoom] = true
@@ -7143,12 +6830,10 @@ function snd.mapper.calculateCoordinates(startRoom)
         local currentCoords = coords[current]
         processed = processed + 1
         
-        -- Progress update
         if processed % 5000 == 0 then
             cecho(string.format("  <dim_gray>Progress: %d rooms processed...<reset>\n", processed))
         end
         
-        -- Process all exits from current room
         if exits[current] then
             for _, exit in ipairs(exits[current]) do
                 local nextRoom = exit.to
@@ -7170,7 +6855,6 @@ function snd.mapper.calculateCoordinates(startRoom)
     
     cecho(string.format("  <green>Calculated coordinates for %d rooms<reset>\n", processed))
     
-    -- Find disconnected rooms (not reachable from start)
     local disconnected = 0
     for roomId, _ in pairs(getRooms()) do
         if not coords[roomId] then
@@ -7181,13 +6865,11 @@ function snd.mapper.calculateCoordinates(startRoom)
     if disconnected > 0 then
         cecho(string.format("  <yellow>Disconnected rooms:<reset> %d (will process separately)\n", disconnected))
         
-        -- Process disconnected areas - find clusters and position them
         local clusterOffset = 1000  -- Offset each cluster by 1000 to separate them
         local clusterCount = 0
         
         for roomId, _ in pairs(getRooms()) do
             if not coords[roomId] then
-                -- Start a new cluster from this room
                 clusterCount = clusterCount + 1
                 local clusterBaseX = clusterCount * clusterOffset
                 
@@ -7223,7 +6905,6 @@ function snd.mapper.calculateCoordinates(startRoom)
         cecho(string.format("  <cyan>Found %d disconnected clusters<reset>\n", clusterCount))
     end
     
-    -- Apply coordinates to Mudlet map
     cecho("  <yellow>Applying coordinates to Mudlet map...<reset>\n")
     
     local applied = 0
@@ -7242,11 +6923,9 @@ function snd.mapper.calculateCoordinates(startRoom)
         end
     end
     
-    -- Save the map
     cecho("  <yellow>Saving map...<reset>\n")
     saveMap()
     
-    -- Summary
     cecho("\n<green>═══ Coordinate Calculation Complete ═══<reset>\n")
     cecho(string.format("  <cyan>Rooms processed:<reset> %d\n", processed))
     cecho(string.format("  <cyan>Coordinates applied:<reset> %d\n", applied))
@@ -7262,14 +6941,6 @@ function snd.mapper.calculateCoordinates(startRoom)
     return true
 end
 
--------------------------------------------------------------------------------
--- Room Color Update - Apply terrain colors from environments table
--------------------------------------------------------------------------------
-
--- Deprecated command alias removed:
---   mapper/snd updatecolors
-
---- Update room colors based on terrain → environment mapping
 function snd.mapper.updateRoomColors()
     if not snd.mapper.db.open() then
         snd.utils.errorNote("Cannot open Aardwolf.db")
@@ -7278,7 +6949,6 @@ function snd.mapper.updateRoomColors()
     
     cecho("\n<yellow>═══ Updating Room Colors ═══<reset>\n")
     
-    -- ANSI color codes to RGB mapping (matching MUSHclient)
     local ansiToRgb = {
         [1]  = {128, 0, 0},       -- Dark Red
         [2]  = {0, 128, 0},       -- Dark Green
@@ -7297,7 +6967,7 @@ function snd.mapper.updateRoomColors()
         [15] = {255, 255, 255},   -- White
     }
     
-    -- Step 1: Load environment color mapping (column is uid, not id)
+    -- The environment key column is uid, not id.
     cecho("  <yellow>Loading environment colors...<reset>\n")
     
     local envQuery = snd.mapper.db.query("SELECT uid, name, color FROM environments")
@@ -7306,7 +6976,6 @@ function snd.mapper.updateRoomColors()
         return false
     end
     
-    -- Build terrain name → env id and color mapping
     local terrainToEnvId = {}
     local envColors = {}
     
@@ -7325,7 +6994,6 @@ function snd.mapper.updateRoomColors()
     
     cecho(string.format("  <cyan>Loaded %d environment types<reset>\n", #envQuery))
     
-    -- Step 2: Register environment colors in Mudlet
     cecho("  <yellow>Registering environment colors in Mudlet...<reset>\n")
     
     local colorsSet = 0
@@ -7335,14 +7003,12 @@ function snd.mapper.updateRoomColors()
             setCustomEnvColor(envId, rgb[1], rgb[2], rgb[3], 255)
             colorsSet = colorsSet + 1
         else
-            -- Fallback for unknown color codes
             setCustomEnvColor(envId, 192, 192, 192, 255)  -- Default gray
         end
     end
     
     cecho(string.format("  <cyan>Set %d environment colors<reset>\n", colorsSet))
     
-    -- Step 3: Load rooms and update their environments
     cecho("  <yellow>Updating room environments...<reset>\n")
     
     local batchSize = 1000
@@ -7388,11 +7054,9 @@ function snd.mapper.updateRoomColors()
         end
     end
     
-    -- Step 4: Save the map
     cecho("  <yellow>Saving map...<reset>\n")
     saveMap()
     
-    -- Summary
     cecho("\n<green>═══ Color Update Complete ═══<reset>\n")
     cecho(string.format("  <cyan>Rooms updated:<reset> %d\n", updated))
     if skipped > 0 then
@@ -7406,7 +7070,6 @@ function snd.mapper.updateRoomColors()
     return true
 end
 
---- Show environment/terrain mapping
 function snd.mapper.showEnvironments()
     if not snd.mapper.db.open() then
         snd.utils.errorNote("Cannot open Aardwolf.db")
@@ -7419,7 +7082,6 @@ function snd.mapper.showEnvironments()
         return
     end
     
-    -- ANSI color names for display
     local ansiNames = {
         [1]  = "Dark Red",
         [2]  = "Dark Green",
@@ -7451,16 +7113,8 @@ function snd.mapper.showEnvironments()
     cecho("<yellow>════════════════════<reset>\n")
 end
 
--- Deprecated command alias removed:
---   mapper/snd showenv
-
--------------------------------------------------------------------------------
--- Cleanup
--------------------------------------------------------------------------------
-
 registerAnonymousEventHandler("sysExitEvent", function()
     snd.mapper.db.close()
 end)
 
--- Module loaded message
 snd.utils.debugNote("Navigation module loaded")

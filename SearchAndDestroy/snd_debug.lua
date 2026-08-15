@@ -1,10 +1,3 @@
---[[
-    Search and Destroy - Debug Module
-    Mudlet Port
-
-    Provides debug helpers and state tracking.
-]]
-
 snd = snd or {}
 snd.debug = snd.debug or {
     enabled = false,
@@ -60,4 +53,3 @@ function snd.debug.recordSearch(context)
     snd.debug.lastSearch = context
 end
 
--- Module loaded silently

@@ -1,22 +1,5 @@
---[[
-    Search and Destroy - Campaign Module
-    Mudlet Port
-    
-    Original MUSHclient plugin by Crowley
-    Ported to Mudlet
-    
-    This module handles campaign (cp) tracking:
-    - Parsing cp info / cp check output
-    - Target list management
-    - Campaign completion/failure
-]]
-
 snd = snd or {}
 snd.cp = snd.cp or {}
-
--------------------------------------------------------------------------------
--- Campaign Info Parsing State
--------------------------------------------------------------------------------
 
 snd.cp.parsing = {
     infoActive = false,
@@ -35,14 +18,6 @@ snd.cp.forceResolveNextCheck = snd.cp.forceResolveNextCheck or false
 
 local CP_COMPLETION_BONUS_WAIT = 0.5
 
--------------------------------------------------------------------------------
--- Campaign Check Request Throttling
--------------------------------------------------------------------------------
-
---- Request a cp check while suppressing duplicate sends in a short window.
--- @param delay number|nil Optional delay in seconds before sending
--- @param reason string|nil Optional debug reason for why check was requested
--- @param force boolean|nil Bypass the duplicate-send interval when a refresh is required
 function snd.cp.requestCheck(delay, reason, force)
     local now = os.clock()
     local minInterval = 0.75
@@ -67,16 +42,12 @@ function snd.cp.requestCheck(delay, reason, force)
     return true
 end
 
---- Request a CP check whose response must rebuild location resolution.
 function snd.cp.requestResolveCheck(delay, reason)
     snd.cp.forceResolveNextCheck = true
     return snd.cp.requestCheck(delay, reason or "forced CP resolution", true)
 end
 
---- Request cp info while coalescing startup/history reconciliation callers.
--- cp check and the following eligibility line can both discover that the
--- persisted campaign needs its Complete-By identity. They should share one
--- server request rather than emitting duplicate full campaign tables.
+-- Reattach paths share one request to avoid duplicate full campaign tables.
 function snd.cp.requestInfo(delay, reason, force)
     local now = os.clock()
     local minInterval = 2.0
@@ -109,13 +80,6 @@ function snd.cp.requestInfo(delay, reason, force)
     return true
 end
 
--------------------------------------------------------------------------------
--- Campaign History Session Tracking
--------------------------------------------------------------------------------
-
---- Normalize "Complete By" text so comparisons are stable.
--- @param value string Raw value captured from cp info.
--- @return string Normalized value
 function snd.cp.normalizeCompleteBy(value)
     local normalized = snd.utils.trim(tostring(value or ""))
     normalized = normalized:gsub("^%[", ""):gsub("%]$", "")
@@ -123,10 +87,6 @@ function snd.cp.normalizeCompleteBy(value)
     return normalized
 end
 
---- Parse normalized "Complete By" text into unix epoch.
--- Expected format: "03:27PM on 13 Apr 2026"
--- @param completeBy string
--- @return number|nil
 function snd.cp.parseCompleteByEpoch(completeBy)
     local text = snd.cp.normalizeCompleteBy(completeBy)
     if text == "" then
@@ -173,8 +133,6 @@ function snd.cp.parseCompleteByEpoch(completeBy)
     })
 end
 
---- Capture "Complete By" for the currently parsed cp info output.
--- @param value string Raw value captured from cp info.
 function snd.cp.captureCompleteBy(value)
     local normalized = snd.cp.normalizeCompleteBy(value)
     if normalized == "" then
@@ -184,10 +142,6 @@ function snd.cp.captureCompleteBy(value)
     snd.utils.debugNote("CP complete-by captured: " .. normalized)
 end
 
---- Parse cp info "Time Left" text into total seconds.
--- Example input: "6 days, 22 hours and 33 minutes"
--- @param value string
--- @return number|nil
 function snd.cp.parseTimeLeftSeconds(value)
     local text = tostring(value or ""):lower()
     if text == "" then
@@ -206,8 +160,6 @@ function snd.cp.parseTimeLeftSeconds(value)
     return total
 end
 
---- Capture "Time Left" for the currently parsed cp info output.
--- @param value string Raw time-left text captured from cp info.
 function snd.cp.captureTimeLeft(value)
     local totalSeconds = snd.cp.parseTimeLeftSeconds(value)
     if not totalSeconds then
@@ -272,7 +224,6 @@ local function buildCompletionRewards(row)
     }
 end
 
---- Persist the current campaign identity snapshot captured from cp info.
 function snd.cp.persistCampaignIdentitySnapshot(completeBy)
     snd.campaign.persistedCompleteBy = snd.cp.normalizeCompleteBy(completeBy)
     snd.campaign.persistedQpReward = tonumber(snd.campaign.qpReward) or 0
@@ -282,13 +233,10 @@ function snd.cp.persistCampaignIdentitySnapshot(completeBy)
     snd.campaign.persistedPracReward = tonumber(snd.campaign.pracReward) or 0
 end
 
---- True when we have an open campaign history row.
 function snd.cp.hasOpenHistorySession()
     return snd.campaign.completeBy ~= nil and snd.campaign.completeBy ~= ""
 end
 
---- Resolve history id for currently tracked Complete-By identity.
--- @return number|nil
 function snd.cp.resolveHistoryIdByCompleteBy()
     if not snd.db or not snd.db.getHistoryIdByCompleteBy then
         return nil
@@ -304,13 +252,7 @@ function snd.cp.resolveHistoryIdByCompleteBy()
     return tonumber(historyId)
 end
 
---- Close currently tracked campaign history row if present.
--- For reset/undocumented closures, if we cannot resolve a history id from Complete-By,
--- force one last reattach attempt by sending "cp info" and waiting 2 seconds before retry.
--- @param status number
--- @param rewards table|nil
--- @param reason string|nil
--- @param opts table|nil {skipReattachProbe=true, forceHistoryId=number} internal guard/override
+-- Unknown closures get one delayed cp-info reattach attempt before reset.
 function snd.cp.closeHistorySession(status, rewards, reason, opts)
     if not snd.db then
         return nil
@@ -376,9 +318,6 @@ function snd.cp.closeHistorySession(status, rewards, reason, opts)
     return endedHistory
 end
 
---- Open a campaign history row/session if none exists.
--- @param levelTaken number Character level when campaign was taken.
--- @param completeBy string|nil Normalized "Complete By" identity captured from cp info.
 function snd.cp.openHistorySession(levelTaken, completeBy)
     if not snd.db then
         return
@@ -442,7 +381,6 @@ function snd.cp.openHistorySession(levelTaken, completeBy)
     end
 end
 
---- Sync currently captured campaign rewards into the open history row.
 function snd.cp.syncHistoryRewards()
     if not snd.db or not snd.db.historyUpdateRewardsById then
         return
@@ -460,28 +398,20 @@ function snd.cp.syncHistoryRewards()
     })
 end
 
--------------------------------------------------------------------------------
--- Parse Mob Target String
--- Extracts mob name and location from strings like "a mob (Area Name)" or "a mob (Room Name)"
--------------------------------------------------------------------------------
 
 function snd.cp.parseMobTarget(targetStr)
     if not targetStr then return nil, nil end
     
-    -- Pattern: "mob name (location)"
     local mob, loc = targetStr:match("^(.+) %((.+)%)$")
     
     if not mob then
-        -- No location, just mob name
         mob = targetStr
         loc = ""
     end
     
-    -- Clean up mob name
     mob = snd.utils.trim(mob)
     loc = snd.utils.trim(loc or "")
     
-    -- Check for " - Dead" suffix
     local isDead = false
     if loc:match(" %- Dead$") then
         isDead = true
@@ -491,11 +421,6 @@ function snd.cp.parseMobTarget(targetStr)
     return mob, loc, isDead
 end
 
--------------------------------------------------------------------------------
--- Campaign Info Processing
--------------------------------------------------------------------------------
-
---- Start processing cp info output
 function snd.cp.startCpInfo()
     snd.cp.parsing.infoActive = true
     snd.cp.parsing.tempTargets = {}
@@ -510,16 +435,12 @@ function snd.cp.startCpInfo()
     snd.utils.debugNote("Started parsing cp info")
 end
 
---- Process a cp info target line
--- @param targetStr The target string (e.g., "a mob (Area Name)")
 function snd.cp.processCpInfoLine(targetStr)
     if not snd.cp.parsing.infoActive then return end
     
     local mob, loc, isDead = snd.cp.parseMobTarget(targetStr)
     if not mob then return end
     
-    -- loc contains the area NAME like "Artificer's Mayhem"
-    -- We need to look up the area KEY for navigation
     local areaKey = ""
     if loc and loc ~= "" and snd.db and snd.db.getAreaKeyFromName then
         areaKey = snd.db.getAreaKeyFromName(loc) or ""
@@ -539,7 +460,6 @@ function snd.cp.processCpInfoLine(targetStr)
     snd.utils.debugNote("CP target: " .. mob .. " in " .. loc .. " (key: " .. areaKey .. ")")
 end
 
---- End processing cp info output
 function snd.cp.endCpInfo()
     if not snd.cp.parsing.infoActive then return end
     
@@ -561,23 +481,16 @@ function snd.cp.endCpInfo()
     end
 end
 
--------------------------------------------------------------------------------
--- Campaign Check Processing
--------------------------------------------------------------------------------
-
---- Start processing cp check output
 function snd.cp.startCpCheck()
     snd.cp.parsing.checkActive = true
     snd.cp.parsing.tempTargets = {}
     snd.campaign.checkList = {}
-    -- cp check output refreshes campaign status only; it should not inherit
-    -- stale nx/xcp-mode state from prior navigation and accidentally fire qw/ht.
+    -- Do not inherit stale navigation state into a cp-check refresh.
     if snd.nav then
         snd.nav.nxState = nil
     end
 end
 
---- Process a cp check target line
 function snd.cp.processCpCheckLine(targetStr)
     if not snd.cp.parsing.checkActive then return end
     
@@ -591,7 +504,6 @@ function snd.cp.processCpCheckLine(targetStr)
     })
 end
 
---- End processing cp check output
 function snd.cp.endCpCheck()
     snd.cp.parsing.checkActive = false
     snd.campaign.lastCheck = os.clock()
@@ -629,7 +541,6 @@ function snd.cp.endCpCheck()
     end
 end
 
---- Build target list from cp check results (when cp info wasn't run first)
 function snd.cp.buildTargetListFromCheck()
     snd.campaign.targets = {}
 
@@ -646,8 +557,7 @@ function snd.cp.buildTargetListFromCheck()
             lastCheckLoc = check.loc,
             arid = areaKey,
             dead = check.dead or false,
-            -- cp check lists only targets that are still required. Any local
-            -- kill marker for a reported row was stale or not campaign credit.
+            -- A reported row is still required, so any local kill marker was stale.
             killed = false,
             campaignIndex = i,
             keyword = snd.gmcp.guessMobKeyword(check.mob, areaKey),
@@ -672,11 +582,6 @@ function snd.cp.buildTargetListFromCheck()
     end
 end
 
--------------------------------------------------------------------------------
--- Target List Management
--------------------------------------------------------------------------------
-
---- Determine if targets are area-based or room-based
 function snd.cp.determineTargetType(targets)
     if not targets or #targets == 0 then return "area" end
 
@@ -850,8 +755,7 @@ function snd.cp.resolveZonesForTarget(target, playerLevel, resolutionContext)
         return tryMapperFallback() or fallback, {}
     end
 
-    -- Fetch every S&D sighting for a unique mob once. Exact room-name matching,
-    -- zone selection, tags, and Express classification all consume this snapshot.
+    -- Share one sighting snapshot across matching, zone selection, tags, and Express.
     local rows = getMobEvidence(context, target.mob)
     if #rows == 0 then
         return tryMapperFallback() or fallback, rows
@@ -979,8 +883,6 @@ function snd.cp.resolveZonesForTarget(target, playerLevel, resolutionContext)
     return kept, rows
 end
 
---- Keep scoped/current CP target aligned with the rebuilt CP target list.
--- Clears stale selections so follow-up actions do not operate on removed mobs.
 function snd.cp.reconcileSelectionAfterRebuild()
     local cpEntries = {}
     for _, entry in ipairs(snd.targets.list or {}) do
@@ -1107,9 +1009,7 @@ local function sortAndIndexCpEntries(cpEntries)
     end
 end
 
---- Build the main target list from campaign targets
 function snd.cp.buildMainTargetList()
-    -- Remove existing CP targets but preserve GQ and Quest targets
     local newList = {}
     for _, t in ipairs(snd.targets.list) do
         if t.activity ~= "cp" then
@@ -1240,8 +1140,7 @@ function snd.cp.buildMainTargetList()
     snd.cp.reconcileSelectionAfterRebuild()
 end
 
---- Propagate canonical campaign status to every already-resolved CP entry.
--- One canonical target may have several zone choices; all choices share status.
+-- Location choices for one canonical target share status.
 function snd.cp.updateTargetStatus()
     local canonicalByIndex = {}
     for i, campaignTarget in ipairs(snd.campaign.targets or {}) do
@@ -1278,9 +1177,7 @@ function snd.cp.updateTargetStatus()
     snd.cp.reconcileSelectionAfterRebuild()
 end
 
---- Apply a parsed CP check to the canonical target roster without re-resolving.
--- Returns false only when the response contains a target that cannot belong to
--- the current roster, in which case the caller safely falls back to a full build.
+-- Reject unexpected targets so the caller can safely rebuild the full roster.
 function snd.cp.applyCheckStatusOnly()
     local targets = snd.campaign.targets or {}
     if not snd.campaign.resolved or #targets == 0 then
@@ -1297,7 +1194,7 @@ function snd.cp.applyCheckStatusOnly()
             or tostring(target.lastCheckLoc or ""):lower() == checkLoc
     end
 
-    -- Prefer exact mob+location identity so duplicate mob names retain ownership.
+    -- Exact mob+location identity preserves duplicate-name ownership.
     for checkIndex, check in ipairs(snd.campaign.checkList or {}) do
         for targetIndex, target in ipairs(targets) do
             if not matchedTargets[targetIndex]
@@ -1310,8 +1207,7 @@ function snd.cp.applyCheckStatusOnly()
         end
     end
 
-    -- A dead line can present a different location. Consume a same-name target
-    -- by stable campaign order, while still rejecting genuinely new mob names.
+    -- Dead lines may change location; fall back by same-name campaign order only.
     for checkIndex, check in ipairs(snd.campaign.checkList or {}) do
         if not assignments[checkIndex] then
             for targetIndex, target in ipairs(targets) do
@@ -1328,10 +1224,8 @@ function snd.cp.applyCheckStatusOnly()
         end
     end
 
-    -- The response is the authoritative roster of targets still required.
-    -- Omitted targets were completed, so remove their canonical records and
-    -- every expanded location row. Explicit - Dead rows remain because they
-    -- are still required after they respawn.
+    -- The response is authoritative: remove omitted targets, but retain explicit
+    -- -Dead rows because they remain required after respawn.
     local retainedTargets = {}
     local newIndexByOldCampaignIndex = {}
     for checkIndex, check in ipairs(snd.campaign.checkList or {}) do
@@ -1358,11 +1252,6 @@ function snd.cp.applyCheckStatusOnly()
     return true
 end
 
--------------------------------------------------------------------------------
--- Campaign Events
--------------------------------------------------------------------------------
-
---- Handle campaign mob killed
 function snd.cp.onMobKilled()
     snd.utils.debugNote("Campaign mob killed!")
     local shouldSyncAfterKill = true
@@ -1380,30 +1269,26 @@ function snd.cp.onMobKilled()
         end
     end
     
-    -- Fallback: when text trigger fires before GMCP clears, ConWin still sees the live enemy
+    -- Text may arrive before GMCP clears; ConWin can still identify the live enemy.
     local activeCombatMob = ""
     if confirmedKilledMob == "" and snd.conwin and snd.conwin.getCurrentCombatMobName then
         activeCombatMob = snd.conwin.getCurrentCombatMobName() or ""
     end
 
-    -- Record the kill if we have a current target
     if snd.targets.current and snd.targets.current.activity == "cp" then
         local roomId = snd.room and snd.room.current and snd.room.current.id or nil
         local killedMobName = confirmedKilledMob ~= "" and confirmedKilledMob or snd.targets.current.name or ""
         if type(raiseEvent) == "function" then
-            -- Integration surface: external scripts can listen to "snd.kill.confirmed"
             raiseEvent("snd.kill.confirmed", killedMobName, roomId)
         end
         local target = snd.targets.current
 
-        -- Mark as dead in target list
         local bestIndex, bestScore = nil, -1
         local currentArea = snd.room and snd.room.current and tostring(snd.room.current.arid or "") or ""
         local currentRoom = snd.room and snd.room.current and tostring(snd.room.current.name or "") or ""
         for i, t in ipairs(snd.targets.list) do
             if t.activity == "cp" and not t.dead then
-                -- ConWin publishes normalized lowercase names, while CP output
-                -- preserves display casing for proper names such as "Blitzen".
+                -- ConWin lowercases names; CP preserves proper-name casing.
                 local nameMatchesCurrent = snd.utils.mobIdentityMatches(t.mob, target.name)
                 local nameMatchesConfirmedKill = snd.utils.mobIdentityMatches(t.mob, confirmedKilledMob)
                 local nameMatchesActiveCombat = snd.utils.mobIdentityMatches(t.mob, activeCombatMob)
@@ -1427,8 +1312,7 @@ function snd.cp.onMobKilled()
             local killedEntry = snd.targets.list[bestIndex]
             killedEntry.dead = true
             killedEntry.killed = true
-            -- Mirror the local kill onto the canonical target until cp check
-            -- returns the authoritative remaining-target roster.
+            -- Mirror locally until cp check supplies the authoritative roster.
             local campaignIdx = tonumber(killedEntry.campaignIndex)
             local ct = campaignIdx and snd.campaign.targets and snd.campaign.targets[campaignIdx]
             if ct and ct.mob == killedEntry.mob then
@@ -1446,11 +1330,8 @@ function snd.cp.onMobKilled()
         end
         snd.cp.updateTargetStatus()
         if snd.cp.getRemainingCount and snd.cp.getRemainingCount() == 0 then
-            -- The original skip exists to avoid racing the cp_complete trigger when
-            -- the player just killed the final alive target. Only honor it when this
-            -- kill is the only one pending refresh; otherwise prior killed-by-player
-            -- mobs would stay in the list as [Killed] forever because no future cp
-            -- check would ever fire to clear them.
+            -- Skip the final refresh only when this is the sole pending kill; otherwise
+            -- earlier [Killed] rows would never receive a clearing cp check.
             local killedPendingCount = 0
             for _, t in ipairs(snd.campaign.targets or {}) do
                 if t.killed then
@@ -1463,7 +1344,6 @@ function snd.cp.onMobKilled()
             end
         end
         
-        -- Clear current target
         snd.clearTarget({refresh = false})
     end
     
@@ -1475,15 +1355,12 @@ function snd.cp.onMobKilled()
     end
     local markedTargetKilled = killedTargetsAfter > killedTargetsBefore
 
-    -- The server confirmed a campaign kill, but no CP entry gained the [Killed]
-    -- state in S&D's target window. Force a refresh without waiting for AutoCheck.
+    -- Force a refresh if server credit did not mark any local CP row [Killed].
     if not markedTargetKilled then
         snd.utils.debugNote("Campaign kill marked no CP target killed; forcing cp check")
         snd.cp.requestCheck(0.1, "cp.onMobKilled:no-target-marked-killed", true)
 
-    -- Otherwise, trigger cp check according to the normal AutoCheck policy.
-    -- Do not re-check immediately after the last kill; completion parsing/DB close
-    -- should proceed without a terminal "not on campaign" sync race.
+    -- Never re-check immediately after the last kill; completion owns that sync.
     elseif shouldSyncAfterKill and (not snd.shouldAutoCheckAfterKill or snd.shouldAutoCheckAfterKill("cp")) then
         snd.cp.requestCheck(0.1, "cp.onMobKilled")
     end
@@ -1498,7 +1375,6 @@ function snd.cp.onMobKilled()
     end
 end
 
---- Handle campaign complete
 function snd.cp.onComplete()
     local endedHistory = nil
     local latest = nil
@@ -1578,7 +1454,6 @@ function snd.cp.onComplete()
     snd.cp.clearCampaign()
 end
 
---- Mark campaign completion as pending so the first-campaign daily bonus can arrive.
 function snd.cp.startCompletionPending()
     cancelCompletionTimer()
     snd.cp.parsing.completionPending = true
@@ -1600,7 +1475,6 @@ function snd.cp.startCompletionPending()
     end)
 end
 
---- Finalize a pending campaign completion once the daily bonus is known or timed out.
 function snd.cp.finalizePendingCompletion(reason)
     if not snd.cp.parsing.completionPending then
         return false
@@ -1618,7 +1492,6 @@ function snd.cp.finalizePendingCompletion(reason)
     return true
 end
 
---- Capture the first-campaign daily QP bonus and close the pending completion early.
 function snd.cp.applyFirstDailyBonus(qpBonus)
     local bonus = tonumber(qpBonus) or 0
     if bonus <= 0 then
@@ -1635,16 +1508,13 @@ function snd.cp.applyFirstDailyBonus(qpBonus)
     return snd.cp.finalizePendingCompletion("first campaign daily bonus captured")
 end
 
---- Observe campaign completion footer separators. Completion waits for bonus or timer.
 function snd.cp.onCompletionSeparator()
     return snd.cp.parsing.completionPending == true
 end
 
---- Handle campaign quit/cleared
 function snd.cp.onQuit()
     snd.utils.reportLine("Campaign cleared.", "campaign")
     
-    -- Record as failed in history
     if snd.db then
         snd.cp.closeHistorySession(snd.db.HISTORY_STATUS_FAILED, nil, "campaign cleared")
     end
@@ -1652,7 +1522,6 @@ function snd.cp.onQuit()
     snd.cp.clearCampaign()
 end
 
---- Handle not on campaign message
 function snd.cp.onNotOnCampaign()
     snd.utils.debugNote(
         "Not on campaign (tracked completeBy='" .. tostring(snd.campaign.completeBy or "") ..
@@ -1670,7 +1539,6 @@ function snd.cp.onNotOnCampaign()
     snd.cp.clearCampaign()
 end
 
---- Handle the first positive signal that a campaign has been accepted.
 function snd.cp.onCampaignAccepted()
     snd.campaign.canGetNew = false
     snd.campaign.acceptedAt = os.time()
@@ -1682,7 +1550,6 @@ function snd.cp.onCampaignAccepted()
     end
 end
 
---- Clear campaign state
 function snd.cp.clearCampaign()
     snd.campaign.active = false
     snd.campaign.levelTaken = 0
@@ -1704,7 +1571,6 @@ function snd.cp.clearCampaign()
     snd.cp.parsing.completionSeparatorsSeen = 0
     snd.cp.parsing.completionStartCompletedToday = nil
 
-    -- Clear targets if no gquest
     if not snd.gquest.active then
         snd.targets.list = {}
         snd.targets.type = "none"
@@ -1728,7 +1594,6 @@ function snd.cp.clearCampaign()
     end
 end
 
---- Handle can get new campaign
 function snd.cp.onCanGetNew()
     snd.campaign.canGetNew = true
     snd.utils.debugNote("Can get new campaign")
@@ -1738,13 +1603,8 @@ function snd.cp.onCanGetNew()
         return
     end
 
-    -- Campaign eligibility only says that this level is allowed to take one;
-    -- it does not prove that a previously accepted campaign has ended. During
-    -- startup, persisted Complete-By state is loaded before the delayed
-    -- `cp check` marks the campaign active, so closing here would split the
-    -- same campaign on every reconnect. Reconcile through `cp info` instead:
-    -- an active campaign reattaches by Complete-By and syncs its rewards,
-    -- while the explicit not-on-campaign response owns any reset closure.
+    -- Eligibility does not prove a persisted campaign ended. Reattach through
+    -- cp info; only an explicit not-on-campaign response may close it.
     if snd.db and snd.cp.hasOpenHistorySession() and not snd.campaign.active then
         snd.utils.debugNote("Campaign eligibility arrived before campaign reconciliation; requesting 'cp info'")
         snd.cp.requestInfo(0, "campaign-eligibility:history-reattach")
@@ -1755,13 +1615,10 @@ function snd.cp.onCanGetNew()
     end
 end
 
---- Return local-date key used for campaign "today" counters.
--- @return string
 function snd.cp.getTodayDateKey()
     return os.date("%Y-%m-%d")
 end
 
---- Ensure campaign "today" counter is scoped to the current local date.
 function snd.cp.normalizeCampaignTodayCounter()
     local today = snd.cp.getTodayDateKey()
     if snd.campaign.completedTodayDate ~= today then
@@ -1770,8 +1627,6 @@ function snd.cp.normalizeCampaignTodayCounter()
     end
 end
 
---- Overwrite campaign completion count for today (from cp check/cp today output).
--- @param count number
 function snd.cp.setCampaignsCompletedToday(count)
     snd.cp.normalizeCampaignTodayCounter()
     snd.campaign.completedToday = math.max(0, tonumber(count) or 0)
@@ -1784,7 +1639,6 @@ function snd.cp.setCampaignsCompletedToday(count)
     end
 end
 
---- Increment campaign completion count for today (when campaign completion is detected).
 function snd.cp.incrementCampaignsCompletedToday()
     snd.cp.normalizeCampaignTodayCounter()
     snd.campaign.completedToday = (tonumber(snd.campaign.completedToday) or 0) + 1
@@ -1794,7 +1648,6 @@ function snd.cp.incrementCampaignsCompletedToday()
     end
 end
 
---- Record a local campaign completion unless the server count already advanced.
 function snd.cp.recordCampaignCompletionToday()
     snd.cp.normalizeCampaignTodayCounter()
     local startCount = tonumber(snd.cp.parsing.completionStartCompletedToday)
@@ -1810,12 +1663,6 @@ function snd.cp.recordCampaignCompletionToday()
     end
 end
 
--------------------------------------------------------------------------------
--- Campaign Target Selection
--------------------------------------------------------------------------------
-
---- Select a campaign target by index
--- @param index Target index (1-based)
 function snd.cp.selectTarget(index, options)
     local opts = type(options) == "table" and options or {}
     index = tonumber(index)
@@ -1908,7 +1755,6 @@ function snd.cp.selectTarget(index, options)
     return true
 end
 
---- Get next available campaign target
 function snd.cp.getNextTarget()
     for _, t in ipairs(snd.targets.list) do
         if t.activity == "cp" and not t.dead then
@@ -1918,7 +1764,6 @@ function snd.cp.getNextTarget()
     return nil
 end
 
---- Count remaining campaign targets
 function snd.cp.getRemainingCount()
     local count = 0
     for _, t in ipairs(snd.targets.list) do
@@ -1929,4 +1774,3 @@ function snd.cp.getRemainingCount()
     return count
 end
 
--- Module loaded silently

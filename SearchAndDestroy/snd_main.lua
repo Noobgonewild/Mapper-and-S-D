@@ -1,22 +1,5 @@
---[[
-    Search and Destroy - Main Module
-    Mudlet Port
-    
-    Original MUSHclient plugin by Crowley
-    Ported to Mudlet
-    
-    This module contains:
-    - Global state variables
-    - Configuration
-    - Initialization
-    - Save/Load state
-]]
-
 snd = snd or {}
 
--------------------------------------------------------------------------------
--- Version Information
--------------------------------------------------------------------------------
 
 snd.version = "7.1.0"
 snd.schemaVersion = 7
@@ -71,68 +54,49 @@ local persistedStateEarly = loadPersistedStateEarly()
 local existingConfig = type(snd.config) == "table" and snd.config or nil
 local wasInitialized = snd.initialized == true
 
--------------------------------------------------------------------------------
--- Configuration
--------------------------------------------------------------------------------
 
 local defaultConfig = {
-    -- Debug mode
     debugMode = false,
     
-    -- Silent mode - suppress some messages
     silentMode = false,
     
-    -- Speed for navigation (run or walk)
     speed = "run",
 
-    -- Optional xrt/navigation guard for areas above the character's level.
     areaGuard = {
         enabled = false,
         allowance = 30,
     },
     
-    -- Kill command for xkill (default: "kill", can be set with xcmd)
     killCommand = "kill",
-    -- Mob target quoting: auto resolves direct cast commands, skill is the
-    -- normal kill/backstab form, cast quotes the numbered selector as a unit,
-    -- and raw preserves the historical unquoted behavior.
+    -- Target syntax: auto, skill, cast, or legacy raw.
     killTargetMode = "auto",
     
-    -- Auto-noexp settings
     anex = {
         automatic = true,
         tnlCutoff = 0,
     },
     
-    -- Vidblain navigation
     vidblain = {
         enabled = false,
         level = 300,
     },
     
-    -- GQ extra aliases
     gqExtraAliases = true,
     
-    -- Next action after arriving at target (smartscan, qs, none)
     nxAction = "qs",
     
-    -- XCP target room source/lookup strategy: db|qw|hybrid|ht
     xcpActionMode = "qw",
     
-    -- Overwrite con data
     overwriteCon = true,
     
-    -- Sound notifications
     soundEnabled = false,
     soundVolume = 100,
     
-    -- Express mode (direct-route proven fixed-room targets)
     express = {
         enabled = true,
         minKillCount = 2,
     },
     
-    -- Auto check behavior after kills: on|smart|off
     autocheck = {
         mode = "on",
         smartKills = 3,
@@ -140,14 +104,11 @@ local defaultConfig = {
         gqKillCounter = 0,
     },
 
-    -- Focused diagnostics for mob tag priority/nohunt/nowhere decisions
     mobTagDebug = false,
 
-    -- Table display settings
     tableNotes = false,
     tableWidth = 80,
     
-    -- Window settings
     window = {
         enabled = true,
         posX = 0,
@@ -158,16 +119,12 @@ local defaultConfig = {
         fontSize = 8,
     },
     
-    -- Automatic update checks
     autoUpdateCheck = true,
 
-    -- Area color banding for target list location labels
     areaColors = true,
 
-    -- Reporting channel for S&D event/history output ("default" = local echo)
     reportChannel = "default",
 
-    -- Mapper portal/bounce preferences used by xrt pathing helpers
     mapper = {
         bouncePortalId = nil,
         bounceRecallId = nil,
@@ -175,7 +132,6 @@ local defaultConfig = {
         bounceRecallCommand = nil,
     },
 
-    -- Mapper/S&D interactive text styling preferences
     mapperUI = {
         links = true,
         hover = true,
@@ -214,9 +170,6 @@ end
 
 snd.config.nxAction = snd.normalizeNxAction(snd.config.nxAction)
 
--------------------------------------------------------------------------------
--- Room State
--------------------------------------------------------------------------------
 
 snd.room = snd.room or {
     current = {
@@ -236,18 +189,12 @@ snd.room = snd.room or {
     history = {},
 }
 
--------------------------------------------------------------------------------
--- Room Characters Tag State
--------------------------------------------------------------------------------
 
 snd.roomChars = snd.roomChars or {
     active = false,
     triggerIds = nil,
 }
 
--------------------------------------------------------------------------------
--- Character State
--------------------------------------------------------------------------------
 
 snd.char = snd.char or {
     state = "0",
@@ -269,9 +216,6 @@ snd.char = snd.char or {
     noexpCommandAt = 0,
 }
 
--------------------------------------------------------------------------------
--- Campaign State
--------------------------------------------------------------------------------
 
 snd.campaign = snd.campaign or {
     active = false,
@@ -286,7 +230,6 @@ snd.campaign = snd.campaign or {
     resolved = false,  -- Location/zone snapshot built for the current campaign
     canGetNew = nil,
     lastCheck = 0,
-    -- Rewards tracking
     qpReward = 0,
     goldReward = 0,
     tpReward = 0,
@@ -301,9 +244,6 @@ snd.campaign = snd.campaign or {
     persistedPracReward = 0,
 }
 
--------------------------------------------------------------------------------
--- Global Quest State
--------------------------------------------------------------------------------
 
 snd.gquest = snd.gquest or {
     active = false,
@@ -324,9 +264,6 @@ snd.gquest = snd.gquest or {
     qpKillBonusTotal = 0,
 }
 
--------------------------------------------------------------------------------
--- Quest State
--------------------------------------------------------------------------------
 
 snd.quest = snd.quest or {
     active = false,
@@ -357,9 +294,6 @@ snd.quest = snd.quest or {
     targetTriggerId = nil,
 }
 
--------------------------------------------------------------------------------
--- History Display State
--------------------------------------------------------------------------------
 
 snd.history = snd.history or {
     lastRows = {},
@@ -456,9 +390,6 @@ function snd.quest.consumeSilentCooldownRequest()
     return false
 end
 
--------------------------------------------------------------------------------
--- Main Target List (unified view of cp/gq targets)
--------------------------------------------------------------------------------
 
 snd.targets = snd.targets or {
     list = {},           -- Main target list
@@ -473,22 +404,8 @@ snd.targets = snd.targets or {
     },
     lastAutoRefresh = 0, -- Timestamp for auto-refreshing target sources
     lineTriggerIds = nil, -- Target line triggers
-    --[[
-        Current target structure:
-        {
-            keyword = "sinister vandal",
-            name = "a sinister vandal",
-            roomName = "In The Courtyard",  -- Only for room-based
-            area = "diatz",
-            index = 4,                       -- Index in target list
-            activity = "cp",                 -- "cp", "gq", "quest", or nil
-        }
-    ]]
 }
 
--------------------------------------------------------------------------------
--- Express Target Classification
--------------------------------------------------------------------------------
 
 snd.express = snd.express or {}
 
@@ -501,11 +418,7 @@ local function clearExpressTarget(target)
     return target
 end
 
---- Snapshot whether a target qualifies for Express routing.
--- Express is deliberately based only on area-scoped S&D mob sightings:
--- exactly one unique room, with at least the configured number of kills.
--- Mapper room-name matches are not mob sightings and do not qualify.
--- @param evidenceRows optional all-room S&D evidence already loaded for this mob
+-- Express requires one proven S&D sighting room; mapper name matches do not qualify.
 function snd.express.classifyTarget(target, evidenceRows)
     clearExpressTarget(target)
     if type(target) ~= "table" then return target end
@@ -568,7 +481,6 @@ function snd.express.classifyTarget(target, evidenceRows)
     return target
 end
 
---- Reclassify the already-built list after changing Express settings.
 function snd.express.reclassifyTargets()
     if snd.targets and type(snd.targets.list) == "table" then
         for _, target in ipairs(snd.targets.list) do
@@ -584,9 +496,6 @@ snd.tabs = snd.tabs or {
     active = "auto", -- auto|quest|gq|cp
 }
 
--------------------------------------------------------------------------------
--- Navigation State
--------------------------------------------------------------------------------
 
 snd.nav = snd.nav or {
     gotoArea = -1,
@@ -597,7 +506,6 @@ snd.nav = snd.nav or {
     nxState = nil,
     xcpLookup = nil,
     
-    -- Auto-hunt state
     autoHunt = {
         direction = "",
         mob = "",
@@ -608,13 +516,11 @@ snd.nav = snd.nav or {
         lastDirection = "",
     },
     
-    -- Hunt trick state
     huntTrick = {
         index = 1,
         firstTarget = true,
     },
     
-    -- Quick where state
     quickWhere = {
         index = 1,
     },
@@ -625,9 +531,6 @@ snd.nav = snd.nav or {
     },
 }
 
--------------------------------------------------------------------------------
--- Combat/Scan State
--------------------------------------------------------------------------------
 
 snd.scan = snd.scan or {
     scannedMobs = {},
@@ -678,12 +581,7 @@ function snd.scan.hasActivityTarget()
 end
 
 function snd.scan.quickScan()
-    local current = snd.targets and snd.targets.current
-    if current and hasNonEmptyText(current.keyword) then
-        send("scan " .. current.keyword, false)
-    else
-        send("scan", false)
-    end
+    send("scan", false)
 end
 
 function snd.scan.currentAreaKey()
@@ -814,7 +712,22 @@ end
 
 function snd.scan.smartScan()
     local target = snd.scan.resolveSmartScanTarget({select = true})
-    local keyword = snd.scan.targetKeyword(target)
+    local keyword = ""
+    if target and snd.commands and type(snd.commands.resolveTargetCommandSelector) == "function" then
+        keyword = snd.commands.resolveTargetCommandSelector(target, "kill", {
+            debugContext = "smartscan",
+        }) or ""
+    end
+    if snd.utils and snd.utils.trim then
+        keyword = snd.utils.trim(keyword)
+    end
+    if keyword == "" then
+        keyword = snd.scan.targetKeyword(target)
+    end
+    -- Scan uses the shared logical selector without xkill quotes or ordinals.
+    if snd.utils and type(snd.utils.parseMobCommandTarget) == "function" then
+        keyword = select(1, snd.utils.parseMobCommandTarget(keyword))
+    end
     if keyword ~= "" then
         send("scan " .. keyword, false)
         return true
@@ -937,9 +850,6 @@ function snd.scan.handleArrivalNxAction(action)
     return snd.scan.runNxAction(action)
 end
 
--------------------------------------------------------------------------------
--- Window/GUI State
--------------------------------------------------------------------------------
 
 snd.gui = snd.gui or {
     window = nil,
@@ -948,9 +858,6 @@ snd.gui = snd.gui or {
     targetHotspots = {},
 }
 
--------------------------------------------------------------------------------
--- Execute in Area/Room Timers
--------------------------------------------------------------------------------
 
 snd.timers = snd.timers or {
     executeInArea = {i = 0, j = 0, arid = "", f = "", stat = 1},
@@ -958,15 +865,9 @@ snd.timers = snd.timers or {
     vidblainNav = {i = 0, j = 0, rmid = "", f = "", stat = 1},
 }
 
--------------------------------------------------------------------------------
--- Maze Start Rooms (user-defined)
--------------------------------------------------------------------------------
 
 snd.mazeStartRooms = snd.mazeStartRooms or {}
 
--------------------------------------------------------------------------------
--- Text Colors for Window
--------------------------------------------------------------------------------
 
 snd.colors = snd.colors or {
     normal = "#E0E0E0",
@@ -982,18 +883,10 @@ snd.colors = snd.colors or {
     alternatingRow = "#000040",
 }
 
--------------------------------------------------------------------------------
--- Save File Path
--------------------------------------------------------------------------------
 
 snd.saveFile = sndSaveFilePath()
--- snd.dbFile = getMudletHomeDir() .. "/snd_database.db"
 
--------------------------------------------------------------------------------
--- Initialization
--------------------------------------------------------------------------------
 
--- Flag to track if we've initialized
 snd.initialized = false
 snd.windowAutoOpenPending = false
 snd.postLoginCpCheckDone = snd.postLoginCpCheckDone or false
@@ -1009,29 +902,24 @@ function snd.initialize(silent)
 
     snd.utils.debugNote("Initializing Search & Destroy modules")
     
-    -- Load saved state
     snd.loadState()
 
     snd.utils.debugNote("State load complete, initializing database")
     
-    -- Initialize database
     if snd.db and snd.db.initialize then
         snd.db.initialize(silent)
     end
 
     snd.utils.debugNote("Database initialization complete, registering GMCP handlers")
     
-    -- Register GMCP handlers
     if snd.gmcp and snd.gmcp.registerHandlers then
         snd.gmcp.registerHandlers()
     end
 
-    -- Request character/room/quest GMCP data after handlers are attached
     snd.requestGMCPData()
 
     snd.utils.debugNote("GMCP handler registration complete, registering temp aliases")
 
-    -- Register temp aliases for manual installs without XML
     if snd.commands and snd.commands.registerTempAliases then
         snd.commands.registerTempAliases()
     end
@@ -1048,7 +936,6 @@ function snd.initialize(silent)
 
     snd.utils.debugNote("Temp alias registration complete, checking GUI config")
     
-    -- Create GUI (if enabled)
     if snd.config.window.enabled and snd.gui and snd.gui.createWindow then
         snd.gui.createWindow()
     end
@@ -1067,7 +954,6 @@ function snd.initialize(silent)
     snd.gui.show()
 end
 
--- Initialize silently on load, then announce when player is active
 function snd.initializeSilent()
     snd.initialize(true)
 end
@@ -1076,7 +962,7 @@ function snd.tryAutoOpenWindow()
     if not snd.initialized then return end
     if not snd.windowAutoOpenPending then return end
 
-    -- Hard login guard: never send commands unless GMCP state is active/in-game.
+    -- Never send startup commands until GMCP confirms the player is active.
     if tostring(snd.char.state or "0") ~= "3" then return end
 
     snd.windowAutoOpenPending = false
@@ -1094,16 +980,13 @@ function snd.tryAutoOpenWindow()
     end
 end
 
--- Called when GMCP char.vitals is received
 function snd.onCharVitalsReady(_)
     snd.tryAutoOpenWindow()
 end
 
--- Called when GMCP confirms player is logged in and active
 function snd.onPlayerActive()
     if not snd.initialized then return end
 
-    -- Enable tags only after we are confirmed active to avoid polluting login/password prompts.
     if not snd.tagsEnabled then
         snd.tagsEnabled = true
         send("tags scan on", false)
@@ -1128,11 +1011,9 @@ function snd.onPlayerActive()
     end
 end
 
---- Request initial GMCP data from the server
 function snd.requestGMCPData()
     if not snd.gmcp then return end
     
-    -- Small delay to ensure connection is ready
     tempTimer(0.5, function()
         sendGMCP("request char")
     end)
@@ -1143,11 +1024,7 @@ function snd.requestGMCPData()
     end)
 end
 
--------------------------------------------------------------------------------
--- State Persistence
--------------------------------------------------------------------------------
 
---- Save current state to file
 function snd.saveState()
     if snd.conwin and snd.conwin.captureWindowState then
         snd.conwin.captureWindowState()
@@ -1211,7 +1088,6 @@ function snd.saveState()
     end
 end
 
---- Load state from file
 function snd.loadState()
     snd.utils.debugNote("Loading state from " .. snd.saveFile)
     if not sndFileExists(snd.saveFile) then
@@ -1230,7 +1106,6 @@ function snd.loadState()
         return
     end
     
-    -- Merge loaded state with defaults
     if state.config then
         mergeTables(snd.config, state.config)
         snd.config.nxAction = snd.normalizeNxAction(snd.config.nxAction)
@@ -1291,31 +1166,23 @@ function snd.loadState()
     snd.utils.debugNote("State loaded successfully")
 end
 
--------------------------------------------------------------------------------
--- Helper Functions for Current Activity
--------------------------------------------------------------------------------
 
---- Check if player is on a campaign
 function snd.isOnCampaign()
     return snd.campaign.active
 end
 
---- Check if player is on a global quest
 function snd.isOnGquest()
     return snd.gquest.active
 end
 
---- Check if player is on a quest
 function snd.isOnQuest()
     return snd.quest.active
 end
 
---- Check if there's any active hunting activity
 function snd.hasActivity()
     return snd.campaign.active or snd.gquest.active or snd.quest.active
 end
 
---- Get current activity type
 function snd.getActivityType()
     if snd.campaign.active then return "cp" end
     if snd.gquest.active then return "gq" end
@@ -1323,32 +1190,24 @@ function snd.getActivityType()
     return "none"
 end
 
---- Check if we have an activity target selected
 function snd.hasActivityTarget()
     return snd.targets.current ~= nil and snd.targets.current.activity ~= nil
 end
 
---- Check if current target is a cp/gq mob
 function snd.isCpOrGqTarget()
     if not snd.targets.current then return false end
     local act = snd.targets.current.activity
     return act == "cp" or act == "gq"
 end
 
--------------------------------------------------------------------------------
--- Target List Priority Sorting
--------------------------------------------------------------------------------
 
--- Priority values: lower = higher priority
 local activityPriority = {
     gq = 1,      -- Global Quest - highest priority (time-limited competition)
     quest = 2,   -- Quest - second priority (time-limited)
     cp = 3,      -- Campaign - third priority (no time limit)
 }
 
--- Proximity is ordering metadata only. S&D never receives a route from this
--- layer and never executes mapper steps; the selected target remains locked
--- while mapper navigation is active.
+-- Proximity is ordering metadata only; S&D never executes mapper steps here.
 snd.proximity = snd.proximity or {
     dirty = true,
     generation = 0,
@@ -1381,8 +1240,6 @@ function snd.markTargetProximityDirty(reason)
     snd.proximity.reason = tostring(reason or "changed")
 end
 
---- Refresh target and area distances in one mapper traversal.
--- The annotations are internal and are never displayed as hops.
 function snd.refreshTargetProximity(reason)
     snd.proximity = snd.proximity or {}
     snd.markTargetProximityDirty(reason or "refresh")
@@ -1399,9 +1256,7 @@ function snd.refreshTargetProximity(reason)
 
     local sourceNumber = tonumber(snd.room and snd.room.current and snd.room.current.rmid)
     if not sourceNumber or sourceNumber <= 0 then
-        -- CP/GQ data can arrive before the first Room.Info packet, or while
-        -- recalled to an unmapped home. Remember that this refresh still
-        -- needs a source even if a previous session left a cached source.
+        -- CP/GQ may arrive without a mapped Room.Info; do not reuse a prior source.
         snd.proximity.awaitingSource = true
         return false, "source_unmapped"
     end
@@ -1445,8 +1300,7 @@ function snd.refreshTargetProximity(reason)
         end
     end
 
-    -- An area start is only a fallback for an area whose targets have no best
-    -- room. getAreaStartRoom is cache-backed, so this does not add SQL per area.
+    -- Area starts are cache-backed fallbacks only when no target room is known.
     for _, group in pairs(groups) do
         if #group.rooms == 0 and group.areaKey ~= ""
             and snd.db and type(snd.db.getAreaStartRoom) == "function"
@@ -1524,9 +1378,6 @@ function snd.refreshTargetProximity(reason)
     return true
 end
 
---- Get priority value for an activity type
--- @param activity Activity type string
--- @return Priority value (lower = higher priority)
 function snd.getActivityPriority(activity)
     return activityPriority[activity] or 99
 end
@@ -1550,8 +1401,6 @@ function snd.reindexTargetsAfterSort()
     end
 end
 
---- Sort target list by priority (GQ > Quest > CP)
--- Call this to ensure targets are displayed in priority order
 function snd.sortTargetsByPriority(options)
     if not snd.targets or not snd.targets.list then return end
 
@@ -1625,7 +1474,7 @@ function snd.sortTargetsByPriority(options)
             return proximityA
         end
 
-        -- Preserve the pre-sort relative order for ties and unreachable rooms.
+        -- Preserve relative order for ties and unreachable rooms.
         return (a._sortOrdinal or 0) < (b._sortOrdinal or 0)
     end)
 
@@ -1653,11 +1502,8 @@ local function emptyQuickWhereScope()
     }
 end
 
---- Invalidate global quick-where state before selecting a different target.
--- QW replies are asynchronous and use temporary global triggers. Leaving an
--- old ad-hoc lookup armed lets its eventual reply replace the newly selected
--- target, while leaving its completed room list active makes nx cycle the old
--- rooms. Target selection is the serialization boundary for both cases.
+-- Target selection serializes async QW replies and room lists so stale lookups
+-- cannot replace the new target or make nx cycle old rooms.
 function snd.nav.invalidateQuickWhereForTarget(nextTarget)
     local quickWhere = snd.nav and snd.nav.quickWhere or nil
     if type(quickWhere) ~= "table" then return false end
@@ -1723,7 +1569,6 @@ function snd.nav.invalidateQuickWhereForTarget(nextTarget)
     return true
 end
 
---- Clear the current target
 function snd.clearTarget(opts)
     local options = opts or {}
     local activity = snd.targets.current and snd.targets.current.activity or nil
@@ -1780,7 +1625,6 @@ function snd.nav.clearActivityQuickWhere(activity)
     end
 end
 
---- Set a new target
 function snd.setTarget(target)
     if target and snd.commands and type(snd.commands.bindTargetSelection) == "function" then
         snd.commands.bindTargetSelection(target)
@@ -1884,11 +1728,7 @@ function snd.getActiveTab()
     return active
 end
 
--------------------------------------------------------------------------------
--- Event Callbacks (to be called by GMCP module)
--------------------------------------------------------------------------------
 
---- Called when room changes
 function snd.onRoomChange()
     if snd.mapper and snd.mapper.onConfirmedRoomVisit then
         snd.mapper.onConfirmedRoomVisit(snd.room.current and snd.room.current.rmid)
@@ -1903,7 +1743,6 @@ function snd.onRoomChange()
         if area ~= matcherArea then snd.triggers.registerTargetLineTriggers() end
     end
 
-    -- Check if we arrived at destination
     local destination = snd.nav.goingToRoom or snd.mapper.goingToRoom
     if destination and tostring(snd.room.current.rmid) == tostring(destination) then
         snd.mapper.pathExecutionActive = false
@@ -1921,11 +1760,8 @@ function snd.onRoomChange()
         end
     end
 
-    -- Skip per-room GUI refresh while mid-route. Area-scoped room-character
-    -- matchers above still switch immediately.
-    -- A completed mapper route is a meaningful decision point. Manual movement
-    -- (including recall to an unmapped home) only dirties proximity; the next
-    -- xcp/nx/tab decision refreshes it synchronously.
+    -- Mid-route room changes skip GUI refresh. Manual movement only dirties
+    -- proximity; xcp/nx/tab refresh it synchronously at the next decision.
     local stillNavigating = (snd.nav.goingToRoom or snd.mapper.goingToRoom) ~= nil
         or snd.mapper.pathExecutionActive == true
     if not (wasNavigating and stillNavigating) then
@@ -1975,7 +1811,6 @@ function snd.isCurrentRoomSafe()
     return false
 end
 
---- Called when we arrive at navigation destination
 function snd.onDestinationArrived()
     snd.utils.debugNote("Arrived at destination room: " .. tostring(snd.room.current.rmid))
 
@@ -1988,17 +1823,13 @@ function snd.onDestinationArrived()
         end
     end
 
-    -- An unreachable target's area-start fallback is an approach destination,
-    -- not proof that the target room was reached. Preserve the selected target
-    -- and room list without firing the normal target-room arrival action.
+    -- Area-start fallback is an approach, not proof the target room was reached.
     if snd.commands and type(snd.commands.handleTargetAreaFallbackArrival) == "function"
         and snd.commands.handleTargetAreaFallbackArrival(snd.room.current.rmid) == true then
         return
     end
 
-    -- QW/hybrid/HT approaches own their arrival action. The live lookup must
-    -- run before the ordinary nx scan/kill action, and replaces it for this
-    -- one arrival.
+    -- QW/hybrid/HT approaches replace the ordinary nx action for this arrival.
     if snd.commands and type(snd.commands.handleXcpLookupArrival) == "function"
         and snd.commands.handleXcpLookupArrival(snd.room.current.rmid) == true then
         return
@@ -2014,7 +1845,6 @@ function snd.onDestinationArrived()
 
 end
 
---- Called when character state changes
 function snd.onStateChange()
     if tostring(snd.char and snd.char.state or "0") == "8"
         and snd.commands and snd.commands.abortQuickWhereForCombat
@@ -2026,35 +1856,25 @@ function snd.onStateChange()
     end
 end
 
--------------------------------------------------------------------------------
--- Cleanup on Unload
--------------------------------------------------------------------------------
 
 function snd.cleanup()
     snd.utils.infoNote("Saving state before unload...")
     snd.saveState()
     
-    -- Kill any timers we created
     if snd.quest and snd.quest.stopReadySoundReminder then
         snd.quest.stopReadySoundReminder()
     end
 
-    -- Cleanup GUI
     if snd.gui and snd.gui.cleanup then
         snd.gui.cleanup()
     end
 end
 
--------------------------------------------------------------------------------
--- Register system events
--------------------------------------------------------------------------------
 
--- Save state when profile is saved
 registerAnonymousEventHandler("sysExitEvent", function()
     snd.cleanup()
 end)
 
--- Save state periodically (every 5 minutes)
 if snd.autoSaveTimer then
     killTimer(snd.autoSaveTimer)
 end
@@ -2062,4 +1882,3 @@ snd.autoSaveTimer = tempTimer(300, function()
     snd.saveState()
 end, true)
 
--- Module loaded silently

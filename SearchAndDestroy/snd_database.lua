@@ -1,27 +1,8 @@
---[[
-    Search and Destroy - Database Module
-    Mudlet Port
-    
-    Original MUSHclient plugin by Crowley
-    Ported to Mudlet
-    
-    This module handles SQLite database operations using LuaSQL directly
-    to read/write the existing MUSHclient database file.
-    
-    Tables (schema v7, migrated in place from the original layouts):
-    - mobs: mob locations and kill counts
-    - area: area information and start rooms
-    - mob_keyword_exceptions: custom keywords
-    - history: campaign/quest history
-]]
-
 snd = snd or {}
 snd.db = snd.db or {}
 
--- Load LuaSQL
 local luasql = require "luasql.sqlite3"
 
--- Database environment and connection
 snd.db.env = nil
 snd.db.conn = nil
 snd.db.isOpen = false
@@ -39,7 +20,6 @@ snd.db.killCacheMaxAgeSeconds = 30      -- short-lived kill dedupe cache
 snd.db.schemaVersion = 7
 snd.db.createdEmpty = false
 
--- Default database path: directly inside the active Mudlet profile.
 snd.db.file = getMudletHomeDir() .. "/SnDdb.db"
 
 local SND_CORE_TABLES = { "area", "mobs", "mob_keyword_exceptions", "history" }
@@ -293,8 +273,7 @@ local function detect_snd_schema(conn)
     if not tables then return nil, tables_err end
     local version = tonumber(scalar_from_connection(conn, "PRAGMA user_version")) or 0
 
-    -- The current Mudlet layout may still need a version stamp or extension
-    -- tables, but its core data can already be validated without conversion.
+    -- A current layout may still need a version stamp or extension tables.
     local current_core = true
     local current_columns = {}
     for table_name, required in pairs(SND_PRE_TIMESTAMP_REQUIRED_COLUMNS) do
@@ -335,8 +314,7 @@ local function detect_snd_schema(conn)
         }
     end
 
-    -- Newer MUSHclient builds use a normalized layout. Converting it requires
-    -- combining sightings/kills and reshaping history, not merely adding tables.
+    -- Normalized MUSHclient layouts require data reshaping, not just new tables.
     local normalized = true
     local normalized_columns = {}
     for table_name, required in pairs(SND_NORMALIZED_TABLE_COLUMNS) do
@@ -365,9 +343,7 @@ local function detect_snd_schema(conn)
         }
     end
 
-    -- Classic MUSHclient schemas v0-v5 have area+mobs, with either the old
-    -- count column or the later seen_count/kill_count pair. Missing history and
-    -- keyword tables are known historical states and are safe to create.
+    -- Classic v0-v5 layouts may safely add missing history and keyword tables.
     if tables.area and tables.mobs then
         local area_columns, area_err = column_set_from_connection(conn, "area")
         if not area_columns then return nil, area_err end
@@ -453,8 +429,7 @@ end
 
 local function run_snd_schema_sql(conn)
     for _, sql in ipairs(SND_SCHEMA_SQL) do
-        -- Case-only duplicate mob tags are normalized during initialize().
-        -- Delay this one unique index until that data cleanup has run.
+        -- Delay this index until initialize() removes case-only duplicate tags.
         if not sql:find("idx_mob_tags_key_nocase", 1, true) then
             local ok, err = execute_on_connection(conn, sql)
             if not ok then return false, err end
@@ -619,26 +594,19 @@ local function migrate_snd_database(conn, plan)
     return true, backup_path
 end
 
--------------------------------------------------------------------------------
--- Database Connection
--------------------------------------------------------------------------------
-
---- Open database connection
 function snd.db.open()
     if snd.db.isOpen then
         return true
     end
     
-    -- Create environment
     snd.db.env = luasql.sqlite3()
     if not snd.db.env then
         snd.utils.errorNote("Failed to create LuaSQL environment")
         return false
     end
     
-    -- Opening a missing SQLite path creates a new file. Existing recognized
-    -- MUSHclient/Mudlet layouts are backed up and upgraded transactionally.
-    -- Corrupt, incomplete, and unrelated SQLite files are never rewritten.
+    -- Opening SQLite creates missing files. Upgrade only recognized layouts,
+    -- transactionally and with backup; never rewrite unrelated/corrupt files.
     local existed = database_file_exists(snd.db.file)
     if existed and not database_looks_like_sqlite(snd.db.file) then
         snd.db.env:close()
@@ -720,7 +688,6 @@ function snd.db.open()
     return true
 end
 
---- Close database connection
 function snd.db.close()
     if snd.db.conn then
         snd.db.conn:close()
@@ -736,20 +703,17 @@ function snd.db.close()
     snd.db.areaCache = nil
 end
 
---- Clear in-memory seen update cooldown cache.
--- This cache is session-only and intentionally never persisted.
+-- Session-only by design.
 function snd.db.clearSeenCache()
     snd.db.seenCache = {}
     snd.db.seenCacheLastPrune = os.time()
 end
 
---- Clear in-memory kill dedupe cache.
 function snd.db.clearKillCache()
     snd.db.killCache = {}
     snd.db.killCacheLastPrune = os.time()
 end
 
---- Prune seen cache entries older than max age.
 function snd.db.pruneSeenCache(now)
     now = tonumber(now) or os.time()
     local maxAge = tonumber(snd.db.seenCacheMaxAgeSeconds) or 3600
@@ -761,7 +725,6 @@ function snd.db.pruneSeenCache(now)
     snd.db.seenCacheLastPrune = now
 end
 
---- Prune kill cache entries older than max age.
 function snd.db.pruneKillCache(now)
     now = tonumber(now) or os.time()
     local maxAge = tonumber(snd.db.killCacheMaxAgeSeconds) or 30
@@ -773,8 +736,7 @@ function snd.db.pruneKillCache(now)
     snd.db.killCacheLastPrune = now
 end
 
---- Ensure campaign Complete-By identity mapping table exists.
--- Keeps compatibility by avoiding changes to the shared history table schema.
+-- Kept separate to avoid changing the shared history schema.
 function snd.db.ensureCampaignIdentityTable()
     if not snd.db.isOpen then
         if not snd.db.open() then
@@ -796,7 +758,6 @@ function snd.db.ensureCampaignIdentityTable()
     return true
 end
 
---- Ensure mob tag table exists.
 function snd.db.ensureMobTagsTable()
     if snd.db.schemaReady then
         return true
@@ -826,14 +787,12 @@ function snd.db.ensureMobTagsTable()
     end
     if not snd.db.mobTagsBaseReady then return false end
 
-    -- This can fail on an older database until normalizeMobTagRows removes
-    -- case-only duplicates. Base readiness still allows that normalization.
+    -- Older DBs may fail here until base readiness permits duplicate normalization.
     local keyIndexOk = snd.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mob_tags_key_nocase ON mob_tags(lower(mob), lower(zone))")
     snd.db.schemaReady = keyIndexOk == true
     return true
 end
 
---- Initialize the database
 function snd.db.initialize(silent)
     if not silent then
         snd.utils.debugNote("Initializing database...")
@@ -845,7 +804,6 @@ function snd.db.initialize(silent)
     snd.db.clearSeenCache()
     snd.db.clearKillCache()
     
-    -- Verify tables exist
     local tables = snd.db.getTables()
     if not silent then
         snd.utils.debugNote("Found tables: " .. table.concat(tables, ", "))
@@ -859,7 +817,6 @@ function snd.db.initialize(silent)
         snd.db.loadAreaCache()
     end
     
-    -- Get stats
     local stats = snd.db.getStats()
     if not silent then
         if snd.db.createdEmpty then
@@ -1051,7 +1008,6 @@ function snd.db.deleteMobTagById(id)
     return snd.db.execute(sql)
 end
 
---- Get list of tables in database
 function snd.db.getTables()
     local tables = {}
     if not snd.db.isOpen then return tables end
@@ -1106,13 +1062,6 @@ function snd.db.getStatus()
     return status
 end
 
--------------------------------------------------------------------------------
--- Query Helpers
--------------------------------------------------------------------------------
-
---- Execute a query and return all results
--- @param sql SQL query string
--- @return Table of rows, or nil on error
 function snd.db.query(sql)
     if not snd.db.isOpen then
         if not snd.db.open() then
@@ -1130,7 +1079,7 @@ function snd.db.query(sql)
     local results = {}
     local row = cursor:fetch({}, "a")
     while row do
-        -- Copy row to new table (cursor reuses the same table)
+        -- Copy because the cursor reuses its row table.
         local newRow = {}
         for k, v in pairs(row) do
             newRow[k] = v
@@ -1143,9 +1092,6 @@ function snd.db.query(sql)
     return results
 end
 
---- Execute a statement (INSERT, UPDATE, DELETE)
--- @param sql SQL statement
--- @return true on success, false on error
 function snd.db.execute(sql)
     if not snd.db.isOpen then
         if not snd.db.open() then
@@ -1163,9 +1109,6 @@ function snd.db.execute(sql)
     return true
 end
 
---- Escape a string for SQL
--- @param str String to escape
--- @return Escaped string (with quotes)
 function snd.db.escape(str)
     if str == nil then
         return "NULL"
@@ -1175,15 +1118,6 @@ function snd.db.escape(str)
     return "'" .. str .. "'"
 end
 
--------------------------------------------------------------------------------
--- Mob Functions
--------------------------------------------------------------------------------
-
---- Record seeing a mob in a room
--- @param mobName Full mob name
--- @param roomName Room name
--- @param roomId Room ID number
--- @param zone Area key
 local function prepareMobSeenWrite(mobName, roomName, roomId, zone, now)
     mobName = tostring(mobName or "")
     if mobName == "" or roomId == nil then return nil end
@@ -1226,8 +1160,7 @@ function snd.db.recordMobSeen(mobName, roomName, roomId, zone)
     return false
 end
 
--- Commit a completed consider roster together. The existing seen-cache and
--- post-combat clearing policy remains authoritative.
+-- Commit only completed consider rosters; existing cache/clearing policy remains authoritative.
 function snd.db.recordMobSeenBatch(sightings)
     if type(sightings) ~= "table" or #sightings == 0 then return true, 0 end
     local now = os.time()
@@ -1267,11 +1200,6 @@ function snd.db.recordMobSeenBatch(sightings)
     return true, #writes
 end
 
---- Record killing a mob in a room
--- @param mobName Full mob name
--- @param roomId Room ID number
--- @param roomName Optional room name
--- @param zone Optional area key
 function snd.db.recordMobKill(mobName, roomId, roomName, zone)
     if not mobName or mobName == "" then return end
     if not roomId then return end
@@ -1312,10 +1240,6 @@ function snd.db.recordMobKill(mobName, roomId, roomName, zone)
     end
 end
 
---- Search for mobs by name
--- @param searchTerm Partial mob name to search for
--- @param zone Optional area to limit search
--- @return Table of matching mobs
 function snd.db.searchMobs(searchTerm, zone)
     if not searchTerm or searchTerm == "" then
         return {}
@@ -1338,10 +1262,6 @@ function snd.db.searchMobs(searchTerm, zone)
     return snd.db.query(sql) or {}
 end
 
---- Get all rooms where a mob has been seen
--- @param mobName Mob name to search for
--- @param zone Optional area to limit search
--- @return Table of room records
 function snd.db.getMobLocations(mobName, zone, opts)
     if not mobName then return {} end
     opts = opts or {}
@@ -1405,13 +1325,6 @@ function snd.db.getMobLocations(mobName, zone, opts)
                         snd.db.escape(roomHint)
                     )
                 else
-                    --[[
-                    sql = string.format(
-                        "SELECT * FROM mobs WHERE lower(mob) = lower(%s) AND zone = %s ORDER BY seen_count DESC, kill_count DESC",
-                        snd.db.escape(name),
-                        snd.db.escape(zone)
-                    )
-                    ]]
                     sql = string.format([[
                         SELECT * FROM (
                             SELECT m.*,
@@ -1490,12 +1403,6 @@ function snd.db.getMobLocations(mobName, zone, opts)
                         snd.db.escape(roomHint)
                     )
                 else
-                    --[[
-                    sql = string.format(
-                        "SELECT * FROM mobs WHERE lower(mob) = lower(%s) ORDER BY seen_count DESC, kill_count DESC",
-                        snd.db.escape(name)
-                    )
-                    ]]
                     sql = string.format([[
                         SELECT * FROM (
                             SELECT m.*,
@@ -1571,10 +1478,6 @@ function snd.db.getMobLocations(mobName, zone, opts)
     return results, matchedName
 end
 
---- Get mob with highest kill count in a zone
--- @param mobName Mob name
--- @param zone Area key
--- @return Best room record or nil
 function snd.db.getBestMobLocation(mobName, zone)
     local locations = snd.db.getMobLocations(mobName, zone)
     if #locations > 0 then
@@ -1582,10 +1485,6 @@ function snd.db.getBestMobLocation(mobName, zone)
     end
     return nil
 end
-
--------------------------------------------------------------------------------
--- Area Functions
--------------------------------------------------------------------------------
 
 local function normalize_area_lookup(value)
     return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
@@ -1630,18 +1529,12 @@ local function get_stored_area(areaKey)
     return cache and cache.byKey[normalize_area_lookup(areaKey)] or nil
 end
 
---- Get area info by key
--- @param areaKey Area keyword
--- @return Area record or nil
 function snd.db.getArea(areaKey)
     if not areaKey or areaKey == "" then return nil end
 
     return get_stored_area(areaKey)
 end
 
---- Get area key from area name
--- @param areaName Full area name (e.g., "Artificer's Mayhem")
--- @return Area key (e.g., "artificer") or nil
 function snd.db.getAreaKeyFromName(areaName)
     if not areaName or areaName == "" then return nil end
 
@@ -1650,13 +1543,11 @@ function snd.db.getAreaKeyFromName(areaName)
     local exact = cache and cache.byName[normalize_area_lookup(trimmed)] or nil
     if exact then return exact.key end
 
-    -- Tolerate punctuation/spacing drift between campaign output and area table,
-    -- e.g. "Necromancers' Guild" vs "Necromancer's Guild".
+    -- Tolerate punctuation drift such as Necromancers' vs Necromancer's Guild.
     local loose = normalize_area_loose(trimmed)
     local normalizedMatch = loose ~= "" and cache and cache.byLooseName[loose] or nil
     if normalizedMatch then return normalizedMatch.key end
 
-    -- Preserve the original final substring fallback without another SQL scan.
     local needle = normalize_area_lookup(trimmed)
     if needle ~= "" and cache then
         for _, row in ipairs(cache.rows) do
@@ -1669,17 +1560,12 @@ function snd.db.getAreaKeyFromName(areaName)
     return nil
 end
 
---- Get or create area record
--- @param areaKey Area keyword
--- @param areaName Full area name
--- @return Area record
 function snd.db.getOrCreateArea(areaKey, areaName)
     local existing = get_stored_area(areaKey)
     if existing then
         return existing
     end
     
-    -- Create new area with defaults
     local defaults = snd.data.areaDefaultStartRooms[areaKey] or {}
     local startRoom = tonumber(defaults.start) or -1
     local vidblain = defaults.vidblain and "yes" or ""
@@ -1698,15 +1584,11 @@ function snd.db.getOrCreateArea(areaKey, areaName)
     return snd.db.getArea(areaKey)
 end
 
---- Update area start room
--- @param areaKey Area keyword
--- @param roomId Room ID to set as start
 function snd.db.setAreaStartRoom(areaKey, roomId)
     if not areaKey or areaKey == "" then return end
     
     roomId = tonumber(roomId) or -1
     
-    -- Check if area exists
     local existing = get_stored_area(areaKey)
     if existing then
         local sql = string.format(
@@ -1718,25 +1600,19 @@ function snd.db.setAreaStartRoom(areaKey, roomId)
         snd.db.invalidateAreaCache()
         snd.utils.infoNote("Updated start room for " .. areaKey .. " to " .. roomId)
     else
-        -- Create new area record
         snd.db.getOrCreateArea(areaKey, areaKey)
         snd.db.setAreaStartRoom(areaKey, roomId)
     end
 end
 
---- Get area start room
--- @param areaKey Area keyword
--- @return Room ID or -1
 function snd.db.getAreaStartRoom(areaKey)
     if not areaKey or areaKey == "" then return -1 end
     
-    -- First check database
     local area = snd.db.getArea(areaKey)
     if area and area.startRoom and tonumber(area.startRoom) > 0 then
         return tonumber(area.startRoom)
     end
     
-    -- Fall back to hardcoded defaults
     local defaults = snd.data.areaDefaultStartRooms[areaKey]
     if defaults and defaults.start then
         return tonumber(defaults.start) or -1
@@ -1745,61 +1621,135 @@ function snd.db.getAreaStartRoom(areaKey)
     return -1
 end
 
--------------------------------------------------------------------------------
--- Mob Keyword Functions
--------------------------------------------------------------------------------
+local function normalizedKeywordMobIdentity(value, ignoreArticle)
+    local text = tostring(value or ""):lower()
+    text = text:gsub("\27%[[0-9;]*m", "")
+    text = text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if ignoreArticle then
+        text = text:gsub("^an%s+", ""):gsub("^a%s+", ""):gsub("^the%s+", "")
+    end
+    return text
+end
 
---- Get custom keyword for a mob
--- @param areaKey Area keyword
--- @param mobName Full mob name
--- @return Custom keyword or nil
-function snd.db.getMobKeyword(areaKey, mobName)
+local function keywordMobIdentityVariants(value)
+    local full = normalizedKeywordMobIdentity(value, false)
+    local loose = normalizedKeywordMobIdentity(value, true)
+    local variants, seen = {}, {}
+    local function add(candidate)
+        if candidate ~= "" and not seen[candidate] then
+            seen[candidate] = true
+            table.insert(variants, candidate)
+        end
+    end
+    add(full)
+    add(loose)
+    if loose ~= "" then
+        add("a " .. loose)
+        add("an " .. loose)
+        add("the " .. loose)
+    end
+    return variants, full
+end
+
+local function findMobKeywordRow(areaKey, mobName)
     if not areaKey or not mobName then return nil end
-    
+
+    -- Prefer exact identity; article-free fallback supports aliases without
+    -- turning the persisted key into a global override.
+    local variants, exactIdentity = keywordMobIdentityVariants(mobName)
+    if #variants == 0 then return nil end
+    local escapedVariants = {}
+    for _, variant in ipairs(variants) do
+        table.insert(escapedVariants, snd.db.escape(variant))
+    end
     local sql = string.format(
-        "SELECT keyword FROM mob_keyword_exceptions WHERE area_name = %s AND mob_name = %s",
+        "SELECT mob_name, keyword FROM mob_keyword_exceptions " ..
+        "WHERE area_name = %s COLLATE NOCASE " ..
+        "AND mob_name COLLATE NOCASE IN (%s) " ..
+        "ORDER BY CASE WHEN mob_name = %s COLLATE NOCASE THEN 0 ELSE 1 END, mob_name LIMIT 1",
         snd.db.escape(areaKey),
-        snd.db.escape(mobName)
+        table.concat(escapedVariants, ", "),
+        snd.db.escape(exactIdentity)
     )
-    
+
     local results = snd.db.query(sql)
     if results and #results > 0 then
-        return results[1].keyword
+        return results[1]
     end
-    
     return nil
 end
 
---- Set custom keyword for a mob
--- @param areaKey Area keyword
--- @param mobName Full mob name
--- @param keyword Keyword to use
+function snd.db.getMobKeyword(areaKey, mobName)
+    local row = findMobKeywordRow(areaKey, mobName)
+    return row and row.keyword or nil
+end
+
 function snd.db.setMobKeyword(areaKey, mobName, keyword)
-    if not areaKey or not mobName or not keyword then return end
-    
-    -- Use INSERT OR REPLACE to handle both insert and update
+    areaKey = tostring(areaKey or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    mobName = tostring(mobName or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    keyword = tostring(keyword or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if areaKey == "" or mobName == "" or keyword == "" then return false end
+
+    -- Atomically replace case/article variants under the legacy UNIQUE constraint.
+    local previous = findMobKeywordRow(areaKey, mobName)
+    if not snd.db.execute("BEGIN IMMEDIATE") then return false end
+    local deleteSql = string.format(
+        "DELETE FROM mob_keyword_exceptions " ..
+        "WHERE area_name = %s COLLATE NOCASE AND mob_name = %s COLLATE NOCASE",
+        snd.db.escape(areaKey),
+        snd.db.escape(previous and previous.mob_name or mobName)
+    )
+    if not snd.db.execute(deleteSql) then
+        snd.db.execute("ROLLBACK")
+        return false
+    end
+
     local sql = string.format(
-        "INSERT OR REPLACE INTO mob_keyword_exceptions (area_name, mob_name, keyword) VALUES (%s, %s, %s)",
+        "INSERT INTO mob_keyword_exceptions (area_name, mob_name, keyword) VALUES (%s, %s, %s)",
         snd.db.escape(areaKey),
         snd.db.escape(mobName),
         snd.db.escape(keyword)
     )
-    
-    if snd.db.execute(sql) then
-        snd.utils.infoNote("Set keyword for '" .. mobName .. "' to '" .. keyword .. "' in " .. areaKey)
+
+    if not snd.db.execute(sql) then
+        snd.db.execute("ROLLBACK")
+        return false
     end
+    if snd.db.execute("COMMIT") then
+        snd.utils.infoNote("Set keyword for '" .. mobName .. "' to '" .. keyword .. "' in " .. areaKey)
+        return true
+    end
+    snd.db.execute("ROLLBACK")
+    return false
 end
 
--------------------------------------------------------------------------------
--- History Functions
--------------------------------------------------------------------------------
+function snd.db.deleteMobKeyword(areaKey, mobName)
+    if not areaKey or not mobName then return false end
+    local stored = findMobKeywordRow(areaKey, mobName)
+    if not stored then return false end
+    local sql = string.format(
+        "DELETE FROM mob_keyword_exceptions " ..
+        "WHERE area_name = %s COLLATE NOCASE AND mob_name = %s COLLATE NOCASE",
+        snd.db.escape(areaKey),
+        snd.db.escape(stored.mob_name)
+    )
+    return snd.db.execute(sql) == true
+end
 
--- History type constants
+function snd.db.listMobKeywords(areaKey)
+    local sql = "SELECT area_name, mob_name, keyword FROM mob_keyword_exceptions"
+    local area = tostring(areaKey or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if area ~= "" then
+        sql = sql .. " WHERE area_name = " .. snd.db.escape(area) .. " COLLATE NOCASE"
+    end
+    sql = sql .. " ORDER BY lower(area_name), lower(mob_name)"
+    return snd.db.query(sql) or {}
+end
+
 snd.db.HISTORY_TYPE_QUEST = 1
 snd.db.HISTORY_TYPE_GQUEST = 2
 snd.db.HISTORY_TYPE_CAMPAIGN = 3
 
--- History status constants
 snd.db.HISTORY_STATUS_INPROGRESS = 1
 snd.db.HISTORY_STATUS_COMPLETE = 2
 snd.db.HISTORY_STATUS_TIMEOUT = 3
@@ -1808,9 +1758,6 @@ snd.db.HISTORY_STATUS_RESET = 5
 snd.db.HISTORY_STATUS_SKIPPED = 6
 snd.db.HISTORY_STATUS_UNDOCUMENTED = 7
 
---- Purge stale in-progress quest history rows older than a maximum age.
--- Only affects quest history rows.
--- @param maxAgeSeconds Optional max age in seconds (default 3600)
 function snd.db.purgeStaleQuestHistory(maxAgeSeconds)
     if not snd.db.isOpen then
         return
@@ -1826,12 +1773,8 @@ function snd.db.purgeStaleQuestHistory(maxAgeSeconds)
     snd.db.execute(sql)
 end
 
---- Start tracking a new activity in history
--- @param historyType Type of activity (quest/gquest/campaign)
--- @param levelTaken Level when started
--- @param startTime number|nil Optional captured start time; defaults to os.time().
 function snd.db.historyStart(historyType, levelTaken, startTime)
-    -- Check if history table exists (it was added in schema v6)
+    -- History is optional on pre-v6 databases.
     local tables = snd.db.getTables()
     local hasHistory = false
     for _, t in ipairs(tables) do
@@ -1863,7 +1806,6 @@ function snd.db.historyStart(historyType, levelTaken, startTime)
         return nil
     end
 
-    -- Return the inserted history id using SQLite's last_insert_rowid() for compatibility.
     local idRows = snd.db.query("SELECT last_insert_rowid() AS id")
     if idRows and idRows[1] then
         return tonumber(idRows[1].id)
@@ -1871,19 +1813,12 @@ function snd.db.historyStart(historyType, levelTaken, startTime)
     return nil
 end
 
---- End tracking an activity in history
--- @param historyType Type of activity
--- @param status Final status (complete/failed/skipped)
--- @param rewards Optional table of rewards {qp, tp, trains, pracs, gold}
---   Pass nil to preserve existing reward values.
--- @param endTime number|nil Optional captured completion time; defaults to os.time().
--- @return table|nil Updated history row with computed duration_seconds, or nil if no row was updated.
+-- Nil reward arguments intentionally preserve stored values.
 function snd.db.historyEnd(historyType, status, rewards, endTime)
     if tonumber(historyType) == snd.db.HISTORY_TYPE_QUEST then
         snd.db.purgeStaleQuestHistory(3600)
     end
     
-    -- Find the most recent in-progress record of this type
     local sql = string.format(
         "SELECT rowid AS history_rowid, * FROM history WHERE type = %d AND status IN (%d, 0) ORDER BY start_time DESC LIMIT 1",
         historyType,
@@ -1938,12 +1873,7 @@ function snd.db.historyEnd(historyType, status, rewards, endTime)
     return nil
 end
 
---- End tracking for a specific history row id
--- @param historyId Primary key id in history table
--- @param status Final status (complete/failed/skipped/reset)
--- @param rewards Optional table of rewards {qp, tp, trains, pracs, gold}
---   Pass nil to preserve existing reward values.
--- @return table|nil Updated history row with computed duration_seconds, or nil if not updated.
+-- Nil reward arguments intentionally preserve stored values.
 function snd.db.historyEndById(historyId, status, rewards)
     historyId = tonumber(historyId)
     if not historyId then
@@ -1989,9 +1919,6 @@ function snd.db.historyEndById(historyId, status, rewards)
     return nil
 end
 
---- Return mapped history id for a Complete-By identity.
--- @param completeBy string
--- @return number|nil
 function snd.db.getHistoryIdByCompleteBy(completeBy)
     completeBy = tostring(completeBy or "")
     if completeBy == "" then
@@ -2009,9 +1936,6 @@ function snd.db.getHistoryIdByCompleteBy(completeBy)
     return nil
 end
 
---- Return mapped Complete-By identity for a history row id.
--- @param historyId number
--- @return string
 function snd.db.getCompleteByByHistoryId(historyId)
     historyId = tonumber(historyId)
     if not historyId then
@@ -2029,10 +1953,6 @@ function snd.db.getCompleteByByHistoryId(historyId)
     return ""
 end
 
---- Create or update Complete-By <-> history id mapping.
--- @param completeBy string
--- @param historyId number
--- @return boolean
 function snd.db.upsertCampaignIdentity(completeBy, historyId)
     completeBy = tostring(completeBy or "")
     historyId = tonumber(historyId)
@@ -2052,8 +1972,6 @@ function snd.db.upsertCampaignIdentity(completeBy, historyId)
     return snd.db.execute(sql)
 end
 
---- Return the latest campaign history row.
--- @return table|nil
 function snd.db.getLatestCampaignHistoryRow()
     local sql = string.format(
         "SELECT id, status, start_time, end_time, qp_rewards, tp_rewards, train_rewards, prac_rewards, gold_rewards " ..
@@ -2067,9 +1985,6 @@ function snd.db.getLatestCampaignHistoryRow()
     return nil
 end
 
---- Return a single history row by primary key id.
--- @param historyId number
--- @return table|nil
 function snd.db.getHistoryById(historyId)
     historyId = tonumber(historyId)
     if not historyId then
@@ -2087,10 +2002,6 @@ function snd.db.getHistoryById(historyId)
     return nil
 end
 
---- Update rewards for a specific history row id without changing status/timestamps.
--- @param historyId Primary key id in history table
--- @param rewards Table of rewards {qp, tp, trains, pracs, gold}
--- @return true if an update was attempted, false otherwise
 function snd.db.historyUpdateRewardsById(historyId, rewards)
     rewards = rewards or {}
     historyId = tonumber(historyId)
@@ -2110,9 +2021,6 @@ function snd.db.historyUpdateRewardsById(historyId, rewards)
     return snd.db.execute(updateSql)
 end
 
---- Return recent history entries
--- @param opts Optional table {limit=20, type=nil}
--- @return Array of rows
 function snd.db.getHistoryEntries(opts)
     opts = opts or {}
     local limit = tonumber(opts.limit) or 20
@@ -2158,9 +2066,6 @@ function snd.db.getHistoryEntries(opts)
     return snd.db.query(sql) or {}
 end
 
---- Get a single history row by rowid
--- @param rowid number sqlite rowid
--- @return row table or nil
 function snd.db.getHistoryByRowId(rowid)
     rowid = tonumber(rowid)
     if not rowid then
@@ -2200,10 +2105,6 @@ function snd.db.getHistoryByRowId(rowid)
     return rows[1]
 end
 
---- Get history statistics
--- @param historyType Optional type filter
--- @param days Number of days to look back (default 14)
--- @return Table of statistics
 function snd.db.getHistoryStats(historyType, days)
     days = days or 14
     local cutoff = os.time() - (days * 24 * 60 * 60)
@@ -2219,7 +2120,6 @@ function snd.db.getHistoryStats(historyType, days)
         totalGold = 0,
     }
     
-    -- Check if history table exists
     local tables = snd.db.getTables()
     local hasHistory = false
     for _, t in ipairs(tables) do
@@ -2264,19 +2164,10 @@ function snd.db.getHistoryStats(historyType, days)
     return stats
 end
 
--------------------------------------------------------------------------------
--- Utility Functions
--------------------------------------------------------------------------------
-
---- Execute a raw SQL query
--- @param sql SQL query string
--- @return Results table or nil
 function snd.db.rawQuery(sql)
     return snd.db.query(sql)
 end
 
---- Get database statistics
--- @return Table with counts
 function snd.db.getStats()
     local stats = {
         mobs = 0,
@@ -2291,25 +2182,21 @@ function snd.db.getStats()
         end
     end
     
-    -- Count mobs
     local result = snd.db.query("SELECT COUNT(*) as cnt FROM mobs")
     if result and #result > 0 then
         stats.mobs = tonumber(result[1].cnt) or 0
     end
     
-    -- Count areas
     result = snd.db.query("SELECT COUNT(*) as cnt FROM area")
     if result and #result > 0 then
         stats.areas = tonumber(result[1].cnt) or 0
     end
     
-    -- Count keywords
     result = snd.db.query("SELECT COUNT(*) as cnt FROM mob_keyword_exceptions")
     if result and #result > 0 then
         stats.keywords = tonumber(result[1].cnt) or 0
     end
     
-    -- Count history (if table exists)
     result = snd.db.query("SELECT COUNT(*) as cnt FROM history")
     if result and #result > 0 then
         stats.history = tonumber(result[1].cnt) or 0
@@ -2318,10 +2205,7 @@ function snd.db.getStats()
     return stats
 end
 
---- Set the database file path
--- @param path Full path to the .db file
 function snd.db.setFile(path)
-    -- Close existing connection if open
     if snd.db.isOpen then
         snd.db.close()
     end
@@ -2330,15 +2214,11 @@ function snd.db.setFile(path)
     snd.utils.infoNote("Database path set to: " .. path)
 end
 
--------------------------------------------------------------------------------
--- Cleanup on exit
--------------------------------------------------------------------------------
 
 registerAnonymousEventHandler("sysExitEvent", function()
     snd.db.close()
 end)
 
--- Module loaded silently
     local tables = snd.db.getTables()
     local hasHistory = false
     for _, t in ipairs(tables) do

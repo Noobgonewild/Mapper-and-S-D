@@ -25,9 +25,7 @@ mm.state = mm.state or {
   debug = false,
 }
 
--- A partially populated state table can survive package reloads.  Always keep
--- the live SQLite database name usable instead of resolving whitespace to the
--- profile directory and producing a misleading "database not found" warning.
+-- Reloaded partial state must retain a usable DB name, never whitespace/profile dir.
 if type(mm.state.map_db) ~= "string" or not mm.state.map_db:match("%S") then
   mm.state.map_db = "Aardwolf.db"
 end
@@ -40,8 +38,7 @@ end
 if type(mm.state.autostop_enabled) ~= "boolean" then
   mm.state.autostop_enabled = true
 end
--- Portal guarding is configured per DINV portal ID.  Keep the retired global
--- flag false even across an in-session package reload where mm.state survives.
+-- The retired global portal guard must remain off across hot reloads.
 mm.state.portal_guard_enabled = false
 
 mm.runtime = mm.runtime or {
@@ -289,9 +286,7 @@ function mm.load_settings_persistence()
     if data.minimap.bigmap_mode == "native" or data.minimap.bigmap_mode == "hybrid" then
       mm.state.minimap.bigmap_mode = data.minimap.bigmap_mode
     elseif data.minimap.bigmap_mode == "local" then
-      -- Local remains an internal hybrid backend, but is no longer a public
-      -- configuration. Migrate old profiles without making them render
-      -- continents through the area renderer.
+      -- Migrate retired public "local" mode without changing hybrid rendering.
       mm.state.minimap.bigmap_mode = "hybrid"
     end
     if tonumber(data.minimap.local_radius) then
@@ -313,7 +308,7 @@ function mm.save_settings_persistence()
     return false, "unable to open mapper settings persistence file for writing"
   end
   f:write("return " .. serialize_value({
-    -- Kept only so older builds also start with their retired global guard off.
+    -- Compatibility: old builds also start with global guard off.
     portal_guard_enabled = false,
     autostop_enabled = mm.state.autostop_enabled ~= false,
     native_mapper_db = mm.state.native_mapper_db or "mmapper_converted_map.dat",
@@ -575,8 +570,7 @@ function mm.load_portal_persistence()
       end
     end
   end
-  -- A missing migration marker is the legacy global-guard format.  Its state is
-  -- deliberately not imported: every portal starts unguarded exactly once.
+  -- Missing marker means legacy global guard; intentionally reset every portal unguarded.
   mm.portals.settings.portal_guard_migration_version = PORTAL_GUARD_MIGRATION_VERSION
   if source_path == mm.legacy_persistence_path(PORTAL_PERSIST_FILE) or not guard_migrated then
     mm.save_portal_persistence()
@@ -936,10 +930,7 @@ function mm.print_portal_guards()
   return true
 end
 
--- Resolve bounce settings from their persisted portal IDs on demand.  The
--- navigation table is recreated when MMapper is reloaded, while mm.portals may
--- survive that reload.  Keeping this resolver in the portal owner prevents a
--- stale/nil copied setting from silently disabling bounce routing.
+-- Resolve bounce IDs in their persistent owner so nav-table reload cannot stale them.
 function mm.get_configured_bounce_step(travel_type)
   ensure_portal_settings()
   local is_recall = travel_type == "recall"
@@ -1328,8 +1319,7 @@ function mm.load_native_mapper_db(path)
   return true
 end
 
--- Convert GMCP/database room info to the mapper's stable TEXT UID convention.
--- Internal room-name spaces and case are intentionally preserved.
+-- Stable TEXT UIDs intentionally preserve internal spaces and case.
 function mm.canonical_room_uid(info)
   if type(info) ~= "table" then return nil end
   local raw_uid = info.num
@@ -1966,7 +1956,6 @@ local MAPPER_REQUIRED_COLUMNS = {
   areas = { "uid", "name", "texture", "color", "flags" },
   environments = { "uid", "name", "color" },
   rooms = { "uid", "name", "area", "building", "terrain", "info", "notes", "x", "y", "z", "norecall", "noportal", "ignore_exits_mismatch" },
-  -- chaos is a managed extension and is added during automatic migration.
   exits = { "dir", "fromuid", "touid", "level" },
 }
 local MAPPER_LEGACY_IDENTITY_COLUMNS = {
@@ -2401,9 +2390,7 @@ function mm.inspect_mapper_database(path)
   return status
 end
 
--- Create a complete empty database when no file exists. Recognized legacy
--- mapper schemas are backed up and migrated transactionally; corrupt,
--- incomplete, and unrelated SQLite files remain untouched.
+-- Create missing DBs; back up and transactionally migrate only recognized schemas.
 function mm.ensure_mapper_database(path)
   local source = mm.resolve_mapper_db(path)
   if not source then return false, "mapper database path is empty" end
@@ -3177,7 +3164,7 @@ function mm.on_cexitif_key_identify_complete(event_name, obj_id)
   for token, entry in pairs(pending) do
     local entry_id = type(entry) == "table" and tostring(entry.obj_id or "") or ""
     local target = type(entry) == "table" and (entry.target or entry) or nil
-    -- Accept the old id-keyed runtime shape during a hot package reload.
+    -- Accept legacy ID-keyed runtime state during hot reload.
     if (entry_id == id or (entry_id == "" and tostring(token) == id)) and target then
       pending[token] = nil
       table.insert(targets, target)
@@ -4537,10 +4524,8 @@ function mm.where_room(dest)
   if not (nav and type(nav.findPath) == "function") then
     return false, "mapper where requires mapper navigation module"
   end
-  -- mapper where is deliberately theoretical: ignore level, area, portal, and
-  -- source-room travel restrictions and rank only by database edge count. Ask
-  -- for a pure walking alternative as well so an equal-distance walk wins over
-  -- a portal route without importing xrt's live DINV operational cost.
+  -- mapper where is theoretical edge count; ignore live xrt restrictions and
+  -- let an equal-distance pure walk beat a portal route.
   local candidates = {}
   local rawPath = nav.findPath(src, dest, nil, nil, true, true, true)
   if rawPath and #rawPath > 0 then
@@ -4747,9 +4732,7 @@ end
 function mm.normalize_stacked_command(command)
   local normalized = tostring(command or "")
   normalized = normalized:gsub("^%s+", ""):gsub("%s+$", "")
-  -- Mudlet special exits require doubled separators between chained commands.
-  -- Canonicalize any semicolon separator runs to ";;" so persisted cexits are
-  -- usable when replayed through mapper navigation.
+  -- Mudlet cexits require doubled separators; canonicalize all runs to ";;".
   normalized = normalized:gsub("%s*;+%s*", ";;")
   return normalized
 end
@@ -4778,7 +4761,7 @@ function mm.add_full_cexit(command, src, dst, level, quiet, opts)
   else
     command = tostring(command or ""):gsub("^%s+", ""):gsub("%s+$", "")
   end
-  -- Preserve nomap_ virtual IDs as strings; convert numeric IDs normally.
+  -- nomap_ IDs must remain strings.
   local srcStr = mm.strip_ansi(src):gsub("^%s+", ""):gsub("%s+$", "")
   local dstStr = mm.strip_ansi(dst):gsub("^%s+", ""):gsub("%s+$", "")
   local srcIsNomap = srcStr:match("^nomap_")
@@ -4812,8 +4795,7 @@ function mm.add_full_cexit(command, src, dst, level, quiet, opts)
   ))
   if not ok then return false, err end
 
-  -- Replacing a cexit with a different destination must not silently carry an
-  -- alternate whose declared landing belonged to the old edge.
+  -- A replacement cexit must not inherit alternates belonging to the old destination.
   local alt_ready = mm.ensure_cexit_key_alternates_table()
   if alt_ready then
     local cleaned, cleanup_err = mm.exec_mapper_db(string.format(
@@ -4827,7 +4809,7 @@ function mm.add_full_cexit(command, src, dst, level, quiet, opts)
     mm.warn("Could not clear stale cexit key observations: " .. tostring(observation_err))
   end
 
-  -- Mudlet bigmap APIs require numeric room IDs; skip them for nomap_ virtual rooms.
+  -- Bigmap APIs require numeric IDs; skip nomap_ rooms.
   if not srcIsNomap and not dstIsNomap then
     if is_cardinal_dir(command) and type(setExit) == "function" then
       pcall(setExit, src, dst, command)
@@ -5358,7 +5340,7 @@ function mm.delete_cexit(index)
   local timing_start = timing_enabled and now_millis() or nil
   local db_start = timing_start
 
-  -- never delete active cexits
+  -- Never delete active cexits.
   local ok, err = mm.exec_mapper_db(string.format(
     "DELETE FROM exits WHERE fromuid=%s AND dir=%s AND touid=%s",
     mm.sql_escape(entry.fromuid), mm.sql_escape(entry.dir), mm.sql_escape(entry.touid)

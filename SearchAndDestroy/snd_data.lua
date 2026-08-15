@@ -1,26 +1,7 @@
---[[
-    Search and Destroy - Static Data Tables
-    Mudlet Port
-    
-    Original MUSHclient plugin by Crowley
-    Ported to Mudlet
-    
-    This module contains static lookup tables:
-    - Area default start rooms
-    - Mob keyword exceptions
-    - Mob keyword filters
-    - Class abbreviations
-    - State strings
-    - Wear locations
-    - Object types
-]]
-
 snd = snd or {}
 snd.data = snd.data or {}
 
--------------------------------------------------------------------------------
 -- Class Abbreviations
--------------------------------------------------------------------------------
 
 snd.data.classAbbreviations = {
     mag = "mage",
@@ -43,9 +24,7 @@ snd.data.classIndex = {
     [6] = "Psionicist",
 }
 
--------------------------------------------------------------------------------
 -- Character State Strings
--------------------------------------------------------------------------------
 
 snd.data.stateStrings = {
     [1] = "login",
@@ -61,9 +40,7 @@ snd.data.stateStrings = {
     [12] = "running",
 }
 
--------------------------------------------------------------------------------
 -- Wear Locations
--------------------------------------------------------------------------------
 
 snd.data.wearLocations = {
     [0] = "light",
@@ -119,9 +96,7 @@ snd.data.optionalWearLocations = {
     [32] = true, -- sleeping
 }
 
--------------------------------------------------------------------------------
 -- Object Types
--------------------------------------------------------------------------------
 
 snd.data.objectTypes = {
     [0] = "None",
@@ -157,9 +132,7 @@ for k, v in pairs(snd.data.objectTypes) do
     snd.data.objectTypesReverse[v] = k
 end
 
--------------------------------------------------------------------------------
 -- Continent IDs
--------------------------------------------------------------------------------
 
 snd.data.continents = {
     [0] = "Mesolar",
@@ -171,9 +144,7 @@ snd.data.continents = {
     [6] = "Vidblain",
 }
 
--------------------------------------------------------------------------------
 -- Direction Mappings
--------------------------------------------------------------------------------
 
 snd.data.directionMap = {
     north = "n",
@@ -193,10 +164,7 @@ snd.data.directionReverse = {
     d = "down",
 }
 
--------------------------------------------------------------------------------
 -- Area Default Start Rooms
--- Format: [areakey] = {start = "roomid", ct = "continent", vidblain = bool, noquest = bool}
--------------------------------------------------------------------------------
 
 snd.data.areaDefaultStartRooms = {
     ["abend"] = {start = "24909", ct = "3"}, -- Continents
@@ -457,7 +425,6 @@ snd.data.areaDefaultStartRooms = {
     ["zodiac"] = {start = "15857"},
     ["zoo"] = {start = "5920"},
     ["zyian"] = {start = "729"},
-    -- Non-questable Areas
     ["manor1"] = {start = "14460", noquest = true}, -- Manor areas
     ["manor3"] = {start = "20836", noquest = true},
     ["manorisle"] = {start = "6366", noquest = true},
@@ -525,10 +492,7 @@ snd.data.areaDefaultStartRooms = {
     ["wolfmaze"] = {start = "-1", noquest = true}
 }
 
--------------------------------------------------------------------------------
 -- Mob Keyword Area Filters
--- These patterns help extract better keywords for specific areas
--------------------------------------------------------------------------------
 
 snd.data.mobKeywordFilters = {
     ["adaldar"] = {{f = "^.*(el)vish (%a*%s?%a+)$", g = "%1 %2"}},
@@ -556,11 +520,7 @@ snd.data.mobKeywordFilters = {
     },
 }
 
--------------------------------------------------------------------------------
 -- Mob Keyword Exceptions
--- Specific mobs that need custom keywords
--- Format: [area] = {[mobname] = keyword}
--------------------------------------------------------------------------------
 
 snd.data.mobKeywordExceptions = {
     ["aardington"] = {
@@ -755,9 +715,6 @@ snd.data.mobKeywordExceptions = {
     },
 }
 
--------------------------------------------------------------------------------
--- Words to omit when guessing keywords
--------------------------------------------------------------------------------
 
 snd.data.keywordOmitWords = {
     ["a"] = true,
@@ -769,4 +726,3 @@ snd.data.keywordOmitWords = {
     ["the"] = true,
 }
 
--- Search and Destroy: Data module loaded silently

@@ -1,13 +1,3 @@
---[[
-    Search and Destroy - Commands Module
-    Mudlet Port
-    
-    Original MUSHclient plugin by Crowley
-    Ported to Mudlet
-    
-    This module contains all user command handlers (aliases)
-]]
-
 snd = snd or {}
 snd.commands = snd.commands or {}
 
@@ -186,9 +176,7 @@ local function persistQuickWhereScope(activity)
         return
     end
     local qw = snd.nav.quickWhere or {}
-    -- An explicit `qw <mob>` is a temporary navigation override, not the
-    -- selected activity target. Persisting it here contaminates the CP/GQ/Q
-    -- cache and resurrects its rooms the next time that tab is activated.
+    -- Never persist an explicit qw override into the selected activity cache.
     if qw.isAdhoc == true then
         return
     end
@@ -212,8 +200,7 @@ local function activateQuickWhereScope(activity)
         and quickWhere.isAdhoc ~= true
         and quickWhere.scope == activity
     then
-        -- Target selection may have just started a live QW fallback. Do not
-        -- replace that in-flight request with an older cached activity list.
+        -- Do not replace an in-flight QW fallback with an older cached list.
         return
     end
 
@@ -320,6 +307,38 @@ local function currentAreaKey()
     return snd.utils.trim(snd.room and snd.room.current and snd.room.current.arid or "")
 end
 
+local function stripMatchingQuotes(value)
+    local text = snd.utils.trim(tostring(value or ""))
+    if #text >= 2 then
+        local first = text:sub(1, 1)
+        local last = text:sub(-1)
+        if (first == "'" and last == "'") or (first == '"' and last == '"') then
+            text = snd.utils.trim(text:sub(2, -2))
+        end
+    end
+    return text
+end
+
+local function looseMobIdentity(value)
+    local text = tostring(value or "")
+    if snd.utils and type(snd.utils.stripColors) == "function" then
+        text = snd.utils.stripColors(text)
+    end
+    text = snd.utils.trim(text):lower():gsub("%s+", " ")
+    return (text:gsub("^an%s+", ""):gsub("^a%s+", ""):gsub("^the%s+", ""))
+end
+
+local function currentTargetMobName(requestedName)
+    local requested = stripMatchingQuotes(requestedName)
+    local current = snd.targets and snd.targets.current or nil
+    local selectedName = current and snd.utils.trim(current.name or current.mob or "") or ""
+    if requested == "" then return selectedName end
+    if selectedName ~= "" and looseMobIdentity(requested) == looseMobIdentity(selectedName) then
+        return selectedName
+    end
+    return requested
+end
+
 local function targetAreaStartRoom(target)
     local areaKey = currentTargetAreaKey(target)
     if areaKey == "" then return nil, "" end
@@ -379,8 +398,6 @@ local function storedTargetResults(target)
         end
     end
 
-    -- Quest and room-style campaign data may provide a concrete mapped room
-    -- even when no mob-sighting row exists yet.
     local roomName = snd.utils.stripColors(current.roomName or "")
     if #results == 0 and roomName ~= "" and snd.mapper and type(snd.mapper.searchRoomsExact) == "function" then
         local mapped = snd.mapper.searchRoomsExact(roomName, areaKey, mobName, {
@@ -530,9 +547,7 @@ local function getCharacterState()
     return tostring(state or "0")
 end
 
--- Resolve location from live GMCP before trusting S&D's room cache. The mapper
--- already follows this policy when planning a route; nx must make its decision
--- from the same source or it can request the room the player is standing in.
+-- Live GMCP is authoritative; stale room cache can create a route to the current room.
 local function getCurrentRoomUid()
     if snd.mapper and type(snd.mapper.currentRoomUid) == "function" then
         local ok, roomId = pcall(snd.mapper.currentRoomUid, true)
@@ -889,8 +904,7 @@ function snd.commands.beginXcpLookup()
     end
 
     if requestedMode == "hybrid" then
-        -- Express is a list-build snapshot. Do not query the DB again here:
-        -- route to its sole proven sighting and leave QW for the nx wrap.
+        -- Express is a snapshot; route to its proven sighting without requerying.
         local expressRoom = current.express == true and tonumber(current.expressRoomId) or nil
         if expressRoom and expressRoom > 0 then
             local installed = installSelectedTargetRoomList({
@@ -1029,9 +1043,33 @@ local function commandSelectorForTarget(target, mode, options)
         end
     end
 
+    -- User kill words outrank heuristics because display words may not be MUD keywords.
+    if mode == "kill" and snd.db and type(snd.db.getMobKeyword) == "function" then
+        local overrideArea = currentAreaKey()
+        if overrideArea == "" or overrideArea == "-1" then
+            overrideArea = areaKey
+        end
+        local override = snd.utils.trim(snd.db.getMobKeyword(overrideArea, selectorName) or "")
+        if override == "" and selectorName ~= name then
+            override = snd.utils.trim(snd.db.getMobKeyword(overrideArea, name) or "")
+        end
+        if override ~= "" then
+            if options and options.debugContext then
+                snd.utils.debugNote(string.format(
+                    "%s selector for '%s': '%s' (area-kill-word)",
+                    options.debugContext,
+                    selectorName,
+                    override
+                ))
+            end
+            return override, "area-kill-word"
+        end
+    end
+
     local selector, reason = snd.utils.buildMobCommandSelector(selectorName, knownNames, {
         mode = mode,
         areaKey = areaKey,
+        preferredSelector = target.keyword,
     })
 
     if selector == "" then
@@ -1056,9 +1094,11 @@ local function commandSelectorForTarget(target, mode, options)
     return selector, reason
 end
 
--------------------------------------------------------------------------------
--- Module Loading Helpers
--------------------------------------------------------------------------------
+-- Quoting and exact-instance ordinals belong only at the xkill send boundary.
+function snd.commands.resolveTargetCommandSelector(target, mode, options)
+    return commandSelectorForTarget(target, mode or "kill", options)
+end
+
 
 function snd.commands.ensureGuiLoaded()
     if snd.gui and snd.gui.toggle then
@@ -1095,9 +1135,7 @@ function snd.commands.sendGameCommand(cmd, echo)
 
     local noEcho = (echo == false)
 
-    -- Mudlet-native send(cmd, echo) is the most reliable route for aliases and
-    -- server command dispatch. Keep legacy Send*/SendNoEcho fallbacks for
-    -- compatibility with older helper layers.
+    -- Prefer Mudlet send(); retain legacy Send* fallbacks for older helper layers.
     if type(send) == "function" then
         local ok = pcall(send, cmd, not noEcho)
         if ok then return true end
@@ -1117,9 +1155,7 @@ function snd.commands.sendGameCommand(cmd, echo)
     return false
 end
 
---- Abort an active quick-where lookup when combat begins.
--- The MUD handles `stop` outside normal FIFO order, so it can clear a where
--- command that was already sent just before the combat state update arrived.
+-- The MUD processes stop outside FIFO order, so it can cancel a just-sent where.
 function snd.commands.abortQuickWhereForCombat()
     local quickWhere = snd.nav and snd.nav.quickWhere or nil
     if not quickWhere or quickWhere.processed ~= false then
@@ -1155,9 +1191,6 @@ function snd.commands.abortQuickWhereForCombat()
     return true
 end
 
---- Dispatch an S&D command through its Lua API instead of re-entering Mudlet's alias engine.
--- @param command string S&D command line
--- @return boolean true when the command was recognized and dispatched
 function snd.commands.dispatchLocalCommand(command)
     local line = snd.utils.trim(command or "")
     if line == "" then return false end
@@ -1205,7 +1238,6 @@ function snd.commands.dispatchLocalCommand(command)
     return false
 end
 
--- Route movement through the mapper's Lua API. MMapper is a required dependency.
 function snd.commands.gotoRoomViaAlias(roomId, options)
     roomId = tonumber(roomId)
     if not roomId or roomId <= 0 then
@@ -1311,9 +1343,7 @@ function snd.commands.gotoRoomViaAlias(roomId, options)
         return false, routeFailure or (snd.mapper and snd.mapper.lastRouteFailure)
     end
 
-    -- Mapper API dispatch is synchronous. A failed route consumes this
-    -- request while building its manual-approach list; successful routes leave
-    -- no fallback state behind.
+    -- Mapper dispatch is synchronous; only failed routes leave manual approaches.
     clearPendingRequests()
     return true
 end
@@ -1325,8 +1355,7 @@ local function suggestXrtNear(requestedRoom)
     )
 end
 
---- Route an unreachable selected-target room to that target area's start room.
--- The target room and QW list remain unchanged; this is only an approach route.
+-- Approach routes must not alter the target room or QW list.
 function snd.commands.fallbackToTargetAreaStart(requestedRoom)
     local requestedId = tonumber(requestedRoom)
     local pending = snd.nav and snd.nav.pendingTargetRoomFallback or nil
@@ -1439,9 +1468,6 @@ function snd.commands.handleTargetAreaFallbackArrival(roomId)
     return pending.continueXcpLookup ~= true
 end
 
--------------------------------------------------------------------------------
--- Main Command: snd
--------------------------------------------------------------------------------
 
 function snd.commands.snd(args)
     args = snd.utils.trim(args or "")
@@ -1535,9 +1561,6 @@ function snd.commands.snd(args)
     end
 end
 
--------------------------------------------------------------------------------
--- snd conwin - Consider Window Commands
--------------------------------------------------------------------------------
 
 function snd.commands.conwin(args)
     args = snd.utils.trim(args or "")
@@ -1637,13 +1660,8 @@ function snd.commands.conwin(args)
     end
 end
 
--------------------------------------------------------------------------------
--- xcp - Select Target
--------------------------------------------------------------------------------
 
---- Select the first living target shown by the active activity tab.
--- This deliberately resolves the target from the live list instead of reusing
--- snd.targets.scoped, which may still describe a target killed moments ago.
+-- Resolve from the live list; scoped cache may still contain a just-killed target.
 function snd.commands.selectFirstTarget(activity)
     local scopedActivity = tostring(activity or getScopedActivity() or ""):lower()
     local success = false
@@ -1705,7 +1723,6 @@ function snd.commands.xcp(args)
     end
     
     if args == "" then
-        -- Show current target and list
         snd.commands.showTargets()
         return
     end
@@ -1727,7 +1744,6 @@ function snd.commands.xcp(args)
         return
     end
 
-    -- Prefer active tab context first, then fallback
     local success = false
 
     if scopedActivity == "cp" and snd.campaign.active then
@@ -1792,9 +1808,6 @@ function snd.commands.selectQuickWhereRoom(index, activity)
     return true
 end
 
--------------------------------------------------------------------------------
--- nx - Next Target / Go to Target
--------------------------------------------------------------------------------
 
 function snd.commands.buildTargetKeyFromEntry(target)
     if not target then return "" end
@@ -1816,16 +1829,12 @@ function snd.commands.buildTargetKeyFromCurrent(target)
     }, "|")
 end
 
--- Quick-where lists should stick to the selected target identity only.
--- Room fields are intentionally excluded so moving between matched rooms does
--- not invalidate the active quick-where cycle.
+-- QW identity excludes room fields so movement does not invalidate the cycle.
 function snd.commands.buildQuickWhereTargetKeyFromCurrent(target)
     return quickWhereTargetIdentity(target)
 end
 
---- Resolve whether a rendered room list came from QW and its request label.
--- The mapper must use the list's explicit context rather than the mutable
--- global QW state, which may already belong to an older manual lookup.
+-- Use the list's context; global QW state may belong to an older manual lookup.
 function snd.commands.quickWhereListDisplay(context)
     if type(context) ~= "table" or context.quickWhere ~= true then
         return false, ""
@@ -1853,9 +1862,7 @@ local function manualApproachMatchesCurrent(approach)
         end
     end
 
-    -- A displayed redirect is an offer for the room where the failed route was
-    -- calculated. Once the player moves, nx must retry the real target from the
-    -- live room instead of consuming a stale approach and sending them back.
+    -- A redirect expires after movement; otherwise nx can send the player backward.
     local offeredFromRoom = tostring(approach.offeredFromRoom or "")
     if offeredFromRoom ~= "" then
         local liveRoom = tostring(getCurrentRoomUid() or "")
@@ -1887,9 +1894,7 @@ local function manualApproachEllipsify(text, maxLength)
     return text:sub(1, maxLength - 3) .. "..."
 end
 
---- Offer an explicit, saved mapper redirect after an S&D room request fails.
--- This deliberately does not modify quickWhere.rooms or the selected target's
--- roomId: the redirect is an approach room, not evidence of the mob's location.
+-- A redirect is an approach, never evidence of the mob's location.
 function snd.commands.offerManualApproach(requestedRoom)
     local requestedId = tonumber(requestedRoom)
     local pending = snd.nav and snd.nav.pendingManualApproachRequest or nil
@@ -2190,9 +2195,7 @@ function snd.commands.nx()
         end
     end
 
-    -- Campaign/GQ room searches populate snd.nav.gotoList for the displayed
-    -- XCP table. If quick-where state was not built (or was stale), use this
-    -- list as a fallback cycle source so nx can still advance through rooms.
+    -- Fall back to the displayed XCP list when QW state is missing or stale.
     local currentQuickWhereKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
     local gotoListKey = snd.nav and snd.nav.gotoListTargetKey or ""
     local gotoListMatchesCurrent = (gotoListKey ~= "" and currentQuickWhereKey ~= "" and gotoListKey == currentQuickWhereKey)
@@ -2233,8 +2236,6 @@ function snd.commands.nx()
         local targetRoom = current and current.roomId or nil
         local foundIndex = nil
 
-        -- Prioritize the room we are currently standing in; the selected target
-        -- can still point at an earlier room from the quick-where result set.
         local function findRoomIndex(roomId)
             if not roomId then
                 return nil
@@ -2252,9 +2253,7 @@ function snd.commands.nx()
         local wrappingCycle = false
         local restartFromFirst = snd.nav.nxState and snd.nav.nxState.restartFromFirst == true
         if restartFromFirst then
-            -- A QW triggered by wrapping the previous list starts a new pass.
-            -- Do not immediately treat the room we are still standing in as
-            -- the end of the newly refreshed list.
+            -- A wrap-triggered QW starts a new pass from the current room.
             nextIndex = 1
             if #quickWhere.rooms > 1
                 and currentRoom
@@ -2275,9 +2274,6 @@ function snd.commands.nx()
                     nextIndex = foundIndex + 1
                 else
                     nextIndex = 1
-                    -- Wrap when cycling a multi-room list, OR when standing in the
-                    -- only room of a single-room list (currentRoomIndex proves the
-                    -- player is physically here, not just targeting it).
                     wrappingCycle = #quickWhere.rooms > 1 or currentRoomIndex ~= nil
                 end
             else
@@ -2287,22 +2283,18 @@ function snd.commands.nx()
         quickWhere.index = nextIndex
         persistQuickWhereScope(quickWhere.scope or (current and current.activity))
 
-        -- A live-backed xcp list refreshes at wrap; a DB-backed list simply
-        -- wraps to room #1. Hybrid refreshes QW and HT reruns only for GQ.
+        -- Live lists refresh at wrap; DB lists wrap locally; hybrid HT reruns only for GQ.
         if wrappingCycle and current
             and (current.activity == "quest" or current.activity == "cp" or current.activity == "gq")
         then
             if runXcpCycleAction(current) then
                 return
             end
-            -- Effective mode "db": fall through to normal room movement.
         end
 
         local nextRoomId = quickWhere.rooms[nextIndex]
         if nextRoomId then
-            -- Defensive last check: never ask the mapper to navigate to the
-            -- live room. This avoids a false arrival callback and nxAction scan
-            -- if list/index state was stale or contained a duplicate room.
+            -- Never route to the live room; stale duplicates could fire a false arrival action.
             if currentRoom and tostring(nextRoomId) == tostring(currentRoom) then
                 snd.utils.debugNote("NX: selected room is already current; skipping mapper dispatch")
                 runXcpCycleAction(current)
@@ -2314,10 +2306,8 @@ function snd.commands.nx()
         end
     end
 
-    -- No active quick-where room list for this target: keep the selected target
-    -- and simply retry going to its current mapped room. If live GMCP says we
-    -- are already there, refresh the configured XCP lookup instead of creating
-    -- a false mapper arrival (which would also run nxAction).
+    -- Without a QW list, retry the mapped room; if already there, refresh XCP
+    -- instead of firing a false mapper arrival and nxAction.
     local currentRoom = getCurrentRoomUid()
     local targetRoom = current and current.roomId or nil
     if targetRoom and currentRoom and tostring(targetRoom) == tostring(currentRoom) then
@@ -2393,9 +2383,6 @@ function snd.commands.handleAlreadyInRoom(roomId)
     return true
 end
 
--------------------------------------------------------------------------------
--- qw - Quick Where
--------------------------------------------------------------------------------
 
 local function resolveSelectedTargetKeyword(mode)
     local function hasText(value)
@@ -2458,8 +2445,7 @@ local function runQuickWhere(args, exact, options)
         keyword = snd.utils.trim(prefixedKeyword)
     end
 
-    -- Support legacy placeholders that refer to the currently tracked target.
-    -- Players commonly use `qw target`, which should behave like `qw`.
+    -- Legacy `qw target` means the current target.
     local lowered = keyword:lower()
     if lowered == "target" or lowered == "current" then
         keyword = ""
@@ -2509,7 +2495,6 @@ local function runQuickWhere(args, exact, options)
         and lowered ~= "gq_target"
         and lowered ~= "quest_target"
 
-    -- If no args, use current target in active tab scope
     if keyword == "" then
         keyword, exactNameHint = resolveSelectedTargetKeyword("where")
         selectedTargetLookup = true
@@ -2692,7 +2677,6 @@ function snd.commands.processQuickWhereResult()
     local preservesSelectedIdentity = snd.utils.trim(quickWhere.exactTargetName or "") ~= ""
     local originalName = snd.utils.trim(snd.targets.current.name or "")
     local matchedName = snd.utils.trim(lastMatch.mob or "")
-    -- whole-word token match: "tree" finds "red tree" and "a large tree", but not "pirate" for "rat"
     local qwKeyword = snd.utils.trim(
         quickWhere.requestedKeyword or quickWhere.lookupKeyword or ""
     ):lower()
@@ -2757,9 +2741,7 @@ function snd.commands.processQuickWhereResult()
     local dedupedResults = {}
     for _, entry in ipairs(results) do
         local roomId = tonumber(entry.rmid) or -1
-        -- Only dedupe by concrete room id.
-        -- Do not collapse unknown-id rows by name/area, because distinct rooms
-        -- can legitimately share the same name.
+        -- Deduplicate only concrete IDs; different rooms may share name and area.
         if roomId > 0 then
             if not seenRoomIds[roomId] then
                 seenRoomIds[roomId] = true
@@ -2922,9 +2904,7 @@ function snd.commands.processQuickWhereResult()
 
     if #quickWhereRooms == 0 then
         if isAdhocQuickWhere then
-            -- The MUD already returned a useful answer, but qw gagged that row
-            -- before asking the mapper to resolve it. Restore the original,
-            -- non-clickable where output only when no mapper room was found.
+            -- Restore gagged MUD output only when the mapper found no room.
             local rawWhereLine = tostring(lastMatch.rawLine or "")
             if rawWhereLine == "" then
                 local mobText = tostring(lastMatch.mob or "")
@@ -3067,9 +3047,6 @@ function snd.commands.processQuickWhereNoMatch(options)
     return installed
 end
 
--------------------------------------------------------------------------------
--- ht - Hunt Trick
--------------------------------------------------------------------------------
 
 local function ensureHuntTrickStore()
     snd.nav = snd.nav or {}
@@ -3197,7 +3174,6 @@ function snd.commands.ht(args)
         keyword = snd.utils.trim(prefixedKeyword)
     end
 
-    -- If no args, use current target
     if keyword == "" then
         if snd.targets.current and (snd.targets.current.name or snd.targets.current.keyword) then
             keyword, exactMatchText = resolveSelectedTargetKeyword("where")
@@ -3212,7 +3188,6 @@ function snd.commands.ht(args)
         return
     end
 
-    -- Initialize hunt trick state
     clearHuntTrickTriggers()
     if snd.commands.stopAutoHunt then
         snd.commands.stopAutoHunt(true)
@@ -3226,8 +3201,7 @@ function snd.commands.ht(args)
         tempTriggers = {},
     }
 
-    -- Use command-owned temp triggers so ht works even when the imported
-    -- SND_Hunt folder is stale or disabled in the live profile.
+    -- Own these temp triggers so stale/disabled imported triggers cannot break ht.
     snd.triggers.disableGroup("Hunt")
     if not registerHuntTrickTriggers() then
         snd.triggers.enableGroup("Hunt")
@@ -3325,7 +3299,6 @@ function snd.commands.huntTrickFail()
     end
 end
 
---- Stop hunt trick
 function snd.commands.stopHunt(silent)
     clearHuntTrickTriggers()
     if snd.nav.huntTrick then
@@ -3341,9 +3314,6 @@ function snd.commands.stopHunt(silent)
     end
 end
 
--------------------------------------------------------------------------------
--- ah - Auto Hunt
--------------------------------------------------------------------------------
 
 local function ensureAutoHuntStore()
     snd.nav = snd.nav or {}
@@ -3509,11 +3479,7 @@ function snd.commands.ah(args)
     snd.commands.sendGameCommand("hunt " .. keyword, false)
 end
 
--------------------------------------------------------------------------------
--- xkill - Kill Current Target
--------------------------------------------------------------------------------
 
---- Kill current target using configured kill command
 function snd.commands.xkill(options)
     local exactConwinIndex = type(options) == "table" and tonumber(options.conwinIndex) or nil
     local exactConwinSource = exactConwinIndex and "mobdetect" or nil
@@ -3531,10 +3497,9 @@ function snd.commands.xkill(options)
 
     local currentTarget = snd.targets.current
     local keyword = ""
+    local selectorReason = nil
 
-    -- A server-marked quest row is instance-specific. Preserve its ConWin
-    -- position for ordinary/manual xkill just as mobdetect already does, so
-    -- duplicate quest mobs produce selectors such as 3.driller.
+    -- Preserve a server-marked quest row's ConWin ordinal for duplicate mobs.
     if not exactConwinIndex and currentTarget
         and tostring(currentTarget.activity or ""):lower() == "quest"
         and snd.conwin and snd.conwin.questTargetIndexFor
@@ -3548,12 +3513,13 @@ function snd.commands.xkill(options)
         end
     end
 
-    -- xkill should always prioritize the selected current target and only
-    -- consider quest fallback when no current target exists.
+    -- Quest fallback is valid only when no current target is selected.
     if currentTarget then
-        keyword = snd.utils.trim(commandSelectorForTarget(currentTarget, "kill", {
+        local resolvedKeyword, resolvedReason = snd.commands.resolveTargetCommandSelector(currentTarget, "kill", {
             debugContext = "xkill",
-        }) or "")
+        })
+        keyword = snd.utils.trim(resolvedKeyword or "")
+        selectorReason = resolvedReason
         if keyword == "" and currentTarget.matchedMobName then
             keyword = snd.utils.trim(tostring(currentTarget.matchedMobName or ""))
         end
@@ -3576,10 +3542,12 @@ function snd.commands.xkill(options)
         return
     end
 
-    -- Reuse the shared GMCP keyword guesser when a stored keyword contains
-    -- punctuation (such as hyphenated forms) that may not be command-safe.
+    -- Rebuild punctuation-heavy stored keywords through the shared selector logic.
     local normalizedKeyword = keyword
-    if currentTarget and currentTarget.name and normalizedKeyword:find("%-") and snd.gmcp and snd.gmcp.guessMobKeyword then
+    if selectorReason ~= "area-kill-word"
+        and currentTarget and currentTarget.name and normalizedKeyword:find("%-")
+        and snd.gmcp and snd.gmcp.guessMobKeyword
+    then
         local arid = snd.room and snd.room.current and snd.room.current.arid
         local guessed = snd.utils.trim(snd.gmcp.guessMobKeyword(currentTarget.name, arid) or "")
         if guessed ~= "" then
@@ -3593,18 +3561,19 @@ function snd.commands.xkill(options)
         local exactSelector = snd.conwin and snd.conwin.killSelectorFor
             and snd.conwin.killSelectorFor(exactConwinIndex) or nil
         exactSelector = snd.utils.trim(exactSelector or "")
-        -- Exact instance selection is intentionally fail-closed: if the
-        -- confirmed ConWin row disappeared or can no longer be addressed,
-        -- never attack an unmarked duplicate through a generic fallback.
+        -- Exact-instance selection is fail-closed; never fall back onto an unmarked duplicate.
         if not row or row.dead or exactSelector == "" then
             return
         end
-        normalizedKeyword = exactSelector
+        if selectorReason == "area-kill-word" then
+            local ordinal = exactSelector:match("^(%d+)%.")
+            normalizedKeyword = ordinal and (ordinal .. "." .. normalizedKeyword) or normalizedKeyword
+        else
+            normalizedKeyword = exactSelector
+        end
     end
 
-    -- The selector builder excludes bare directions, but retain a final guard
-    -- here for stored/ad-hoc keywords and callers that bypass name-based
-    -- selection. Never emit commands such as "kill up".
+    -- Final guard for stored/ad-hoc selectors: never emit commands such as "kill up".
     if snd.utils.isReservedMobCommandSelector
         and snd.utils.isReservedMobCommandSelector(normalizedKeyword)
     then
@@ -3612,11 +3581,9 @@ function snd.commands.xkill(options)
         return
     end
 
-    -- Get the kill command (default: "kill")
     local killCmd = snd.config.killCommand or "kill"
     
-    -- Apply command-aware quoting only at the send boundary. Stored target
-    -- names/selectors remain logical and unquoted for matching and DB use.
+    -- Quote only at send time; stored selectors remain logical and unquoted.
     local fullCmd = killCmd .. " " .. normalizedKeyword
     if snd.utils and type(snd.utils.buildMobTargetCommand) == "function" then
         fullCmd = snd.utils.buildMobTargetCommand(
@@ -3641,12 +3608,7 @@ function snd.commands.xkill(options)
     send(fullCmd)
 end
 
--------------------------------------------------------------------------------
--- xcmd - Set Kill Command
--------------------------------------------------------------------------------
 
---- Set the kill command used by xkill
--- @param args The command to use (e.g., "cast 'lightning bolt'")
 function snd.commands.xcmd(args)
     args = snd.utils.trim(args or "")
     local configuredMode = snd.config.killTargetMode or "auto"
@@ -3669,7 +3631,6 @@ function snd.commands.xcmd(args)
     end
     
     if args == "" then
-        -- Show current command
         cecho("\n<cyan>Current xkill command:<reset> " .. (snd.config.killCommand or "kill") .. "\n")
         cecho("<cyan>Target syntax:<reset> " .. configuredMode .. " <dim_gray>(resolves to " .. resolvedMode() .. ")<reset>\n")
         cecho("<dim_gray>Usage: xcmd <command> | xcmd mode <auto|skill|cast|raw><reset>\n")
@@ -3698,26 +3659,18 @@ function snd.commands.xcmd(args)
         return
     end
     
-    -- Set the new kill command
     snd.config.killCommand = args
     snd.utils.infoNote("Kill command set to: " .. args)
     
-    -- Save config
     if snd.saveState then
         snd.saveState()
     end
 end
 
--------------------------------------------------------------------------------
--- qref - Quest Refresh/Status
--------------------------------------------------------------------------------
 
---- Show quest status and refresh target
 function snd.commands.qref()
-    -- Request fresh quest data from server
     sendGMCP("request quest")
     
-    -- Show current quest info
     tempTimer(0.2, function()
         if snd.quest.active and snd.quest.target.mob ~= "" then
             cecho("\n<magenta>Quest Target:<reset> " .. snd.quest.target.mob .. "\n")
@@ -3737,7 +3690,6 @@ function snd.commands.qref()
                 cecho("<green>Status: Target killed - return to questor!<reset>\n")
             end
             
-            -- Make sure quest is in target list
             snd.gmcp.addQuestToTargetList()
         else
             cecho("\n<yellow>No active quest.<reset>\n")
@@ -3753,14 +3705,11 @@ function snd.commands.qref()
     end)
 end
 
--- Backward-compatible callable function name (no alias registration).
+-- Callable legacy name; intentionally not registered as an alias.
 function snd.commands.qr()
     snd.commands.qref()
 end
 
--------------------------------------------------------------------------------
--- goto - Navigate to Target
--------------------------------------------------------------------------------
 
 function snd.commands.gotoTarget()
     local quickWhere = snd.nav and snd.nav.quickWhere or nil
@@ -3848,9 +3797,6 @@ function snd.commands.gotoTarget()
             ))
         end
 
-        -- Prime nx quick-where cycling from direct room-name searches too.
-        -- This keeps `nx` cycling functional even when a fresh `qw` parse was
-        -- not captured (or when users immediately press nx from a shown XCP list).
         if snd.nav.quickWhere then
             local roomIds = {}
             if results then
@@ -3897,22 +3843,17 @@ function snd.commands.gotoTarget()
         return
     end
     
-    -- Get area start room
     local startRoom = snd.db.getAreaStartRoom(areaKey)
     
     if startRoom and startRoom > 0 then
         local displayName = areaName ~= "" and areaName or areaKey
         snd.utils.infoNote("Going to " .. displayName .. " (room " .. startRoom .. ")")
-        -- Dispatch through xrt alias for navigation
         snd.commands.gotoRoomViaAlias(startRoom)
     else
         snd.utils.infoNote("No start room known for " .. areaKey)
     end
 end
 
--------------------------------------------------------------------------------
--- go - Navigate to a search result index
--------------------------------------------------------------------------------
 
 function snd.commands.goToIndex(args)
     local index
@@ -3953,9 +3894,6 @@ function snd.commands.goToIndex(args)
     end
 end
 
--------------------------------------------------------------------------------
--- xset - Configuration
--------------------------------------------------------------------------------
 
 function snd.commands.xset(args)
     args = snd.utils.trim(args or "")
@@ -4185,8 +4123,74 @@ function snd.commands.xset(args)
         snd.utils.infoNote("S&D area colors: " .. (snd.config.areaColors ~= false and "on" or "off"))
         if snd.gui and snd.gui.refresh then snd.gui.refresh() end
         
+    elseif setting == "kw" or setting == "killword" then
+        local kwArgs = snd.utils.trim(args:match("^%S+%s*(.-)%s*$") or "")
+        local action, mobText = kwArgs:match("^(%S+)%s*(.-)%s*$")
+        action = stripMatchingQuotes(action or "")
+        mobText = stripMatchingQuotes(mobText or "")
+        local loweredAction = action:lower()
+        local zone = currentAreaKey()
+        if zone == "" or zone == "-1" then
+            snd.utils.infoNote("Current area is unknown; cannot set an area kill word.")
+            return
+        end
+
+        if action == "" or loweredAction == "help" or loweredAction == "?" then
+            snd.commands.showKillWordHelp()
+            return
+        elseif loweredAction == "list" then
+            local rows = snd.db and snd.db.listMobKeywords and snd.db.listMobKeywords(zone) or {}
+            if #rows == 0 then
+                snd.utils.infoNote("No kill words saved for area " .. zone .. ".")
+                return
+            end
+            cecho("\n<white>Area      Kill word        Mob<reset>\n")
+            cecho("<gray>---------------------------------------------------------------<reset>\n")
+            for _, row in ipairs(rows) do
+                cecho(string.format("<cyan>%-10s<reset> %-16s %s\n",
+                    tostring(row.area_name or ""):sub(1, 10),
+                    tostring(row.keyword or ""):sub(1, 16),
+                    tostring(row.mob_name or "")))
+            end
+            return
+        elseif loweredAction == "clear" or loweredAction == "delete" or loweredAction == "del" then
+            local mobName = currentTargetMobName(mobText)
+            if mobName == "" then
+                snd.utils.infoNote("No target selected. Usage: xset kw clear <mob name>")
+                return
+            end
+            if snd.db and snd.db.deleteMobKeyword and snd.db.deleteMobKeyword(zone, mobName) then
+                snd.utils.infoNote("Cleared kill word for '" .. mobName .. "' in " .. zone .. ".")
+            else
+                snd.utils.infoNote("No saved kill word found for '" .. mobName .. "' in " .. zone .. ".")
+            end
+            return
+        end
+
+        if action:find("%s") then
+            snd.utils.infoNote("Kill word must be one word. Usage: xset kw <kill-word> [mob name]")
+            return
+        end
+        if not action:match("^[%w_%-]+$") then
+            snd.utils.infoNote("Kill word may contain only letters, numbers, underscores, or hyphens.")
+            return
+        end
+        if snd.utils.isReservedMobCommandSelector and snd.utils.isReservedMobCommandSelector(action) then
+            snd.utils.infoNote("Refusing to save a movement direction as a kill word: " .. action)
+            return
+        end
+        local mobName = currentTargetMobName(mobText)
+        if mobName == "" then
+            snd.utils.infoNote("No target selected. Usage: xset kw <kill-word> <mob name>")
+            return
+        end
+        if not snd.db or not snd.db.setMobKeyword or not snd.db.setMobKeyword(zone, mobName, action) then
+            snd.utils.infoNote("Failed to save kill word for '" .. mobName .. "' in " .. zone .. ".")
+            return
+        end
+        return
+
     elseif setting == "keyword" then
-        -- Set custom keyword for current target
         if not snd.targets.current then
             snd.utils.infoNote("No target selected")
             return
@@ -4205,7 +4209,6 @@ function snd.commands.xset(args)
         end
         
     elseif setting == "startroom" then
-        -- Set start room for current area
         local roomId = tonumber(value) or tonumber(snd.room.current.rmid)
         local area = parts[3] or snd.room.current.arid
         
@@ -4300,7 +4303,6 @@ function snd.commands.xset(args)
         snd.commands.showConfig()
     end
     
-    -- Save config after changes
     snd.saveState()
 end
 
@@ -4343,9 +4345,6 @@ function snd.commands.setAutocheckSmartKills(value)
     return true
 end
 
--------------------------------------------------------------------------------
--- xhelp - Help
--------------------------------------------------------------------------------
 
 function snd.commands.xhelp(args)
     args = snd.utils.trim(args or "")
@@ -4361,9 +4360,6 @@ function snd.commands.xhelp(args)
     end
 end
 
--------------------------------------------------------------------------------
--- Display Functions
--------------------------------------------------------------------------------
 
 local function urlEncode(s)
     s = tostring(s or "")
@@ -4386,7 +4382,6 @@ local function emitHelpCommandLink(commandText, commandToSend, hint)
             snd.utils.errorNote("Help link command is not registered: " .. trimmed)
         end
     end
-    -- Use classic Mudlet links (stable rendering across consoles / logs).
     if type(cechoLink) == "function" then
         cechoLink("<cyan>" .. text .. "<reset>", linkAction, tooltip, true)
     else
@@ -4464,6 +4459,7 @@ function snd.commands.showHelp()
     emitLinkedHelpRow("xcp mode <db|qw|hybrid|ht>", "xcp mode", "Set XCP room lookup mode", "Choose stored rooms, live where, hybrid, or GQ hunt lookup")
     emitLinkedHelpRow("nx", "nx", "Go to next/current target", "Go to next/current target")
     emitLinkedHelpRow("xkill", "xkill", "Kill current target", "Kill current target with precise temporary selector")
+    emitLinkedHelpRow("xset kw <word> [mob]", "xset kw help", "Set an area kill word", "Persist the MUD kill word for a mob in the current area")
     emitLinkedHelpRow("xcmd <command>", "xcmd", "Show or set xkill command", "Show or set the command used by xkill")
     emitLinkedHelpRow("xcmd mode <auto|skill|cast|raw>", "xcmd mode", "Set xkill target syntax", "Auto-detect direct casts or force a target quoting style")
 
@@ -4548,6 +4544,7 @@ function snd.commands.showCommandHelp()
     emitPlainHelpRow("xset areaguard <on|off>", "Toggle persisted navigation area guard")
     emitPlainHelpRow("xset sound [on|off|volume <n%>]", "Toggle/query sound alerts")
     emitPlainHelpRow("xset keyword <kw>", "Set mob keyword")
+    emitPlainHelpRow("xset kw <word> [mob]", "Persist an xkill word for the selected or named mob in the current area")
     emitPlainHelpRow("xset startroom", "Set area start room")
     emitPlainHelpRow("xcmd <command>", "Set the command used by xkill")
     emitPlainHelpRow("xcmd mode <auto|skill|cast|raw>", "Set xkill target quoting; auto recognizes direct cast commands")
@@ -4579,13 +4576,14 @@ function snd.commands.showConfigHelp()
     emitPlainHelpRow("silent <on|off>", "Hide regular [S&D] info notes. Error notes still show.")
     emitPlainHelpRow("speed <run|walk>", "Default travel mode for nx/go. run=xrt (portal-aware), walk=walkto (no portals)")
     emitPlainHelpRow("areaguard <on|off>", "Avoid areas more than 30 levels above you. Clan rooms are locally exempt; later rooms are checked normally. Default: off.")
-    emitPlainHelpRow("nxaction <smartscan|qs|none>", "default=qs; smartscan scans selected current-area target; none does nothing on arrival")
+	emitPlainHelpRow("nxaction <smartscan|qs|none>", "default=qs; qs runs an unfiltered scan; smartscan scans the selected current-area target; none does nothing on arrival")
     emitPlainHelpRow("express <on|off>", "Prefer known fixed-room targets")
     emitPlainHelpRow("expressmin <number>", "Min kills before express applies")
     emitPlainHelpRow("autocheck <on|smart|off>", "Post-kill CP/GQ recheck mode")
     emitPlainHelpRow("autocheck kills <number>", "SMART mode: run check every N kills")
     emitPlainHelpRow("xcp mode <db|qw|hybrid|ht>", "XCP target lookup; ht applies to GQ only and automatically uses qw for quest/CP")
     emitPlainHelpRow("mob tags", "xset mob help|tags|delete|nowhere|nohunt|priority")
+    emitPlainHelpRow("kw <word> [mob]", "Area-scoped xkill word; use xset kw help for list/clear commands")
     emitPlainHelpRow("window <on|off>", "GUI window")
     emitPlainHelpRow("sound <on|off|volume>", "Sound alerts and volume")
     emitPlainHelpRow("areacolors <on|off>", "Color-band area labels in target list")
@@ -4605,9 +4603,16 @@ function snd.commands.showMobHelp()
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
--------------------------------------------------------------------------------
--- Temp Alias Registration (for manual installs without XML)
--------------------------------------------------------------------------------
+function snd.commands.showKillWordHelp()
+    emitHelpTitle("Search and Destroy - Area Kill Words")
+    emitHelpSection("Persistent xkill Overrides")
+    emitPlainHelpRow("xset kw <word>", "Save a kill word for the currently selected target in this area. Example: xset kw rat")
+    emitPlainHelpRow("xset kw <word> <mob>", "Save for a named mob. Single or double quotes around the mob name are accepted. Example: xset kw rat 'a tiny rat'")
+    emitPlainHelpRow("xset kw list", "List saved kill words for the current area")
+    emitPlainHelpRow("xset kw clear [mob]", "Remove the selected or named mob's kill-word override in the current area")
+    cecho("<gray>----------------------------------------<reset>\n")
+end
+
 
 local function sndHasAlias(name)
     if type(getAlias) == "function" then
@@ -4698,7 +4703,6 @@ function snd.commands.showStatus()
     cecho("\n<white>Search and Destroy - Status<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
 
-    -- Character info
     cecho(string.format("  <yellow>Character:<reset> %s (Level %d)\n", 
         snd.char.name or "Unknown", snd.char.level or 0))
     local roomName = snd.utils.stripColors(snd.room.current.name or "Unknown")
@@ -4706,7 +4710,6 @@ function snd.commands.showStatus()
     cecho(string.format("  <yellow>Room:<reset> %s (%s)\n",
         roomName, roomArea))
     
-    -- Campaign status
     if snd.campaign.active then
         local remaining = snd.cp.getRemainingCount()
         cecho(string.format("  <yellow>Campaign:<reset> <green>Active<reset> (%d remaining)\n", remaining))
@@ -4714,7 +4717,6 @@ function snd.commands.showStatus()
         cecho("  <yellow>Campaign:<reset> <gray>None<reset>\n")
     end
     
-    -- GQuest status
     if snd.gquest.active then
         local remaining = snd.gq.getRemainingCount()
         local kills = snd.gq.getTotalRemainingKills()
@@ -4724,7 +4726,6 @@ function snd.commands.showStatus()
         cecho("  <yellow>GQuest:<reset> <gray>None<reset>\n")
     end
     
-    -- Quest status
     if snd.quest.active then
         cecho(string.format("  <yellow>Quest:<reset> <green>%s<reset> in %s\n",
             snd.quest.target.mob, snd.quest.target.area))
@@ -4732,7 +4733,6 @@ function snd.commands.showStatus()
         cecho("  <yellow>Quest:<reset> <gray>None<reset>\n")
     end
     
-    -- Current target
     if snd.targets.current then
         cecho(string.format("  <yellow>Target:<reset> %s [%s]\n",
             snd.targets.current.name or snd.targets.current.keyword,
@@ -4823,14 +4823,11 @@ function snd.commands.showTargets()
                     local isCurrent = snd.targets.current and targetMatchesCurrent(target, snd.targets.current)
                     local rowLead = (target.activity == "cp" and isCurrent) and "<orange_red>▶<reset> " or "  "
 
-                    -- Build the line
                     if not target.dead then
-                        -- Clickable index number
                         cecho(rowLead)
                         cecho(string.format(" <%s>%2d.<reset>", (target.activity == "cp" and isCurrent) and "orange_red" or "yellow", selectIndex))
                         cecho(string.format("<%s>[%s]<reset> ", prefixColor, prefix))
 
-                        -- Clickable mob name
                         local areaKey = target.arid or ""
                         if target.hasMobData == false then
                             cecho("<red>")
@@ -4850,7 +4847,6 @@ function snd.commands.showTargets()
 
                         cecho(status)
 
-                        -- Area on same line
                         if target.loc and target.loc ~= "" then
                             cecho(" <dim_gray>in<reset> ")
                             if areaKey ~= "" then
@@ -4919,7 +4915,6 @@ function snd.commands.showTargets()
         end
     end
     
-    -- Show current target
     if snd.targets.current then
         cecho("  <yellow>Current:<reset> " .. (snd.targets.current.name or snd.targets.current.keyword))
         if snd.targets.current.area and snd.targets.current.area ~= "" then
@@ -4933,7 +4928,6 @@ function snd.commands.showTargets()
     end
 end
 
---- Select a target by index and activity type (for clickable links)
 function snd.commands.selectTarget(index, activity, options)
     local opts = type(options) == "table" and options or {}
     local runsXcpLookup = opts.xcpLookup ~= false
@@ -4953,9 +4947,6 @@ function snd.commands.selectTarget(index, activity, options)
     if selectedCurrent then
         clearNxOverride()
         if runsXcpLookup and snd.nav and snd.nav.invalidateQuickWhereForTarget then
-            -- Re-selecting the same target is still a fresh xcp request, but
-            -- invalidate only after selection succeeds so a bad index cannot
-            -- discard an active ad-hoc QW target.
             snd.nav.invalidateQuickWhereForTarget(nil)
         end
         setScopedCurrent(snd.targets.current.activity, snd.targets.current)
@@ -4966,7 +4957,6 @@ function snd.commands.selectTarget(index, activity, options)
             snd.setActiveTab(snd.targets.current.activity, {save = true, refresh = false})
         end
         if didSelect and snd.targets.current ~= previousCurrent and type(raiseEvent) == "function" then
-            -- Integration surface: external scripts can listen to "snd.target.selected"
             raiseEvent("snd.target.selected", snd.targets.current)
         end
     end
@@ -4976,7 +4966,6 @@ function snd.commands.selectTarget(index, activity, options)
     return didSelect
 end
 
---- Select quest target as current target
 function snd.commands.selectQuestTarget(options)
     local opts = type(options) == "table" and options or {}
     if not snd.quest.active or not snd.quest.target.mob or snd.quest.target.mob == "" then
@@ -4984,7 +4973,6 @@ function snd.commands.selectQuestTarget(options)
         return false
     end
     
-    -- Find quest target in list
     for _, target in ipairs(snd.targets.list) do
         if target.activity == "quest" then
             local roomName = target.roomName
@@ -5020,8 +5008,7 @@ function snd.commands.selectQuestTarget(options)
                 local locations = snd.db.getMobLocations(target.mob, questAreaKey, { legacy = true }) or {}
                 local filteredLocations = {}
 
-                -- Quest cache fallback: if area key is missing, prefer rows that also match
-                -- the quest room name to avoid cross-zone mob-name collisions.
+                -- Missing area keys require room-name matching to avoid cross-zone collisions.
                 if questAreaKey == "" and questRoomName ~= "" then
                     for _, row in ipairs(locations) do
                         local rowRoom = snd.utils.stripColors(row.room or row.name or "")
@@ -5040,8 +5027,7 @@ function snd.commands.selectQuestTarget(options)
                     end
                 end
 
-                -- If cache is empty but quest gives a concrete room+area, fall back to
-                -- room-name mapping scoped to the quest area.
+                -- With no sightings, resolve a concrete quest room within its area.
                 if #rooms == 0 and questRoomName ~= "" and snd.mapper and snd.mapper.searchRoomsExact then
                     local mapped = snd.mapper.searchRoomsExact(questRoomName, questAreaKey, target.mob, {
                         activity = "quest",
@@ -5078,7 +5064,6 @@ function snd.commands.selectQuestTarget(options)
     return false
 end
 
---- Select quest target, navigate to it, and execute xkill
 function snd.commands.selectQuestTargetAndKill()
     snd.commands.selectQuestTarget()
     tempTimer(0.1, function()
@@ -5089,7 +5074,6 @@ function snd.commands.selectQuestTargetAndKill()
     end)
 end
 
---- Select and immediately go to target (for clickable links)
 function snd.commands.selectAndGo(index, activity)
     snd.commands.selectTarget(index, activity, {xcpLookup = false})
     tempTimer(0.1, function()
@@ -5097,7 +5081,6 @@ function snd.commands.selectAndGo(index, activity)
     end)
 end
 
---- Select a target and run exact quick where if selection did not already do it
 function snd.commands.selectAndQuickWhere(index, activity)
     snd.commands.selectTarget(index, activity, {xcpLookup = false})
     local quickWhere = snd.nav and snd.nav.quickWhere or nil
@@ -5107,7 +5090,6 @@ function snd.commands.selectAndQuickWhere(index, activity)
     snd.commands.qw("")
 end
 
---- Go to an area by key (for clickable links)
 function snd.commands.gotoArea(areaKey)
     if not areaKey or areaKey == "" then
         snd.utils.infoNote("No area key provided")
@@ -5117,7 +5099,6 @@ function snd.commands.gotoArea(areaKey)
     local startRoom = snd.db.getAreaStartRoom(areaKey)
     if startRoom and startRoom > 0 then
         snd.utils.infoNote("Going to " .. areaKey .. " (room " .. startRoom .. ")")
-        -- Dispatch through xrt alias for navigation
         snd.commands.gotoRoomViaAlias(startRoom)
     else
         snd.utils.infoNote("No start room for " .. areaKey)
@@ -5308,7 +5289,6 @@ function snd.commands.showStats(args)
     cecho("\n<white>Search and Destroy - Statistics<reset>\n")
     cecho("<gray>----------------------------------------<reset>\n")
     
-    -- Database stats
     local dbStats = snd.db.getStats()
     cecho(string.format("  <yellow>Database:<reset>\n"))
     cecho(string.format("    Mobs tracked: %d\n", dbStats.mobs))
@@ -5316,7 +5296,6 @@ function snd.commands.showStats(args)
     cecho(string.format("    Custom keywords: %d\n", dbStats.keywords))
     cecho(string.format("    History entries: %d\n", dbStats.history))
     
-    -- History stats (last 14 days)
     local histStats = snd.db.getHistoryStats(nil, 14)
     cecho(string.format("\n  <yellow>Last 14 days:<reset>\n"))
     cecho(string.format("    Campaigns: %d\n", histStats.totalCampaigns))
@@ -5362,7 +5341,6 @@ function snd.commands.showDbInfo()
             cecho("  <orange_red>Database classification: EMPTY.<reset> No preloaded mob or area data.\n")
         end
 
-        -- Show tables
         local tables = snd.db.getTables()
         cecho("  <yellow>Tables:<reset> " .. table.concat(tables, ", ") .. "\n")
     end
@@ -5859,4 +5837,3 @@ function snd.commands.channel(args)
     snd.utils.infoNote("S&D report channel set to: " .. args)
 end
 
--- Module loaded silently

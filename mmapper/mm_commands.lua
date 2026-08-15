@@ -143,6 +143,15 @@ local function normalize_line(line)
     :gsub("%s+$", "")
 end
 
+local function current_mapper_room_id()
+  if snd and snd.mapper and type(snd.mapper.currentRoomUid) == "function" then
+    local room_id = snd.mapper.currentRoomUid(false)
+    if room_id ~= nil and tostring(room_id) ~= "" then return tostring(room_id) end
+  end
+  local room_id = snd and snd.room and snd.room.current and snd.room.current.rmid
+  return room_id ~= nil and tostring(room_id) or nil
+end
+
 local BOOKMARK_COMMAND_ALIASES = {"mapper bookmark", "bookmarks", "bookmark"}
 
 local function normalize_bookmark_command(line)
@@ -1333,7 +1342,7 @@ mm.alias_specs = {
   {"^mapper thisroom$", function() mm.print_room_details() end},
   {"^mapper showroom (.+)$", function(m) mm.print_room_details(m[2]) end},
   {"^mapper saferoom$", function()
-      local rid = snd and snd.room and snd.room.current and snd.room.current.rmid
+      local rid = current_mapper_room_id()
       if not rid or rid == "-1" then mm.warn("Current room unknown.") return end
       if snd.mapper and snd.mapper.markRoomSafe and snd.mapper.markRoomSafe(rid, true) then
         mm.note("Room " .. tostring(rid) .. " saferoom = on")
@@ -1343,7 +1352,7 @@ mm.alias_specs = {
     end},
   {"^mapper saferoom (%w+)$", function(m)
       local arg = tostring(m[2] or ""):lower()
-      local rid = snd and snd.room and snd.room.current and snd.room.current.rmid
+      local rid = current_mapper_room_id()
       local value
       local targetId
       if arg == "on" or arg == "off" then
@@ -1532,8 +1541,7 @@ function mm.register_aliases()
     mm._alias = nil
   end
   mm._alias = tempAlias("^(mapper|mapper .+|bookmarks?(?: .+)?|bookmarkwin(?: .+)?|maptype .+|mapshow .+|updatecolors(?: .+)?|resetaard|recon?)$", function()
-    -- Prefer Mudlet's raw command text when available so stacked separators
-    -- like ";;" are preserved for downstream mapper parsing/persistence.
+    -- Raw command text preserves ";;" for mapper parsing and persistence.
     local line = command or matches[2] or matches[1]
     if mm.handle_command(line) then return end
   end)
