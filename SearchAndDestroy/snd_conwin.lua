@@ -267,6 +267,37 @@ local function targetIdentityMatchesMob(target, mobName)
     return false
 end
 
+function CW.cancelPendingSmartScanForConsideredTarget(mobName)
+    local pending = snd and snd.scan and snd.scan.pendingNxAction or nil
+    local flight = CW.captureInFlight
+    if not pending or tostring(pending.action or ""):lower() ~= "smartscan"
+        or not flight or flight.failed or flight.cancelled
+    then
+        return false
+    end
+
+    local observedRoom = tostring(flight.observedRoom or "")
+    if observedRoom ~= "" and observedRoom ~= currentRoomId() then return false end
+
+    local current = snd and snd.targets and snd.targets.current or nil
+    if snd.scan and type(snd.scan.resolveSmartScanTarget) == "function" then
+        current = snd.scan.resolveSmartScanTarget({select = true})
+    end
+    local activityLabel = activeActivityLabel(current)
+    if activityLabel ~= "CP" and activityLabel ~= "GQ" then return false end
+    if snd.scan and type(snd.scan.targetIsAlive) == "function"
+        and not snd.scan.targetIsAlive(current)
+    then
+        return false
+    end
+    if not targetIdentityMatchesMob(current, mobName) then return false end
+
+    if snd.scan and type(snd.scan.cancelPendingNxAction) == "function" then
+        return snd.scan.cancelPendingNxAction(nil, "target-consider-line-found") == true
+    end
+    return false
+end
+
 function CW.detectActiveTargetInRoom()
     local roomId = currentRoomId()
     if roomId == "" or roomId ~= tostring(CW.lastRoomId or "") then return false end
@@ -777,6 +808,35 @@ function CW.applyQuestTargetEvidence(mobs, roomId)
     return markedIndices[1], markedIndices
 end
 
+function CW.cancelPendingSmartScanForQuestEvidence(evidence)
+    local pending = snd and snd.scan and snd.scan.pendingNxAction or nil
+    if not pending or tostring(pending.action or ""):lower() ~= "smartscan" then
+        return false
+    end
+    if type(evidence) ~= "table" or evidence.complete ~= true
+        or tostring(evidence.roomId or "") ~= currentRoomId()
+        or #questEvidenceOrdinals(evidence) == 0
+    then
+        return false
+    end
+
+    local current = snd and snd.targets and snd.targets.current or nil
+    if snd.scan and type(snd.scan.resolveSmartScanTarget) == "function" then
+        current = snd.scan.resolveSmartScanTarget({select = true})
+    end
+    if activeActivityLabel(current) ~= "quest" then return false end
+    if snd.scan and type(snd.scan.targetIsAlive) == "function"
+        and not snd.scan.targetIsAlive(current)
+    then
+        return false
+    end
+
+    if snd.scan and type(snd.scan.cancelPendingNxAction) == "function" then
+        return snd.scan.cancelPendingNxAction(nil, "quest-roomchars-target-found") == true
+    end
+    return false
+end
+
 function CW.onQuestTargetEvidenceUpdated(evidence)
     CW.emptyRoomEvidence = nil
     if type(evidence) == "table" and evidence.complete == true
@@ -793,8 +853,20 @@ function CW.onQuestTargetEvidenceUpdated(evidence)
         }
     end
     local markedIndex = CW.applyQuestTargetEvidence(CW.mobs, currentRoomId())
+    CW.cancelPendingSmartScanForQuestEvidence(evidence)
     CW.render()
     return markedIndex
+end
+
+local function activityTargetIsLive(target)
+    if snd.scan and type(snd.scan.targetIsAlive) == "function" then
+        return snd.scan.targetIsAlive(target) == true
+    end
+    if not target or target.dead or target.killed then return false end
+    local status = tostring(target.status or ""):lower()
+    if status == "dead" or status == "killed" then return false end
+    if target.remaining ~= nil and tonumber(target.remaining) == 0 then return false end
+    return true
 end
 
 function CW.activityMarkersForMob(name, mob)
@@ -803,25 +875,27 @@ function CW.activityMarkersForMob(name, mob)
     if needle == "" or not snd.targets or not snd.targets.list then return "" end
     local seen = {}
     for _, t in ipairs(snd.targets.list) do
-        local matchesTarget = false
-        for _, candidate in ipairs({t.mob or "", t.name or "", t.matchedMobName or ""}) do
-            if candidate and snd.utils.mobIdentityMatches(candidate, needle) then
-                matchesTarget = true
-                break
-            end
-        end
-        if matchesTarget and t.activity and not seen[t.activity] then
-            if t.activity == "quest" then
-                if type(mob) == "table" and mob.questTarget == true then
-                    seen[t.activity] = true
-                    markers[#markers+1] = "[Q]"
+        if activityTargetIsLive(t) then
+            local matchesTarget = false
+            for _, candidate in ipairs({t.mob or "", t.name or "", t.matchedMobName or ""}) do
+                if candidate and snd.utils.mobIdentityMatches(candidate, needle) then
+                    matchesTarget = true
+                    break
                 end
-            elseif t.activity == "gq" then
-                seen[t.activity] = true
-                markers[#markers+1] = "[GQ]"
-            elseif t.activity == "cp" then
-                seen[t.activity] = true
-                markers[#markers+1] = "[CP]"
+            end
+            if matchesTarget and t.activity and not seen[t.activity] then
+                if t.activity == "quest" then
+                    if type(mob) == "table" and mob.questTarget == true then
+                        seen[t.activity] = true
+                        markers[#markers+1] = "[Q]"
+                    end
+                elseif t.activity == "gq" then
+                    seen[t.activity] = true
+                    markers[#markers+1] = "[GQ]"
+                elseif t.activity == "cp" then
+                    seen[t.activity] = true
+                    markers[#markers+1] = "[CP]"
+                end
             end
         end
     end
@@ -1365,6 +1439,9 @@ function CW.considerLine(name, color, range, prefixHint)
     local mobName, alignTag = splitPrefixAndName(name)
     if not alignTag then
         alignTag = parseAlignTag(prefixHint)
+    end
+    if flight and mobName ~= "" then
+        CW.cancelPendingSmartScanForConsideredTarget(mobName)
     end
     local markerText = mobName ~= "" and CW.activityMarkersForMob(mobName) or ""
     if markerText ~= "" and type(suffix) == "function" and type(cecho) == "function" then

@@ -1175,6 +1175,9 @@ function snd.cp.updateTargetStatus()
         })
     end
     snd.cp.reconcileSelectionAfterRebuild()
+    if snd.conwin and snd.conwin.render then
+        snd.conwin.render()
+    end
 end
 
 -- Reject unexpected targets so the caller can safely rebuild the full roster.
