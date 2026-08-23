@@ -1518,7 +1518,10 @@ function snd.nav.invalidateQuickWhereForTarget(nextTarget)
         return false
     end
 
-    for _, timerField in ipairs({"probeTimer", "processTimer", "disableTimer"}) do
+    for _, timerField in ipairs({
+        "probeTimer", "processTimer", "disableTimer",
+        "enumerationInactivityTimer", "enumerationOverallTimer",
+    }) do
         local timerId = quickWhere[timerField]
         if timerId ~= nil and type(killTimer) == "function" then
             pcall(killTimer, timerId)
@@ -1550,6 +1553,8 @@ function snd.nav.invalidateQuickWhereForTarget(nextTarget)
     quickWhere.probePending = false
     quickWhere.commandInFlight = false
     quickWhere.isAdhoc = false
+    quickWhere.collectAllExact = false
+    quickWhere.enumerationTruncated = false
     quickWhere.requestedKeyword = nil
     quickWhere.lookupKeyword = nil
     quickWhere.exact = false
@@ -1561,6 +1566,7 @@ function snd.nav.invalidateQuickWhereForTarget(nextTarget)
     snd.nav.nxOverride = nil
     snd.nav.nxState = nil
     snd.nav.xcpLookup = nil
+    snd.nav.questHybrid = nil
     snd.nav.pendingTargetRoomFallback = nil
     snd.nav.targetAreaFallback = nil
 
@@ -1613,6 +1619,9 @@ function snd.nav.clearActivityQuickWhere(activity)
     if snd.nav.nxState and type(snd.nav.nxState.targetKey) == "string"
         and snd.nav.nxState.targetKey:sub(1, #prefix) == prefix then
         snd.nav.nxState = nil
+    end
+    if activity == "quest" then
+        snd.nav.questHybrid = nil
     end
 
     if type(snd.nav.gotoListTargetKey) == "string"

@@ -855,7 +855,11 @@ function snd.triggers.onWhereCommandIssued()
 
     snd.utils.qwDebugNote("QW DEBUG: where command observed, enabling QuickWhere capture")
     quickWhere.lastMatch = nil
-    quickWhere.pendingMatches = {}
+    if quickWhere.collectAllExact ~= true then
+        quickWhere.pendingMatches = {}
+    else
+        quickWhere.pendingMatches = quickWhere.pendingMatches or {}
+    end
     quickWhere.processed = false
     quickWhere.awaitingCommandEcho = false
     quickWhere.probePending = false
@@ -867,6 +871,11 @@ function snd.triggers.onWhereCommandIssued()
     end
 
     snd.triggers.enableQuickWhereTriggers()
+    if quickWhere.collectAllExact == true
+        and snd.commands and snd.commands.armQuestHybridQuickWhereInactivityTimeout
+    then
+        snd.commands.armQuestHybridQuickWhereInactivityTimeout()
+    end
 
     if quickWhere.disableTimer then
         killTimer(quickWhere.disableTimer)
@@ -1042,28 +1051,55 @@ function snd.triggers.qwMatch(matches)
         return true
     end
 
-    if not lineMatchesTarget() then
-        if quickWhere.probePending == true then
-            snd.utils.qwDebugNote("QW DEBUG: numbered where probe already pending; ignoring duplicate rejected row")
-            return
-        end
-        local blockReason, blockState = quickWhereBlockedReason()
-        if blockReason then
-            snd.utils.infoNote("Quick where stopped while " .. blockReason .. ".")
-            snd.utils.qwDebugNote("QW DEBUG: numbered probe blocked by char.status.state=" .. tostring(blockState))
+    local function stopQuickWhereForBlock(blockReason, blockState)
+        snd.utils.infoNote("Quick where stopped while " .. blockReason .. ".")
+        snd.utils.qwDebugNote("QW DEBUG: numbered probe blocked by char.status.state=" .. tostring(blockState))
+        if blockReason == "combat" and snd.commands and snd.commands.abortQuickWhereForCombat then
+            snd.commands.abortQuickWhereForCombat()
+        elseif quickWhere.collectAllExact == true
+            and snd.commands and snd.commands.processQuickWhereNoMatch
+        then
+            snd.commands.processQuickWhereNoMatch({reason = "questHybridBlocked"})
+            snd.triggers.disableQuickWhereTriggers()
+        else
             quickWhere.processed = true
             quickWhere.completed = true
             quickWhere.awaitingCommandEcho = false
             quickWhere.probePending = false
+            quickWhere.commandInFlight = false
             snd.triggers.disableQuickWhereTriggers()
-            return
+        end
+    end
+
+    local function finishCollectedQuickWhereAtLimit()
+        quickWhere.enumerationTruncated = true
+        snd.utils.infoNote("Quest live where reached the 100-match safety limit; using the collected rooms.")
+        if quickWhere.pendingMatches and #quickWhere.pendingMatches > 0 then
+            local ok, err = pcall(snd.commands.processQuickWhereResult)
+            if not ok then
+                snd.utils.errorNote("QW DEBUG: processing collected where results failed: " .. tostring(err))
+            end
+        elseif snd.commands and snd.commands.processQuickWhereNoMatch then
+            snd.commands.processQuickWhereNoMatch({reason = "questHybridMatchLimit"})
+        end
+    end
+
+    local function continueNumberedProbe()
+        if quickWhere.probePending == true then
+            snd.utils.qwDebugNote("QW DEBUG: numbered where probe already pending; ignoring duplicate row")
+            return false
+        end
+        local blockReason, blockState = quickWhereBlockedReason()
+        if blockReason then
+            stopQuickWhereForBlock(blockReason, blockState)
+            return false
         end
         quickWhere.index = (tonumber(quickWhere.index) or 1) + 1
         if quickWhere.index < 101 then
             local lookupKeyword = snd.utils.trim(quickWhere.lookupKeyword or quickWhere.requestedKeyword or "")
             if lookupKeyword ~= "" then
                 local cmd = string.format("where %d.%s", quickWhere.index, lookupKeyword)
-                snd.utils.qwDebugNote("QW DEBUG: line not accepted, probing next index with '" .. cmd .. "'")
+                snd.utils.qwDebugNote("QW DEBUG: probing next numbered match with '" .. cmd .. "'")
                 quickWhere.probePending = true
                 if type(tempTimer) == "function" then
                     local activeQuickWhere = quickWhere
@@ -1076,17 +1112,9 @@ function snd.triggers.qwMatch(matches)
                             activeQuickWhere.probePending = false
                             local currentBlockReason = quickWhereBlockedReason()
                             if currentBlockReason then
-                                if currentBlockReason == "combat"
-                                    and snd.commands and snd.commands.abortQuickWhereForCombat
-                                then
-                                    snd.commands.abortQuickWhereForCombat()
-                                else
-                                    activeQuickWhere.processed = true
-                                    activeQuickWhere.completed = true
-                                    activeQuickWhere.awaitingCommandEcho = false
-                                    activeQuickWhere.commandInFlight = false
-                                    snd.triggers.disableQuickWhereTriggers()
-                                end
+                                stopQuickWhereForBlock(currentBlockReason, tostring(
+                                    gmcp and gmcp.char and gmcp.char.status and gmcp.char.status.state or ""
+                                ))
                                 return
                             end
 
@@ -1102,6 +1130,11 @@ function snd.triggers.qwMatch(matches)
                             if not sent then
                                 activeQuickWhere.commandInFlight = false
                             end
+                            if activeQuickWhere.collectAllExact == true
+                                and snd.commands and snd.commands.armQuestHybridQuickWhereInactivityTimeout
+                            then
+                                snd.commands.armQuestHybridQuickWhereInactivityTimeout()
+                            end
                         end
                     end)
                 else
@@ -1115,6 +1148,11 @@ function snd.triggers.qwMatch(matches)
                     else
                         send(cmd, false)
                     end
+                    if quickWhere.collectAllExact == true
+                        and snd.commands and snd.commands.armQuestHybridQuickWhereInactivityTimeout
+                    then
+                        snd.commands.armQuestHybridQuickWhereInactivityTimeout()
+                    end
                 end
             else
                 quickWhere.processed = true
@@ -1124,13 +1162,46 @@ function snd.triggers.qwMatch(matches)
                 snd.triggers.disableQuickWhereTriggers()
             end
         else
-            snd.utils.infoNote("qw: too many fails")
-            quickWhere.processed = true
-            quickWhere.completed = true
-            quickWhere.awaitingCommandEcho = false
-            quickWhere.probePending = false
-            snd.triggers.disableQuickWhereTriggers()
+            if quickWhere.collectAllExact == true then
+                finishCollectedQuickWhereAtLimit()
+            else
+                snd.utils.infoNote("qw: too many fails")
+                quickWhere.processed = true
+                quickWhere.completed = true
+                quickWhere.awaitingCommandEcho = false
+                quickWhere.probePending = false
+                snd.triggers.disableQuickWhereTriggers()
+            end
         end
+        return true
+    end
+
+    local matchesTarget = lineMatchesTarget()
+    if quickWhere.collectAllExact == true then
+        if quickWhere.probePending == true then
+            snd.utils.qwDebugNote("QW DEBUG: numbered where probe already pending; ignoring duplicate row")
+            return
+        end
+        if matchesTarget then
+            snd.utils.qwDebugNote("QW DEBUG: collected exact where row at index=" .. tostring(quickWhere.index or 1))
+            selectCurrentLine()
+            deleteLine()
+            quickWhere.lastMatch = {
+                mob = mobName,
+                room = roomName,
+                rawLine = rawLine,
+                matchesCurrentTarget = true,
+            }
+            quickWhere.pendingMatches = quickWhere.pendingMatches or {}
+            table.insert(quickWhere.pendingMatches, quickWhere.lastMatch)
+            quickWhere.accepted = true
+        end
+        continueNumberedProbe()
+        return
+    end
+
+    if not matchesTarget then
+        continueNumberedProbe()
         return
     end
 
@@ -1174,17 +1245,31 @@ function snd.triggers.qwNoMatch()
     snd.utils.qwDebugNote("QW DEBUG: server returned 'There is no ... around here.'")
     
     if snd.nav.quickWhere and snd.nav.quickWhere.processed == false then
-        snd.nav.quickWhere.commandInFlight = false
-        if snd.nav.quickWhere.probeTimer then
-            pcall(function() killTimer(snd.nav.quickWhere.probeTimer) end)
-            snd.nav.quickWhere.probeTimer = nil
+        local quickWhere = snd.nav.quickWhere
+        quickWhere.commandInFlight = false
+        if quickWhere.probeTimer then
+            pcall(function() killTimer(quickWhere.probeTimer) end)
+            quickWhere.probeTimer = nil
         end
-        if snd.utils.trim(snd.nav.quickWhere.exactTargetName or "") ~= "" then
+        if snd.utils.trim(quickWhere.exactTargetName or "") ~= "" then
             snd.utils.qwDebugNote("QW DEBUG: exact selected-target lookup stopped without broad fallback")
         end
-        if snd.nav.quickWhere.processTimer then
-            killTimer(snd.nav.quickWhere.processTimer)
-            snd.nav.quickWhere.processTimer = nil
+        if quickWhere.processTimer then
+            killTimer(quickWhere.processTimer)
+            quickWhere.processTimer = nil
+        end
+        if quickWhere.collectAllExact == true
+            and quickWhere.pendingMatches and #quickWhere.pendingMatches > 0
+        then
+            local ok, err = pcall(snd.commands.processQuickWhereResult)
+            if not ok then
+                snd.utils.errorNote("QW DEBUG: processing collected where results failed: " .. tostring(err))
+                if snd.commands and snd.commands.processQuickWhereNoMatch then
+                    snd.commands.processQuickWhereNoMatch({reason = "questHybridResultError"})
+                end
+            end
+            snd.triggers.disableQuickWhereTriggers()
+            return
         end
         local handledByDb = false
         if snd.commands and snd.commands.processQuickWhereNoMatch then
@@ -1194,12 +1279,12 @@ function snd.triggers.qwNoMatch()
                 snd.utils.errorNote("QW DEBUG: processing no-match fallback failed: " .. tostring(result))
             end
         end
-        snd.nav.quickWhere.lastMatch = nil
+        quickWhere.lastMatch = nil
         if not handledByDb then
-            snd.nav.quickWhere.processed = true
-            snd.nav.quickWhere.completed = true
-            snd.nav.quickWhere.awaitingCommandEcho = false
-            snd.nav.quickWhere.probePending = false
+            quickWhere.processed = true
+            quickWhere.completed = true
+            quickWhere.awaitingCommandEcho = false
+            quickWhere.probePending = false
         end
         snd.triggers.disableQuickWhereTriggers()
     end

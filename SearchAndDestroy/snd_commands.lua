@@ -153,6 +153,9 @@ local function quickWhereTargetIdentity(target)
     }, "|")
 end
 
+local cancelQuestHybridQuickWhereTimers
+local restoreQuestHybridAfterEnumeration
+
 local function ensureQuickWhereScopes()
     snd.nav = snd.nav or {}
     snd.nav.quickWhere = snd.nav.quickWhere or {}
@@ -376,9 +379,12 @@ local function storedTargetResults(target)
     local results = {}
     local seenRoomIds = {}
     local totalSeen = 0
+    local normalizedAreaKey = targetIdentityText(areaKey)
     for _, row in ipairs(rows) do
         local roomId = tonumber(row.roomid or row.rmid)
-        if roomId and roomId > 0 and not seenRoomIds[roomId] then
+        local rowArea = targetIdentityText(row.zone or row.arid)
+        local rowMatchesArea = normalizedAreaKey == "" or rowArea == normalizedAreaKey
+        if rowMatchesArea and roomId and roomId > 0 and not seenRoomIds[roomId] then
             seenRoomIds[roomId] = true
             local seenCount = tonumber(row.seen_count) or 0
             local priorityRoom = tonumber(row.priority_room)
@@ -409,7 +415,9 @@ local function storedTargetResults(target)
         }) or {}
         for _, entry in ipairs(mapped) do
             local roomId = tonumber(entry.rmid or entry.uid)
-            if roomId and roomId > 0 and not seenRoomIds[roomId] then
+            local entryArea = targetIdentityText(entry.arid or entry.area)
+            local entryMatchesArea = normalizedAreaKey == "" or entryArea == normalizedAreaKey
+            if entryMatchesArea and roomId and roomId > 0 and not seenRoomIds[roomId] then
                 seenRoomIds[roomId] = true
                 local seenCount = tonumber(entry.seen_count) or 0
                 totalSeen = totalSeen + seenCount
@@ -444,6 +452,7 @@ end
 local function resetSelectedTargetRoomList()
     snd.nav = snd.nav or {}
     snd.nav.xcpLookup = nil
+    snd.nav.questHybrid = nil
     snd.nav.nxState = nil
     snd.nav.pendingManualApproachRequest = nil
     snd.nav.manualApproach = nil
@@ -466,6 +475,8 @@ local function resetSelectedTargetRoomList()
     quickWhere.probePending = false
     quickWhere.commandInFlight = false
     quickWhere.isAdhoc = false
+    quickWhere.collectAllExact = false
+    quickWhere.enumerationTruncated = false
     quickWhere.source = nil
 
     local current = snd.targets and snd.targets.current or nil
@@ -511,6 +522,8 @@ local function installSelectedTargetRoomList(results, source, context)
     quickWhere.probePending = false
     quickWhere.commandInFlight = false
     quickWhere.isAdhoc = false
+    quickWhere.collectAllExact = false
+    quickWhere.enumerationTruncated = false
     quickWhere.scope = current.activity
     quickWhere.source = source
 
@@ -522,6 +535,87 @@ local function installSelectedTargetRoomList(results, source, context)
     persistQuickWhereScope(current.activity)
     syncCurrentTargetScope()
     return #rooms > 0
+end
+
+local function currentQuestHybridState()
+    local state = snd.nav and snd.nav.questHybrid or nil
+    local current = snd.targets and snd.targets.current or nil
+    if type(state) ~= "table" or not current or current.activity ~= "quest" then
+        return nil
+    end
+    if tostring(state.targetKey or "") ~= quickWhereTargetIdentity(current) then
+        snd.nav.questHybrid = nil
+        return nil
+    end
+    return state
+end
+
+local function beginQuestHybridState(current, results)
+    local state = {
+        targetKey = quickWhereTargetIdentity(current),
+        dbResults = snd.utils.deepcopy(results or {}),
+        dbRooms = {},
+        dbRoomSet = {},
+        visitedDbRooms = {},
+        phase = "approach",
+        refreshNotBefore = 0,
+    }
+    for _, entry in ipairs(state.dbResults) do
+        local roomId = tonumber(entry.rmid or entry.uid)
+        if roomId and roomId > 0 and not state.dbRoomSet[roomId] then
+            state.dbRoomSet[roomId] = true
+            table.insert(state.dbRooms, roomId)
+        end
+    end
+    snd.nav.questHybrid = state
+    return state
+end
+
+local function markQuestHybridDbRoomVisited(roomId)
+    local state = currentQuestHybridState()
+    local numeric = tonumber(roomId)
+    if not state or not numeric or not state.dbRoomSet[numeric] then return false end
+    state.visitedDbRooms[numeric] = true
+    return true
+end
+
+local function removeUnavailableQuestHybridDbRooms(state, unavailable)
+    if not state or type(unavailable) ~= "table" then return end
+    local retained = {}
+    state.dbRooms = {}
+    state.dbRoomSet = {}
+    for _, entry in ipairs(state.dbResults or {}) do
+        local roomId = tonumber(entry.rmid or entry.uid)
+        if roomId and roomId > 0 and unavailable[roomId] ~= true then
+            table.insert(retained, entry)
+            if not state.dbRoomSet[roomId] then
+                state.dbRoomSet[roomId] = true
+                table.insert(state.dbRooms, roomId)
+            end
+        end
+    end
+    state.dbResults = retained
+end
+
+local function installQuestHybridDbCycle(checkedRoomId)
+    local state = currentQuestHybridState()
+    local current = snd.targets and snd.targets.current or nil
+    if not state or not current or #state.dbResults == 0 then return false end
+
+    markQuestHybridDbRoomVisited(checkedRoomId)
+    state.phase = "db"
+    state.resumePhase = nil
+    state.filterVisitedDbOnNextQw = true
+    local installed = installSelectedTargetRoomList(state.dbResults, "quest-hybrid-db", {
+        reason = "xcpQuestHybridDbCycle",
+    })
+    if installed then
+        current.roomId = tonumber(checkedRoomId) or current.roomId
+        current.xcpRoomSource = "quest-hybrid-db"
+        syncCurrentTargetScope()
+        snd.utils.infoNote("Quest target not in the best room; cycling remaining stored rooms before live where.")
+    end
+    return installed
 end
 
 local function installStoredFallback(reason)
@@ -651,6 +745,20 @@ local function runXcpCycleAction(current)
 
     local mode = current.xcpEffectiveMode
         or effectiveXcpActionMode((snd.config and snd.config.xcpActionMode) or "qw", current.activity)
+    local questHybrid = current.activity == "quest" and currentQuestHybridState() or nil
+    if mode == "hybrid" and questHybrid then
+        local now = os.time()
+        if tonumber(questHybrid.refreshNotBefore) and now < tonumber(questHybrid.refreshNotBefore) then
+            snd.utils.infoNote("Quest live-location refresh is cooling down; try nx again shortly.")
+            return true
+        end
+        if snd.commands and snd.commands.startQuestHybridQuickWhere then
+            snd.utils.debugNote("NX: quest hybrid room cycle exhausted; enumerating all exact live matches")
+            beginXcpCycleRefresh()
+            snd.commands.startQuestHybridQuickWhere()
+            return true
+        end
+    end
     if (mode == "qw" or mode == "hybrid") and snd.commands and snd.commands.qw then
         snd.utils.debugNote("NX: wrap detected, refreshing quick-where without extra move")
         beginXcpCycleRefresh()
@@ -668,7 +776,7 @@ end
 local xcpModeDescriptions = {
     db = "db - build the room list from stored DB/mapped rooms",
     qw = "qw - enter the target area, then exact live where",
-    hybrid = "hybrid - check the best stored room with ConWin, then where only if absent (Express skips the check)",
+    hybrid = "hybrid - best stored room first; quests cycle DB rooms then exhaustive where, others where on miss",
     ht = "ht - GQ hunt trick, then exact live where (quest/CP use qw)",
 }
 
@@ -716,6 +824,14 @@ local function startSelectedTargetLiveLookup(mode, source)
     current.roomId = nil
     current.xcpRoomSource = source or "live"
     syncCurrentTargetScope()
+
+    if mode == "hybrid" and current.activity == "quest"
+        and currentQuestHybridState()
+        and snd.commands and snd.commands.startQuestHybridQuickWhere
+    then
+        snd.utils.debugNote("XCP quest hybrid: starting exhaustive exact live where")
+        return snd.commands.startQuestHybridQuickWhere()
+    end
 
     if mode == "ht" and current.activity == "gq" and snd.commands and snd.commands.ht then
         snd.utils.debugNote("XCP: running GQ hunt trick for selected target")
@@ -837,10 +953,18 @@ function snd.commands.handleXcpHybridConsiderResult(roomId, targetHere)
 
     snd.nav.xcpLookup = nil
     if targetHere then
+        if current.activity == "quest" then
+            snd.nav.questHybrid = nil
+        end
         current.roomId = tonumber(roomId) or roomId
         current.xcpRoomSource = "hybrid-conwin"
         syncCurrentTargetScope()
         snd.utils.debugNote("XCP hybrid: target found by ConWin in the best stored room; skipping qw")
+        return true
+    end
+
+    if current.activity == "quest" and installQuestHybridDbCycle(roomId) then
+        snd.utils.debugNote("XCP quest hybrid: target absent from best room; installed stored-room cycle")
         return true
     end
 
@@ -868,6 +992,13 @@ function snd.commands.handleXcpLookupArrival(roomId)
     end
 
     snd.nav.xcpLookup = nil
+    if pending.reason == "xcp_hybrid_best_room"
+        and current.activity == "quest"
+        and installQuestHybridDbCycle(roomId)
+    then
+        snd.utils.debugNote("XCP quest hybrid: ConWin unavailable; installed stored-room cycle after arrival")
+        return true
+    end
     return startSelectedTargetLiveLookup(pending.effectiveMode, pending.source)
 end
 
@@ -907,7 +1038,7 @@ function snd.commands.beginXcpLookup()
         -- Express is a snapshot; route to its proven sighting without requerying.
         local expressRoom = current.express == true and tonumber(current.expressRoomId) or nil
         if expressRoom and expressRoom > 0 then
-            local installed = installSelectedTargetRoomList({
+            local expressResults = {
                 {
                     rmid = expressRoom,
                     name = current.roomName or "",
@@ -915,7 +1046,13 @@ function snd.commands.beginXcpLookup()
                     kill_count = tonumber(current.expressKillCount) or 0,
                     percentage = 1,
                 },
-            }, "express", {
+            }
+            if current.activity == "quest" then
+                local state = beginQuestHybridState(current, expressResults)
+                state.phase = "db"
+                state.filterVisitedDbOnNextQw = true
+            end
+            local installed = installSelectedTargetRoomList(expressResults, "express", {
                 reason = "xcpHybridExpress",
             })
             if not installed then return false end
@@ -932,6 +1069,9 @@ function snd.commands.beginXcpLookup()
         end
 
         local results = storedTargetResults(current)
+        if current.activity == "quest" then
+            beginQuestHybridState(current, results)
+        end
         local best = results[1]
         local bestRoom = best and tonumber(best.rmid) or nil
         if bestRoom and bestRoom > 0 then
@@ -954,6 +1094,33 @@ function snd.commands.beginXcpLookup()
             )
             if scheduled then
                 return true
+            end
+
+            if current.activity == "quest" then
+                local state = currentQuestHybridState()
+                local unavailable = {[bestRoom] = true}
+                for index = 2, #results do
+                    local candidateRoom = tonumber(results[index].rmid or results[index].uid)
+                    if candidateRoom and candidateRoom > 0 then
+                        local candidateScheduled = scheduleSelectedTargetLookup(
+                            candidateRoom,
+                            "hybrid",
+                            "hybrid",
+                            "xcp_hybrid_best_room"
+                        )
+                        if candidateScheduled then
+                            removeUnavailableQuestHybridDbRooms(state, unavailable)
+                            snd.utils.infoNote(string.format(
+                                "Best stored quest room %d was unreachable; trying stored room %d instead.",
+                                bestRoom,
+                                candidateRoom
+                            ))
+                            return true
+                        end
+                        unavailable[candidateRoom] = true
+                    end
+                end
+                removeUnavailableQuestHybridDbRooms(state, unavailable)
             end
 
             local targetArea, areaName = targetAreaTravelText(current)
@@ -1172,6 +1339,11 @@ function snd.commands.abortQuickWhereForCombat()
         quickWhere.processTimer = nil
     end
 
+    local wasQuestEnumeration = quickWhere.collectAllExact == true
+    if wasQuestEnumeration then
+        cancelQuestHybridQuickWhereTimers(quickWhere)
+    end
+
     quickWhere.processed = true
     quickWhere.completed = true
     quickWhere.awaitingCommandEcho = false
@@ -1186,6 +1358,9 @@ function snd.commands.abortQuickWhereForCombat()
         snd.utils.infoNote("Quick where stopped by combat; sent 'stop' to clear queued commands.")
     else
         snd.utils.infoNote("Quick where stopped while combat began.")
+    end
+    if wasQuestEnumeration and snd.commands.processQuickWhereNoMatch then
+        snd.commands.processQuickWhereNoMatch({reason = "questHybridBlocked"})
     end
     snd.utils.qwDebugNote("QW DEBUG: aborted on combat state=" .. getCharacterState())
     return true
@@ -1703,7 +1878,7 @@ function snd.commands.xcp(args)
             snd.utils.infoNote("Syntax: xcp mode <db|qw|hybrid|ht>")
             snd.utils.infoNote("  db: build the selected target's room list from stored DB/mapped rooms; use qw if empty.")
             snd.utils.infoNote("  qw: if outside the target area, go to its start room; then exact live where.")
-            snd.utils.infoNote("  hybrid: go to the best stored room, wait for ConWin, and use qw only when the target is absent.")
+            snd.utils.infoNote("  hybrid: go to the best stored room; quests cycle DB rooms then all exact qw matches, others use qw on miss.")
             snd.utils.infoNote("  ht: GQ hunt trick then exact live where; quest and CP targets use qw.")
         elseif xcpModeDescriptions[normalized] then
             snd.config.xcpActionMode = normalized
@@ -2103,6 +2278,13 @@ function snd.commands.nx()
         return
     end
 
+    local questHybrid = current.activity == "quest" and currentQuestHybridState() or nil
+    if questHybrid and questHybrid.phase == "db" then
+        markQuestHybridDbRoomVisited(getCurrentRoomUid())
+    elseif questHybrid and questHybrid.phase == "exhausted" then
+        if runXcpCycleAction(current) then return end
+    end
+
     local manualApproach = snd.nav and snd.nav.manualApproach or nil
     if manualApproach and manualApproach.active == true then
         if manualApproachMatchesCurrent(manualApproach) then
@@ -2421,12 +2603,92 @@ local function resolveSelectedTargetKeyword(mode)
     return keyword, exactNameHint
 end
 
+local QUEST_HYBRID_QW_INACTIVITY_TIMEOUT = 8
+local QUEST_HYBRID_QW_OVERALL_TIMEOUT = 90
+
+cancelQuestHybridQuickWhereTimers = function(quickWhere)
+    local active = quickWhere or (snd.nav and snd.nav.quickWhere) or nil
+    if not active then return end
+    for _, field in ipairs({"enumerationInactivityTimer", "enumerationOverallTimer"}) do
+        if active[field] then
+            pcall(function() killTimer(active[field]) end)
+            active[field] = nil
+        end
+    end
+end
+
+restoreQuestHybridAfterEnumeration = function(reason)
+    local state = currentQuestHybridState()
+    if not state then return end
+    local resumePhase = state.resumePhase
+    if resumePhase == nil or resumePhase == "approach" or resumePhase == "enumerating" then
+        resumePhase = state.dbRooms and #state.dbRooms > 0 and "db" or "exhausted"
+    end
+    state.phase = resumePhase
+    state.resumePhase = nil
+    state.refreshNotBefore = os.time() + 3
+    if reason and reason ~= "" then
+        snd.utils.debugNote("XCP quest hybrid: live enumeration ended without a new list (" .. tostring(reason) .. ")")
+    end
+end
+
+function snd.commands.armQuestHybridQuickWhereInactivityTimeout()
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    if not quickWhere or quickWhere.collectAllExact ~= true or quickWhere.processed ~= false then
+        return false
+    end
+    if quickWhere.enumerationInactivityTimer then
+        pcall(function() killTimer(quickWhere.enumerationInactivityTimer) end)
+        quickWhere.enumerationInactivityTimer = nil
+    end
+    local activeQuickWhere = quickWhere
+    activeQuickWhere.enumerationInactivityTimer = tempTimer(QUEST_HYBRID_QW_INACTIVITY_TIMEOUT, function()
+        activeQuickWhere.enumerationInactivityTimer = nil
+        if snd.nav and snd.nav.quickWhere == activeQuickWhere
+            and activeQuickWhere.collectAllExact == true
+            and activeQuickWhere.processed == false
+        then
+            snd.utils.infoNote("Quest live where timed out; keeping the previous room cycle.")
+            if snd.commands and snd.commands.processQuickWhereNoMatch then
+                snd.commands.processQuickWhereNoMatch({reason = "questHybridInactivityTimeout"})
+            end
+            if snd.triggers and snd.triggers.disableQuickWhereTriggers then
+                snd.triggers.disableQuickWhereTriggers()
+            end
+        end
+    end)
+    return true
+end
+
+local function armQuestHybridQuickWhereOverallTimeout(quickWhere)
+    if not quickWhere or quickWhere.collectAllExact ~= true then return end
+    if quickWhere.enumerationOverallTimer then
+        pcall(function() killTimer(quickWhere.enumerationOverallTimer) end)
+    end
+    local activeQuickWhere = quickWhere
+    activeQuickWhere.enumerationOverallTimer = tempTimer(QUEST_HYBRID_QW_OVERALL_TIMEOUT, function()
+        activeQuickWhere.enumerationOverallTimer = nil
+        if snd.nav and snd.nav.quickWhere == activeQuickWhere
+            and activeQuickWhere.collectAllExact == true
+            and activeQuickWhere.processed == false
+        then
+            snd.utils.infoNote("Quest live where reached its overall timeout; keeping the previous room cycle.")
+            if snd.commands and snd.commands.processQuickWhereNoMatch then
+                snd.commands.processQuickWhereNoMatch({reason = "questHybridOverallTimeout"})
+            end
+            if snd.triggers and snd.triggers.disableQuickWhereTriggers then
+                snd.triggers.disableQuickWhereTriggers()
+            end
+        end
+    end)
+end
+
 local function runQuickWhere(args, exact, options)
     args = snd.utils.trim(args or "")
     local opts = options or {}
 
     if not canStartQuickWhere() then
-        return
+        return false
     end
 
     local function hasText(value)
@@ -2500,7 +2762,7 @@ local function runQuickWhere(args, exact, options)
         selectedTargetLookup = true
         if keyword == "" then
             snd.utils.infoNote("No target selected. Usage: qw <keyword>")
-            return
+            return false
         end
     end
 
@@ -2511,7 +2773,7 @@ local function runQuickWhere(args, exact, options)
     end
     if keyword == "" then
         snd.utils.infoNote("No target keyword available. Usage: qw <keyword>")
-        return
+        return false
     end
 
     if hasText(opts.exactMatchText) then
@@ -2536,6 +2798,8 @@ local function runQuickWhere(args, exact, options)
         snd.nav.quickWhere.pendingMatches = {}
         snd.nav.quickWhere.processed = false
         snd.nav.quickWhere.isAdhoc = isAdhocQw
+        snd.nav.quickWhere.collectAllExact = opts.collectAllExact == true
+        snd.nav.quickWhere.enumerationTruncated = false
         snd.nav.quickWhere.requestedKeyword = keyword
         snd.nav.quickWhere.lookupKeyword = keyword
         snd.nav.quickWhere.index = startIndex
@@ -2592,20 +2856,64 @@ local function runQuickWhere(args, exact, options)
         end
     end
 
-    tempTimer(5, function()
-        if snd.nav.quickWhere and snd.nav.quickWhere.processed == false then
-            local handledByDb = snd.commands.processQuickWhereNoMatch
-                and snd.commands.processQuickWhereNoMatch({reason = "quickWhereTimeout"}) == true
-            if not handledByDb then
-                snd.nav.quickWhere.processed = true
-                snd.nav.quickWhere.completed = true
-                snd.nav.quickWhere.awaitingCommandEcho = false
-                snd.nav.quickWhere.probePending = false
-                snd.nav.quickWhere.commandInFlight = false
+    if snd.nav.quickWhere.collectAllExact == true then
+        snd.commands.armQuestHybridQuickWhereInactivityTimeout()
+        armQuestHybridQuickWhereOverallTimeout(snd.nav.quickWhere)
+    else
+        tempTimer(5, function()
+            if snd.nav.quickWhere and snd.nav.quickWhere.processed == false then
+                local handledByDb = snd.commands.processQuickWhereNoMatch
+                    and snd.commands.processQuickWhereNoMatch({reason = "quickWhereTimeout"}) == true
+                if not handledByDb then
+                    snd.nav.quickWhere.processed = true
+                    snd.nav.quickWhere.completed = true
+                    snd.nav.quickWhere.awaitingCommandEcho = false
+                    snd.nav.quickWhere.probePending = false
+                    snd.nav.quickWhere.commandInFlight = false
+                end
+                snd.triggers.disableQuickWhereTriggers()
             end
-            snd.triggers.disableQuickWhereTriggers()
+        end)
+    end
+    return true
+end
+
+function snd.commands.startQuestHybridQuickWhere()
+    local state = currentQuestHybridState()
+    local current = snd.targets and snd.targets.current or nil
+    if not state or not current then return false end
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    if state.phase == "enumerating" and quickWhere and quickWhere.processed == false then
+        snd.utils.infoNote("Quest live where is still in progress.")
+        return true
+    end
+
+    state.resumePhase = state.phase
+    state.filterVisitedDbForEnumeration = state.phase == "db"
+        and state.filterVisitedDbOnNextQw == true
+    state.previousRooms = snd.utils.deepcopy(quickWhere and quickWhere.rooms or {})
+    state.previousIndex = tonumber(quickWhere and quickWhere.index) or 1
+    local currentRoom = getCurrentRoomUid()
+    for index, roomId in ipairs(state.previousRooms) do
+        if currentRoom and tostring(roomId) == tostring(currentRoom) then
+            state.previousIndex = index
+            break
         end
-    end)
+    end
+    state.previousSource = quickWhere and quickWhere.source or nil
+    state.phase = "enumerating"
+    snd.utils.infoNote("Stored quest rooms exhausted; collecting all exact live where matches.")
+    local started = runQuickWhere("", false, {
+        forceTargetExact = true,
+        collectAllExact = true,
+        source = "quest-hybrid-qw",
+    }) == true
+    if not started then
+        restoreQuestHybridAfterEnumeration("blocked")
+        local nxState = snd.nav and snd.nav.nxState or nil
+        if nxState then nxState.awaitingListRefresh = false end
+    end
+    return started
 end
 
 function snd.commands.qw(args)
@@ -2640,6 +2948,16 @@ function snd.commands.processQuickWhereResult()
         return
     end
     local restartsNxCycle = takePendingXcpCycleRefresh()
+    local questHybrid = currentQuestHybridState()
+    local isQuestHybridEnumeration = quickWhere.collectAllExact == true
+        and quickWhere.scope == "quest"
+        and questHybrid ~= nil
+    local previousRooms = isQuestHybridEnumeration
+        and snd.utils.deepcopy(questHybrid.previousRooms or quickWhere.rooms or {}) or nil
+    local previousIndex = isQuestHybridEnumeration
+        and (tonumber(questHybrid.previousIndex) or 1) or nil
+    local previousSource = isQuestHybridEnumeration
+        and (questHybrid.previousSource or quickWhere.source) or nil
 
     local matchesToProcess = {}
     if quickWhere.pendingMatches and #quickWhere.pendingMatches > 0 then
@@ -2675,6 +2993,11 @@ function snd.commands.processQuickWhereResult()
     local quickWhereScope = quickWhere.scope
     local isAdhocQuickWhere = quickWhere.isAdhoc == true
     local preservesSelectedIdentity = snd.utils.trim(quickWhere.exactTargetName or "") ~= ""
+    local selectedAreaKey = currentTargetAreaKey(snd.targets.current)
+    local selectionAreaKey = snd.utils.trim(snd.targets.current.selectionArea or "")
+    if selectionAreaKey ~= "" then
+        selectedAreaKey = selectionAreaKey
+    end
     local originalName = snd.utils.trim(snd.targets.current.name or "")
     local matchedName = snd.utils.trim(lastMatch.mob or "")
     local qwKeyword = snd.utils.trim(
@@ -2713,6 +3036,11 @@ function snd.commands.processQuickWhereResult()
     snd.targets.current.roomName = lastMatch.room or snd.targets.current.roomName
 
     local areaKey = resolveQuickWhereAreaKey()
+    if not isAdhocQuickWhere and selectedAreaKey ~= "" then
+        -- A selected activity target's area is authoritative. The current-room
+        -- cache can be blank while traversing an incompletely mapped area.
+        areaKey = selectedAreaKey
+    end
     snd.targets.current.area = areaKey
     if areaKey ~= "" then
         snd.utils.qwDebugNote("QW DEBUG: restricting room lookup to current area '" .. tostring(areaKey) .. "'")
@@ -2721,18 +3049,36 @@ function snd.commands.processQuickWhereResult()
     end
 
     local roomRows = {}
+    local roomNameGroups = {}
     for _, matchEntry in ipairs(matchesToProcess) do
-        local roomResults = snd.mapper.searchRoomsExact(matchEntry.room, areaKey, nil, { silent = true })
-        for _, roomEntry in ipairs(roomResults) do
-            local roomArea = tostring(roomEntry.arid or "")
-            if areaKey == "" or roomArea == areaKey then
-                table.insert(roomRows, {
-                    uid = roomEntry.rmid,
-                    name = roomEntry.name,
-                    area = roomEntry.arid,
-                })
+        local roomNameKey = targetIdentityText(matchEntry.room)
+        local group = roomNameGroups[roomNameKey]
+        if not group then
+            group = {
+                displayName = tostring(matchEntry.room or ""),
+                occurrences = 0,
+                roomIds = {},
+                roomCount = 0,
+            }
+            roomNameGroups[roomNameKey] = group
+            local roomResults = snd.mapper.searchRoomsExact(matchEntry.room, areaKey, nil, { silent = true })
+            for _, roomEntry in ipairs(roomResults) do
+                local roomArea = tostring(roomEntry.arid or "")
+                if areaKey == "" or roomArea == areaKey then
+                    local roomId = tonumber(roomEntry.rmid or roomEntry.uid)
+                    if roomId and roomId > 0 and not group.roomIds[roomId] then
+                        group.roomIds[roomId] = true
+                        group.roomCount = group.roomCount + 1
+                    end
+                    table.insert(roomRows, {
+                        uid = roomEntry.rmid,
+                        name = roomEntry.name,
+                        area = roomEntry.arid,
+                    })
+                end
             end
         end
+        group.occurrences = group.occurrences + 1
     end
 
     local results = snd.mapper.searchRoomsRows(roomRows, nil, { silent = true })
@@ -2752,6 +3098,27 @@ function snd.commands.processQuickWhereResult()
         end
     end
     results = dedupedResults
+
+    local candidateMetadata = {}
+    for _, group in pairs(roomNameGroups) do
+        for roomId in pairs(group.roomIds) do
+            candidateMetadata[roomId] = {
+                roomName = group.displayName,
+                occurrences = group.occurrences,
+                ambiguous = group.roomCount > 1,
+                candidateCount = group.roomCount,
+            }
+        end
+    end
+    for _, entry in ipairs(results) do
+        local metadata = candidateMetadata[tonumber(entry.rmid)]
+        if metadata then
+            entry.qw_room_name = metadata.roomName
+            entry.qw_occurrences = metadata.occurrences
+            entry.qw_ambiguous = metadata.ambiguous
+            entry.qw_candidate_count = metadata.candidateCount
+        end
+    end
 
     local chanceMob = snd.utils.trim(quickWhere.exactTargetName or "")
     if chanceMob == "" then
@@ -2847,6 +3214,43 @@ function snd.commands.processQuickWhereResult()
         return (a.rmid or 0) < (b.rmid or 0)
     end)
 
+    local mappedBeforeQuestFilter = #results
+    local skippedUniqueVisited = 0
+    local ambiguousRevisits = 0
+    if isQuestHybridEnumeration and questHybrid.filterVisitedDbForEnumeration == true then
+        local newRooms = {}
+        local revisitRooms = {}
+        for _, entry in ipairs(results) do
+            local roomId = tonumber(entry.rmid)
+            local wasVisited = roomId and questHybrid.visitedDbRooms[roomId] == true
+            if wasVisited and entry.qw_ambiguous == true then
+                entry.qw_revisit = true
+                ambiguousRevisits = ambiguousRevisits + 1
+                table.insert(revisitRooms, entry)
+            elseif wasVisited then
+                skippedUniqueVisited = skippedUniqueVisited + 1
+            else
+                table.insert(newRooms, entry)
+            end
+        end
+        results = newRooms
+        for _, entry in ipairs(revisitRooms) do
+            table.insert(results, entry)
+        end
+        questHybrid.filterVisitedDbOnNextQw = false
+    end
+
+    if isQuestHybridEnumeration then
+        snd.utils.qwDebugNote(string.format(
+            "QW DEBUG: quest exhaustive mapping exactRows=%d mapped=%d newOrEligible=%d uniqueVisitedSkipped=%d ambiguousRevisits=%d",
+            #matchesToProcess,
+            mappedBeforeQuestFilter,
+            #results,
+            skippedUniqueVisited,
+            ambiguousRevisits
+        ))
+    end
+
     if snd.debug and snd.debug.mobTag then
         local parts = {}
         for i, entry in ipairs(results or {}) do
@@ -2902,36 +3306,64 @@ function snd.commands.processQuickWhereResult()
         end
     end
 
-    if #quickWhereRooms == 0 then
-        if isAdhocQuickWhere then
-            -- Restore gagged MUD output only when the mapper found no room.
-            local rawWhereLine = tostring(lastMatch.rawLine or "")
-            if rawWhereLine == "" then
-                local mobText = tostring(lastMatch.mob or "")
-                local roomText = tostring(lastMatch.room or "")
-                if #mobText < 30 then
-                    rawWhereLine = mobText .. string.rep(" ", 30 - #mobText) .. roomText
-                else
-                    rawWhereLine = mobText .. "  " .. roomText
+    if #quickWhereRooms == 0 and isQuestHybridEnumeration then
+        if mappedBeforeQuestFilter > 0 then
+            snd.utils.infoNote("Live where found only uniquely resolved rooms already checked in this pass.")
+        else
+            snd.utils.infoNote("Live where found exact quest matches, but none could be mapped in the target area.")
+            local shown = {}
+            for _, matchEntry in ipairs(matchesToProcess) do
+                local key = targetIdentityText(matchEntry.room)
+                if key ~= "" and not shown[key] then
+                    shown[key] = true
+                    local rawWhereLine = tostring(matchEntry.rawLine or "")
+                    if rawWhereLine ~= "" then echo("\n" .. rawWhereLine .. "\n") end
                 end
             end
-            echo("\n" .. rawWhereLine .. "\n")
-        else
-            snd.utils.infoNote("Live where returned no mappable rooms; trying stored DB/mapped rooms.")
-            if snd.commands.processQuickWhereNoMatch({
-                restartsNxCycle = restartsNxCycle,
-                reason = "quickWhereUnmappedResult",
-            }) then
-                snd.triggers.disableQuickWhereTriggers()
-                return
+        end
+    elseif #quickWhereRooms == 0 then
+        -- The live row was gagged after it matched. Restore it when its room is
+        -- unmapped so the positive result is never mistaken for a failed where.
+        local rawWhereLine = tostring(lastMatch.rawLine or "")
+        if rawWhereLine == "" then
+            local mobText = tostring(lastMatch.mob or "")
+            local roomText = tostring(lastMatch.room or "")
+            if #mobText < 30 then
+                rawWhereLine = mobText .. string.rep(" ", 30 - #mobText) .. roomText
+            else
+                rawWhereLine = mobText .. "  " .. roomText
             end
+        end
+        if rawWhereLine ~= "" then
+            echo("\n" .. rawWhereLine .. "\n")
+        end
+
+        if not isAdhocQuickWhere then
+            -- A positive live result is more authoritative than stored sightings.
+            -- Clear stale navigation so nx/go cannot leave the requested area.
+            snd.targets.current.roomId = nil
+            snd.targets.current.xcpRoomSource = "qw-unmapped"
+            snd.nav.gotoList = {}
+            snd.nav.gotoListTargetKey = ""
+            quickWhere.source = "qw-unmapped"
+
+            local areaLabel = snd.utils.trim(snd.targets.current.areaName or "")
+            if areaLabel == "" then areaLabel = areaKey end
+            local areaSuffix = areaLabel ~= "" and (" in " .. areaLabel) or ""
+            snd.utils.infoNote(string.format(
+                "Live where matched %s in %s, but that room is not mapped%s. Staying in the target area; stored sightings were not used.",
+                tostring(matchedName ~= "" and matchedName or snd.targets.current.name or "the target"),
+                tostring(lastMatch.room or "an unknown room"),
+                areaSuffix
+            ))
+            syncCurrentTargetScope()
         end
     end
 
     if firstRoomId and snd.targets and snd.targets.current then
         snd.targets.current.roomId = firstRoomId
-        snd.targets.current.roomName = lastMatch.room
-        snd.targets.current.xcpRoomSource = "qw"
+        snd.targets.current.roomName = results[1] and results[1].name or lastMatch.room
+        snd.targets.current.xcpRoomSource = isQuestHybridEnumeration and "quest-hybrid-qw" or "qw"
 
         if not isAdhocQuickWhere then
             local scopeForSync = quickWhereScope
@@ -2947,16 +3379,22 @@ function snd.commands.processQuickWhereResult()
                 if nameMatchesScoped then
                     scoped.roomId = firstRoomId
                     scoped.roomName = lastMatch.room
-                    scoped.xcpRoomSource = "qw"
+                    scoped.xcpRoomSource = isQuestHybridEnumeration and "quest-hybrid-qw" or "qw"
                 end
             end
         end
     end
 
     if snd.nav.quickWhere then
-        snd.nav.quickWhere.rooms = quickWhereRooms
-        snd.nav.quickWhere.index = 1
-        snd.nav.quickWhere.active = #quickWhereRooms > 0
+        if isQuestHybridEnumeration and #quickWhereRooms == 0 then
+            snd.nav.quickWhere.rooms = previousRooms or {}
+            snd.nav.quickWhere.index = previousIndex or 1
+            snd.nav.quickWhere.active = #snd.nav.quickWhere.rooms > 0
+        else
+            snd.nav.quickWhere.rooms = quickWhereRooms
+            snd.nav.quickWhere.index = 1
+            snd.nav.quickWhere.active = #quickWhereRooms > 0
+        end
         if snd.targets and snd.targets.current then
             snd.nav.quickWhere.targetKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(snd.targets.current)
         else
@@ -2969,9 +3407,33 @@ function snd.commands.processQuickWhereResult()
         snd.nav.quickWhere.commandInFlight = false
         snd.nav.quickWhere.pendingMatches = {}
         if #quickWhereRooms > 0 then
-            snd.nav.quickWhere.source = "qw"
+            snd.nav.quickWhere.source = isQuestHybridEnumeration and "quest-hybrid-qw" or "qw"
+        elseif isQuestHybridEnumeration then
+            snd.nav.quickWhere.source = previousSource
         end
         persistQuickWhereScope(snd.nav.quickWhere.scope)
+    end
+
+    if isQuestHybridEnumeration then
+        cancelQuestHybridQuickWhereTimers(quickWhere)
+        if #quickWhereRooms > 0 then
+            questHybrid.phase = "live"
+            questHybrid.resumePhase = nil
+            questHybrid.previousRooms = nil
+            questHybrid.previousIndex = nil
+            questHybrid.previousSource = nil
+            questHybrid.refreshNotBefore = 0
+            snd.utils.infoNote(string.format(
+                "Live quest room list ready: %d mapped room%s%s.",
+                #quickWhereRooms,
+                #quickWhereRooms == 1 and "" or "s",
+                ambiguousRevisits > 0 and string.format(" (%d ambiguous revisit%s last)",
+                    ambiguousRevisits, ambiguousRevisits == 1 and "" or "s") or ""
+            ))
+        else
+            restoreQuestHybridAfterEnumeration("no-new-mapped-rooms")
+        end
+        quickWhere.collectAllExact = false
     end
 
     if (not isAdhocQuickWhere) and snd.nav.nxState and snd.targets.current and #quickWhereRooms > 0 then
@@ -3008,6 +3470,34 @@ function snd.commands.processQuickWhereNoMatch(options)
     if activity ~= "cp" and activity ~= "gq" and activity ~= "quest" then
         finishXcpCycleRefresh(restartsNxCycle, false)
         return false
+    end
+
+    if quickWhere.collectAllExact == true and activity == "quest" then
+        local state = currentQuestHybridState()
+        cancelQuestHybridQuickWhereTimers(quickWhere)
+        if state then
+            quickWhere.rooms = snd.utils.deepcopy(state.previousRooms or quickWhere.rooms or {})
+            quickWhere.index = tonumber(state.previousIndex) or quickWhere.index or 1
+            quickWhere.active = #quickWhere.rooms > 0
+            quickWhere.source = state.previousSource or quickWhere.source
+        end
+        quickWhere.processed = true
+        quickWhere.completed = true
+        quickWhere.awaitingCommandEcho = false
+        quickWhere.probePending = false
+        quickWhere.commandInFlight = false
+        quickWhere.pendingMatches = {}
+        quickWhere.collectAllExact = false
+        restoreQuestHybridAfterEnumeration(tostring(opts.reason or "no-match"))
+        persistQuickWhereScope(quickWhere.scope)
+        finishXcpCycleRefresh(restartsNxCycle, false)
+        if tostring(opts.reason or "") ~= "questHybridInactivityTimeout"
+            and tostring(opts.reason or "") ~= "questHybridOverallTimeout"
+            and tostring(opts.reason or "") ~= "questHybridBlocked"
+        then
+            snd.utils.infoNote("No exact live quest matches found; stored room cycle remains available.")
+        end
+        return true
     end
 
     local mobName = snd.utils.trim(current.name or current.mob or "")
@@ -4529,7 +5019,7 @@ function snd.commands.showCommandHelp()
     emitHelpSection("Target Selection")
     emitPlainHelpRow("xcp", "Show all targets")
     emitPlainHelpRow("xcp <n>", "Select target #n")
-    emitPlainHelpRow("xcp mode <db|qw|hybrid|ht>", "Target room source: db=stored list, qw=area then exact where, hybrid=ConWin-check best room then where if absent, ht=GQ hunt then where")
+    emitPlainHelpRow("xcp mode <db|qw|hybrid|ht>", "Target room source: db=stored list, qw=area then exact where, hybrid=best room then quest DB/all-match QW or normal QW, ht=GQ hunt then where")
 
     emitHelpSection("Navigation")
     emitPlainHelpRow("nx", "Go to current target")

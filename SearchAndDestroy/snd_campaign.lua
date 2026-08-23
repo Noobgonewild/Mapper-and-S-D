@@ -805,6 +805,36 @@ function snd.cp.resolveZonesForTarget(target, playerLevel, resolutionContext)
         end
     end
 
+    -- When the campaign location resolves to a real area, that area is the
+    -- authoritative scope. Historical sightings elsewhere must not relocate
+    -- the campaign target. Keep the exact-room match above this guard because
+    -- some location text can legitimately be both an area and a room name.
+    local campaignAreaKey = snd.utils.trim(target.arid or "")
+    if campaignAreaKey ~= "" then
+        local bestRow = nil
+        local totalSeen = 0
+        local priorityMatch = false
+        for _, row in ipairs(getMobZoneEvidence(context, target.mob, campaignAreaKey)) do
+            totalSeen = totalSeen + (tonumber(row.seen_count) or 0)
+            if rowMatchesPriority(row) then priorityMatch = true end
+            if rowRanksBefore(row, bestRow) then bestRow = row end
+        end
+
+        local area = getResolutionArea(context, campaignAreaKey)
+        return {
+            {
+                arid = campaignAreaKey,
+                areaName = (area and area.name) or hint,
+                roomName = bestRow and bestRow.room or "",
+                roomId = bestRow and tonumber(bestRow.roomid) or nil,
+                seenCount = totalSeen,
+                priorityMatch = priorityMatch,
+                fromDb = bestRow ~= nil,
+                tags = tagsFromEvidenceRow(bestRow),
+            },
+        }, rows
+    end
+
     local byZone = {}
     local zoneOrder = {}
     for _, row in ipairs(rows) do

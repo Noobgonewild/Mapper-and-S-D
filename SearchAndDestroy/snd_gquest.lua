@@ -17,6 +17,26 @@ local function entryHasMobPriority(entry)
     return priorityRoom ~= nil and priorityRoom > 0
 end
 
+local function startGquestHistory()
+    if tonumber(snd.gquest.historyId) and tonumber(snd.gquest.historyId) > 0 then
+        return
+    end
+    if not snd.db or not snd.db.historyStart then
+        return
+    end
+
+    snd.gquest.historyId = snd.db.historyStart(
+        snd.db.HISTORY_TYPE_GQUEST,
+        snd.char.level or 0
+    ) or 0
+
+    -- Rewards may already have been parsed when target data is the fallback
+    -- that proves this queued GQ has actually started.
+    if snd.gquest.historyId > 0 and snd.gq.syncHistoryRewards then
+        snd.gq.syncHistoryRewards()
+    end
+end
+
 function snd.gq.startGqInfo(gqId)
     snd.gq.parsing.infoActive = true
     snd.gq.parsing.tempTargets = {}
@@ -99,6 +119,7 @@ function snd.gq.endGqInfo()
     end
     
     if #snd.gquest.targets > 0 then
+        startGquestHistory()
         snd.gquest.targetType = snd.cp.determineTargetType(snd.gquest.targets)
         snd.targets.type = snd.gquest.targetType
         snd.targets.activity = "gq"
@@ -206,6 +227,7 @@ function snd.gq.endGqCheck()
         snd.gquest.targetType = snd.cp.determineTargetType(snd.gquest.targets)
         snd.targets.type = snd.gquest.targetType
         snd.targets.activity = "gq"
+        startGquestHistory()
         snd.gq.buildMainTargetList()
     end
     
@@ -412,12 +434,9 @@ function snd.gq.onJoined(gqId)
         snd.utils.infoNote("Search and Destroy: Turning noexp ON (joined global quest)")
     end
 
-    if snd.db then
-        snd.gquest.historyId = snd.db.historyStart(snd.db.HISTORY_TYPE_GQUEST, snd.char.level or 0) or 0
-    end
-    
     snd.gquest.targets = {}
     snd.gquest.active = true
+    snd.gquest.historyId = 0
     snd.gquest.qpReward = 0
     snd.gquest.tpReward = 0
     snd.gquest.trainReward = 0
@@ -425,6 +444,12 @@ function snd.gq.onJoined(gqId)
     snd.gquest.goldReward = 0
     snd.gquest.qpPerKillBonus = 0
     snd.gquest.qpKillBonusTotal = 0
+
+    -- A numbered join message can mean either "queued" or "joined an already
+    -- running GQ". Only the latter should begin elapsed-time history here.
+    if tostring(snd.gquest.started) == tostring(gqId) then
+        startGquestHistory()
+    end
     
     tempTimer(0.5, function()
         send("gq info", false)
@@ -436,6 +461,7 @@ function snd.gq.onStarted(gqId, minLvl, maxLvl)
     snd.gquest.started = gqId
     
     if snd.gquest.joined == gqId then
+        startGquestHistory()
         tempTimer(0.5, function()
             send("gq info", false)
         end)
@@ -749,4 +775,3 @@ function snd.gq.getTotalRemainingKills()
     end
     return count
 end
-
