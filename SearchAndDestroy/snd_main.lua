@@ -83,7 +83,8 @@ local defaultConfig = {
     
     gqExtraAliases = true,
     
-    nxAction = "qs",
+    nxAction = "smartscan",
+    smartNx = true,
     
     xcpActionMode = "qw",
     
@@ -548,6 +549,9 @@ snd.scan = snd.scan or {
     conAfterScan = false,
     mobCountHere = 0,
     pendingNxAction = nil,
+    smartNxSession = nil,
+    smartNxSuggestion = nil,
+    smartNxPass = nil,
     
     lastMobDamaged = nil,
     lastMobKilled = nil,
@@ -741,6 +745,501 @@ function snd.scan.currentRoomId()
         return tostring(roomId)
     end
     return ""
+end
+
+local smartNxActivities = {
+    quest = true,
+    gq = true,
+    cp = true,
+    qw = true,
+}
+
+local smartNxDirectionAliases = {
+    n = "n", north = "n",
+    e = "e", east = "e",
+    s = "s", south = "s",
+    w = "w", west = "w",
+    u = "u", up = "u",
+    d = "d", down = "d",
+}
+
+local smartNxDirectionNames = {
+    n = "north", e = "east", s = "south",
+    w = "west", u = "up", d = "down",
+}
+
+local function smartNxDirection(direction)
+    if snd.mapper and type(snd.mapper.normalizeDirection) == "function" then
+        local normalized = snd.mapper.normalizeDirection(direction)
+        if normalized then return normalized end
+    end
+    return smartNxDirectionAliases[tostring(direction or ""):lower()]
+end
+
+local function smartNxTargetKey(target)
+    if snd.commands and type(snd.commands.buildTargetSelectionKey) == "function" then
+        local key = tostring(snd.commands.buildTargetSelectionKey(target) or "")
+        if key ~= "" then return key end
+    end
+    return table.concat({
+        tostring(target and target.activity or ""),
+        tostring(target and (target.selectionName or target.name or target.mob) or ""),
+        tostring(target and (target.selectionArea or target.area or target.arid) or ""),
+        tostring(target and (target.selectionDiscriminator or target.index or target.displayIndex) or ""),
+    }, "|")
+end
+
+local function smartNxTargetListEntry(target)
+    if not (target and snd.targets and type(snd.targets.list) == "table") then
+        return nil
+    end
+    if snd.commands and type(snd.commands.findTargetSelectionEntry) == "function" then
+        local entry = snd.commands.findTargetSelectionEntry(target, snd.targets.list)
+        if entry then return entry end
+    end
+    local activity = tostring(target.activity or "")
+    local name = tostring(target.selectionName or target.name or target.mob or "")
+    local area = tostring(target.selectionArea or target.area or target.arid or "")
+    for _, entry in ipairs(snd.targets.list) do
+        local entryName = tostring(entry.mob or entry.name or "")
+        local entryArea = tostring(entry.arid or entry.area or entry.loc or "")
+        if tostring(entry.activity or "") == activity
+            and entryName == name
+            and (area == "" or entryArea == "" or entryArea == area)
+        then
+            return entry
+        end
+    end
+    return nil
+end
+
+function snd.scan.smartNxTargetSnapshot(target)
+    local current = target or (snd.targets and snd.targets.current) or nil
+    local activity = current and tostring(current.activity or ""):lower() or ""
+    if not current or not smartNxActivities[activity] then return nil end
+    if not snd.scan.targetIsAlive(current) then return nil end
+
+    local entry = smartNxTargetListEntry(current)
+    if activity ~= "qw" and not entry then
+        return nil
+    end
+    local targetName = snd.utils.trim(tostring(
+        (entry and (entry.mob or entry.name))
+        or current.selectionName
+        or current.name
+        or current.mob
+        or ""
+    ))
+    if targetName == "" then return nil end
+
+    return {
+        targetKey = smartNxTargetKey(current),
+        targetName = targetName,
+        activity = activity,
+    }
+end
+
+function snd.scan.clearSmartNxSuggestion(reason)
+    if snd.scan.smartNxSuggestion then
+        snd.utils.debugNote("Smart NX: cleared scan suggestion (" .. tostring(reason or "cleared") .. ").")
+    end
+    snd.scan.smartNxSuggestion = nil
+end
+
+local function smartNxRoomPassGeneration()
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    return tonumber(quickWhere and quickWhere.passGeneration) or 0
+end
+
+function snd.scan.resetSmartNxPass(reason)
+    if snd.scan.smartNxPass then
+        snd.utils.debugNote("Smart NX: reset room coverage (" .. tostring(reason or "reset") .. ").")
+    end
+    snd.scan.smartNxPass = nil
+    snd.scan.smartNxSession = nil
+    snd.scan.smartNxSuggestion = nil
+    if snd.nav then snd.nav.smartNxDetour = nil end
+end
+
+local function smartNxPassForSnapshot(snapshot, create)
+    if not snapshot then return nil end
+    local generation = smartNxRoomPassGeneration()
+    local pass = snd.scan.smartNxPass
+    if pass and (pass.targetKey ~= snapshot.targetKey or pass.generation ~= generation) then
+        pass = nil
+        snd.scan.smartNxPass = nil
+    end
+    if not pass and create then
+        pass = {
+            targetKey = snapshot.targetKey,
+            targetName = snapshot.targetName,
+            activity = snapshot.activity,
+            generation = generation,
+            coveredRooms = {},
+            positiveRooms = {},
+            visitedRooms = {},
+            rejectedRooms = {},
+        }
+        snd.scan.smartNxPass = pass
+    end
+    return pass
+end
+
+function snd.scan.isSmartNxRoomHandled(target, roomId)
+    local room = tonumber(roomId)
+    if not room then return false end
+    local snapshot = snd.scan.smartNxTargetSnapshot(target)
+    local pass = smartNxPassForSnapshot(snapshot, false)
+    if not pass then return false end
+    room = math.floor(room)
+    if pass.rejectedRooms[room] or pass.visitedRooms[room] then return true end
+    return pass.coveredRooms[room] == true and pass.positiveRooms[room] ~= true
+end
+
+function snd.scan.confirmSmartNxArrival(roomId)
+    local room = tonumber(roomId)
+    local detour = snd.nav and snd.nav.smartNxDetour or nil
+    if not room or not detour or tonumber(detour.destinationRoom) ~= room then return false end
+    local snapshot = snd.scan.smartNxTargetSnapshot()
+    local pass = smartNxPassForSnapshot(snapshot, false)
+    if not pass or tostring(detour.smartTargetKey or "") ~= tostring(pass.targetKey)
+        or tonumber(detour.passGeneration) ~= tonumber(pass.generation)
+    then
+        return false
+    end
+    room = math.floor(room)
+    pass.visitedRooms[room] = true
+    pass.positiveRooms[room] = nil
+    detour.confirmed = true
+    return true
+end
+
+function snd.scan.rejectSmartNxQuestRoom(roomId, reason)
+    local room = tonumber(roomId)
+    local snapshot = snd.scan.smartNxTargetSnapshot()
+    if not room or not snapshot or snapshot.activity ~= "quest" then return false end
+    local pass = smartNxPassForSnapshot(snapshot, false)
+    local detour = snd.nav and snd.nav.smartNxDetour or nil
+    if not pass or not detour or tonumber(detour.destinationRoom) ~= room then return false end
+    room = math.floor(room)
+    pass.visitedRooms[room] = true
+    pass.rejectedRooms[room] = true
+    pass.positiveRooms[room] = nil
+    snd.utils.debugNote("Smart NX: Quest room " .. tostring(room)
+        .. " rejected (" .. tostring(reason or "no-quest-tag") .. ").")
+    return true
+end
+
+local function smartNxExitFromTable(exits, direction)
+    if type(exits) ~= "table" then return nil end
+    local destination = nil
+    for rawDirection, rawDestination in pairs(exits) do
+        if smartNxDirection(rawDirection) == direction then
+            local candidate = tonumber(rawDestination)
+            if candidate and candidate > 0 then
+                candidate = math.floor(candidate)
+                if destination and destination ~= candidate then
+                    return nil
+                end
+                destination = candidate
+            end
+        end
+    end
+    return destination
+end
+
+local function smartNxDbExit(roomId, direction)
+    if not (snd.mapper and snd.mapper.db and type(snd.mapper.db.query) == "function") then
+        return nil
+    end
+    local longDirection = smartNxDirectionNames[direction]
+    if not longDirection then return nil end
+    local sql = string.format(
+        "SELECT dir, touid FROM exits WHERE fromuid=%d AND lower(trim(dir)) IN ('%s','%s')",
+        roomId,
+        direction,
+        longDirection
+    )
+    local ok, rows = pcall(snd.mapper.db.query, sql)
+    if not ok or type(rows) ~= "table" then return nil end
+    local destination = nil
+    for _, row in ipairs(rows) do
+        if smartNxDirection(row.dir) == direction then
+            local candidate = tonumber(row.touid)
+            if candidate and candidate > 0 then
+                candidate = math.floor(candidate)
+                if destination and destination ~= candidate then
+                    return nil
+                end
+                destination = candidate
+            end
+        end
+    end
+    return destination
+end
+
+local function smartNxMappedExit(roomId, direction)
+    if type(getRoomExits) == "function" then
+        local ok, exits = pcall(getRoomExits, roomId)
+        if ok then
+            local destination = smartNxExitFromTable(exits, direction)
+            if destination then return destination end
+        end
+    end
+    return smartNxDbExit(roomId, direction)
+end
+
+function snd.scan.resolveSmartNxRoom(originRoom, direction, distance)
+    local roomId = tonumber(originRoom)
+    local normalizedDirection = smartNxDirection(direction)
+    local steps = tonumber(distance)
+    if not roomId or roomId <= 0 or not normalizedDirection or not steps then
+        return nil
+    end
+    steps = math.floor(steps)
+    if steps < 0 or steps > 2 then return nil end
+    roomId = math.floor(roomId)
+    for _ = 1, steps do
+        roomId = smartNxMappedExit(roomId, normalizedDirection)
+        if not roomId then return nil end
+    end
+    return roomId
+end
+
+local function smartNxLineOfSightRooms(originRoom)
+    local rooms = {}
+    for _, direction in ipairs({"n", "e", "s", "w", "u", "d"}) do
+        for distance = 1, 2 do
+            local roomId = snd.scan.resolveSmartNxRoom(originRoom, direction, distance)
+            if not roomId then break end
+            rooms[math.floor(roomId)] = true
+        end
+    end
+    return rooms
+end
+
+local function smartNxScannedMobName(rawName)
+    local name = snd.utils.trim(tostring(rawName or ""))
+    while name ~= "" do
+        local rest = name:match("^%b[]%s*(.*)$")
+        if rest == nil then
+            rest = name:match("^%b()%s*(.*)$")
+        end
+        if rest == nil then break end
+        name = snd.utils.trim(rest)
+    end
+    return name
+end
+
+function snd.scan.beginSmartNxScan()
+    snd.scan.smartNxSession = nil
+    snd.scan.clearSmartNxSuggestion("new-scan")
+    if not (snd.config and snd.config.smartNx == true) then return false end
+
+    local snapshot = snd.scan.smartNxTargetSnapshot()
+    local originRoom = tonumber(snd.scan.currentRoomId())
+    if not snapshot or not originRoom or originRoom <= 0 then return false end
+
+    snd.scan.smartNxSession = {
+        targetKey = snapshot.targetKey,
+        targetName = snapshot.targetName,
+        activity = snapshot.activity,
+        originRoom = math.floor(originRoom),
+        location = nil,
+        hits = {},
+        hitRooms = {},
+        nextOrder = 0,
+    }
+    return true
+end
+
+function snd.scan.setSmartNxCurrentLocation()
+    local session = snd.scan.smartNxSession
+    if not session then return false end
+    session.location = {
+        roomId = session.originRoom,
+        direction = "here",
+        distance = 0,
+    }
+    return true
+end
+
+function snd.scan.setSmartNxNearbyLocation(distance, direction)
+    local session = snd.scan.smartNxSession
+    if not session then return false end
+    local normalizedDirection = smartNxDirection(direction)
+    local steps = tonumber(distance) or 1
+    steps = math.floor(steps)
+    session.location = {
+        roomId = snd.scan.resolveSmartNxRoom(session.originRoom, normalizedDirection, steps),
+        direction = normalizedDirection,
+        distance = steps,
+    }
+    return session.location.roomId ~= nil
+end
+
+function snd.scan.recordSmartNxMob(rawName)
+    local session = snd.scan.smartNxSession
+    local location = session and session.location or nil
+    if not session or not location or not location.roomId then return false end
+
+    local scannedName = smartNxScannedMobName(rawName)
+    local scannedIdentity = scannedName:lower():gsub("%s+", " ")
+    local targetIdentity = snd.utils.trim(session.targetName):lower():gsub("%s+", " ")
+    if scannedIdentity ~= targetIdentity then return false end
+
+    local roomId = tonumber(location.roomId)
+    local existing = roomId and session.hitRooms[roomId] or nil
+    if not roomId or roomId <= 0 then return false end
+    roomId = math.floor(roomId)
+    local pass = smartNxPassForSnapshot({
+        targetKey = session.targetKey,
+        targetName = session.targetName,
+        activity = session.activity,
+    }, false)
+    if pass and (pass.visitedRooms[roomId] or pass.rejectedRooms[roomId]) then
+        snd.utils.debugNote("Smart NX: ignored a scan hit in handled room " .. tostring(roomId))
+        return false
+    end
+    session.nextOrder = session.nextOrder + 1
+    local hit = {
+        roomId = roomId,
+        direction = location.direction,
+        distance = tonumber(location.distance) or 0,
+        order = session.nextOrder,
+    }
+    if existing then
+        if hit.distance < existing.distance then
+            existing.direction = hit.direction
+            existing.distance = hit.distance
+            existing.order = hit.order
+        end
+    else
+        session.hitRooms[hit.roomId] = hit
+        table.insert(session.hits, hit)
+    end
+    return true
+end
+
+local function addSmartNxRouteDistances(session)
+    if not (snd.mapper and type(snd.mapper.findDistances) == "function") then return end
+    local distanceCounts = {}
+    local hasTie = false
+    for _, hit in ipairs(session.hits) do
+        local scanDistance = tonumber(hit.distance) or 0
+        distanceCounts[scanDistance] = (distanceCounts[scanDistance] or 0) + 1
+        if distanceCounts[scanDistance] > 1 then hasTie = true end
+    end
+    if not hasTie then return end
+
+    local destinations = {}
+    for _, hit in ipairs(session.hits) do
+        table.insert(destinations, tostring(hit.roomId))
+    end
+    local ok, distances = pcall(snd.mapper.findDistances, tostring(session.originRoom), destinations, {
+        usePortals = true,
+        useRecall = true,
+    })
+    if not ok or type(distances) ~= "table" then return end
+    for _, hit in ipairs(session.hits) do
+        hit.routeDistance = tonumber(distances[tostring(hit.roomId)] or distances[hit.roomId])
+    end
+end
+
+function snd.scan.finishSmartNxScan()
+    local session = snd.scan.smartNxSession
+    snd.scan.smartNxSession = nil
+    if not session or not (snd.config and snd.config.smartNx == true) then return false end
+    if tostring(snd.scan.currentRoomId()) ~= tostring(session.originRoom) then return false end
+
+    local snapshot = snd.scan.smartNxTargetSnapshot()
+    if not snapshot
+        or snapshot.targetKey ~= session.targetKey
+        or snapshot.targetName ~= session.targetName
+        or #session.hits == 0
+    then
+        return false
+    end
+
+
+    local pass = smartNxPassForSnapshot(snapshot, true)
+    if pass then
+        for roomId in pairs(smartNxLineOfSightRooms(session.originRoom)) do
+            pass.coveredRooms[roomId] = true
+        end
+        for _, hit in ipairs(session.hits) do
+            local numericRoomId = tonumber(hit.roomId)
+            if numericRoomId then
+                local roomId = math.floor(numericRoomId)
+                pass.coveredRooms[roomId] = nil
+                pass.positiveRooms[roomId] = true
+            end
+        end
+    end
+
+    addSmartNxRouteDistances(session)
+    table.sort(session.hits, function(a, b)
+        if a.distance ~= b.distance then return a.distance < b.distance end
+        if (a.routeDistance ~= nil) ~= (b.routeDistance ~= nil) then
+            return a.routeDistance ~= nil
+        end
+        if a.routeDistance ~= nil and a.routeDistance ~= b.routeDistance then
+            return a.routeDistance < b.routeDistance
+        end
+        return a.order < b.order
+    end)
+
+    local best = session.hits[1]
+    snd.scan.smartNxSuggestion = {
+        targetKey = session.targetKey,
+        targetName = session.targetName,
+        activity = session.activity,
+        originRoom = session.originRoom,
+        destinationRoom = best.roomId,
+        direction = best.direction,
+        distance = best.distance,
+        matchCount = #session.hits,
+    }
+
+    if best.distance == 0 then
+        snd.utils.infoNote(string.format(
+            "Smart NX: exact target '%s' is already in this room (room %d).",
+            session.targetName,
+            best.roomId
+        ))
+    else
+        local locationText = string.format(
+            "%d %s",
+            best.distance,
+            smartNxDirectionNames[best.direction] or tostring(best.direction)
+        )
+        snd.utils.infoNote(string.format(
+            "Smart NX: exact target '%s' seen %s (room %d); next nx will go there.",
+            session.targetName,
+            locationText,
+            best.roomId
+        ))
+    end
+    return true
+end
+
+function snd.scan.consumeSmartNxSuggestion(target)
+    local suggestion = snd.scan.smartNxSuggestion
+    snd.scan.smartNxSuggestion = nil
+    if not suggestion or not (snd.config and snd.config.smartNx == true) then return nil end
+
+    local snapshot = snd.scan.smartNxTargetSnapshot(target)
+    if not snapshot
+        or snapshot.targetKey ~= suggestion.targetKey
+        or snapshot.targetName ~= suggestion.targetName
+        or tostring(snd.scan.currentRoomId()) ~= tostring(suggestion.originRoom)
+    then
+        snd.utils.debugNote("Smart NX: discarded stale scan suggestion.")
+        return nil
+    end
+    local destination = tonumber(suggestion.destinationRoom)
+    if not destination or destination <= 0 then return nil end
+    return math.floor(destination), suggestion
 end
 
 function snd.scan.runNxAction(action)
@@ -1500,6 +1999,9 @@ local function emptyQuickWhereScope()
         index = 1,
         active = false,
         targetKey = "",
+        confirmedIndex = 0,
+        cursorInitialized = true,
+        passGeneration = 0,
     }
 end
 
@@ -1542,6 +2044,13 @@ function snd.nav.invalidateQuickWhereForTarget(nextTarget)
 
     quickWhere.rooms = {}
     quickWhere.index = 1
+    quickWhere.confirmedIndex = 0
+    quickWhere.pendingIndex = nil
+    quickWhere.pendingRoomId = nil
+    quickWhere.pendingTargetKey = nil
+    quickWhere.pendingPassGeneration = nil
+    quickWhere.cursorInitialized = true
+    quickWhere.passGeneration = 0
     quickWhere.active = false
     quickWhere.targetKey = ""
     quickWhere.lastMatch = nil
@@ -1569,6 +2078,9 @@ function snd.nav.invalidateQuickWhereForTarget(nextTarget)
     snd.nav.questHybrid = nil
     snd.nav.pendingTargetRoomFallback = nil
     snd.nav.targetAreaFallback = nil
+    if snd.scan and type(snd.scan.resetSmartNxPass) == "function" then
+        snd.scan.resetSmartNxPass("target-change")
+    end
 
     if snd.utils and type(snd.utils.debugNote) == "function" then
         snd.utils.debugNote("Invalidated quick-where state for target change")
@@ -1600,12 +2112,22 @@ function snd.nav.clearActivityQuickWhere(activity)
         index = 1,
         active = false,
         targetKey = "",
+        confirmedIndex = 0,
+        cursorInitialized = true,
+        passGeneration = 0,
     }
 
     snd.nav.quickWhere = snd.nav.quickWhere or {}
     if snd.nav.quickWhere.scope == activity or snd.nav.quickWhere.scope == nil then
         snd.nav.quickWhere.rooms = {}
         snd.nav.quickWhere.index = 1
+        snd.nav.quickWhere.confirmedIndex = 0
+        snd.nav.quickWhere.pendingIndex = nil
+        snd.nav.quickWhere.pendingRoomId = nil
+        snd.nav.quickWhere.pendingTargetKey = nil
+        snd.nav.quickWhere.pendingPassGeneration = nil
+        snd.nav.quickWhere.cursorInitialized = true
+        snd.nav.quickWhere.passGeneration = 0
         snd.nav.quickWhere.active = false
         snd.nav.quickWhere.targetKey = ""
         snd.nav.quickWhere.pendingMatches = {}
@@ -1824,6 +2346,13 @@ end
 function snd.onDestinationArrived()
     snd.utils.debugNote("Arrived at destination room: " .. tostring(snd.room.current.rmid))
 
+    if snd.commands and type(snd.commands.confirmQuickWhereArrival) == "function" then
+        snd.commands.confirmQuickWhereArrival(snd.room.current.rmid)
+    end
+    if snd.scan and type(snd.scan.confirmSmartNxArrival) == "function" then
+        snd.scan.confirmSmartNxArrival(snd.room.current.rmid)
+    end
+
     if snd.nav.nxState and snd.nav.nxState.targetKey and snd.targets.current then
         if snd.commands and snd.commands.buildTargetKeyFromCurrent then
             local key = snd.commands.buildTargetKeyFromCurrent(snd.targets.current)
@@ -1891,4 +2420,3 @@ end
 snd.autoSaveTimer = tempTimer(300, function()
     snd.saveState()
 end, true)
-

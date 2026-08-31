@@ -1285,119 +1285,174 @@ function snd.cp.applyCheckStatusOnly()
     return true
 end
 
+local function cpKillEvidence()
+    if snd.conwin and type(snd.conwin.getActivityKillEvidence) == "function" then
+        local evidence = snd.conwin.getActivityKillEvidence("cp", 3)
+        if type(evidence) == "table" then
+            return evidence
+        end
+    end
+
+    -- Compatibility for ConWin versions that predate activity evidence.
+    if snd.conwin and type(snd.conwin.getRecentKilledMobName) == "function" then
+        local name = snd.conwin.getRecentKilledMobName(3) or ""
+        if name ~= "" then
+            return {status = "resolved", name = name, source = "legacy-death", keys = {}}
+        end
+    end
+    if snd.conwin and type(snd.conwin.getCurrentCombatMobName) == "function" then
+        local name = snd.conwin.getCurrentCombatMobName() or ""
+        if name ~= "" then
+            return {status = "resolved", name = name, source = "legacy-combat", keys = {}}
+        end
+    end
+    return {status = "none", source = "none", keys = {}}
+end
+
+local function consumeCpKillEvidence(evidence)
+    if snd.conwin and type(snd.conwin.consumeActivityKillEvidence) == "function" then
+        snd.conwin.consumeActivityKillEvidence("cp", evidence)
+    elseif evidence and evidence.source == "legacy-death"
+        and snd.conwin and type(snd.conwin.clearRecentKilledMobName) == "function"
+    then
+        snd.conwin.clearRecentKilledMobName()
+    end
+end
+
+local function currentCpSelectionIndex()
+    local selection = snd.targets and snd.targets.current
+    if type(selection) ~= "table" or selection.activity ~= "cp" then return nil end
+    if tonumber(selection.campaignIndex) then return tonumber(selection.campaignIndex) end
+    if snd.commands and type(snd.commands.findTargetSelectionEntry) == "function" then
+        local entry = snd.commands.findTargetSelectionEntry(selection, snd.targets.list or {})
+        if entry and entry.activity == "cp" then return tonumber(entry.campaignIndex) end
+    end
+    for _, entry in ipairs((snd.targets and snd.targets.list) or {}) do
+        if entry.activity == "cp"
+            and snd.utils.mobIdentityMatches(entry.mob, selection.name or selection.mob)
+        then
+            return tonumber(entry.campaignIndex)
+        end
+    end
+    return nil
+end
+
+local function findCpKillEntry(name, preferredCampaignIndex)
+    local candidates = {}
+    for _, entry in ipairs((snd.targets and snd.targets.list) or {}) do
+        if entry.activity == "cp" and not entry.dead and not entry.killed
+            and snd.utils.mobIdentityMatches(entry.mob, name)
+        then
+            candidates[#candidates + 1] = entry
+        end
+    end
+    if preferredCampaignIndex then
+        for _, entry in ipairs(candidates) do
+            if tonumber(entry.campaignIndex) == tonumber(preferredCampaignIndex) then return entry end
+        end
+    end
+
+    local room = snd.room and snd.room.current or {}
+    local roomId = tostring(room.rmid or room.id or "")
+    local roomName = tostring(room.name or ""):lower()
+    local area = tostring(room.arid or ""):lower()
+    for _, entry in ipairs(candidates) do
+        local sameRoomId = roomId ~= "" and entry.rmid ~= nil and tostring(entry.rmid) == roomId
+        local entryRoomName = tostring(entry.roomName or ""):lower()
+        local entryArea = tostring(entry.arid or ""):lower()
+        local sameNamedRoom = roomName ~= "" and entryRoomName == roomName
+            and (area == "" or entryArea == "" or entryArea == area)
+        if sameRoomId or sameNamedRoom then return entry end
+    end
+    if area ~= "" then
+        for _, entry in ipairs(candidates) do
+            if tostring(entry.arid or ""):lower() == area then return entry end
+        end
+    end
+    return candidates[1]
+end
+
 function snd.cp.onMobKilled()
     snd.utils.debugNote("Campaign mob killed!")
     local shouldSyncAfterKill = true
     local killedTargetsBefore = 0
     for _, target in ipairs(snd.campaign.targets or {}) do
-        if target.killed then
-            killedTargetsBefore = killedTargetsBefore + 1
-        end
-    end
-    local confirmedKilledMob = ""
-    if snd.conwin and snd.conwin.getRecentKilledMobName then
-        confirmedKilledMob = snd.conwin.getRecentKilledMobName(3) or ""
-        if confirmedKilledMob ~= "" and snd.conwin.clearRecentKilledMobName then
-            snd.conwin.clearRecentKilledMobName()
-        end
-    end
-    
-    -- Text may arrive before GMCP clears; ConWin can still identify the live enemy.
-    local activeCombatMob = ""
-    if confirmedKilledMob == "" and snd.conwin and snd.conwin.getCurrentCombatMobName then
-        activeCombatMob = snd.conwin.getCurrentCombatMobName() or ""
+        if target.killed then killedTargetsBefore = killedTargetsBefore + 1 end
     end
 
-    if snd.targets.current and snd.targets.current.activity == "cp" then
-        local roomId = snd.room and snd.room.current and snd.room.current.id or nil
-        local killedMobName = confirmedKilledMob ~= "" and confirmedKilledMob or snd.targets.current.name or ""
-        if type(raiseEvent) == "function" then
-            raiseEvent("snd.kill.confirmed", killedMobName, roomId)
-        end
-        local target = snd.targets.current
+    local evidence = cpKillEvidence()
+    local evidenceStatus = tostring(evidence.status or "none")
+    local selectedCampaignIndex = currentCpSelectionIndex()
+    local killedName = ""
+    local preferredCampaignIndex = nil
+    if evidenceStatus == "resolved" then
+        killedName = tostring(evidence.name or "")
+    elseif evidenceStatus == "none"
+        and snd.targets.current and snd.targets.current.activity == "cp"
+    then
+        -- The selected target is only a fallback when ConWin observed no identity.
+        killedName = tostring(snd.targets.current.name or snd.targets.current.mob or "")
+        preferredCampaignIndex = selectedCampaignIndex
+    end
 
-        local bestIndex, bestScore = nil, -1
-        local currentArea = snd.room and snd.room.current and tostring(snd.room.current.arid or "") or ""
-        local currentRoom = snd.room and snd.room.current and tostring(snd.room.current.name or "") or ""
-        for i, t in ipairs(snd.targets.list) do
-            if t.activity == "cp" and not t.dead then
-                -- ConWin lowercases names; CP preserves proper-name casing.
-                local nameMatchesCurrent = snd.utils.mobIdentityMatches(t.mob, target.name)
-                local nameMatchesConfirmedKill = snd.utils.mobIdentityMatches(t.mob, confirmedKilledMob)
-                local nameMatchesActiveCombat = snd.utils.mobIdentityMatches(t.mob, activeCombatMob)
-                if nameMatchesCurrent or nameMatchesConfirmedKill or nameMatchesActiveCombat then
-                    local score = 5
-                    if nameMatchesConfirmedKill then score = score + 8 end
-                    if nameMatchesActiveCombat then score = score + 4 end
-                    if t.arid and currentArea ~= "" and tostring(t.arid) == currentArea then score = score + 3 end
-                    if t.roomName and currentRoom ~= "" and tostring(t.roomName) == currentRoom then score = score + 2 end
-                    if target.index and t.displayIndex and tonumber(target.index) == tonumber(t.displayIndex) then
-                        score = score + 1
-                    end
-                    if score > bestScore then
-                        bestScore = score
-                        bestIndex = i
-                    end
-                end
+    local killedEntry = killedName ~= "" and findCpKillEntry(killedName, preferredCampaignIndex) or nil
+    local killedCampaignIndex = killedEntry and tonumber(killedEntry.campaignIndex) or nil
+    local canonical = killedCampaignIndex and snd.campaign.targets
+        and snd.campaign.targets[killedCampaignIndex] or nil
+    if killedEntry and not canonical then
+        for i, target in ipairs(snd.campaign.targets or {}) do
+            if not target.killed and snd.utils.mobIdentityMatches(target.mob, killedEntry.mob) then
+                canonical = target
+                killedCampaignIndex = i
+                break
             end
         end
-        if bestIndex and snd.targets.list[bestIndex] then
-            local killedEntry = snd.targets.list[bestIndex]
-            killedEntry.dead = true
-            killedEntry.killed = true
-            -- Mirror locally until cp check supplies the authoritative roster.
-            local campaignIdx = tonumber(killedEntry.campaignIndex)
-            local ct = campaignIdx and snd.campaign.targets and snd.campaign.targets[campaignIdx]
-            if ct and ct.mob == killedEntry.mob then
-                ct.dead = true
-                ct.killed = true
-            else
-                for _, c in ipairs(snd.campaign.targets or {}) do
-                    if c.mob == killedEntry.mob and not c.killed then
-                        c.dead = true
-                        c.killed = true
-                        break
-                    end
-                end
-            end
-        end
+    end
+
+    if canonical and not canonical.killed then
+        canonical.dead = true
+        canonical.killed = true
+        local killedWasSelected = selectedCampaignIndex ~= nil
+            and tonumber(selectedCampaignIndex) == tonumber(killedCampaignIndex)
         snd.cp.updateTargetStatus()
+        if killedWasSelected and snd.targets.current and snd.targets.current.activity == "cp" then
+            snd.clearTarget({refresh = false})
+        end
+        if type(raiseEvent) == "function" then
+            local roomId = snd.room and snd.room.current and snd.room.current.id or nil
+            raiseEvent("snd.kill.confirmed", canonical.mob or killedName, roomId)
+        end
+
         if snd.cp.getRemainingCount and snd.cp.getRemainingCount() == 0 then
-            -- Skip the final refresh only when this is the sole pending kill; otherwise
-            -- earlier [Killed] rows would never receive a clearing cp check.
             local killedPendingCount = 0
-            for _, t in ipairs(snd.campaign.targets or {}) do
-                if t.killed then
-                    killedPendingCount = killedPendingCount + 1
-                end
+            for _, target in ipairs(snd.campaign.targets or {}) do
+                if target.killed then killedPendingCount = killedPendingCount + 1 end
             end
             if killedPendingCount <= 1 then
                 shouldSyncAfterKill = false
                 snd.utils.debugNote("Skipping post-kill cp check because last campaign target was just killed")
             end
         end
-        
-        snd.clearTarget({refresh = false})
     end
-    
+    consumeCpKillEvidence(evidence)
+
     local killedTargetsAfter = 0
     for _, target in ipairs(snd.campaign.targets or {}) do
-        if target.killed then
-            killedTargetsAfter = killedTargetsAfter + 1
-        end
+        if target.killed then killedTargetsAfter = killedTargetsAfter + 1 end
     end
     local markedTargetKilled = killedTargetsAfter > killedTargetsBefore
 
-    -- Force a refresh if server credit did not mark any local CP row [Killed].
     if not markedTargetKilled then
-        snd.utils.debugNote("Campaign kill marked no CP target killed; forcing cp check")
+        snd.utils.debugNote(
+            "Campaign kill evidence '" .. evidenceStatus .. "' marked no CP target; forcing cp check"
+        )
         snd.cp.requestCheck(0.1, "cp.onMobKilled:no-target-marked-killed", true)
-
-    -- Never re-check immediately after the last kill; completion owns that sync.
-    elseif shouldSyncAfterKill and (not snd.shouldAutoCheckAfterKill or snd.shouldAutoCheckAfterKill("cp")) then
+    elseif shouldSyncAfterKill
+        and (not snd.shouldAutoCheckAfterKill or snd.shouldAutoCheckAfterKill("cp"))
+    then
         snd.cp.requestCheck(0.1, "cp.onMobKilled")
     end
-    
+
     if snd.setActiveTab and snd.getPreferredActiveActivity then
         snd.setActiveTab(snd.getPreferredActiveActivity() or "auto", {save = false, refresh = false})
     end

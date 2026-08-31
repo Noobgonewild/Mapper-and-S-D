@@ -170,6 +170,13 @@ local function ensureQuickWhereScopes()
         slot.index = tonumber(slot.index) or 1
         slot.active = slot.active == true
         slot.targetKey = tostring(slot.targetKey or "")
+        slot.confirmedIndex = tonumber(slot.confirmedIndex)
+        slot.pendingIndex = tonumber(slot.pendingIndex)
+        slot.pendingRoomId = slot.pendingRoomId and tonumber(slot.pendingRoomId) or nil
+        slot.pendingTargetKey = tostring(slot.pendingTargetKey or "")
+        slot.pendingPassGeneration = tonumber(slot.pendingPassGeneration)
+        slot.cursorInitialized = slot.cursorInitialized == true
+        slot.passGeneration = tonumber(slot.passGeneration) or 0
     end
 end
 
@@ -188,6 +195,13 @@ local function persistQuickWhereScope(activity)
         index = tonumber(qw.index) or 1,
         active = qw.active == true and type(qw.rooms) == "table" and #qw.rooms > 0,
         targetKey = tostring(qw.targetKey or ""),
+        confirmedIndex = tonumber(qw.confirmedIndex),
+        pendingIndex = tonumber(qw.pendingIndex),
+        pendingRoomId = qw.pendingRoomId and tonumber(qw.pendingRoomId) or nil,
+        pendingTargetKey = tostring(qw.pendingTargetKey or ""),
+        pendingPassGeneration = tonumber(qw.pendingPassGeneration),
+        cursorInitialized = qw.cursorInitialized == true,
+        passGeneration = tonumber(qw.passGeneration) or 0,
     }
 end
 
@@ -219,6 +233,13 @@ local function activateQuickWhereScope(activity)
     snd.nav.quickWhere.active = slot.active == true and #snd.nav.quickWhere.rooms > 0
     snd.nav.quickWhere.scope = activity
     snd.nav.quickWhere.targetKey = tostring(slot.targetKey or "")
+    snd.nav.quickWhere.confirmedIndex = tonumber(slot.confirmedIndex)
+    snd.nav.quickWhere.pendingIndex = tonumber(slot.pendingIndex)
+    snd.nav.quickWhere.pendingRoomId = slot.pendingRoomId and tonumber(slot.pendingRoomId) or nil
+    snd.nav.quickWhere.pendingTargetKey = tostring(slot.pendingTargetKey or "")
+    snd.nav.quickWhere.pendingPassGeneration = tonumber(slot.pendingPassGeneration)
+    snd.nav.quickWhere.cursorInitialized = slot.cursorInitialized == true
+    snd.nav.quickWhere.passGeneration = tonumber(slot.passGeneration) or 0
     snd.nav.quickWhere.pendingMatches = snd.nav.quickWhere.pendingMatches or {}
     snd.nav.quickWhere.isAdhoc = false
     snd.nav.quickWhere.requestedKeyword = nil
@@ -226,6 +247,128 @@ local function activateQuickWhereScope(activity)
     snd.nav.quickWhere.exactMatchText = nil
     snd.nav.quickWhere.exactTargetName = nil
     snd.nav.quickWhere.source = nil
+end
+
+local function quickWhereRoomIndex(quickWhere, roomId)
+    if type(quickWhere) ~= "table" or type(quickWhere.rooms) ~= "table" or roomId == nil then
+        return nil
+    end
+    for index, candidate in ipairs(quickWhere.rooms) do
+        if tostring(candidate) == tostring(roomId) then return index end
+    end
+    return nil
+end
+
+local function ensureQuickWhereCursor(quickWhere, currentRoom)
+    if type(quickWhere) ~= "table" then return nil end
+    local roomCount = type(quickWhere.rooms) == "table" and #quickWhere.rooms or 0
+    if quickWhere.cursorInitialized ~= true then
+        local legacyIndex = tonumber(quickWhere.confirmedIndex)
+        if legacyIndex == nil then
+            local displayedIndex = math.floor(tonumber(quickWhere.index) or 0)
+            if currentRoom ~= nil
+                and tostring(quickWhere.rooms[displayedIndex] or "") == tostring(currentRoom)
+            then
+                legacyIndex = displayedIndex
+            else
+                legacyIndex = 0
+            end
+        end
+        legacyIndex = math.floor(legacyIndex or 0)
+        if legacyIndex < 0 then legacyIndex = 0 end
+        if legacyIndex > roomCount then legacyIndex = roomCount end
+        quickWhere.confirmedIndex = legacyIndex
+        quickWhere.cursorInitialized = true
+    else
+        local confirmed = math.floor(tonumber(quickWhere.confirmedIndex) or 0)
+        quickWhere.confirmedIndex = math.max(0, math.min(confirmed, roomCount))
+    end
+    quickWhere.passGeneration = math.max(0, math.floor(tonumber(quickWhere.passGeneration) or 0))
+    return quickWhere
+end
+
+function snd.commands.beginQuickWhereRoomPass(quickWhere, reason)
+    local state = type(quickWhere) == "table" and quickWhere
+        or (snd.nav and snd.nav.quickWhere) or nil
+    if not state then return false end
+    state.passGeneration = math.floor(tonumber(state.passGeneration) or 0) + 1
+    state.confirmedIndex = 0
+    state.pendingIndex = nil
+    state.pendingRoomId = nil
+    state.pendingTargetKey = nil
+    state.pendingPassGeneration = nil
+    state.cursorInitialized = true
+    state.index = 1
+    if snd.scan and type(snd.scan.resetSmartNxPass) == "function" then
+        snd.scan.resetSmartNxPass(reason or "new-room-list")
+    end
+    return true
+end
+
+function snd.commands.registerQuickWhereDispatch(roomId, options)
+    local opts = type(options) == "table" and options or {}
+    if tostring(opts.source or ""):lower() == "smartnx" then return false end
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    if not quickWhere or not quickWhere.active or type(quickWhere.rooms) ~= "table" then return false end
+    ensureQuickWhereCursor(quickWhere)
+    local roomIndex = tonumber(opts.quickWhereIndex) or quickWhereRoomIndex(quickWhere, roomId)
+    roomIndex = roomIndex and math.floor(roomIndex) or nil
+    if not roomIndex or roomIndex < 1 or roomIndex > #quickWhere.rooms
+        or tostring(quickWhere.rooms[roomIndex]) ~= tostring(roomId)
+    then
+        return false
+    end
+    quickWhere.pendingIndex = roomIndex
+    quickWhere.pendingRoomId = tonumber(roomId)
+    quickWhere.pendingTargetKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(
+        snd.targets and snd.targets.current or nil
+    )
+    quickWhere.pendingPassGeneration = tonumber(quickWhere.passGeneration) or 0
+    return true
+end
+
+function snd.commands.confirmQuickWhereArrival(roomId)
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    if not quickWhere or not quickWhere.active then return false end
+    ensureQuickWhereCursor(quickWhere, roomId)
+    local pendingIndex = tonumber(quickWhere.pendingIndex)
+    if not pendingIndex or tostring(quickWhere.pendingRoomId or "") ~= tostring(roomId or "") then
+        return false
+    end
+    local currentTargetKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(
+        snd.targets and snd.targets.current or nil
+    )
+    if tostring(quickWhere.pendingTargetKey or "") ~= tostring(currentTargetKey)
+        or tonumber(quickWhere.pendingPassGeneration) ~= tonumber(quickWhere.passGeneration)
+    then
+        quickWhere.pendingIndex = nil
+        quickWhere.pendingRoomId = nil
+        quickWhere.pendingTargetKey = nil
+        quickWhere.pendingPassGeneration = nil
+        return false
+    end
+    local arrivalIndex
+    if tostring(quickWhere.rooms[pendingIndex] or "") == tostring(roomId or "") then
+        arrivalIndex = pendingIndex
+    else
+        arrivalIndex = quickWhereRoomIndex(quickWhere, roomId)
+    end
+    if not arrivalIndex then
+        quickWhere.pendingIndex = nil
+        quickWhere.pendingRoomId = nil
+        quickWhere.pendingTargetKey = nil
+        quickWhere.pendingPassGeneration = nil
+        return false
+    end
+    quickWhere.confirmedIndex = arrivalIndex
+    quickWhere.index = arrivalIndex
+    quickWhere.pendingIndex = nil
+    quickWhere.pendingRoomId = nil
+    quickWhere.pendingTargetKey = nil
+    quickWhere.pendingPassGeneration = nil
+    persistQuickWhereScope(quickWhere.scope or (snd.targets and snd.targets.current and snd.targets.current.activity))
+    snd.utils.debugNote("NX: GMCP confirmed room-list index " .. tostring(arrivalIndex))
+    return true
 end
 
 local function clearNxOverride()
@@ -464,6 +607,13 @@ local function resetSelectedTargetRoomList()
     local quickWhere = snd.nav.quickWhere
     quickWhere.rooms = {}
     quickWhere.index = 1
+    quickWhere.confirmedIndex = 0
+    quickWhere.pendingIndex = nil
+    quickWhere.pendingRoomId = nil
+    quickWhere.pendingTargetKey = nil
+    quickWhere.pendingPassGeneration = nil
+    quickWhere.cursorInitialized = true
+    quickWhere.passGeneration = 0
     quickWhere.active = false
     quickWhere.targetKey = ""
     quickWhere.lastMatch = nil
@@ -511,6 +661,10 @@ local function installSelectedTargetRoomList(results, source, context)
 
     snd.nav.quickWhere = snd.nav.quickWhere or {}
     local quickWhere = snd.nav.quickWhere
+    local preservePass = source == "db-fallback" and quickWhere.cursorInitialized == true
+    local previousConfirmedRoom = preservePass and type(quickWhere.rooms) == "table"
+        and quickWhere.rooms[math.floor(tonumber(quickWhere.confirmedIndex) or 0)] or nil
+    local previousPendingRoom = preservePass and quickWhere.pendingRoomId or nil
     quickWhere.rooms = rooms
     quickWhere.index = 1
     quickWhere.active = #rooms > 0
@@ -526,6 +680,23 @@ local function installSelectedTargetRoomList(results, source, context)
     quickWhere.enumerationTruncated = false
     quickWhere.scope = current.activity
     quickWhere.source = source
+    if not preservePass then
+        snd.commands.beginQuickWhereRoomPass(quickWhere, tostring(source or "stored-room-list"))
+    else
+        local confirmedIndex = quickWhereRoomIndex(quickWhere, previousConfirmedRoom) or 0
+        quickWhere.confirmedIndex = confirmedIndex
+        quickWhere.index = confirmedIndex > 0 and confirmedIndex or 1
+        local pendingIndex = quickWhereRoomIndex(quickWhere, previousPendingRoom)
+        if pendingIndex then
+            quickWhere.pendingIndex = pendingIndex
+            quickWhere.pendingRoomId = tonumber(previousPendingRoom)
+        else
+            quickWhere.pendingIndex = nil
+            quickWhere.pendingRoomId = nil
+            quickWhere.pendingTargetKey = nil
+            quickWhere.pendingPassGeneration = nil
+        end
+    end
 
     if #rooms > 0 then
         current.roomId = rooms[1]
@@ -610,6 +781,13 @@ local function installQuestHybridDbCycle(checkedRoomId)
         reason = "xcpQuestHybridDbCycle",
     })
     if installed then
+        local confirmedIndex = quickWhereRoomIndex(snd.nav.quickWhere, checkedRoomId)
+        if confirmedIndex then
+            snd.nav.quickWhere.confirmedIndex = confirmedIndex
+            snd.nav.quickWhere.index = confirmedIndex
+            snd.nav.quickWhere.cursorInitialized = true
+            persistQuickWhereScope(snd.nav.quickWhere.scope)
+        end
         current.roomId = tonumber(checkedRoomId) or current.roomId
         current.xcpRoomSource = "quest-hybrid-db"
         syncCurrentTargetScope()
@@ -1518,6 +1696,9 @@ function snd.commands.gotoRoomViaAlias(roomId, options)
         return false, routeFailure or (snd.mapper and snd.mapper.lastRouteFailure)
     end
 
+    snd.commands.registerQuickWhereDispatch(roomId, opts)
+    snd.commands.confirmQuickWhereArrival(getCurrentRoomUid())
+
     -- Mapper dispatch is synchronous; only failed routes leave manual approaches.
     clearPendingRequests()
     return true
@@ -1971,15 +2152,12 @@ function snd.commands.selectQuickWhereRoom(index, activity)
         return false
     end
 
-    quickWhere.index = roomIndex
-    persistQuickWhereScope(scope or quickWhere.scope)
-
     if snd.targets and snd.targets.current then
         snd.targets.current.roomId = roomId
     end
 
     snd.utils.infoNote("Going to room " .. tostring(roomId))
-    snd.commands.gotoRoomViaAlias(roomId)
+    snd.commands.gotoRoomViaAlias(roomId, {quickWhereIndex = roomIndex})
     return true
 end
 
@@ -2278,6 +2456,58 @@ function snd.commands.nx()
         return
     end
 
+    local currentRoomBeforeSmartNx = getCurrentRoomUid()
+    snd.commands.confirmQuickWhereArrival(currentRoomBeforeSmartNx)
+    local smartNxTargetKeyAtPress = snd.commands.buildQuickWhereTargetKeyFromCurrent(current)
+    local smartNxDetour = snd.nav and snd.nav.smartNxDetour or nil
+    if smartNxDetour then
+        local detourMatchesTarget = tostring(smartNxDetour.targetKey or "") == tostring(smartNxTargetKeyAtPress)
+        local atDetourDestination = currentRoomBeforeSmartNx
+            and tostring(currentRoomBeforeSmartNx) == tostring(smartNxDetour.destinationRoom or "")
+        if not detourMatchesTarget or not atDetourDestination then
+            snd.nav.smartNxDetour = nil
+            smartNxDetour = nil
+        end
+    end
+
+    local smartNxRoomId = nil
+    local smartNxSuggestion = nil
+    if snd.scan and type(snd.scan.consumeSmartNxSuggestion) == "function" then
+        smartNxRoomId, smartNxSuggestion = snd.scan.consumeSmartNxSuggestion(current)
+    end
+    if smartNxRoomId then
+        local currentRoom = currentRoomBeforeSmartNx
+        if currentRoom and tostring(currentRoom) == tostring(smartNxRoomId) then
+            if smartNxDetour then
+                snd.utils.debugNote("Smart NX: leaving scanned detour room; resuming the original room list.")
+            else
+                snd.utils.infoNote("Smart NX: exact target is already in this room.")
+                return
+            end
+        end
+
+        if not (currentRoom and tostring(currentRoom) == tostring(smartNxRoomId)) then
+            local dispatched = snd.commands.gotoRoomViaAlias(smartNxRoomId, {
+                source = "smartnx",
+                targetRoom = true,
+                allowManualApproach = false,
+                allowAreaStartFallback = false,
+            })
+            if dispatched then
+                local quickWhereState = snd.nav and snd.nav.quickWhere or nil
+                snd.nav.smartNxDetour = {
+                    targetKey = smartNxTargetKeyAtPress,
+                    smartTargetKey = smartNxSuggestion and smartNxSuggestion.targetKey or "",
+                    passGeneration = tonumber(quickWhereState and quickWhereState.passGeneration) or 0,
+                    originRoom = currentRoom,
+                    destinationRoom = smartNxRoomId,
+                }
+                return
+            end
+            snd.utils.infoNote("Smart NX scan destination is unavailable; continuing normal nx.")
+        end
+    end
+
     local questHybrid = current.activity == "quest" and currentQuestHybridState() or nil
     if questHybrid and questHybrid.phase == "db" then
         markQuestHybridDbRoomVisited(getCurrentRoomUid())
@@ -2401,12 +2631,12 @@ function snd.commands.nx()
 
         if #fallbackRooms > 0 and snd.nav.quickWhere then
             snd.nav.quickWhere.rooms = fallbackRooms
-            snd.nav.quickWhere.index = 1
             snd.nav.quickWhere.active = true
             snd.nav.quickWhere.processed = true
             snd.nav.quickWhere.pendingMatches = {}
             snd.nav.quickWhere.scope = current and current.activity or snd.nav.quickWhere.scope
             snd.nav.quickWhere.targetKey = currentQuickWhereKey
+            snd.commands.beginQuickWhereRoomPass(snd.nav.quickWhere, "xcp-list-seed")
             persistQuickWhereScope(snd.nav.quickWhere.scope)
             quickWhere = snd.nav.quickWhere
             snd.utils.debugNote("NX: seeded cycle list from current XCP results")
@@ -2415,75 +2645,90 @@ function snd.commands.nx()
 
     if quickWhere and quickWhere.active and quickWhere.rooms and #quickWhere.rooms > 0 then
         local currentRoom = getCurrentRoomUid()
-        local targetRoom = current and current.roomId or nil
-        local foundIndex = nil
+        ensureQuickWhereCursor(quickWhere, currentRoom)
+        snd.commands.confirmQuickWhereArrival(currentRoom)
 
-        local function findRoomIndex(roomId)
-            if not roomId then
-                return nil
-            end
-            for i, candidate in ipairs(quickWhere.rooms) do
-                if tostring(candidate) == tostring(roomId) then
-                    return i
-                end
-            end
-            return nil
-        end
-
-        local currentRoomIndex = findRoomIndex(currentRoom)
+        local pendingIndex = tonumber(quickWhere.pendingIndex)
         local nextIndex = nil
-        local wrappingCycle = false
         local restartFromFirst = snd.nav.nxState and snd.nav.nxState.restartFromFirst == true
         if restartFromFirst then
-            -- A wrap-triggered QW starts a new pass from the current room.
-            nextIndex = 1
-            if #quickWhere.rooms > 1
-                and currentRoom
-                and tostring(quickWhere.rooms[1]) == tostring(currentRoom)
-            then
-                nextIndex = 2
-            end
+            quickWhere.confirmedIndex = 0
+            quickWhere.pendingIndex = nil
+            quickWhere.pendingRoomId = nil
+            quickWhere.pendingTargetKey = nil
+            quickWhere.pendingPassGeneration = nil
             snd.nav.nxState.restartFromFirst = false
-            snd.utils.debugNote("NX: starting refreshed quick-where list at room index " .. tostring(nextIndex))
+            nextIndex = 1
+        elseif pendingIndex and pendingIndex >= 1 and pendingIndex <= #quickWhere.rooms then
+            nextIndex = pendingIndex
         else
-            foundIndex = currentRoomIndex
-            if not foundIndex and (not currentRoom or tostring(currentRoom) == "") then
-                foundIndex = findRoomIndex(targetRoom)
-            end
-
-            if foundIndex then
-                if foundIndex < #quickWhere.rooms then
-                    nextIndex = foundIndex + 1
-                else
-                    nextIndex = 1
-                    wrappingCycle = #quickWhere.rooms > 1 or currentRoomIndex ~= nil
-                end
-            else
-                nextIndex = quickWhere.index or 1
-            end
+            nextIndex = math.floor(tonumber(quickWhere.confirmedIndex) or 0) + 1
         end
-        quickWhere.index = nextIndex
-        persistQuickWhereScope(quickWhere.scope or (current and current.activity))
 
-        -- Live lists refresh at wrap; DB lists wrap locally; hybrid HT reruns only for GQ.
-        if wrappingCycle and current
-            and (current.activity == "quest" or current.activity == "cp" or current.activity == "gq")
+        local function skipHandledRooms(index)
+            while index <= #quickWhere.rooms
+                and snd.scan and type(snd.scan.isSmartNxRoomHandled) == "function"
+                and snd.scan.isSmartNxRoomHandled(current, quickWhere.rooms[index])
+            do
+                snd.utils.debugNote("NX: skipping scan-covered room " .. tostring(quickWhere.rooms[index]))
+                index = index + 1
+            end
+            return index
+        end
+
+        nextIndex = skipHandledRooms(nextIndex)
+
+        -- A fresh QW list can arrive after the player has already reached its
+        -- first candidate, so there is no earlier route dispatch to confirm.
+        -- Consume only the exact next candidate when it is the live room; do
+        -- not infer progress from standing in an arbitrary later list room.
+        local currentCandidate = quickWhere.rooms[nextIndex]
+        if currentCandidate and currentRoom
+            and tostring(currentCandidate) == tostring(currentRoom)
         then
-            if runXcpCycleAction(current) then
+            snd.commands.registerQuickWhereDispatch(currentCandidate, {quickWhereIndex = nextIndex})
+            snd.commands.confirmQuickWhereArrival(currentRoom)
+            snd.utils.debugNote("NX: current room already satisfies the next room-list candidate")
+            nextIndex = math.floor(tonumber(quickWhere.confirmedIndex) or nextIndex) + 1
+            nextIndex = skipHandledRooms(nextIndex)
+        end
+
+        local wrappingCycle = nextIndex > #quickWhere.rooms
+        if wrappingCycle and useAdhocQuickWhere then
+            local keyword = snd.utils.trim(
+                (nxOverride and nxOverride.keyword)
+                    or quickWhere.lookupKeyword
+                    or quickWhere.requestedKeyword
+                    or ""
+            )
+            if keyword ~= "" and snd.commands and snd.commands.qw then
+                snd.utils.debugNote("NX: ad-hoc room cycle exhausted; refreshing quick-where")
+                beginXcpCycleRefresh()
+                snd.commands.qw(keyword)
                 return
             end
+            snd.utils.infoNote("Ad-hoc quick where cycle is complete, but its keyword is unavailable; run qw again.")
+            return
+        end
+        if wrappingCycle and current
+            and (current.activity == "quest" or current.activity == "cp" or current.activity == "gq")
+            and runXcpCycleAction(current)
+        then
+            return
+        elseif wrappingCycle then
+            snd.commands.beginQuickWhereRoomPass(quickWhere, "local-room-list-wrap")
+            nextIndex = skipHandledRooms(1)
+        end
+
+        if smartNxDetour then
+            snd.nav.smartNxDetour = nil
+            smartNxDetour = nil
         end
 
         local nextRoomId = quickWhere.rooms[nextIndex]
         if nextRoomId then
-            -- Never route to the live room; stale duplicates could fire a false arrival action.
-            if currentRoom and tostring(nextRoomId) == tostring(currentRoom) then
-                snd.utils.debugNote("NX: selected room is already current; skipping mapper dispatch")
-                runXcpCycleAction(current)
-                return
-            end
             snd.utils.infoNote("Going to room " .. nextRoomId)
-            snd.commands.gotoRoomViaAlias(nextRoomId)
+            snd.commands.gotoRoomViaAlias(nextRoomId, {quickWhereIndex = nextIndex})
             return
         end
     end
@@ -2492,6 +2737,9 @@ function snd.commands.nx()
     -- instead of firing a false mapper arrival and nxAction.
     local currentRoom = getCurrentRoomUid()
     local targetRoom = current and current.roomId or nil
+    if smartNxDetour then
+        snd.nav.smartNxDetour = nil
+    end
     if targetRoom and currentRoom and tostring(targetRoom) == tostring(currentRoom) then
         snd.utils.debugNote("NX: target room is already current; skipping mapper dispatch")
         runXcpCycleAction(current)
@@ -3408,6 +3656,7 @@ function snd.commands.processQuickWhereResult()
         snd.nav.quickWhere.pendingMatches = {}
         if #quickWhereRooms > 0 then
             snd.nav.quickWhere.source = isQuestHybridEnumeration and "quest-hybrid-qw" or "qw"
+            snd.commands.beginQuickWhereRoomPass(snd.nav.quickWhere, snd.nav.quickWhere.source)
         elseif isQuestHybridEnumeration then
             snd.nav.quickWhere.source = previousSource
         end
@@ -4307,6 +4556,7 @@ function snd.commands.gotoTarget()
             snd.nav.quickWhere.processed = true
             snd.nav.quickWhere.pendingMatches = {}
             snd.nav.quickWhere.scope = (snd.targets.current and snd.targets.current.activity) or "unknown"
+            snd.commands.beginQuickWhereRoomPass(snd.nav.quickWhere, "mapped-db-room-list")
             persistQuickWhereScope(snd.nav.quickWhere.scope)
             if snd.targets.current then
                 snd.nav.quickWhere.targetKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(snd.targets.current)
@@ -4497,6 +4747,37 @@ function snd.commands.xset(args)
             snd.utils.infoNote("Next action: " .. snd.config.nxAction)
         else
             snd.utils.infoNote("Usage: xset nxaction <smartscan|qs|none>")
+            return
+        end
+
+    elseif setting == "smartnx" then
+        if not normalized or normalized == "" then
+            snd.utils.infoNote("Smart NX: " .. (snd.config.smartNx == true and "ON" or "OFF"))
+        elseif normalized == "on" or normalized == "true" or normalized == "1" then
+            snd.config.smartNx = true
+            local nxAction = snd.normalizeNxAction and snd.normalizeNxAction(snd.config.nxAction)
+                or tostring(snd.config.nxAction or ""):lower()
+            if nxAction ~= "smartscan" then
+                snd.config.nxAction = "smartscan"
+                snd.utils.infoNote("Next action: smartscan (enabled by Smart NX)")
+            end
+            snd.utils.infoNote("Smart NX: ON")
+        elseif normalized == "off" or normalized == "false" or normalized == "0" then
+            snd.config.smartNx = false
+            if snd.nav then
+                snd.nav.smartNxDetour = nil
+            end
+            if snd.scan then
+                if type(snd.scan.resetSmartNxPass) == "function" then
+                    snd.scan.resetSmartNxPass("disabled")
+                else
+                    snd.scan.smartNxSession = nil
+                    snd.scan.smartNxSuggestion = nil
+                end
+            end
+            snd.utils.infoNote("Smart NX: OFF")
+        else
+            snd.utils.infoNote("Usage: xset smartnx <on|off>")
             return
         end
         
@@ -5066,7 +5347,8 @@ function snd.commands.showConfigHelp()
     emitPlainHelpRow("silent <on|off>", "Hide regular [S&D] info notes. Error notes still show.")
     emitPlainHelpRow("speed <run|walk>", "Default travel mode for nx/go. run=xrt (portal-aware), walk=walkto (no portals)")
     emitPlainHelpRow("areaguard <on|off>", "Avoid areas more than 30 levels above you. Clan rooms are locally exempt; later rooms are checked normally. Default: off.")
-	emitPlainHelpRow("nxaction <smartscan|qs|none>", "default=qs; qs runs an unfiltered scan; smartscan scans the selected current-area target; none does nothing on arrival")
+    emitPlainHelpRow("nxaction <smartscan|qs|none>", "default=smartscan; qs runs an unfiltered scan; smartscan scans the selected current-area target; none does nothing on arrival")
+    emitPlainHelpRow("smartnx <on|off>", "Use exact positive scan matches as the next nx destination; enabling it also selects nxaction smartscan. Default: on.")
     emitPlainHelpRow("express <on|off>", "Prefer known fixed-room targets")
     emitPlainHelpRow("expressmin <number>", "Min kills before express applies")
     emitPlainHelpRow("autocheck <on|smart|off>", "Post-kill CP/GQ recheck mode")
@@ -5175,6 +5457,7 @@ function snd.commands.showConfig()
         snd.config.areaGuard and snd.config.areaGuard.enabled and "ON" or "OFF",
         tonumber(snd.config.areaGuard and snd.config.areaGuard.allowance) or 30))
     cecho(string.format("  <cyan>nxaction<reset>    %s\n", snd.config.nxAction))
+    cecho(string.format("  <cyan>smartnx<reset>     %s\n", snd.config.smartNx == true and "ON" or "OFF"))
     cecho(string.format("  <cyan>xcpmode<reset>     %s\n", normalizeXcpActionMode(snd.config.xcpActionMode or "qw")))
     cecho(string.format("  <cyan>express<reset>     %s\n", snd.config.express.enabled and "ON" or "OFF"))
     cecho(string.format("  <cyan>expressmin<reset>  %d\n", snd.config.express.minKillCount))
@@ -5538,6 +5821,7 @@ function snd.commands.selectQuestTarget(options)
                 snd.nav.quickWhere.pendingMatches = {}
                 snd.nav.quickWhere.scope = "quest"
                 snd.nav.quickWhere.targetKey = snd.commands.buildQuickWhereTargetKeyFromCurrent(snd.targets.current)
+                snd.commands.beginQuickWhereRoomPass(snd.nav.quickWhere, "quest-room-list")
                 persistQuickWhereScope("quest")
             end
             setScopedCurrent("quest", snd.targets.current)
@@ -6326,4 +6610,3 @@ function snd.commands.channel(args)
     snd.saveState()
     snd.utils.infoNote("S&D report channel set to: " .. args)
 end
-

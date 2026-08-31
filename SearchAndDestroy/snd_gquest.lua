@@ -389,24 +389,34 @@ end
 
 function snd.gq.updateTargetStatus()
     local consumedChecks = {}
-    for _, target in ipairs(snd.targets.list) do
-        if target.activity == "gq" then
-            local found = false
-            for idx, check in ipairs(snd.gquest.checkList) do
-                if not consumedChecks[idx]
-                    and target.mob == check.mob
-                    and ((target.loc or "") == (check.loc or "") or (check.loc or "") == "" or (target.loc or "") == "") then
-                    found = true
-                    consumedChecks[idx] = true
-                    target.remaining = check.remaining
-                    target.dead = check.remaining == 0 or check.dead
-                    break
-                end
+    for _, target in ipairs(snd.gquest.targets or {}) do
+        local found = false
+        for idx, check in ipairs(snd.gquest.checkList or {}) do
+            if not consumedChecks[idx]
+                and target.mob == check.mob
+                and ((target.loc or "") == (check.loc or "")
+                    or (check.loc or "") == "" or (target.loc or "") == "")
+            then
+                found = true
+                consumedChecks[idx] = true
+                target.remaining = tonumber(check.remaining) or 0
+                target.dead = target.remaining == 0 or check.dead == true
+                break
             end
-            
-            if not found then
-                target.remaining = 0
-                target.dead = true
+        end
+        if not found then
+            target.remaining = 0
+            target.dead = true
+        end
+    end
+
+    for _, entry in ipairs((snd.targets and snd.targets.list) or {}) do
+        if entry.activity == "gq" then
+            local canonical = snd.gquest.targets
+                and snd.gquest.targets[tonumber(entry.sourceIndex)] or nil
+            if canonical then
+                entry.remaining = tonumber(canonical.remaining) or 0
+                entry.dead = canonical.dead == true or entry.remaining == 0
             end
         end
     end
@@ -468,64 +478,154 @@ function snd.gq.onStarted(gqId, minLvl, maxLvl)
     end
 end
 
+local function gqKillEvidence()
+    if snd.conwin and type(snd.conwin.getActivityKillEvidence) == "function" then
+        local evidence = snd.conwin.getActivityKillEvidence("gq", 3)
+        if type(evidence) == "table" then return evidence end
+    end
+
+    -- Compatibility for ConWin versions that predate activity evidence.
+    if snd.conwin and type(snd.conwin.getRecentKilledMobName) == "function" then
+        local name = snd.conwin.getRecentKilledMobName(3) or ""
+        if name ~= "" then
+            return {status = "resolved", name = name, source = "legacy-death", keys = {}}
+        end
+    end
+    if snd.conwin and type(snd.conwin.getCurrentCombatMobName) == "function" then
+        local name = snd.conwin.getCurrentCombatMobName() or ""
+        if name ~= "" then
+            return {status = "resolved", name = name, source = "legacy-combat", keys = {}}
+        end
+    end
+    return {status = "none", source = "none", keys = {}}
+end
+
+local function consumeGqKillEvidence(evidence)
+    if snd.conwin and type(snd.conwin.consumeActivityKillEvidence) == "function" then
+        snd.conwin.consumeActivityKillEvidence("gq", evidence)
+    elseif evidence and evidence.source == "legacy-death"
+        and snd.conwin and type(snd.conwin.clearRecentKilledMobName) == "function"
+    then
+        snd.conwin.clearRecentKilledMobName()
+    end
+end
+
+local function currentGqSelectionIndex()
+    local selection = snd.targets and snd.targets.current
+    if type(selection) ~= "table" or selection.activity ~= "gq" then return nil end
+    if tonumber(selection.sourceIndex) then return tonumber(selection.sourceIndex) end
+    if snd.commands and type(snd.commands.findTargetSelectionEntry) == "function" then
+        local entry = snd.commands.findTargetSelectionEntry(selection, snd.targets.list or {})
+        if entry and entry.activity == "gq" then return tonumber(entry.sourceIndex) end
+    end
+    for _, entry in ipairs((snd.targets and snd.targets.list) or {}) do
+        if entry.activity == "gq"
+            and snd.utils.mobIdentityMatches(entry.mob, selection.name or selection.mob)
+        then
+            return tonumber(entry.sourceIndex)
+        end
+    end
+    return nil
+end
+
+local function findGqKillEntry(name, preferredSourceIndex)
+    local candidates = {}
+    for _, entry in ipairs((snd.targets and snd.targets.list) or {}) do
+        if entry.activity == "gq" and not entry.dead
+            and (entry.remaining == nil or tonumber(entry.remaining) ~= 0)
+            and snd.utils.mobIdentityMatches(entry.mob, name)
+        then
+            candidates[#candidates + 1] = entry
+        end
+    end
+    if preferredSourceIndex then
+        for _, entry in ipairs(candidates) do
+            if tonumber(entry.sourceIndex) == tonumber(preferredSourceIndex) then return entry end
+        end
+    end
+
+    local room = snd.room and snd.room.current or {}
+    local roomId = tostring(room.rmid or room.id or "")
+    local roomName = tostring(room.name or ""):lower()
+    local area = tostring(room.arid or ""):lower()
+    for _, entry in ipairs(candidates) do
+        local sameRoomId = roomId ~= "" and entry.rmid ~= nil and tostring(entry.rmid) == roomId
+        local entryRoomName = tostring(entry.roomName or ""):lower()
+        local entryArea = tostring(entry.arid or ""):lower()
+        local sameNamedRoom = roomName ~= "" and entryRoomName == roomName
+            and (area == "" or entryArea == "" or entryArea == area)
+        if sameRoomId or sameNamedRoom then return entry end
+    end
+    if area ~= "" then
+        for _, entry in ipairs(candidates) do
+            if tostring(entry.arid or ""):lower() == area then return entry end
+        end
+    end
+    return candidates[1]
+end
+
 function snd.gq.onMobKilled()
     snd.utils.debugNote("Global quest mob killed!")
-    local confirmedKilledMob = ""
-    if snd.conwin and snd.conwin.getRecentKilledMobName then
-        confirmedKilledMob = snd.conwin.getRecentKilledMobName(3) or ""
-        if confirmedKilledMob ~= "" and snd.conwin.clearRecentKilledMobName then
-            snd.conwin.clearRecentKilledMobName()
-        end
+    local evidence = gqKillEvidence()
+    local evidenceStatus = tostring(evidence.status or "none")
+    local selectedSourceIndex = currentGqSelectionIndex()
+    local killedName = ""
+    local preferredSourceIndex = nil
+    if evidenceStatus == "resolved" then
+        killedName = tostring(evidence.name or "")
+    elseif evidenceStatus == "none"
+        and snd.targets.current and snd.targets.current.activity == "gq"
+    then
+        -- The selected target is only a fallback when ConWin observed no identity.
+        killedName = tostring(snd.targets.current.name or snd.targets.current.mob or "")
+        preferredSourceIndex = selectedSourceIndex
     end
 
-    -- Text may arrive before GMCP clears; ConWin can still identify the live enemy.
-    local activeCombatMob = ""
-    if confirmedKilledMob == "" and snd.conwin and snd.conwin.getCurrentCombatMobName then
-        activeCombatMob = snd.conwin.getCurrentCombatMobName() or ""
-    end
-
-    if snd.targets.current and snd.targets.current.activity == "gq" then
-        local roomId = snd.room and snd.room.current and snd.room.current.id or nil
-        local killedMobName = confirmedKilledMob ~= "" and confirmedKilledMob or snd.targets.current.name or ""
-        if type(raiseEvent) == "function" then
-            raiseEvent("snd.kill.confirmed", killedMobName, roomId)
-        end
-        local bestIndex, bestScore = nil, -1
-        local currentArea = snd.room and snd.room.current and tostring(snd.room.current.arid or "") or ""
-        local currentRoom = snd.room and snd.room.current and tostring(snd.room.current.name or "") or ""
-        for i, t in ipairs(snd.targets.list) do
-            if t.activity == "gq" and not t.dead then
-                -- ConWin lowercases names; GQ may preserve proper-name casing.
-                local nameMatchesCurrent = snd.utils.mobIdentityMatches(t.mob, snd.targets.current.name)
-                local nameMatchesConfirmedKill = snd.utils.mobIdentityMatches(t.mob, confirmedKilledMob)
-                local nameMatchesActiveCombat = snd.utils.mobIdentityMatches(t.mob, activeCombatMob)
-                if nameMatchesCurrent or nameMatchesConfirmedKill or nameMatchesActiveCombat then
-                    local score = 5
-                    if nameMatchesConfirmedKill then score = score + 8 end
-                    if nameMatchesActiveCombat then score = score + 4 end
-                    if t.arid and currentArea ~= "" and tostring(t.arid) == currentArea then score = score + 3 end
-                    if t.roomName and currentRoom ~= "" and tostring(t.roomName) == currentRoom then score = score + 2 end
-                    if snd.targets.current.index and t.index and tonumber(snd.targets.current.index) == tonumber(t.index) then
-                        score = score + 1
-                    end
-                    if score > bestScore then
-                        bestScore = score
-                        bestIndex = i
-                    end
-                end
-            end
-        end
-        if bestIndex and snd.targets.list[bestIndex] then
-            local t = snd.targets.list[bestIndex]
-            t.remaining = math.max(0, (t.remaining or 1) - 1)
-            if t.remaining == 0 then
-                t.dead = true
-                if t.mob == snd.targets.current.name then
-                    snd.clearTarget({refresh = false})
-                end
+    local killedEntry = killedName ~= "" and findGqKillEntry(killedName, preferredSourceIndex) or nil
+    local killedSourceIndex = killedEntry and tonumber(killedEntry.sourceIndex) or nil
+    local canonical = killedSourceIndex and snd.gquest.targets
+        and snd.gquest.targets[killedSourceIndex] or nil
+    if killedEntry and not canonical then
+        for i, target in ipairs(snd.gquest.targets or {}) do
+            local remaining = tonumber(target.remaining) or tonumber(target.qty) or 1
+            if remaining > 0 and snd.utils.mobIdentityMatches(target.mob, killedEntry.mob) then
+                canonical = target
+                killedSourceIndex = i
+                break
             end
         end
     end
+
+    local markedTargetKilled = false
+    if canonical then
+        local remaining = tonumber(canonical.remaining) or tonumber(canonical.qty) or 1
+        if remaining > 0 then
+            canonical.remaining = math.max(0, remaining - 1)
+            canonical.dead = canonical.remaining == 0
+            markedTargetKilled = true
+            for _, entry in ipairs((snd.targets and snd.targets.list) or {}) do
+                if entry.activity == "gq"
+                    and tonumber(entry.sourceIndex) == tonumber(killedSourceIndex)
+                then
+                    entry.remaining = canonical.remaining
+                    entry.dead = canonical.dead
+                end
+            end
+
+            local killedWasSelected = selectedSourceIndex ~= nil
+                and tonumber(selectedSourceIndex) == tonumber(killedSourceIndex)
+            if killedWasSelected and canonical.dead
+                and snd.targets.current and snd.targets.current.activity == "gq"
+            then
+                snd.clearTarget({refresh = false})
+            end
+            if type(raiseEvent) == "function" then
+                local roomId = snd.room and snd.room.current and snd.room.current.id or nil
+                raiseEvent("snd.kill.confirmed", canonical.mob or killedName, roomId)
+            end
+        end
+    end
+    consumeGqKillEvidence(evidence)
 
     if snd.sortTargetsByPriority then
         snd.sortTargetsByPriority({
@@ -533,9 +633,15 @@ function snd.gq.onMobKilled()
             reason = "gq_kill",
         })
     end
-    
-    if not snd.shouldAutoCheckAfterKill or snd.shouldAutoCheckAfterKill("gq") then
-        tempTimer(0.5, function()
+
+    local forceCheck = not markedTargetKilled
+    if forceCheck then
+        snd.utils.debugNote(
+            "GQ kill evidence '" .. evidenceStatus .. "' marked no GQ target; forcing gq check"
+        )
+    end
+    if forceCheck or not snd.shouldAutoCheckAfterKill or snd.shouldAutoCheckAfterKill("gq") then
+        tempTimer(forceCheck and 0.1 or 0.5, function()
             send("gq check", false)
         end)
     end

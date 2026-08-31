@@ -727,6 +727,74 @@
             </Trigger>
         </TriggerGroup>
         
+        <!-- Tagged scan output used by optional Smart NX routing. -->
+        <TriggerGroup isActive="yes" isFolder="yes" name="SND_Scan">
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>snd_scan_start</name>
+                <script>if snd and snd.triggers and snd.triggers.scanStart then snd.triggers.scanStart() end</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^\{scan\}$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>snd_scan_end</name>
+                <script>if snd and snd.triggers and snd.triggers.scanEnd then snd.triggers.scanEnd() end</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^\{/scan\}$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>snd_scan_current_location</name>
+                <script>if snd and snd.triggers and snd.triggers.scanCurrentLocation then snd.triggers.scanCurrentLocation() end</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^Right here you see:$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>snd_scan_nearby_location</name>
+                <script>if snd and snd.triggers and snd.triggers.scanNearbyLocation then snd.triggers.scanNearbyLocation(matches) end</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^(?:(\d+)\s+)?(North|East|South|West|Up|Down) from here you see:$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>snd_scan_mob</name>
+                <script>if snd and snd.triggers and snd.triggers.scanLine then snd.triggers.scanLine(matches) end</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^\s*-\s*(.+?)\s*$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+        </TriggerGroup>
+
         <!-- Hunt Triggers -->
         <TriggerGroup isActive="no" isFolder="yes" name="SND_Hunt">
             <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
@@ -825,7 +893,7 @@ local modules = {
 
 local triggerGroups = {
     "SND_Campaign", "SND_Noexp", "SND_GQuest", "SND_Quest",
-    "SND_QuickWhere", "SND_Hunt", "SND_Dinv",
+    "SND_QuickWhere", "SND_Scan", "SND_Hunt", "SND_Dinv",
 }
 
 local function setSndTriggers(enabled)
@@ -1197,7 +1265,7 @@ snd.commands.xcmd(matches[2])
 
 local triggerGroups = {
     "SND_Campaign", "SND_Noexp", "SND_GQuest", "SND_Quest",
-    "SND_QuickWhere", "SND_Hunt", "SND_Dinv",
+    "SND_QuickWhere", "SND_Scan", "SND_Hunt", "SND_Dinv",
 }
 
 local function setSndTriggers(enabled)

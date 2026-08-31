@@ -1445,7 +1445,40 @@ function snd.triggers.cpInfoRewardPrac(matches)
 end
 
 
+function snd.triggers.scanStart()
+    snd.triggers.gagCurrentLine()
+    if snd.scan and type(snd.scan.beginSmartNxScan) == "function" then
+        snd.scan.beginSmartNxScan()
+    end
+end
+
+function snd.triggers.scanEnd()
+    -- Delete the boundary before finishSmartNxScan emits its result note, so
+    -- the note itself can never become the line selected for deletion.
+    snd.triggers.gagCurrentLine()
+    if snd.scan and type(snd.scan.finishSmartNxScan) == "function" then
+        snd.scan.finishSmartNxScan()
+    end
+end
+
+function snd.triggers.scanCurrentLocation()
+    if snd.scan and type(snd.scan.setSmartNxCurrentLocation) == "function" then
+        snd.scan.setSmartNxCurrentLocation()
+    end
+end
+
+function snd.triggers.scanNearbyLocation(matches)
+    if not (matches and matches[3]) then return end
+    if snd.scan and type(snd.scan.setSmartNxNearbyLocation) == "function" then
+        snd.scan.setSmartNxNearbyLocation(matches[2], matches[3])
+    end
+end
+
 function snd.triggers.scanLine(matches)
+    if not (matches and matches[2]) then return end
+    if snd.scan and type(snd.scan.recordSmartNxMob) == "function" then
+        snd.scan.recordSmartNxMob(matches[2])
+    end
 end
 
 function snd.triggers.considerLine(matches)
@@ -1608,4 +1641,3 @@ function snd.triggers.createGqInfoEndTrigger()
         snd.gq.parsing.infoEndTimer = nil
     end)
 end
-

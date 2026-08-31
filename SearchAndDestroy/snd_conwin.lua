@@ -48,6 +48,7 @@ CW.combatRefreshQueued = CW.combatRefreshQueued == true
 CW.COMBAT_END_DELAY = 0.20
 CW.ATTACK_INTENT_TTL = 2.0
 CW.ESCAPE_INTENT_TTL = 2.0
+CW.DAMAGE_OBSERVATION_TTL = 3
 CW.SAME_NAME_RESET_MIN_JUMP = 20
 CW.SAME_NAME_RESET_MAX_LOW = 50
 -- Combat observations are session-local; reload invalidates event ordering.
@@ -58,6 +59,9 @@ CW.lastKilledMobName = ""
 CW.lastKilledAt = 0
 CW.pendingAttackIntent = nil
 CW.pendingEscapeIntent = nil
+CW.damageObservationSerial = tonumber(CW.damageObservationSerial) or 0
+CW.damageBurst = nil
+CW.consumedKillEvidence = {cp = {}, gq = {}, quest = {}}
 CW.combat = CW.combat or {}
 if CW.combat.pendingEndTimer and type(killTimer) == "function" then
     pcall(killTimer, CW.combat.pendingEndTimer)
@@ -351,6 +355,13 @@ function CW.resolveCurrentRoomTargetForNxAction()
                 snd.scan.cancelPendingNxAction(nil, "target-found")
             end
         elseif snd and snd.scan and snd.scan.runPendingNxAction then
+            local evidence = snd.roomChars and snd.roomChars.questTargetEvidence or nil
+            if type(evidence) == "table" and evidence.complete == true
+                and tostring(evidence.roomId or "") == currentRoomId()
+                and type(snd.scan.rejectSmartNxQuestRoom) == "function"
+            then
+                snd.scan.rejectSmartNxQuestRoom(currentRoomId(), "complete-roomchars-without-quest-target")
+            end
             snd.scan.runPendingNxAction(CW.lastRoomId, "target-not-found")
         end
     elseif pendingAction ~= "" and snd and snd.scan and snd.scan.runPendingNxAction then
@@ -869,6 +880,338 @@ local function activityTargetIsLive(target)
     return true
 end
 
+local function observationIsFresh(observedAt, maxAgeSeconds)
+    local stamp = tonumber(observedAt)
+    if not stamp then return false end
+    local age = os.time() - stamp
+    return age >= 0 and age <= (tonumber(maxAgeSeconds) or CW.DAMAGE_OBSERVATION_TTL)
+end
+
+local function addDamageCandidate(candidates, name, rowId, source)
+    local normalized = normalizeMobName(name)
+    if normalized == "" then return end
+    local candidate = candidates[normalized]
+    if not candidate then
+        candidate = {
+            name = trim(name),
+            normalized = normalized,
+            rowIds = {},
+            sources = {},
+        }
+        candidates[normalized] = candidate
+    end
+    if rowId ~= nil then
+        candidate.rowIds[tostring(rowId)] = rowId
+    end
+    candidate.sources[tostring(source or "unknown")] = true
+end
+
+local function currentDamageCandidates()
+    local candidates = {}
+    local activeEnemy = CW.getActiveEnemyName and CW.getActiveEnemyName() or ""
+    addDamageCandidate(candidates, activeEnemy, CW.currentEnemyMobId, "gmcp")
+
+    for _, mob in ipairs(CW.mobs or {}) do
+        if not mob.dead then
+            addDamageCandidate(candidates, mob.name, mob.id, "conwin")
+        end
+    end
+
+    for _, target in ipairs((snd.targets and snd.targets.list) or {}) do
+        if activityTargetIsLive(target) then
+            addDamageCandidate(
+                candidates,
+                target.mob or target.name or target.matchedMobName,
+                nil,
+                tostring(target.activity or "target")
+            )
+        end
+    end
+    return candidates
+end
+
+local function damageBodyWithoutFraming(line)
+    local text = tostring(line or "")
+    if snd.utils and type(snd.utils.stripColors) == "function" then
+        text = snd.utils.stripColors(text)
+    end
+    text = trim(text)
+    text = text:gsub("^%[%d+%]%s+", "")
+    local body = text:match("^(.-)%s+%[[^%]]+%]%s*$")
+    if body then text = body end
+    text = trim(text)
+    -- Combat punctuation is appended after the mob name and can be emphatic.
+    text = text:gsub("[!%.%?]+%s*$", "")
+    return normalizeMobName(text)
+end
+
+local function damageVictimForLine(line)
+    local body = damageBodyWithoutFraming(line)
+    if body == "" then return nil end
+
+    local best = nil
+    for _, candidate in pairs(currentDamageCandidates()) do
+        local name = candidate.normalized
+        local startAt = #body - #name + 1
+        local boundaryOk = startAt == 1
+            or (startAt > 1 and body:sub(startAt - 1, startAt - 1):match("%s") ~= nil)
+        if startAt >= 1 and boundaryOk and body:sub(startAt) == name
+            and (not best or #name > #best.normalized)
+        then
+            best = candidate
+        end
+    end
+    return best
+end
+
+function CW.observeDamageLine(line)
+    local candidate = damageVictimForLine(line)
+    if not candidate then return nil end
+
+    local roomId = currentRoomId()
+    local now = os.time()
+    local burst = CW.damageBurst
+    if type(burst) ~= "table"
+        or tostring(burst.roomId or "") ~= tostring(roomId or "")
+        or not observationIsFresh(burst.lastObservedAt, CW.DAMAGE_OBSERVATION_TTL)
+    then
+        burst = {
+            roomId = roomId,
+            startedAt = now,
+            lastObservedAt = now,
+            victims = {},
+            order = {},
+        }
+        CW.damageBurst = burst
+    end
+
+    CW.damageObservationSerial = (tonumber(CW.damageObservationSerial) or 0) + 1
+    local victim = burst.victims[candidate.normalized]
+    if not victim then
+        victim = {
+            name = candidate.name,
+            normalized = candidate.normalized,
+            rowIds = {},
+            firstSerial = CW.damageObservationSerial,
+        }
+        burst.victims[candidate.normalized] = victim
+        burst.order[#burst.order + 1] = candidate.normalized
+    end
+    for key, rowId in pairs(candidate.rowIds or {}) do
+        victim.rowIds[key] = rowId
+    end
+
+    local activeEnemy = normalizeMobName(CW.getActiveEnemyName and CW.getActiveEnemyName() or "")
+    victim.name = candidate.name
+    victim.lastSerial = CW.damageObservationSerial
+    victim.observedAt = now
+    victim.gmcpName = activeEnemy
+    victim.gmcpVerified = victim.gmcpVerified == true
+        or (activeEnemy ~= "" and activeEnemy == candidate.normalized)
+    burst.lastObservedAt = now
+    return victim
+end
+
+local function liveActivityTargetNames(activity)
+    local names = {}
+    local wanted = tostring(activity or ""):lower()
+    for _, target in ipairs((snd.targets and snd.targets.list) or {}) do
+        if tostring(target.activity or ""):lower() == wanted and activityTargetIsLive(target) then
+            local name = target.mob or target.name or target.matchedMobName or ""
+            local normalized = normalizeMobName(name)
+            if normalized ~= "" then
+                names[normalized] = names[normalized] or {name = trim(name), entries = {}}
+                names[normalized].entries[#names[normalized].entries + 1] = target
+            end
+        end
+    end
+    return names
+end
+
+local function killEvidenceWasConsumed(activity, key)
+    if not key or key == "" then return false end
+    local consumed = CW.consumedKillEvidence[tostring(activity or ""):lower()]
+    return type(consumed) == "table" and consumed[key] == true
+end
+
+local function appendEvidenceKey(keys, seen, key)
+    if key and key ~= "" and not seen[key] then
+        seen[key] = true
+        keys[#keys + 1] = key
+    end
+end
+
+local function sortedEvidenceNames(names)
+    local result = {}
+    for normalized, value in pairs(names or {}) do
+        result[#result + 1] = value.name or normalized
+    end
+    table.sort(result)
+    return result
+end
+
+function CW.consumeActivityKillEvidence(activity, evidence)
+    if type(evidence) ~= "table" then return end
+    local key = tostring(activity or ""):lower()
+    CW.consumedKillEvidence[key] = CW.consumedKillEvidence[key] or {}
+    for _, evidenceKey in ipairs(evidence.keys or {}) do
+        CW.consumedKillEvidence[key][evidenceKey] = true
+    end
+end
+
+function CW.getActivityKillEvidence(activity, maxAgeSeconds)
+    local wanted = tostring(activity or ""):lower()
+    local ttl = tonumber(maxAgeSeconds) or CW.DAMAGE_OBSERVATION_TTL
+    local roomId = currentRoomId()
+    local liveNames = liveActivityTargetNames(wanted)
+    local observedNames = {}
+    local observedKeys = {}
+    local observedKeySet = {}
+
+    local function noteObserved(name, evidenceKey)
+        local normalized = normalizeMobName(name)
+        if normalized ~= "" then
+            observedNames[normalized] = observedNames[normalized] or {name = trim(name)}
+        end
+        appendEvidenceKey(observedKeys, observedKeySet, evidenceKey)
+        return normalized
+    end
+
+    -- A completed death transition is the strongest evidence. Select the
+    -- newest event, not an older event that merely happens to match this list.
+    local newestDeath = nil
+    for i = #CW.deathEvents, 1, -1 do
+        local event = CW.deathEvents[i]
+        if observationIsFresh(event.at, ttl)
+            and tostring(event.roomId or "") == tostring(roomId or "")
+        then
+            newestDeath = {event = event, index = i}
+            break
+        end
+    end
+    if newestDeath then
+        local event = newestDeath.event
+        local key = "death:" .. tostring(event.serial or newestDeath.index)
+        if not killEvidenceWasConsumed(wanted, key) then
+            local normalized = noteObserved(event.name, key)
+            if liveNames[normalized] then
+                return {
+                    status = "resolved",
+                    name = liveNames[normalized].name,
+                    source = "death-event",
+                    keys = {key},
+                }
+            end
+            return {
+                status = "unmatched",
+                names = sortedEvidenceNames(observedNames),
+                source = "death-event-non-target",
+                keys = {key},
+            }
+        end
+    end
+
+    local candidates = {}
+    local function addEvidenceCandidate(name, source, evidenceKey, verified)
+        local normalized = noteObserved(name, evidenceKey)
+        if normalized == "" then return end
+        if not liveNames[normalized] or killEvidenceWasConsumed(wanted, evidenceKey) then return end
+        local candidate = candidates[normalized]
+        if not candidate then
+            candidate = {
+                name = liveNames[normalized].name,
+                normalized = normalized,
+                sources = {},
+                keys = {},
+                keySet = {},
+                gmcpVerified = false,
+            }
+            candidates[normalized] = candidate
+        end
+        candidate.sources[source] = true
+        candidate.gmcpVerified = candidate.gmcpVerified or verified == true
+        appendEvidenceKey(candidate.keys, candidate.keySet, evidenceKey)
+    end
+
+    local burst = CW.damageBurst
+    if type(burst) == "table"
+        and tostring(burst.roomId or "") == tostring(roomId or "")
+        and observationIsFresh(burst.lastObservedAt, ttl)
+    then
+        for _, normalized in ipairs(burst.order or {}) do
+            local victim = burst.victims and burst.victims[normalized]
+            if victim and observationIsFresh(victim.observedAt, ttl) then
+                addEvidenceCandidate(
+                    victim.name,
+                    "damage-burst",
+                    "damage:" .. tostring(victim.lastSerial or victim.firstSerial or normalized),
+                    victim.gmcpVerified
+                )
+            end
+        end
+    end
+
+    local activeName = CW.getCurrentCombatMobName and CW.getCurrentCombatMobName() or ""
+    local activeNormalized = normalizeMobName(activeName)
+    if activeNormalized ~= "" then
+        addEvidenceCandidate(
+            activeName,
+            "active-combat",
+            "combat:" .. tostring(CW.combat and CW.combat.generation or 0) .. ":" .. activeNormalized,
+            true
+        )
+    end
+
+    local candidateCount = 0
+    local onlyCandidate = nil
+    for _, candidate in pairs(candidates) do
+        candidateCount = candidateCount + 1
+        onlyCandidate = candidate
+    end
+    if candidateCount == 1 and onlyCandidate then
+        return {
+            status = "resolved",
+            name = onlyCandidate.name,
+            source = onlyCandidate.gmcpVerified and "gmcp-verified-damage" or "damage-or-combat",
+            keys = onlyCandidate.keys,
+        }
+    elseif candidateCount > 1 then
+        return {
+            status = "ambiguous",
+            names = sortedEvidenceNames(candidates),
+            source = "damage-burst-conflict",
+            keys = observedKeys,
+        }
+    end
+
+    local intent = CW.pendingAttackIntent
+    if type(intent) == "table"
+        and tostring(intent.roomId or "") == tostring(roomId or "")
+        and observationIsFresh(intent.createdWallAt, math.max(ttl, CW.ATTACK_INTENT_TTL))
+    then
+        local intentKey = "attack:" .. tostring(intent.serial or 0)
+        local intentNormalized = noteObserved(intent.name, intentKey)
+        if liveNames[intentNormalized] and not killEvidenceWasConsumed(wanted, intentKey) then
+            return {
+                status = "resolved",
+                name = liveNames[intentNormalized].name,
+                source = "attack-intent",
+                keys = {intentKey},
+            }
+        end
+    end
+
+    if next(observedNames) ~= nil then
+        return {
+            status = "unmatched",
+            names = sortedEvidenceNames(observedNames),
+            source = "observed-non-target",
+            keys = observedKeys,
+        }
+    end
+    return {status = "none", names = {}, source = "none", keys = {}}
+end
+
 function CW.activityMarkersForMob(name, mob)
     local markers = {}
     local needle = trim(name)
@@ -1045,11 +1388,14 @@ function CW.noteAttackIntent(mob, source)
     if type(mob) ~= "table" then return nil end
     local name = normalizeMobName(mob.name)
     if name == "" then return nil end
+    CW.attackIntentSerial = (tonumber(CW.attackIntentSerial) or 0) + 1
     CW.pendingAttackIntent = {
+        serial = CW.attackIntentSerial,
         rowId = mob.id,
         name = name,
         roomId = currentRoomId(),
         createdAt = os.clock(),
+        createdWallAt = os.time(),
         source = tostring(source or "attack"),
     }
     return CW.pendingAttackIntent
@@ -1799,6 +2145,7 @@ function CW.onRoomInfo()
     end
 
     if moved then
+        CW.damageBurst = nil
         CW.latestRoomId = roomId
         CW.onTravelStarted("room-changed")
         -- Debounce Room.Info bursts; callback still requires idle GMCP and mapper.
@@ -1915,7 +2262,7 @@ function CW.getRecentKilledMobName(maxAgeSeconds)
             table.remove(CW.deathEvents, i)
         end
     end
-    local event = CW.deathEvents[1]
+    local event = CW.deathEvents[#CW.deathEvents]
     if event then
         CW.lastReturnedDeathSerial = event.serial
         return trim(event.name or "")
@@ -2132,6 +2479,12 @@ function CW.install()
     end)
     CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^You see no one here but yourself!$", "snd.conwin.onEmptyConsiderResult")
     CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^Not while you are fighting!$", "snd.conwin.onConsiderRejected")
+    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger(
+        [=[^\s*\[\d+\]\s+(.+?)\s+\[[^\]]+\]\s*$]=],
+        function()
+            CW.observeDamageLine(matches[2] or matches[1] or "")
+        end
+    )
 
     for _, id in ipairs(CW.ids.events) do pcall(killAnonymousEventHandler, id) end
     CW.ids.events = {}

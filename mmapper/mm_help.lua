@@ -241,7 +241,13 @@ mm.help_table = {
       { cmd = "mapper areas", desc = "Show a list of all mapped areas" },
       { cmd = "mapper areas <name>", desc = "Show a list of mapped areas partially matching <name>" },
       { cmd = "mapper unmapped", desc = "List unmapped exit counts for known areas" },
-      { cmd = "mapper unmapped <here/area>", desc = "List unmapped exits in this or another area" },
+      { cmd = "mapper unmapped <here/area>", desc = "List indexed, directly explorable cardinal exits in this or another area" },
+      { cmd = "mapper explore <index>", desc = "Walk without portals to that indexed source room and prepare its unmapped exit" },
+      { cmd = "mapper explore next [direction]", desc = "Take one prepared cardinal exit; a direction selects between multiple exits" },
+      { cmd = "mapper explore status", desc = "Show the current Explore state" },
+      { cmd = "mapper explore stop", desc = "Stop Explore without cancelling unrelated movement" },
+      { cmd = "mapper explore window <on|off|toggle>", desc = "Enable, disable, or toggle the compact Explore controller" },
+      { cmd = "mapper explore window fontsize <6-32>", desc = "Set the Explore controller font size (default 11)" },
     }
   },
   ['moving'] = {

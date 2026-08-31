@@ -23,6 +23,8 @@ local requiredFiles = {
   "mm_bookmark_window.lua",
   "mm_help.lua",
   "mm_minimap.lua",
+  "mm_explore.lua",
+  "mm_explore_window.lua",
   "mm_commands.lua",
   "mm_import.lua",
   "mm_gmcp.lua",

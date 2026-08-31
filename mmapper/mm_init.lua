@@ -79,6 +79,8 @@ load_module(base, "mm_bookmarks.lua")
 load_module(base, "mm_bookmark_window.lua")
 load_module(base, "mm_help.lua")
 load_module(base, "mm_minimap.lua")
+load_module(base, "mm_explore.lua")
+load_module(base, "mm_explore_window.lua")
 load_module(base, "mm_commands.lua")
 load_module(base, "mm_import.lua")
 load_module(base, "mm_gmcp.lua")
@@ -318,6 +320,8 @@ function mm.initialize()
     end
   end)
   safe_step("minimap.init", function() mm.minimap.init() end)
+  safe_step("explore.initialize", function() mm.explore.initialize() end)
+  safe_step("explore_window.initialize", function() mm.explore_window.initialize() end)
 
   if configured_mode == "native" then
     mm.schedule_native_mapper_load("native_startup")
