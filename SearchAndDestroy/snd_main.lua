@@ -1,7 +1,7 @@
 snd = snd or {}
 
 
-snd.version = "7.1.0"
+snd.version = "7.1.2"
 snd.schemaVersion = 7
 snd.fullVersion = "Search & Destroy v" .. snd.version
 

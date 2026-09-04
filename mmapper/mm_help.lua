@@ -4,6 +4,7 @@ mm.help_header = "GMCP Mapper Help"
 
 mm.help_index_rows = {
   { cmd = "mapper help", desc = "Show this list" },
+  { cmd = "mapper version", desc = "Show the currently loaded mapper build number" },
   { cmd = "mapper help all", desc = "Show the entire list of all mapper commands" },
   { cmd = "mapper help config", desc = "Commands for configuring the mapper" },
   { cmd = "mapper help exits", desc = "Commands for managing exits" },
@@ -81,6 +82,7 @@ mm.help_table = {
   ['utils'] = {
     header = "Utilities",
     rows = {
+      { cmd = "mapper version", desc = "Show the currently loaded mapper build number" },
       { cmd = "mapper backup", desc = "Create new archived backup of your map database in a db_backups directory, preserving a few prior backups" },
       { cmd = "mapper addnote", desc = "Append a new note line to the current room" },
       { cmd = "mapper addnote <note>", desc = "Append a new note line without using the dialog" },
@@ -91,13 +93,13 @@ mm.help_table = {
       { cmd = "mapper stats reset", desc = "Reset the session-only mapper stats counters" },
       { cmd = "mapper bigmap renderstats", desc = "Show measured local-render time and drawable reuse counters" },
       { cmd = "mapper bigmap renderstats reset", desc = "Reset local-render measurements for a fresh travel sample" },
-      { cmd = "mapper ui", desc = "Show mapper/S&D UI style status (links, hover, visited, chips)" },
-      { cmd = "mapper ui status", desc = "Print current mapper/S&D UI style toggles" },
-      { cmd = "mapper ui links on/off", desc = "Enable or disable clickable room links in quick-where style output" },
-      { cmd = "mapper ui hover on/off", desc = "Reserve toggle for hover styling behavior (OSC8 capable clients)" },
-      { cmd = "mapper ui visited on/off", desc = "Enable or disable visited-room styling in quick-where cycles" },
-      { cmd = "mapper ui chips on/off", desc = "Enable or disable compact status chips in mapper output headers" },
-      { cmd = "mapper ui reset", desc = "Reset mapper/S&D UI style toggles to defaults (all on)" },
+      { cmd = "mapper ui", desc = "Show optional search/QW text settings (links, chips); these do not change map windows or navigation" },
+      { cmd = "mapper ui status", desc = "Show links/chips settings; changes apply to newly printed output" },
+      { cmd = "mapper ui links [on/off]", desc = "Toggle clickable room entries in search/QW text, or explicitly turn them on/off" },
+      { cmd = "mapper ui hover", desc = "Unused legacy command: hover styling was never implemented and has no effect" },
+      { cmd = "mapper ui visited", desc = "Unused legacy command: visited-room styling was never implemented and has no effect" },
+      { cmd = "mapper ui chips [on/off]", desc = "Toggle the [QW] target heading above search results, or explicitly turn it on/off" },
+      { cmd = "mapper ui reset", desc = "Restore clickable room entries and the [QW] target heading (both on)" },
       { cmd = "mapper autostop [on|off]", desc = "Send the MUD command 'stop' when GMCP enters combat during active mapper navigation (default is on)" },
       { cmd = "mapper saferoom", desc = "Mark current room safe (appends 'safe' to rooms.info, preserving existing flags)" },
       { cmd = "mapper saferoom on/off", desc = "Toggle the safe flag on the current room" },
@@ -137,10 +139,10 @@ mm.help_table = {
   ['portals'] = {
     header = "Portal Actions",
     rows = {
-      { cmd = "mapper portals", desc = "List known hand-held portals; click/right-click a bracketed portal row to report it" },
-      { cmd = "mapper portalstats [count|all]", desc = "Show current portals ranked by used/tried, followed by unused portals in mapper order (default 20); click/right-click a portal ID to report it" },
+      { cmd = "mapper portals", desc = "List known hand-held portals; click/right-click a bracketed portal row to report or copy it" },
+      { cmd = "mapper portalstats [count|all]", desc = "Show current portals ranked by used/tried, followed by unused portals in mapper order (default 20); click/right-click a portal ID to report or copy it" },
       { cmd = "mapper portalstats unused [count|all]", desc = "Show only current portals that have never been attempted" },
-      { cmd = "mapper chaosstats [count|all]", desc = "Show the same statistics for current chaos portals only, including unused chaos portals (default 20)" },
+      { cmd = "mapper chaosstats [count|all]", desc = "Show the same statistics for current chaos portals only, including unused chaos portals (default 20); portal IDs can be reported or copied" },
       { cmd = "mapper chaosstats unused [count|all]", desc = "Show only current chaos portals that have never been attempted" },
       { cmd = "mapper portalstats recent [count]", desc = "Show the newest portal attempts with confirmation details (default 20, maximum 50)" },
       { cmd = "mapper rebuildportals", desc = "Rebuild portal list from exits with commands starting 'dinv portal use <id>'" },
@@ -230,6 +232,7 @@ mm.help_table = {
       { cmd = "mapper next", desc = "Visit the next room in the most recent list of results." },
       { cmd = "mapper next <index>", desc = "Ditto, but skip to the given result index." },
       { cmd = "mapper where <room id>", desc = "Show directions to a room number" },
+      { cmd = "mapper analyzelanding <room id>[,room id,...]", desc = "Analyze one or more portal landing rooms (e.g. 16600, 2199). Each landing shows its travel comparison and a table containing only other area starts made shorter by the new portal" },
       { cmd = "mapper guarded <room id>", desc = "Preview the xrt route with AreaGuard forced on; does not move you (alias: mapper areaguard)" },
     }
   },

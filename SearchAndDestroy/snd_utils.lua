@@ -700,7 +700,8 @@ end
 
 local function unwrapMobTargetQuotes(value)
     local text = snd.utils.trim(tostring(value or ""))
-    if #text >= 2 and text:sub(1, 1) == "'" and text:sub(-1) == "'" then
+    local quote = text:sub(1, 1)
+    if #text >= 2 and (quote == "'" or quote == '"') and text:sub(-1) == quote then
         return snd.utils.trim(text:sub(2, -2))
     end
     return text
@@ -836,6 +837,26 @@ end
 function snd.utils.isDefaultReportChannel(channel)
     channel = snd.utils.trim(channel or ""):lower()
     return channel == "" or channel == "default" or channel == "echo"
+end
+
+function snd.utils.copyReportText(payload)
+    local text = snd.utils.trim(tostring(payload or ""))
+    if text == "" then
+        return false
+    end
+    if type(setClipboardText) ~= "function" then
+        snd.utils.errorNote("Copying reports requires Mudlet 4.10 or newer.")
+        return false
+    end
+
+    local ok, err = pcall(setClipboardText, text)
+    if not ok then
+        snd.utils.errorNote("Could not copy report to clipboard: " .. tostring(err))
+        return false
+    end
+
+    snd.utils.infoNote("Report copied to clipboard.")
+    return true
 end
 
 
@@ -1066,4 +1087,3 @@ function snd.utils.tableLength(tbl)
     for _ in pairs(tbl) do count = count + 1 end
     return count
 end
-

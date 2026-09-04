@@ -308,7 +308,12 @@ local function dinv_portal_items()
 end
 
 local function strip_aard_colors(value)
-  return tostring(value or ""):gsub("@.", "")
+  local text = tostring(value or "")
+  text = text:gsub("@@", "\001")
+  text = text:gsub("@%-", "~")
+  text = text:gsub("@x%d?%d?%d?", "")
+  text = text:gsub("@.", "")
+  return text:gsub("\001", "@")
 end
 
 local function metadata_for_item(item)
@@ -465,9 +470,11 @@ local function echo_report_link(label, menu_label, reporter, fallback_command)
         function() reporter("say") end,
         "",
         function() reporter("gtell") end,
+        "",
+        function() reporter(nil, true) end,
       },
       {
-        "Left-click: report this portal via " .. channel_label(channel) .. "\nRight-click for other channels",
+        "Left-click: report this portal via " .. channel_label(channel) .. "\nRight-click for other channels or copy",
         menu_label,
         "",
         channel_label(channel),
@@ -477,6 +484,8 @@ local function echo_report_link(label, menu_label, reporter, fallback_command)
         "Say",
         "",
         "Group",
+        "",
+        "Copy",
       },
       true
     )
@@ -497,7 +506,7 @@ function usage.echo_report_link(index)
   echo_report_link(
     label,
     label,
-    function(channel) usage.report_from_link(index, channel) end,
+    function(channel, copy_only) usage.report_from_link(index, channel, copy_only) end,
     string.format("mm.portal_usage.report_from_link(%d)", tonumber(index) or 0)
   )
 end
@@ -512,7 +521,7 @@ function usage.echo_report_id_link(portal_id, display_label, chaos_only)
   echo_report_link(
     label,
     id,
-    function(channel) usage.report_id_from_link(id, channel, chaos_only) end,
+    function(channel, copy_only) usage.report_id_from_link(id, channel, chaos_only, copy_only) end,
     string.format(
       "mm.portal_usage.report_id_from_link(%q, nil, %s)",
       id, tostring(chaos_only == true)
@@ -520,14 +529,14 @@ function usage.echo_report_id_link(portal_id, display_label, chaos_only)
   )
 end
 
-function usage.report_from_link(index, channel)
-  local ok, err = usage.report(index, channel)
+function usage.report_from_link(index, channel, copy_only)
+  local ok, err = usage.report(index, channel, copy_only)
   if not ok and mm and mm.warn then mm.warn(err) end
   return ok
 end
 
-function usage.report_id_from_link(portal_id, channel, chaos_only)
-  local ok, err = usage.report_by_id(portal_id, channel, chaos_only)
+function usage.report_id_from_link(portal_id, channel, chaos_only, copy_only)
+  local ok, err = usage.report_by_id(portal_id, channel, chaos_only, copy_only)
   if not ok and mm and mm.warn then mm.warn(err) end
   return ok
 end
@@ -670,6 +679,22 @@ local function echo_aard_report(payload)
   echo_aard_text(payload, true)
 end
 
+local function copy_report_payload(payload)
+  if snd and snd.utils and type(snd.utils.copyReportText) == "function" then
+    return snd.utils.copyReportText(payload)
+  end
+  if type(setClipboardText) ~= "function" then
+    return false, "Copying reports requires Mudlet 4.10 or newer."
+  end
+
+  local ok, err = pcall(setClipboardText, trim(tostring(payload or "")))
+  if not ok then
+    return false, "Could not copy report to clipboard: " .. tostring(err)
+  end
+  if mm and mm.note then mm.note("Report copied to clipboard.") end
+  return true
+end
+
 local function dispatch_report(channel, payload)
   channel = trim(channel)
   if channel == "" then channel = configured_report_channel() end
@@ -688,12 +713,15 @@ local function dispatch_report(channel, payload)
   return false
 end
 
-local function report_portal(portal, channel, chaos_only)
+local function report_portal(portal, channel, chaos_only, copy_only)
   local selected_channel = trim(channel)
   if selected_channel == "" then selected_channel = configured_report_channel() end
   local payload, payload_err = usage.build_report(portal, chaos_only)
   if not payload then
     return false, "Could not calculate portal usage report: " .. tostring(payload_err)
+  end
+  if copy_only then
+    return copy_report_payload(payload)
   end
   if selected_channel:lower() == "default" or selected_channel:lower() == "echo" then
     echo_aard_report(payload)
@@ -705,7 +733,7 @@ local function report_portal(portal, channel, chaos_only)
   return true
 end
 
-function usage.report(index, channel)
+function usage.report(index, channel, copy_only)
   index = tonumber(index)
   if not index then return false, "Invalid portal report row" end
   local portal = usage.last_rows[index] or (mm.portals and mm.portals.rebuilt and mm.portals.rebuilt[index])
@@ -716,10 +744,10 @@ function usage.report(index, channel)
   if not portal.usage_trackable then
     return false, "Portal row #" .. tostring(index) .. " is not a DINV handheld portal."
   end
-  return report_portal(portal, channel)
+  return report_portal(portal, channel, nil, copy_only)
 end
 
-function usage.report_by_id(portal_id, channel, chaos_only)
+function usage.report_by_id(portal_id, channel, chaos_only, copy_only)
   local id = normalized_id(portal_id)
   if not id then return false, "Invalid portal ID" end
 
@@ -729,7 +757,7 @@ function usage.report_by_id(portal_id, channel, chaos_only)
     if not portal.usage_trackable then
       return false, "Portal ID " .. id .. " is not a DINV handheld portal."
     end
-    return report_portal(portal, channel, chaos_only)
+    return report_portal(portal, channel, chaos_only, copy_only)
   end
 
   local rows, rows_err = query(string.format([[
@@ -755,7 +783,7 @@ function usage.report_by_id(portal_id, channel, chaos_only)
     usage_trackable = true,
     chaos = tonumber(row.last_was_chaos) == 1 and "yes" or "no",
   }
-  return report_portal(portal, channel, chaos_only)
+  return report_portal(portal, channel, chaos_only, copy_only)
 end
 
 local function clean_stat_text(value, fallback)

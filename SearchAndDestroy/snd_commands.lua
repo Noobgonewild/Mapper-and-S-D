@@ -153,9 +153,6 @@ local function quickWhereTargetIdentity(target)
     }, "|")
 end
 
-local cancelQuestHybridQuickWhereTimers
-local restoreQuestHybridAfterEnumeration
-
 local function ensureQuickWhereScopes()
     snd.nav = snd.nav or {}
     snd.nav.quickWhere = snd.nav.quickWhere or {}
@@ -454,15 +451,38 @@ local function currentAreaKey()
 end
 
 local function stripMatchingQuotes(value)
-    local text = snd.utils.trim(tostring(value or ""))
+    local text = snd.utils.trim(tostring(value or "")) or ""
     if #text >= 2 then
         local first = text:sub(1, 1)
         local last = text:sub(-1)
         if (first == "'" and last == "'") or (first == '"' and last == '"') then
-            text = snd.utils.trim(text:sub(2, -2))
+            text = snd.utils.trim(text:sub(2, -2)) or ""
         end
     end
     return text
+end
+
+-- Read one argument without splitting quoted multi-word selectors.
+---@return string|nil argument
+---@return string remainder
+---@return boolean quoted
+local function readKeywordArgument(value)
+    local text = snd.utils.trim(value or "") or ""
+    local quote = text:sub(1, 1)
+    if quote ~= "'" and quote ~= '"' then
+        local word, rest = text:match("^(%S+)%s*(.-)%s*$")
+        return word or "", rest or "", false
+    end
+    local closing = text:find(quote, 2, true)
+    while closing do
+        local following = text:sub(closing + 1, closing + 1)
+        if following == "" or following:match("%s") then
+            return snd.utils.trim(text:sub(2, closing - 1)) or "",
+                snd.utils.trim(text:sub(closing + 1)) or "", true
+        end
+        closing = text:find(quote, closing + 1, true)
+    end
+    return nil, "Unclosed keyword or mob-name quote.", false
 end
 
 local function looseMobIdentity(value)
@@ -547,6 +567,7 @@ local function storedTargetResults(target)
         end
     end
 
+    -- Quest/CP data may provide a mapped room before any mob sighting exists.
     local roomName = snd.utils.stripColors(current.roomName or "")
     if #results == 0 and roomName ~= "" and snd.mapper and type(snd.mapper.searchRoomsExact) == "function" then
         local mapped = snd.mapper.searchRoomsExact(roomName, areaKey, mobName, {
@@ -707,6 +728,9 @@ local function installSelectedTargetRoomList(results, source, context)
     syncCurrentTargetScope()
     return #rooms > 0
 end
+
+local cancelQuestHybridQuickWhereTimers
+local restoreQuestHybridAfterEnumeration
 
 local function currentQuestHybridState()
     local state = snd.nav and snd.nav.questHybrid or nil
@@ -1071,6 +1095,7 @@ local function scheduleSelectedTargetLookup(destinationRoom, mode, source, reaso
         source = reason or "xcp_lookup",
         quietRouteFailure = true,
         suppressXrtNear = true,
+        announceOnSuccessOnly = true,
     })
     if dispatched ~= true then
         snd.nav.xcpLookup = nil
@@ -1388,16 +1413,17 @@ local function commandSelectorForTarget(target, mode, options)
         end
     end
 
-    -- User kill words outrank heuristics because display words may not be MUD keywords.
-    if mode == "kill" and snd.db and type(snd.db.getMobKeyword) == "function" then
-        local overrideArea = currentAreaKey()
+    -- Saved keywords also refine where/hunt; searches use the target's area.
+    if snd.db and type(snd.db.getMobKeyword) == "function" then
+        local overrideArea = mode == "kill" and currentAreaKey() or areaKey
         if overrideArea == "" or overrideArea == "-1" then
-            overrideArea = areaKey
+            overrideArea = mode == "kill" and areaKey or currentAreaKey()
         end
         local override = snd.utils.trim(snd.db.getMobKeyword(overrideArea, selectorName) or "")
         if override == "" and selectorName ~= name then
             override = snd.utils.trim(snd.db.getMobKeyword(overrideArea, name) or "")
         end
+        override = stripMatchingQuotes(override):gsub("%s+", " ")
         if override ~= "" then
             if options and options.debugContext then
                 snd.utils.debugNote(string.format(
@@ -1443,7 +1469,6 @@ end
 function snd.commands.resolveTargetCommandSelector(target, mode, options)
     return commandSelectorForTarget(target, mode or "kill", options)
 end
-
 
 function snd.commands.ensureGuiLoaded()
     if snd.gui and snd.gui.toggle then
@@ -1680,6 +1705,7 @@ function snd.commands.gotoRoomViaAlias(roomId, options)
     local navigationOptions = {
         quietFailure = opts.quietRouteFailure == true,
         suppressXrtNear = opts.suppressXrtNear == true,
+        announceOnSuccessOnly = opts.announceOnSuccessOnly == true,
     }
     local dispatched, travelResult, routeFailure = pcall(
         travelApi,
@@ -1824,7 +1850,6 @@ function snd.commands.handleTargetAreaFallbackArrival(roomId)
     return pending.continueXcpLookup ~= true
 end
 
-
 function snd.commands.snd(args)
     args = snd.utils.trim(args or "")
     
@@ -1916,7 +1941,6 @@ function snd.commands.snd(args)
         snd.commands.showHelp()
     end
 end
-
 
 function snd.commands.conwin(args)
     args = snd.utils.trim(args or "")
@@ -2016,7 +2040,6 @@ function snd.commands.conwin(args)
     end
 end
 
-
 -- Resolve from the live list; scoped cache may still contain a just-killed target.
 function snd.commands.selectFirstTarget(activity)
     local scopedActivity = tostring(activity or getScopedActivity() or ""):lower()
@@ -2037,6 +2060,43 @@ function snd.commands.selectFirstTarget(activity)
 
     snd.utils.infoNote("No living target available on the " .. (scopedActivity ~= "" and scopedActivity or "active") .. " tab")
     return false
+end
+
+-- Returning to the list transfers NX ownership without starting a lookup/move.
+local function restoreXcpTarget()
+    local activity = getScopedActivity()
+    if activity ~= "cp" and activity ~= "gq" and activity ~= "quest" then
+        activity = snd.campaign and snd.campaign.active and "cp"
+            or (snd.gquest and snd.gquest.active and "gq")
+            or (snd.quest and snd.quest.active and "quest")
+            or nil
+    end
+    if activity == "quest" then
+        if not (snd.quest and snd.quest.active) then return false end
+        return snd.commands.selectTarget(1, activity, {selectionOnly = true})
+    end
+    if activity ~= "cp" and activity ~= "gq" then return false end
+    local living = {}
+    for _, entry in ipairs(snd.targets.list or {}) do
+        if entry.activity == activity and not entry.dead then
+            living[#living + 1] = entry
+        end
+    end
+    if #living == 0 then return false end
+    local current = snd.targets.current
+    local preferred = current and current.activity == activity and current
+        or (snd.targets.scoped and snd.targets.scoped[activity])
+    local selected = snd.commands.findTargetSelectionEntry(preferred, living)
+    local index = 1
+    for i, entry in ipairs(living) do
+        if entry == selected then index = i break end
+    end
+    if selected and preferred == current and not (snd.nav and snd.nav.nxOverride)
+        and not (snd.nav and snd.nav.quickWhere and snd.nav.quickWhere.isAdhoc)
+    then
+        return true
+    end
+    return snd.commands.selectTarget(index, activity, {selectionOnly = true})
 end
 
 function snd.commands.xcp(args)
@@ -2079,6 +2139,7 @@ function snd.commands.xcp(args)
     end
     
     if args == "" then
+        restoreXcpTarget()
         snd.commands.showTargets()
         return
     end
@@ -2160,7 +2221,6 @@ function snd.commands.selectQuickWhereRoom(index, activity)
     snd.commands.gotoRoomViaAlias(roomId, {quickWhereIndex = roomIndex})
     return true
 end
-
 
 function snd.commands.buildTargetKeyFromEntry(target)
     if not target then return "" end
@@ -2544,7 +2604,7 @@ function snd.commands.nx()
     end
 
     if useAdhocQuickWhere and not currentQuickWhereList() then
-        snd.utils.infoNote("Ad-hoc quick where has no mappable rooms; nx cannot navigate this target.")
+        snd.utils.infoNote("Ad-hoc quick where has no mappable rooms; use xcp or select a target with xcp <number> to switch back.")
         return
     end
 
@@ -2813,7 +2873,6 @@ function snd.commands.handleAlreadyInRoom(roomId)
     return true
 end
 
-
 local function resolveSelectedTargetKeyword(mode)
     local function hasText(value)
         return snd.utils.trim(tostring(value or "")) ~= ""
@@ -2932,7 +2991,7 @@ local function armQuestHybridQuickWhereOverallTimeout(quickWhere)
 end
 
 local function runQuickWhere(args, exact, options)
-    args = snd.utils.trim(args or "")
+    args = stripMatchingQuotes(args or "")
     local opts = options or {}
 
     if not canStartQuickWhere() then
@@ -2952,7 +3011,7 @@ local function runQuickWhere(args, exact, options)
     local prefixedIndex, prefixedKeyword = keyword:match("^(%d+)%.(.+)$")
     if prefixedIndex and prefixedKeyword then
         startIndex = tonumber(prefixedIndex) or 1
-        keyword = snd.utils.trim(prefixedKeyword)
+        keyword = stripMatchingQuotes(prefixedKeyword)
     end
 
     -- Legacy `qw target` means the current target.
@@ -3168,6 +3227,19 @@ function snd.commands.qw(args)
     runQuickWhere(args, false)
 end
 
+-- The link beside Current must query that target, including an ad-hoc QW.
+function snd.commands.qwCurrent()
+    local current = snd.targets and snd.targets.current
+    if current and current.activity == "qw" then
+        local override = snd.nav and snd.nav.nxOverride
+        local quickWhere = snd.nav and snd.nav.quickWhere
+        local keyword = (override and override.keyword)
+            or (quickWhere and quickWhere.lookupKeyword) or current.keyword or current.name
+        return runQuickWhere(keyword, false)
+    end
+    return runQuickWhere("", false)
+end
+
 function snd.commands.qwx(args)
     runQuickWhere(args, true)
 end
@@ -3226,7 +3298,10 @@ function snd.commands.processQuickWhereResult()
             quickWhere.completed = true
             quickWhere.awaitingCommandEcho = false
             quickWhere.probePending = false
-            quickWhere.commandInFlight = false
+    quickWhere.commandInFlight = false
+    if wasQuestEnumeration then
+        restoreQuestHybridAfterEnumeration("combat")
+    end
             finishXcpCycleRefresh(restartsNxCycle, false)
         end
         snd.triggers.disableQuickWhereTriggers()
@@ -3786,7 +3861,6 @@ function snd.commands.processQuickWhereNoMatch(options)
     return installed
 end
 
-
 local function ensureHuntTrickStore()
     snd.nav = snd.nav or {}
     snd.nav.huntTrick = snd.nav.huntTrick or {}
@@ -3896,7 +3970,7 @@ local function markHuntTrickLineHandled()
 end
 
 function snd.commands.ht(args)
-    args = snd.utils.trim(args or "")
+    args = stripMatchingQuotes(args or "")
 
     local lowered = args:lower()
     if lowered == "stop" or lowered == "abort" or lowered == "a" or lowered == "0" then
@@ -3910,7 +3984,7 @@ function snd.commands.ht(args)
     local prefixedIndex, prefixedKeyword = keyword:match("^(%d+)%.(.+)$")
     if prefixedIndex and prefixedKeyword then
         startIndex = tonumber(prefixedIndex) or 1
-        keyword = snd.utils.trim(prefixedKeyword)
+        keyword = stripMatchingQuotes(prefixedKeyword)
     end
 
     if keyword == "" then
@@ -4052,7 +4126,6 @@ function snd.commands.stopHunt(silent)
         snd.utils.infoNote("Hunt stopped")
     end
 end
-
 
 local function ensureAutoHuntStore()
     snd.nav = snd.nav or {}
@@ -4218,7 +4291,6 @@ function snd.commands.ah(args)
     snd.commands.sendGameCommand("hunt " .. keyword, false)
 end
 
-
 function snd.commands.xkill(options)
     local exactConwinIndex = type(options) == "table" and tonumber(options.conwinIndex) or nil
     local exactConwinSource = exactConwinIndex and "mobdetect" or nil
@@ -4347,7 +4419,6 @@ function snd.commands.xkill(options)
     send(fullCmd)
 end
 
-
 function snd.commands.xcmd(args)
     args = snd.utils.trim(args or "")
     local configuredMode = snd.config.killTargetMode or "auto"
@@ -4406,7 +4477,6 @@ function snd.commands.xcmd(args)
     end
 end
 
-
 function snd.commands.qref()
     sendGMCP("request quest")
     
@@ -4448,7 +4518,6 @@ end
 function snd.commands.qr()
     snd.commands.qref()
 end
-
 
 function snd.commands.gotoTarget()
     local quickWhere = snd.nav and snd.nav.quickWhere or nil
@@ -4536,6 +4605,7 @@ function snd.commands.gotoTarget()
             ))
         end
 
+        -- Prime nx cycling even when no fresh qw parse was captured.
         if snd.nav.quickWhere then
             local roomIds = {}
             if results then
@@ -4594,7 +4664,6 @@ function snd.commands.gotoTarget()
     end
 end
 
-
 function snd.commands.goToIndex(args)
     local index
     if type(args) == "number" then
@@ -4633,7 +4702,6 @@ function snd.commands.goToIndex(args)
         snd.utils.infoNote("Invalid target entry at index " .. index)
     end
 end
-
 
 function snd.commands.xset(args)
     args = snd.utils.trim(args or "")
@@ -4894,22 +4962,40 @@ function snd.commands.xset(args)
         snd.utils.infoNote("S&D area colors: " .. (snd.config.areaColors ~= false and "on" or "off"))
         if snd.gui and snd.gui.refresh then snd.gui.refresh() end
         
-    elseif setting == "kw" or setting == "killword" then
+    elseif setting == "kw" or setting == "killword" or setting == "keyword" then
         local kwArgs = snd.utils.trim(args:match("^%S+%s*(.-)%s*$") or "")
-        local action, mobText = kwArgs:match("^(%S+)%s*(.-)%s*$")
-        action = stripMatchingQuotes(action or "")
-        mobText = stripMatchingQuotes(mobText or "")
+        local action, mobText, quoted = readKeywordArgument(kwArgs)
+        if not action then
+            snd.utils.infoNote(mobText)
+            return
+        end
         local loweredAction = action:lower()
+        local subcommand = not quoted and (action == "" or loweredAction == "help"
+            or loweredAction == "?" or loweredAction == "list" or loweredAction == "clear"
+            or loweredAction == "delete" or loweredAction == "del")
+        -- Retain the old unquoted current-target form: xset keyword half judge.
+        if setting == "keyword" and not quoted and not subcommand then
+            action, mobText = kwArgs, ""
+        end
+        if mobText:sub(1, 1) == "'" or mobText:sub(1, 1) == '"' then
+            local mob, remaining = readKeywordArgument(mobText)
+            if not mob or remaining ~= "" then
+                snd.utils.infoNote(not mob and remaining or "Unexpected text after the quoted mob name.")
+                return
+            end
+            mobText = mob
+        end
+        action = snd.utils.trim(action:gsub("%s+", " "))
         local zone = currentAreaKey()
         if zone == "" or zone == "-1" then
             snd.utils.infoNote("Current area is unknown; cannot set an area kill word.")
             return
         end
 
-        if action == "" or loweredAction == "help" or loweredAction == "?" then
+        if subcommand and (action == "" or loweredAction == "help" or loweredAction == "?") then
             snd.commands.showKillWordHelp()
             return
-        elseif loweredAction == "list" then
+        elseif subcommand and loweredAction == "list" then
             local rows = snd.db and snd.db.listMobKeywords and snd.db.listMobKeywords(zone) or {}
             if #rows == 0 then
                 snd.utils.infoNote("No kill words saved for area " .. zone .. ".")
@@ -4924,7 +5010,7 @@ function snd.commands.xset(args)
                     tostring(row.mob_name or "")))
             end
             return
-        elseif loweredAction == "clear" or loweredAction == "delete" or loweredAction == "del" then
+        elseif subcommand and (loweredAction == "clear" or loweredAction == "delete" or loweredAction == "del") then
             local mobName = currentTargetMobName(mobText)
             if mobName == "" then
                 snd.utils.infoNote("No target selected. Usage: xset kw clear <mob name>")
@@ -4938,12 +5024,8 @@ function snd.commands.xset(args)
             return
         end
 
-        if action:find("%s") then
-            snd.utils.infoNote("Kill word must be one word. Usage: xset kw <kill-word> [mob name]")
-            return
-        end
-        if not action:match("^[%w_%-]+$") then
-            snd.utils.infoNote("Kill word may contain only letters, numbers, underscores, or hyphens.")
+        if action == "" or not action:match("^[%w_%-][%w_%s%-]*$") then
+            snd.utils.infoNote("Keyword may contain only letters, numbers, spaces, underscores, or hyphens.")
             return
         end
         if snd.utils.isReservedMobCommandSelector and snd.utils.isReservedMobCommandSelector(action) then
@@ -4961,24 +5043,6 @@ function snd.commands.xset(args)
         end
         return
 
-    elseif setting == "keyword" then
-        if not snd.targets.current then
-            snd.utils.infoNote("No target selected")
-            return
-        end
-        
-        local keyword = table.concat(parts, " ", 2)
-        if keyword and keyword ~= "" then
-            snd.targets.current.keyword = keyword
-            snd.db.setMobKeyword(
-                snd.room.current.arid or snd.targets.current.area,
-                snd.targets.current.name,
-                keyword
-            )
-        else
-            snd.utils.infoNote("Usage: xset keyword <keyword>")
-        end
-        
     elseif setting == "startroom" then
         local roomId = tonumber(value) or tonumber(snd.room.current.rmid)
         local area = parts[3] or snd.room.current.arid
@@ -5116,7 +5180,6 @@ function snd.commands.setAutocheckSmartKills(value)
     return true
 end
 
-
 function snd.commands.xhelp(args)
     args = snd.utils.trim(args or "")
     
@@ -5130,7 +5193,6 @@ function snd.commands.xhelp(args)
         snd.commands.showHelp()
     end
 end
-
 
 local function urlEncode(s)
     s = tostring(s or "")
@@ -5153,6 +5215,7 @@ local function emitHelpCommandLink(commandText, commandToSend, hint)
             snd.utils.errorNote("Help link command is not registered: " .. trimmed)
         end
     end
+    -- Classic Mudlet links render consistently across consoles and logs.
     if type(cechoLink) == "function" then
         cechoLink("<cyan>" .. text .. "<reset>", linkAction, tooltip, true)
     else
@@ -5226,11 +5289,11 @@ function snd.commands.showHelp()
     emitHelpTitle("Search and Destroy - Mudlet Port")
     emitHelpSection("Targeting & Combat")
     emitLinkedHelpRow("xcp <n>", "xcp 1", "Select target by number", "Select target by number")
-    emitLinkedHelpRow("xcp", "xcp", "Show clickable target list", "Show clickable target list")
+    emitLinkedHelpRow("xcp", "xcp", "Show targets and resume activity navigation", "Return nx to a living activity target and show the target list")
     emitLinkedHelpRow("xcp mode <db|qw|hybrid|ht>", "xcp mode", "Set XCP room lookup mode", "Choose stored rooms, live where, hybrid, or GQ hunt lookup")
     emitLinkedHelpRow("nx", "nx", "Go to next/current target", "Go to next/current target")
     emitLinkedHelpRow("xkill", "xkill", "Kill current target", "Kill current target with precise temporary selector")
-    emitLinkedHelpRow("xset kw <word> [mob]", "xset kw help", "Set an area kill word", "Persist the MUD kill word for a mob in the current area")
+    emitLinkedHelpRow("xset kw <keyword> [mob]", "xset kw help", "Set an area target keyword", "Persist a keyword for xkill, qw, and ht; quote multiword keywords")
     emitLinkedHelpRow("xcmd <command>", "xcmd", "Show or set xkill command", "Show or set the command used by xkill")
     emitLinkedHelpRow("xcmd mode <auto|skill|cast|raw>", "xcmd mode", "Set xkill target syntax", "Auto-detect direct casts or force a target quoting style")
 
@@ -5257,8 +5320,8 @@ function snd.commands.showHelp()
     emitLinkedHelpRow("snd status", "snd status", "Show status", "Show current status")
     emitLinkedHelpRow("snd db", "snd db", "Show database info/path", "Show database info/path")
     emitLinkedHelpRow("snd channel", "snd channel", "Show/set report channel", "Show/set report channel")
-    emitLinkedHelpRow("snd history", "snd history", "Show history", "Show last 20 history rows")
-    emitLinkedHelpRow("snd stats cp/gq/quest", "snd stats help", "Show stats commands", "Stats by type (campaign/gq/quest)")
+    emitLinkedHelpRow("snd history", "snd history", "Show history", "Show last 20 history rows; report or copy rows")
+    emitLinkedHelpRow("snd stats cp/gq/quest", "snd stats help", "Show stats commands", "Stats by type; report or copy lines")
 
     emitHelpSection("Debug")
     emitLinkedHelpRow("xset debug <on|off>", "xset debug", "Toggle S&D debug", "General S&D debug notes")
@@ -5298,7 +5361,7 @@ end
 function snd.commands.showCommandHelp()
     emitHelpTitle("Search and Destroy - Commands")
     emitHelpSection("Target Selection")
-    emitPlainHelpRow("xcp", "Show all targets")
+    emitPlainHelpRow("xcp", "Show all targets and return nx to a living activity target")
     emitPlainHelpRow("xcp <n>", "Select target #n")
     emitPlainHelpRow("xcp mode <db|qw|hybrid|ht>", "Target room source: db=stored list, qw=area then exact where, hybrid=best room then quest DB/all-match QW or normal QW, ht=GQ hunt then where")
 
@@ -5315,7 +5378,7 @@ function snd.commands.showCommandHelp()
     emitPlainHelpRow("xset areaguard <on|off>", "Toggle persisted navigation area guard")
     emitPlainHelpRow("xset sound [on|off|volume <n%>]", "Toggle/query sound alerts")
     emitPlainHelpRow("xset keyword <kw>", "Set mob keyword")
-    emitPlainHelpRow("xset kw <word> [mob]", "Persist an xkill word for the selected or named mob in the current area")
+    emitPlainHelpRow("xset kw <keyword> [mob]", "Persist an area keyword for xkill/qw/ht; quote multiword keywords and mob names")
     emitPlainHelpRow("xset startroom", "Set area start room")
     emitPlainHelpRow("xcmd <command>", "Set the command used by xkill")
     emitPlainHelpRow("xcmd mode <auto|skill|cast|raw>", "Set xkill target quoting; auto recognizes direct cast commands")
@@ -5330,7 +5393,7 @@ function snd.commands.showCommandHelp()
     emitPlainHelpRow("snd history <q|quest|cp|campaign|gq|gquest>", "Filter by run type")
     emitPlainHelpRow("snd history <type> last <n>", "Filtered rows + count (e.g. q/cp/gq)")
     emitPlainHelpRow("snd history report <n> [channel]", "Report one shown row (optional channel override)")
-    cecho("  <dim_gray>Tip: left-click row number in snd history for configured channel; right-click for menu.<reset>\n")
+    cecho("  <dim_gray>Tip: left-click row number in snd history for configured channel; right-click for channels or copy.<reset>\n")
 
     emitHelpSection("ConWin")
     emitPlainHelpRow("snd conwin help", "ConWin command family")
@@ -5355,7 +5418,7 @@ function snd.commands.showConfigHelp()
     emitPlainHelpRow("autocheck kills <number>", "SMART mode: run check every N kills")
     emitPlainHelpRow("xcp mode <db|qw|hybrid|ht>", "XCP target lookup; ht applies to GQ only and automatically uses qw for quest/CP")
     emitPlainHelpRow("mob tags", "xset mob help|tags|delete|nowhere|nohunt|priority")
-    emitPlainHelpRow("kw <word> [mob]", "Area-scoped xkill word; use xset kw help for list/clear commands")
+    emitPlainHelpRow("kw <keyword> [mob]", "Area-scoped target keyword; use xset kw help for quoted examples and list/clear commands")
     emitPlainHelpRow("window <on|off>", "GUI window")
     emitPlainHelpRow("sound <on|off|volume>", "Sound alerts and volume")
     emitPlainHelpRow("areacolors <on|off>", "Color-band area labels in target list")
@@ -5377,14 +5440,14 @@ end
 
 function snd.commands.showKillWordHelp()
     emitHelpTitle("Search and Destroy - Area Kill Words")
-    emitHelpSection("Persistent xkill Overrides")
-    emitPlainHelpRow("xset kw <word>", "Save a kill word for the currently selected target in this area. Example: xset kw rat")
-    emitPlainHelpRow("xset kw <word> <mob>", "Save for a named mob. Single or double quotes around the mob name are accepted. Example: xset kw rat 'a tiny rat'")
+    emitHelpSection("Persistent Target Keywords")
+    emitPlainHelpRow("xset kw <keyword>", "Save a keyword for the selected target in this area, used by xkill, qw and ht. Example: xset kw 'half judge'")
+    emitPlainHelpRow("xset kw <keyword> <mob>", "Single or double quotes are accepted for both arguments. Example: xset kw 'half judge' 'a half-griffon judge'")
+    emitPlainHelpRow("xset keyword <keyword>", "Compatibility alias; unquoted multi-word input still applies to the selected target")
     emitPlainHelpRow("xset kw list", "List saved kill words for the current area")
     emitPlainHelpRow("xset kw clear [mob]", "Remove the selected or named mob's kill-word override in the current area")
     cecho("<gray>----------------------------------------<reset>\n")
 end
-
 
 local function sndHasAlias(name)
     if type(getAlias) == "function" then
@@ -5689,30 +5752,38 @@ function snd.commands.showTargets()
     end
     
     if snd.targets.current then
-        cecho("  <yellow>Current:<reset> " .. (snd.targets.current.name or snd.targets.current.keyword))
+        local adhoc = snd.targets.current.activity == "qw"
+        cecho("  <yellow>Current:<reset> " .. (adhoc and "[QW] " or "")
+            .. (snd.targets.current.name or snd.targets.current.keyword))
         if snd.targets.current.area and snd.targets.current.area ~= "" then
             cecho(" <dim_gray>in<reset> " .. snd.targets.current.area)
         end
         echo("  ")
-        echoLink("[goto]", [[snd.commands.nx()]], "Go to target", true)
+        local qw = snd.nav and snd.nav.quickWhere
+        if not adhoc or (qw and qw.active and qw.rooms and #qw.rooms > 0) then
+            echoLink("[goto]", [[snd.commands.nx()]], "Go to target", true)
+        else
+            cecho("<dim_gray>[no mapped rooms]<reset>")
+        end
         echo("  ")
-        echoLink("[where]", [[snd.commands.qw("")]], "Quick where", true)
+        echoLink("[where]", [[snd.commands.qwCurrent()]], "Quick where for the current target", true)
         echo("\n")
     end
 end
 
 function snd.commands.selectTarget(index, activity, options)
     local opts = type(options) == "table" and options or {}
-    local runsXcpLookup = opts.xcpLookup ~= false
+    local runsXcpLookup = opts.xcpLookup ~= false and opts.selectionOnly ~= true
+    local skipLookup = runsXcpLookup or opts.selectionOnly == true
     local previousCurrent = snd.targets and snd.targets.current or nil
     local didSelect = false
 
     if activity == "cp" then
-        didSelect = snd.cp.selectTarget(index, {skipLookup = runsXcpLookup}) == true
+        didSelect = snd.cp.selectTarget(index, {skipLookup = skipLookup}) == true
     elseif activity == "gq" then
-        didSelect = snd.gq.selectTarget(index, {skipLookup = runsXcpLookup}) == true
+        didSelect = snd.gq.selectTarget(index, {skipLookup = skipLookup}) == true
     elseif activity == "quest" then
-        didSelect = snd.commands.selectQuestTarget({skipLookup = runsXcpLookup}) == true
+        didSelect = snd.commands.selectQuestTarget({skipLookup = skipLookup}) == true
     end
 
     local selectedCurrent = didSelect and snd.targets and snd.targets.current
@@ -5720,6 +5791,7 @@ function snd.commands.selectTarget(index, activity, options)
     if selectedCurrent then
         clearNxOverride()
         if runsXcpLookup and snd.nav and snd.nav.invalidateQuickWhereForTarget then
+            -- Invalidate QW only after selection succeeds; bad indices preserve ad-hoc QW.
             snd.nav.invalidateQuickWhereForTarget(nil)
         end
         setScopedCurrent(snd.targets.current.activity, snd.targets.current)
@@ -5906,8 +5978,8 @@ local function statsEmitReportRow(label, lineText, reportText, typeLabel)
         echoReportChannelPopup(
             "<cyan>[>>]<reset>",
             snd.config and snd.config.reportChannel or "default",
-            function(channel)
-                snd.commands.reportStatsLine(reportText, typeLabel, channel)
+            function(channel, copyOnly)
+                snd.commands.reportStatsLine(reportText, typeLabel, channel, copyOnly)
             end
         )
     else
@@ -5985,8 +6057,8 @@ local function statsShowType(historyType)
     statsEmitReportRow("Total", totalLine, string.format("%s Stats - Total: %s", title, totalLine), typeLabel)
     cecho("  ")
     if type(cechoPopup) == "function" then
-        echoReportChannelPopup("<cyan>[>>]<reset>", snd.config and snd.config.reportChannel or "default", function(channel)
-            snd.commands.reportStatsLine(string.format("%s Stats - Time: %s", title, timeLine), typeLabel, channel)
+        echoReportChannelPopup("<cyan>[>>]<reset>", snd.config and snd.config.reportChannel or "default", function(channel, copyOnly)
+            snd.commands.reportStatsLine(string.format("%s Stats - Time: %s", title, timeLine), typeLabel, channel, copyOnly)
         end)
     else
         cecho("[>>]")
@@ -5994,11 +6066,11 @@ local function statsShowType(historyType)
     cecho("  <yellow>Time        <reset> ")
     cecho(string.format("avg %s  |  ", avgDur))
     if type(cechoPopup) == "function" then
-        echoReportChannelPopup("<green>best<reset>", snd.config and snd.config.reportChannel or "default", function(channel)
+        echoReportChannelPopup("<green>best<reset>", snd.config and snd.config.reportChannel or "default", function(channel, copyOnly)
             if bestRow then
-                snd.commands.reportHistoryLikeRow(bestRow, channel, "BEST")
+                snd.commands.reportHistoryLikeRow(bestRow, channel, "BEST", copyOnly)
             else
-                snd.commands.reportStatsLine(string.format("%s Stats - Time: best %s", title, bestDur), typeLabel, channel)
+                snd.commands.reportStatsLine(string.format("%s Stats - Time: best %s", title, bestDur), typeLabel, channel, copyOnly)
             end
         end, "Left-click: report BEST run via ")
     else
@@ -6006,11 +6078,11 @@ local function statsShowType(historyType)
     end
     cecho(string.format(" %s  |  ", bestDur))
     if type(cechoPopup) == "function" then
-        echoReportChannelPopup("<red>worst<reset>", snd.config and snd.config.reportChannel or "default", function(channel)
+        echoReportChannelPopup("<red>worst<reset>", snd.config and snd.config.reportChannel or "default", function(channel, copyOnly)
             if worstRow then
-                snd.commands.reportHistoryLikeRow(worstRow, channel, "WORST")
+                snd.commands.reportHistoryLikeRow(worstRow, channel, "WORST", copyOnly)
             else
-                snd.commands.reportStatsLine(string.format("%s Stats - Time: worst %s", title, worstDur), typeLabel, channel)
+                snd.commands.reportStatsLine(string.format("%s Stats - Time: worst %s", title, worstDur), typeLabel, channel, copyOnly)
             end
         end, "Left-click: report WORST run via ")
     else
@@ -6022,16 +6094,20 @@ local function statsShowType(historyType)
     statsEmitReportRow("TP earned", tpLine, string.format("%s Stats - TP earned: %s", title, tpLine), typeLabel)
     statsEmitReportRow("Gold", goldLine, string.format("%s Stats - Gold: %s", title, goldLine), typeLabel)
     statsEmitReportRow("Trains", trprLine, string.format("%s Stats - Trains: %s", title, trprLine), typeLabel)
-    cecho(string.format("<gray>Click [>>] to report that line to your configured channel (%s).<reset>\n", tostring(snd.config.reportChannel or "gt")))
+    cecho(string.format("<gray>Click [>>] to report that line to your configured channel (%s); right-click to copy.<reset>\n", tostring(snd.config.reportChannel or "gt")))
 end
 
-function snd.commands.reportStatsLine(reportText, typeLabel, channelOverride)
+function snd.commands.reportStatsLine(reportText, typeLabel, channelOverride, copyOnly)
+    local style = snd.utils.getReportTypeStyle(typeLabel)
+    local payload = string.format("%s[%s]@W %s", snd.utils.getReportAardColor(typeLabel), style.label, reportText)
+    if copyOnly then
+        return snd.utils.copyReportText(payload)
+    end
+
     local channel = channelOverride and snd.utils.trim(tostring(channelOverride)) or "default"
     if channel:lower() == "group" then
         channel = "gtell"
     end
-    local style = snd.utils.getReportTypeStyle(typeLabel)
-    local payload = string.format("%s[%s]@W %s", snd.utils.getReportAardColor(typeLabel), style.label, reportText)
     if snd.utils.isDefaultReportChannel(channel) then
         snd.utils.aardEchoLine(payload)
         return
@@ -6152,7 +6228,7 @@ local function historyTypeLabel(v)
     return "unknown"
 end
 
-function snd.commands.reportHistoryLikeRow(row, channelOverride, statsLabel)
+function snd.commands.reportHistoryLikeRow(row, channelOverride, statsLabel, copyOnly)
     if not row then
         snd.utils.infoNote("No history row available to report.")
         return
@@ -6166,6 +6242,9 @@ function snd.commands.reportHistoryLikeRow(row, channelOverride, statsLabel)
     end
     if statsLabel then
         local payload = snd.commands.buildStatsHistoryRowChannelText(row, statsLabel)
+        if copyOnly then
+            return snd.utils.copyReportText(payload)
+        end
         if snd.utils.isDefaultReportChannel(channel) then
             snd.utils.aardEchoLine(payload)
             return
@@ -6179,6 +6258,9 @@ function snd.commands.reportHistoryLikeRow(row, channelOverride, statsLabel)
     end
 
     local payload = snd.commands.buildHistoryRowChannelText(row)
+    if copyOnly then
+        return snd.utils.copyReportText(payload)
+    end
     if snd.utils.isDefaultReportChannel(channel) then
         snd.utils.aardEchoLine(payload)
         return
@@ -6436,9 +6518,11 @@ echoReportChannelPopup = function(triggerText, configuredChannel, reporter, tool
             function() reporter("say") end,
             "",
             function() reporter("gtell") end,
+            "",
+            function() reporter(nil, true) end,
         },
         {
-            tip .. defaultLabel .. "\nRight-click for other channels",
+            tip .. defaultLabel .. "\nRight-click for other channels or copy",
             plainLabel,
             "",
             defaultLabel,
@@ -6448,6 +6532,8 @@ echoReportChannelPopup = function(triggerText, configuredChannel, reporter, tool
             "Say",
             "",
             "Group",
+            "",
+            "Copy",
         },
         true
     )
@@ -6458,13 +6544,13 @@ local function echoHistoryRowLink(index, configuredChannel)
     echoReportChannelPopup(
         string.format("[%2d]", rowNumber),
         configuredChannel,
-        function(channel) snd.commands.reportHistoryRow(index, channel) end,
+        function(channel, copyOnly) snd.commands.reportHistoryRow(index, channel, copyOnly) end,
         "Left-click: report this row via "
     )
 end
 
 
-function snd.commands.reportHistoryRow(index, channelOverride)
+function snd.commands.reportHistoryRow(index, channelOverride, copyOnly)
     index = tonumber(index)
     if not index then
         snd.utils.infoNote("Usage: snd history report <row-number>")
@@ -6475,6 +6561,11 @@ function snd.commands.reportHistoryRow(index, channelOverride)
         snd.utils.infoNote("No cached history row #" .. tostring(index) .. ". Run 'snd history' first.")
         return
     end
+    local payload = snd.commands.buildHistoryRowChannelText(row)
+    if copyOnly then
+        return snd.utils.copyReportText(payload)
+    end
+
     local channel = channelOverride and snd.utils.trim(tostring(channelOverride)) or "default"
     if channel == "default" and snd.config and snd.config.reportChannel then
         channel = snd.utils.trim(snd.config.reportChannel)
@@ -6482,8 +6573,6 @@ function snd.commands.reportHistoryRow(index, channelOverride)
     if channel:lower() == "group" then
         channel = "gtell"
     end
-
-    local payload = snd.commands.buildHistoryRowChannelText(row)
     if snd.utils.isDefaultReportChannel(channel) then
         snd.utils.aardEchoLine(payload)
         return
@@ -6551,7 +6640,7 @@ function snd.commands.history(args)
 
     cecho("\n<white>Search and Destroy - History<reset>\n")
     cecho("<gray>--------------------------------------------------------------------------------<reset>\n")
-    cecho(string.format("<dim_gray>Showing last %d rows%s. Left-click row number to report over configured snd channel; right-click for channel menu.\n<reset>",
+    cecho(string.format("<dim_gray>Showing last %d rows%s. Left-click row number to report over configured snd channel; right-click for channels or copy.\n<reset>",
         limit, typeFilter and (" for " .. historyTypeLabel(typeFilter)) or ""))
     cecho("<dim_gray>Format: [#] type | lvl | start -> end | duration | status | rewards<reset>\n")
 

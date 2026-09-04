@@ -2881,7 +2881,7 @@ local function normalizeDistanceDestinations(destinations)
     return normalized
 end
 
--- One bounded forward BFS returns distances only; routing remains mapper-owned.
+-- One forward BFS returns distances only; callers choose bounded or exhaustive.
 function snd.mapper.findDistances(src, destinations, opts)
     opts = type(opts) == "table" and opts or {}
     local sourceNumber = tonumber(src)
@@ -2909,21 +2909,24 @@ function snd.mapper.findDistances(src, destinations, opts)
         return {}, metadata
     end
 
-    local myLevel = tonumber(snd.char and snd.char.level) or 201
-    local myTier = tonumber(snd.char and snd.char.tier) or 0
+    local myLevel = tonumber(opts.playerLevel) or tonumber(snd.char and snd.char.level) or 201
+    local myTier = tonumber(opts.playerTier) or tonumber(snd.char and snd.char.tier) or 0
     local effectiveLevel = myLevel + (myTier * 10)
     local ignoreLockedExits = opts.ignoreLockedExits == true
     local ignoreAreaGuard = opts.ignoreAreaGuard == true
     local ignoreTravelRestrictions = opts.ignoreTravelRestrictions == true
     local allowChaosPortals = opts.allowChaosPortals == true
+    local expandJumps = opts.expandJumps == true
+    local excludeRandomExits = opts.excludeRandomExits == true
+    local exhaustive = opts.exhaustive == true
     local noPortals = opts.noPortals == true
         or opts.usePortals == false
-        or snd.mapper.config.usePortals == false
+        or (opts.usePortals == nil and snd.mapper.config.usePortals == false)
     local noRecalls = opts.noRecalls == true
         or opts.useRecall == false
-        or snd.mapper.config.useRecall == false
+        or (opts.useRecall == nil and snd.mapper.config.useRecall == false)
     local sourceInfo = snd.mapper.getRoomInfo(source)
-    if not ignoreTravelRestrictions then
+    if not ignoreTravelRestrictions and not expandJumps then
         noPortals = noPortals or (sourceInfo and tonumber(sourceInfo.noportal) == 1 or false)
         noRecalls = noRecalls or (sourceInfo and tonumber(sourceInfo.norecall) == 1 or false)
     end
@@ -2936,7 +2939,9 @@ function snd.mapper.findDistances(src, destinations, opts)
         effectiveLevel
     )
     local randomLevelWhere = ignoreLockedExits and "1=1" or string.format("level <= %d", myLevel)
-    local portalGuardWhere = snd.mapper.portalGuardSql("dir", "level", effectiveLevel, ignoreLockedExits)
+    local portalGuardWhere = snd.mapper.portalGuardSql(
+        "dir", "level", effectiveLevel, ignoreLockedExits or opts.ignorePortalGuard == true
+    )
     local chaosWhere = (gqActive and not allowChaosPortals)
         and "(fromuid <> '*' OR ifnull(chaos, 'no') <> 'yes')"
         or "1=1"
@@ -2954,8 +2959,11 @@ function snd.mapper.findDistances(src, destinations, opts)
     )
 
     local maxDepth = tonumber(snd.mapper.config.maxSearchDepth) or 100
+    local absoluteDepth = tonumber(opts.absoluteDepthLimit)
     local requestedDepth = tonumber(opts.searchDepthLimit)
-    if requestedDepth then
+    if absoluteDepth and not exhaustive then
+        maxDepth = math.max(0, math.floor(absoluteDepth))
+    elseif requestedDepth and not exhaustive then
         maxDepth = math.max(0, math.min(maxDepth, math.floor(requestedDepth)))
     end
 
@@ -2970,6 +2978,9 @@ function snd.mapper.findDistances(src, destinations, opts)
         tostring(ignoreAreaGuard),
         tostring(ignoreTravelRestrictions),
         tostring(allowChaosPortals),
+        tostring(expandJumps),
+        tostring(excludeRandomExits),
+        tostring(exhaustive),
         tostring(myLevel),
         tostring(myTier),
         tostring(gqActive),
@@ -3004,22 +3015,30 @@ function snd.mapper.findDistances(src, destinations, opts)
 
     local visited = {[source] = true}
     local frontier = {source}
-    if not noPortals then
+    if not noPortals and not expandJumps then
         visited["*"] = true
         table.insert(frontier, "*")
     end
-    if not noRecalls then
+    if not noRecalls and not expandJumps then
         visited["**"] = true
         table.insert(frontier, "**")
     end
 
     local randomBySource = {}
-    local randomCexits = snd.mapper.db.query(string.format([[
-        SELECT fromuid, touid, dir, level, 1 AS random_cexit
-        FROM random_cexits
-        WHERE %s AND %s AND %s
-    ]], randomLevelWhere, randomAreaFromWhere, randomAreaToWhere)) or {}
-    metadata.queries = metadata.queries + 1
+    local randomCexits = {}
+    if not excludeRandomExits then
+        local queriedCexits, randomError = snd.mapper.db.query(string.format([[
+            SELECT fromuid, touid, dir, level, 1 AS random_cexit
+            FROM random_cexits
+            WHERE %s AND %s AND %s
+        ]], randomLevelWhere, randomAreaFromWhere, randomAreaToWhere))
+        metadata.queries = metadata.queries + 1
+        if not queriedCexits then
+            metadata.error = randomError or "random_exit_query_failed"
+            return {}, metadata
+        end
+        randomCexits = queriedCexits
+    end
     for _, row in ipairs(randomCexits) do
         local fromId = tostring(row.fromuid or "")
         randomBySource[fromId] = randomBySource[fromId] or {}
@@ -3027,12 +3046,42 @@ function snd.mapper.findDistances(src, destinations, opts)
     end
 
     local depth = 0
-    while remainingCount > 0 and #frontier > 0 and depth < maxDepth do
+    while (remainingCount > 0 or (expandJumps and not noPortals and not visited["*"]))
+        and #frontier > 0 and (exhaustive or depth < maxDepth) do
+        -- Analysis may walk/recall out of a restricted room before using a
+        -- global jump. Expand each origin at its earliest eligible depth.
+        -- Normal routing and existing distance callers keep their old policy.
+        if expandJumps and ((not noPortals and not visited["*"])
+            or (not noRecalls and not visited["**"])) then
+            local ids = {}
+            for _, roomId in ipairs(frontier) do
+                table.insert(ids, snd.mapper.db.escape(roomId))
+            end
+            local flags, flagsError = snd.mapper.db.query(
+                "SELECT uid, noportal, norecall FROM rooms WHERE uid IN (" .. table.concat(ids, ",") .. ")"
+            )
+            metadata.queries = metadata.queries + 1
+            if not flags then
+                metadata.error = flagsError or "room_flags_query_failed"
+                return {}, metadata
+            end
+            for _, room in ipairs(flags) do
+                if not noPortals and not visited["*"] and tonumber(room.noportal) ~= 1 then
+                    visited["*"] = true
+                    metadata.portalAccessDistance = depth
+                    table.insert(frontier, "*")
+                end
+                if not noRecalls and not visited["**"] and tonumber(room.norecall) ~= 1 then
+                    visited["**"] = true
+                    table.insert(frontier, "**")
+                end
+            end
+        end
         local escapedFrontier = {}
         for _, roomId in ipairs(frontier) do
             table.insert(escapedFrontier, snd.mapper.db.escape(roomId))
         end
-        local results = snd.mapper.db.query(string.format([[
+        local results, queryError = snd.mapper.db.query(string.format([[
             SELECT fromuid, touid, dir, chaos
             FROM exits
             WHERE fromuid IN (%s)
@@ -3048,8 +3097,12 @@ function snd.mapper.findDistances(src, destinations, opts)
             chaosWhere,
             areaFromWhere,
             areaToWhere
-        )) or {}
+        ))
         metadata.queries = metadata.queries + 1
+        if not results then
+            metadata.error = queryError or "exit_query_failed"
+            return {}, metadata
+        end
         for _, fromId in ipairs(frontier) do
             for _, row in ipairs(randomBySource[fromId] or {}) do
                 table.insert(results, row)
@@ -3083,6 +3136,10 @@ function snd.mapper.findDistances(src, destinations, opts)
     metadata.depth = depth
     metadata.visited = visitedCount
     metadata.elapsedMs = (os.clock() - startedAt) * 1000
+    metadata.exhaustive = exhaustive
+    metadata.depthLimit = exhaustive and nil or maxDepth
+    metadata.depthLimitReached = not exhaustive
+        and remainingCount > 0 and #frontier > 0 and depth >= maxDepth
     metadata.unreachable = {}
     for _, roomId in ipairs(requested) do
         if distances[roomId] == nil then table.insert(metadata.unreachable, roomId) end
@@ -3196,9 +3253,10 @@ function snd.mapper.findPath(
     end
     
     local depth = 0
+    local exhaustive = searchDepthLimit == "exhaustive"
     local maxDepth = tonumber(snd.mapper.config.maxSearchDepth) or 100
     local requestedDepth = tonumber(searchDepthLimit)
-    if requestedDepth then
+    if requestedDepth and not exhaustive then
         maxDepth = math.max(0, math.min(maxDepth, math.floor(requestedDepth)))
     end
     local roomSets = {}
@@ -3226,7 +3284,7 @@ function snd.mapper.findPath(
     visitedSet[dst] = true
     visited = table.concat(visitedList, ",")
     
-    while not found and depth < maxDepth do
+    while not found and (exhaustive or depth < maxDepth) do
         depth = depth + 1
         
         if depth > 1 then
@@ -3368,7 +3426,9 @@ function snd.mapper.findPath(
     end
     
     if not found then
-        snd.utils.debugNote("findPath failed: no route found within depth " .. tostring(maxDepth))
+        snd.utils.debugNote(exhaustive
+            and "findPath failed after exhausting the reachable graph."
+            or "findPath failed: no route found within depth " .. tostring(maxDepth))
         return nil
     end
     
@@ -5447,6 +5507,14 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     options = type(options) == "table" and options or {}
     snd.mapper.lastRouteFailure = nil
 
+    local function announceAcceptedRoute()
+        local announcement = options.successAnnouncement
+        if type(announcement) == "string" and announcement ~= "" then
+            options.successAnnouncement = nil
+            cecho(announcement)
+        end
+    end
+
     local currentRoom = snd.mapper.currentRoomUid(true)
 
     if not currentRoom or currentRoom == "-1" then
@@ -5511,6 +5579,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
         snd.nav.goingToRoom = roomId
         snd.mapper.pendingBlockedTravel = nil
         if snd.mapper.handleBlockedTravel(pendingBlocked.blockedType, ignoreLockedExits) then
+            announceAcceptedRoute()
             return true
         end
     elseif pendingBlocked and tostring(pendingBlocked.destination or "") == roomId then
@@ -5531,6 +5600,7 @@ function snd.mapper.gotoRoom(roomId, usePortals, ignoreLockedExits, iterativeMod
     local noRecalls = routePlan.noRecalls
 
     if path and #path > 0 then
+        announceAcceptedRoute()
         snd.utils.debugNote("Found path with " .. #path .. " steps (depth " .. depth .. ")")
 
         snd.mapper.goingToRoom = roomId
@@ -6162,20 +6232,36 @@ function snd.mapper.xrt(dest, options)
     
     options = type(options) == "table" and options or {}
     dest = dest:lower():trim()
+
+    local function gotoResolvedRoom(roomId, announcement, reason)
+        if options.announceOnSuccessOnly ~= true then
+            cecho(announcement)
+        else
+            options.successAnnouncement = announcement
+        end
+        snd.mapper.debugXrtDecision(dest, roomId, reason)
+        local routed, failure = snd.mapper.gotoRoom(roomId, nil, nil, nil, dest, options)
+        options.successAnnouncement = nil
+        return routed, failure
+    end
     
     local roomNum = tonumber(dest)
     if roomNum then
-        cecho("<yellow>[MMAPPER]<reset> Going to room " .. roomNum .. "\n")
-        snd.mapper.debugXrtDecision(dest, roomNum, "numeric destination")
-        return snd.mapper.gotoRoom(roomNum, nil, nil, nil, dest, options)
+        return gotoResolvedRoom(
+            roomNum,
+            "<yellow>[MMAPPER]<reset> Going to room " .. roomNum .. "\n",
+            "numeric destination"
+        )
     end
     
     if snd.db and snd.db.getAreaStartRoom then
         local startRoom = tonumber(snd.db.getAreaStartRoom(dest)) or -1
         if startRoom > 0 then
-            cecho("<yellow>[MMAPPER]<reset> Going to " .. dest .. " (room " .. startRoom .. ")\n")
-            snd.mapper.debugXrtDecision(dest, startRoom, "area start room from snd.db.getAreaStartRoom")
-            return snd.mapper.gotoRoom(startRoom, nil, nil, nil, dest, options)
+            return gotoResolvedRoom(
+                startRoom,
+                "<yellow>[MMAPPER]<reset> Going to " .. dest .. " (room " .. startRoom .. ")\n",
+                "area start room from snd.db.getAreaStartRoom"
+            )
         end
 
         if snd.db.query then
@@ -6189,9 +6275,11 @@ function snd.mapper.xrt(dest, options)
                 local areaKey = areaRows[1].key
                 local roomId = tonumber(areaRows[1].startRoom) or -1
                 if roomId > 0 then
-                    cecho("<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. roomId .. ")\n")
-                    snd.mapper.debugXrtDecision(dest, roomId, "area match from snd.db area query")
-                    return snd.mapper.gotoRoom(roomId, nil, nil, nil, dest, options)
+                    return gotoResolvedRoom(
+                        roomId,
+                        "<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. roomId .. ")\n",
+                        "area match from snd.db area query"
+                    )
                 end
             end
         end
@@ -6200,16 +6288,20 @@ function snd.mapper.xrt(dest, options)
     if snd.data and snd.data.areaDefaultStartRooms then
         local areaData = snd.data.areaDefaultStartRooms[dest]
         if areaData and areaData.start then
-            cecho("<yellow>[MMAPPER]<reset> Going to " .. dest .. " (room " .. areaData.start .. ")\n")
-            snd.mapper.debugXrtDecision(dest, areaData.start, "bundled default area start")
-            return snd.mapper.gotoRoom(areaData.start, nil, nil, nil, dest, options)
+            return gotoResolvedRoom(
+                areaData.start,
+                "<yellow>[MMAPPER]<reset> Going to " .. dest .. " (room " .. areaData.start .. ")\n",
+                "bundled default area start"
+            )
         end
         
         for areaKey, data in pairs(snd.data.areaDefaultStartRooms) do
             if areaKey:lower():find(dest, 1, true) and data.start then
-                cecho("<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. data.start .. ")\n")
-                snd.mapper.debugXrtDecision(dest, data.start, "bundled partial area match")
-                return snd.mapper.gotoRoom(data.start, nil, nil, nil, dest, options)
+                return gotoResolvedRoom(
+                    data.start,
+                    "<yellow>[MMAPPER]<reset> Going to " .. areaKey .. " (room " .. data.start .. ")\n",
+                    "bundled partial area match"
+                )
             end
         end
     end
@@ -6222,9 +6314,11 @@ function snd.mapper.xrt(dest, options)
         local results = snd.mapper.db.query(sql)
         if results and #results > 0 then
             local roomId = results[1].uid
-            cecho("<yellow>[MMAPPER]<reset> Going to area matching '" .. dest .. "' (room " .. roomId .. ")\n")
-            snd.mapper.debugXrtDecision(dest, roomId, "mapper db area LIKE fallback")
-            return snd.mapper.gotoRoom(roomId, nil, nil, nil, dest, options)
+            return gotoResolvedRoom(
+                roomId,
+                "<yellow>[MMAPPER]<reset> Going to area matching '" .. dest .. "' (room " .. roomId .. ")\n",
+                "mapper db area LIKE fallback"
+            )
         end
     end
     
@@ -6393,11 +6487,10 @@ function snd.mapper.walkTo(dest, opts)
         return false
     end
     
-    cecho("<yellow>[MMAPPER]<reset> Walking to " .. displayName .. " (no portals)...\n")
-    
     local path, depth = snd.mapper.findPath(currentRoom, targetRoom, true, true)  -- noPortals=true, noRecalls=true
     
     if path and #path > 0 then
+        cecho("<yellow>[MMAPPER]<reset> Walking to " .. displayName .. " (no portals)...\n")
         cecho("<dim_gray>[MMAPPER] Found path with " .. #path .. " steps<reset>\n")
         if not embedded then
             snd.mapper.goingToRoom = targetRoom
@@ -6406,6 +6499,9 @@ function snd.mapper.walkTo(dest, opts)
         snd.mapper.executePath(path, {preserveExecutionSerial = embedded})
         return true
     else
+        if opts.announceOnSuccessOnly ~= true then
+            cecho("<yellow>[MMAPPER]<reset> Walking to " .. displayName .. " (no portals)...\n")
+        end
         if snd.mapper.areaGuardEnabled() then
             local unguardedPath = snd.mapper.findPath(currentRoom, targetRoom, true, true, false, true)
             if unguardedPath and #unguardedPath > 0 then

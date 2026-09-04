@@ -1,4 +1,6 @@
 mm = mm or {}
+-- Increment for each distributed mapper build; report the loaded code, not disk state.
+mm.build_number = 2026090408
 
 mm.state = mm.state or {
   quick_mode = true,
@@ -4434,24 +4436,17 @@ function mm.search_notes_text(raw_text)
   return true
 end
 
-function mm.where_room(dest)
-  dest = tonumber(dest)
-  if not dest then return false, "mapper where expects a room id" end
-  local src = mm.current_room()
-  if not src then return false, "current room unknown; try LOOK first" end
-  if src == dest then return false, "you are already in that room" end
-  local nav = (mm and mm.nav) or (snd and snd.mapper) or nil
-  if not (nav and type(nav.findPath) == "function") then
-    return false, "mapper where requires mapper navigation module"
-  end
+local function where_path(nav, src, dest, exhaustive)
+  if tostring(src) == tostring(dest) then return {} end
   -- mapper where is theoretical edge count; ignore live xrt restrictions and
   -- let an equal-distance pure walk beat a portal route.
   local candidates = {}
-  local rawPath = nav.findPath(src, dest, nil, nil, true, true, true)
+  local depthLimit = exhaustive and "exhaustive" or nil
+  local rawPath = nav.findPath(src, dest, nil, nil, true, true, true, depthLimit, nil, exhaustive)
   if rawPath and #rawPath > 0 then
     table.insert(candidates, {kind = "raw", path = rawPath})
   end
-  local walkingPath = nav.findPath(src, dest, true, true, true, true, true)
+  local walkingPath = nav.findPath(src, dest, true, true, true, true, true, depthLimit)
   if walkingPath and #walkingPath > 0 then
     table.insert(candidates, {kind = "walk", path = walkingPath})
   end
@@ -4475,7 +4470,20 @@ function mm.where_room(dest)
     end
   end
 
-  local path = selected and selected.path or nil
+  return selected and selected.path or nil
+end
+
+function mm.where_room(dest)
+  dest = tonumber(dest)
+  if not dest then return false, "mapper where expects a room id" end
+  local src = mm.current_room()
+  if not src then return false, "current room unknown; try LOOK first" end
+  if src == dest then return false, "you are already in that room" end
+  local nav = (mm and mm.nav) or (snd and snd.mapper) or nil
+  if not (nav and type(nav.findPath) == "function") then
+    return false, "mapper where requires mapper navigation module"
+  end
+  local path = where_path(nav, src, dest)
   local depth = path and #path or nil
   if not path then return false, string.format("path from %s to %s not found", tostring(src), tostring(dest)) end
 
@@ -4534,6 +4542,309 @@ function mm.where_room(dest)
     end
   end
   return true
+end
+
+local function portal_analysis_area_key(value)
+  local refs = mm.area_references
+  local ref = refs and refs.get and refs.get(value)
+  return string.lower(trim(ref and ref.keyword or value))
+end
+
+local function portal_analysis_area_level(value)
+  local refs = mm.area_references
+  local ref = refs and refs.get and refs.get(value)
+  local minimum = ref and tonumber(ref.min) or nil
+  local maximum = ref and tonumber(ref.max) or nil
+  if not minimum or not maximum then return "?" end
+  if minimum == maximum then return tostring(minimum) end
+  return string.format("%d-%d", minimum, maximum)
+end
+
+local function portal_analysis_targets()
+  local refs = mm.area_references
+  local rows = snd and snd.db and type(snd.db.query) == "function"
+    and snd.db.query("SELECT name, key, startRoom FROM area") or nil
+  if not rows or #rows == 0 then
+    rows = {}
+    for _, ref in ipairs(refs and refs.areas or {}) do
+      rows[#rows + 1] = {name = ref.name, key = ref.keyword, startRoom = ref.start}
+    end
+  end
+
+  local candidates, ids, seen = {}, {}, {}
+  for _, row in ipairs(rows) do
+    local uid = tonumber(row.startRoom)
+    local key = portal_analysis_area_key(row.key)
+    local ref = refs and refs.get and refs.get(key)
+    if uid and uid > 0 and uid == math.floor(uid) and key ~= ""
+        and not seen[key] and not (ref and ref.ct ~= nil) then
+      seen[key] = true
+      local id = string.format("%.0f", uid)
+      candidates[#candidates + 1] = {
+        uid = id, key = key, name = row.name or key, areaLevel = portal_analysis_area_level(key),
+      }
+      ids[#ids + 1] = mm.sql_escape(id)
+    end
+  end
+  if #ids == 0 then return nil, "no configured area starts are available" end
+  local mapped, err = mm.query_mapper_db(
+    "SELECT rooms.uid, rooms.area, areas.flags FROM rooms LEFT JOIN areas ON areas.uid = rooms.area "
+      .. "WHERE rooms.uid IN (" .. table.concat(ids, ",") .. ")"
+  )
+  if not mapped then return nil, err end
+  local byId = {}
+  for _, room in ipairs(mapped) do byId[tostring(room.uid)] = room end
+  local targets = {}
+  for _, area in ipairs(candidates) do
+    local room = byId[area.uid]
+    local flags = string.lower(tostring(room and room.flags or ""))
+    if room and portal_analysis_area_key(room.area) == area.key
+        and not string.find(flags, "clanarea", 1, true) and not string.find(flags, "manorarea", 1, true)
+        and not string.find(flags, "morgue", 1, true) then
+      targets[#targets + 1] = area
+    end
+  end
+  if #targets == 0 then return nil, "no configured area starts match the mapped rooms" end
+  return targets
+end
+
+local function portal_analysis_room_ids(raw_dest)
+  local ids, seen = {}, {}
+  for part in string.gmatch(trim(raw_dest) .. ",", "(.-),") do
+    local arg = trim(part)
+    local dest = tonumber(arg)
+    if not string.match(arg, "^%d+$") or not dest or dest <= 0 or dest == math.huge then
+      return nil, "Usage: mapper analyzelanding <room id>[,room id,...]"
+    end
+    local id = string.format("%.0f", dest)
+    ---@cast id string
+    if not seen[id] then
+      seen[id] = true
+      ids[#ids + 1] = id
+    end
+  end
+  return ids
+end
+
+local function portal_analysis_distances(nav, origin, ids, walking, absoluteDepthLimit)
+  local options = {
+    playerLevel = 201, playerTier = 9, ignoreAreaGuard = true,
+    ignorePortalGuard = true, allowChaosPortals = true, excludeRandomExits = true,
+    usePortals = not walking, useRecall = not walking, expandJumps = not walking,
+    exhaustive = not walking or absoluteDepthLimit == nil,
+  }
+  if absoluteDepthLimit ~= nil then options.absoluteDepthLimit = absoluteDepthLimit end
+  local values, meta = nav.findDistances(origin, ids, options)
+  if not values or (meta and meta.error) then
+    return nil, meta and meta.error or "distance search failed"
+  end
+  return values, meta or {}
+end
+
+local function portal_analysis_report(context, landing)
+  local landingId = tostring(landing.uid)
+  local existing = context.existing
+  local portalCost = context.portalCost
+  local landingArea = portal_analysis_area_key(landing.area)
+  local maximumUsefulDepth = -1
+  local requiresExhaustiveSearch = false
+  for _, area in ipairs(context.targets) do
+    if area.key ~= landingArea then
+      local old = existing[area.uid]
+      if old == nil then
+        requiresExhaustiveSearch = true
+      else
+        maximumUsefulDepth = math.max(maximumUsefulDepth, old - portalCost - 1)
+      end
+    end
+  end
+
+  local fromLanding, landingMeta = {}, {}
+  if requiresExhaustiveSearch or maximumUsefulDepth >= 0 then
+    if requiresExhaustiveSearch then
+      fromLanding, landingMeta = portal_analysis_distances(
+        context.nav, tonumber(landingId), context.targetIds, true
+      )
+    else
+      fromLanding, landingMeta = portal_analysis_distances(
+        context.nav, tonumber(landingId), context.targetIds, true, maximumUsefulDepth
+      )
+    end
+    if not fromLanding then return nil, landingMeta end
+  end
+  local landingDistance = existing[landingId]
+  local landingSaved = landingDistance and math.max(0, landingDistance - portalCost) or nil
+  local report = {
+    source = tostring(context.source), landing = landingId, name = landing.name, area = landing.area,
+    areaLevel = portal_analysis_area_level(landing.area),
+    landingDistance = landingDistance, landingSaved = landingSaved,
+    portalCost = portalCost, rows = {}, compared = 0,
+    depthLimited = context.depthLimited or landingMeta.depthLimitReached,
+  }
+  for _, area in ipairs(context.targets) do
+    local old = existing[area.uid]
+    local onward = fromLanding[area.uid]
+    local via = onward and portalCost + onward or nil
+    if area.key == landingArea then
+      report.ownArea = {
+        name = area.name, uid = area.uid, areaLevel = area.areaLevel, existing = old, via = via,
+      }
+    else
+      if old ~= nil then report.compared = report.compared + 1 end
+      if via and (old == nil or via < old) then
+        report.rows[#report.rows + 1] = {
+          name = area.name, uid = area.uid, areaLevel = area.areaLevel,
+          existing = old, fromLanding = onward, via = via, saved = old and old - via or nil,
+        }
+      end
+    end
+  end
+  table.sort(report.rows, function(a, b)
+    if (a.saved == nil) ~= (b.saved == nil) then return a.saved == nil end
+    if a.saved ~= b.saved then return a.saved > b.saved end
+    if a.name ~= b.name then return a.name < b.name end
+    return tonumber(a.uid) < tonumber(b.uid)
+  end)
+  report.totalStepsSaved = 0
+  report.savedAreaCount = 0
+  report.newRouteCount = 0
+  for _, row in ipairs(report.rows) do
+    if row.saved ~= nil then
+      report.totalStepsSaved = report.totalStepsSaved + row.saved
+      report.savedAreaCount = report.savedAreaCount + 1
+    else
+      report.newRouteCount = report.newRouteCount + 1
+    end
+  end
+  report.totalPotentialStepsSaved = report.totalStepsSaved + (report.landingSaved or 0)
+  return report
+end
+
+-- Compare each candidate independently, sharing the existing-route search.
+-- Never register hypothetical portals or change live travel/character settings.
+function mm.build_portal_analyses(raw_dest)
+  local landingIds, inputError = portal_analysis_room_ids(raw_dest)
+  if not landingIds then return nil, inputError end
+  local src = mm.current_room()
+  if not src or tonumber(src) == nil or tonumber(src) <= 0 then
+    return nil, "current room unknown; try LOOK first"
+  end
+  local nav = mm.nav or (snd and snd.mapper)
+  if not (nav and type(nav.findDistances) == "function") then
+    return nil, "mapper analyzelanding requires mapper navigation module"
+  end
+  local landings, ids, errors = {}, {}, {}
+  for _, id in ipairs(landingIds) do
+    local rooms, roomError = mm.query_mapper_db(
+      "SELECT uid, name, area, noportal FROM rooms WHERE uid = " .. mm.sql_escape(id) .. " LIMIT 1"
+    )
+    if not rooms then return nil, roomError end
+    if rooms[1] then
+      landings[#landings + 1] = rooms[1]
+      ids[#ids + 1] = id
+    else
+      errors[#errors + 1] = "landing room " .. id .. " is not mapped"
+    end
+  end
+  if #landings == 0 then return nil, table.concat(errors, "; ") end
+  local targets, targetError = portal_analysis_targets()
+  if not targets then return nil, targetError end
+  local targetIds = {}
+  for _, area in ipairs(targets) do
+    ids[#ids + 1] = area.uid
+    targetIds[#targetIds + 1] = area.uid
+  end
+  local existing, existingMeta = portal_analysis_distances(nav, src, ids, false)
+  if not existing then return nil, existingMeta end
+  if existingMeta.portalAccessDistance == nil then
+    return nil, "no portal-allowed room is reachable from the current room"
+  end
+  local context = {
+    source = src, nav = nav, targetIds = targetIds, targets = targets, existing = existing,
+    portalCost = existingMeta.portalAccessDistance + 1,
+    depthLimited = existingMeta.depthLimitReached,
+  }
+  local reports = {}
+  for _, landing in ipairs(landings) do
+    local report, reportError = portal_analysis_report(context, landing)
+    if report then
+      reports[#reports + 1] = report
+    else
+      errors[#errors + 1] = "landing room " .. tostring(landing.uid) .. ": " .. tostring(reportError)
+    end
+  end
+  if #reports == 0 then return nil, table.concat(errors, "; ") end
+  return reports, nil, errors
+end
+
+function mm.build_portal_analysis(raw_dest)
+  local ids, err = portal_analysis_room_ids(raw_dest)
+  if not ids then return nil, err end
+  if #ids ~= 1 then return nil, "build_portal_analysis expects one landing room" end
+  local reports, reportError = mm.build_portal_analyses(ids[1])
+  return reports and reports[1] or nil, reportError
+end
+
+function mm.analyze_landing(dest)
+  local reports, err, errors = mm.build_portal_analyses(dest)
+  if not reports then return false, err end
+  local function number(value) return value == nil and "--" or tostring(value) end
+  local function label(value, width)
+    local text = string.gsub(trim(mm.strip_ansi(value)), "[\r\n\t]", " ")
+    if width and #text > width then text = string.sub(text, 1, width - 3) .. "..." end
+    return text
+  end
+  for _, report in ipairs(reports) do
+    cecho("\n<CornflowerBlue>[MMAPPER]<reset> <white>Landing analysis<reset>\n\n")
+    cecho("  <deep_sky_blue>Landing room  Landing area                    Area level  Current travel  With landing portal  Steps saved<reset>\n")
+    local landingArea = label(string.format("%s / %s", report.name, report.area), 31)
+    echo(string.format("  %-12s  %-31s  %-10s  %14s  ",
+      report.landing, landingArea, report.areaLevel, number(report.landingDistance)))
+    cecho(string.format("<yellow>%19s<reset>  <green>%11s<reset>\n",
+      number(report.portalCost), number(report.landingSaved)))
+    cecho("\n  <yellow>Other destinations improved through this landing:<reset>\n")
+    if #report.rows > 0 then
+      cecho("  <deep_sky_blue>Steps saved to                 Area start room  Area level  Steps now  Steps with portal  Steps saved<reset>\n")
+      for _, row in ipairs(report.rows) do
+        echo(string.format("  %-30s %15s  %-10s %10s  ",
+          label(row.name, 30), row.uid, row.areaLevel, number(row.existing)))
+        cecho(string.format("<yellow>%17s<reset>  <green>%11s<reset>\n",
+          number(row.via), row.saved and tostring(row.saved) or "new"))
+      end
+    else
+      cecho("  <light_grey>No shorter paths to other area starts.<reset>\n")
+    end
+    if report.landingSaved ~= nil then
+      if report.savedAreaCount > 0 then
+        cecho(string.format("  <green>Total potential steps saved: <white>%d<reset><green> across the landing and %d other destination%s.<reset>\n",
+          report.totalPotentialStepsSaved, report.savedAreaCount,
+          report.savedAreaCount == 1 and "" or "s"))
+      else
+        cecho(string.format("  <green>Total potential steps saved: <white>%d<reset><green> for the landing.<reset>\n",
+          report.totalPotentialStepsSaved))
+      end
+    else
+      cecho(string.format("  <green>Total potential steps saved: <white>%d<reset><green> across %d other destination%s; the landing had no current route.<reset>\n",
+        report.totalPotentialStepsSaved, report.savedAreaCount,
+        report.savedAreaCount == 1 and "" or "s"))
+    end
+    if report.newRouteCount > 0 then
+      cecho(string.format("  <green>%d additional area%s become%s reachable.<reset>\n",
+        report.newRouteCount, report.newRouteCount == 1 and "" or "s",
+        report.newRouteCount == 1 and "s" or ""))
+    end
+  end
+  for _, message in ipairs(errors or {}) do mm.warn(message) end
+  cecho("\n  <light_grey>Route analysis policy: 201/T9; respects noportal/norecall; ignores AreaGuard/PortalGuard.<reset>\n")
+  if #reports > 1 then
+    cecho("  <light_grey>Each landing is compared independently with the same existing routes.<reset>\n")
+  end
+  return true
+end
+
+-- Compatibility for scripts which called the original internal function name.
+function mm.analyze_portal(dest)
+  return mm.analyze_landing(dest)
 end
 
 function mm.guarded_room(dest)

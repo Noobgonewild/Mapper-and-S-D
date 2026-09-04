@@ -304,6 +304,13 @@ local function set_window_visibility(which, visible)
   end
 end
 
+local function raise_bigmap_window()
+  local w = mm.minimap.windows and mm.minimap.windows.bigmap
+  if w and w.container and type(w.container.raiseAll) == "function" then
+    pcall(w.container.raiseAll, w.container)
+  end
+end
+
 local function destroy_window(which)
   local w = mm.minimap.windows and mm.minimap.windows[which]
   if not w then return end
@@ -561,7 +568,7 @@ local function create_local_map_canvas()
     width = "100%",
     height = "100%",
   }, canvas)
-  background:setStyleSheet("background-color: rgba(17,17,17,245); border: 0px;")
+  background:setStyleSheet("background-color: rgb(0,0,0); border: 0px;")
 
   mm.minimap.windows.bigmap = {
     kind = "local_radius",
@@ -1497,7 +1504,8 @@ local function render_local_graphical(window, graph)
     end
   end
 
-  if window.background and window.background.lower then pcall(window.background.lower, window.background) end
+  -- The background was created before the drawables. Lowering it here sends
+  -- it behind unrelated Mudlet widgets, not just behind this canvas's rooms.
   finish_local_drawables(window)
   record_local_render(window, started_at)
 end
@@ -1523,7 +1531,6 @@ local function render_local_nomap(window, room_size)
   new_local_drawable(window, "nomap", (width - size) / 2, (height - size) / 2,
     size, size,
     "background-color: rgba(105,105,105,155); border: 3px solid " .. LOCAL_CURRENT_COLOR .. ";")
-  if window.background and window.background.lower then pcall(window.background.lower, window.background) end
   finish_local_drawables(window)
   record_local_render(window, started_at)
 end
@@ -1692,10 +1699,36 @@ local function ensure_native_bigmap_data()
 end
 
 local function activate_current_bigmap_surface(reason, completion, load_immediately)
+  local previous = mm.minimap.windows and mm.minimap.windows.bigmap
+  local container = previous and previous.container
+  local geometry = {}
+  if container and not container.minimized then
+    for _, key in ipairs({"x", "y", "width", "height"}) do
+      local getter = container["get_" .. key]
+      if type(getter) == "function" then
+        local ok, value = pcall(getter, container)
+        if ok then geometry[key] = tonumber(value) end
+      end
+    end
+  end
+  local cfg = ensure_geom("bigmap")
+  local visible = cfg.enabled
   destroy_window("bigmap")
   mm.minimap.lines = mm.minimap.lines or {}
   mm.minimap.lines.bigmap = {}
-  create_window("bigmap")
+  local window = create_window("bigmap")
+  -- Adjustable may reload an older saved layout while recreating the shell.
+  -- Keep the live geometry without changing the native widget/load lifecycle.
+  if window and window.container and geometry.x and geometry.y
+      and geometry.width and geometry.width > 0 and geometry.height and geometry.height > 0 then
+    if type(window.container.move) == "function" then
+      window.container:move(geometry.x, geometry.y)
+    end
+    if type(window.container.resize) == "function" then
+      window.container:resize(geometry.width, geometry.height)
+    end
+  end
+  set_window_visibility("bigmap", visible)
 
   if active_bigmap_mode() == "local" then
     mm.minimap.update_local_map(nil, { force = true })
@@ -1715,6 +1748,9 @@ local function activate_current_bigmap_surface(reason, completion, load_immediat
       completion(false, "native BigMap surface could not be created")
     end
   end
+  -- Native preload completion may synchronously restore the local surface.
+  -- Raise whichever surface is now current, only when the user wants it shown.
+  if visible then raise_bigmap_window() end
   return true
 end
 
@@ -1952,6 +1988,7 @@ function mm.minimap.set_window_visible(which, visible)
   cfg.enabled = visible and true or false
   create_window(which)
   set_window_visibility(which, cfg.enabled)
+  if which == "bigmap" and cfg.enabled then raise_bigmap_window() end
   save_window_persistence()
   mm.note(string.format("%s window %s.", which, cfg.enabled and "shown" or "hidden"))
 end

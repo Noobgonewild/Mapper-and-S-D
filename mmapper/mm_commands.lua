@@ -92,8 +92,6 @@ local function ensure_mapper_ui_config()
   snd.config.mapperUI = snd.config.mapperUI or {}
   local ui = snd.config.mapperUI
   if ui.links == nil then ui.links = true end
-  if ui.hover == nil then ui.hover = true end
-  if ui.visited == nil then ui.visited = true end
   if ui.chips == nil then ui.chips = true end
   return ui
 end
@@ -101,10 +99,8 @@ end
 local function mapper_ui_status_text()
   local ui = ensure_mapper_ui_config()
   return string.format(
-    "mapper ui: links=%s, hover=%s, visited=%s, chips=%s",
+    "mapper ui: links=%s, chips=%s (applies to new search/QW text output)",
     ui.links and "on" or "off",
-    ui.hover and "on" or "off",
-    ui.visited and "on" or "off",
     ui.chips and "on" or "off"
   )
 end
@@ -297,6 +293,10 @@ local function handle_autostop(mode)
 end
 
 local function handle_command_inline(line)
+  if line == "mapper version" then
+    mm.note("Mapper build: " .. tostring(mm.build_number or "unknown (reload the complete mapper)"))
+    return true
+  end
   line = normalize_line(line)
 
   if line == "mapper" then
@@ -457,8 +457,6 @@ local function handle_command_inline(line)
   if line == "mapper ui reset" then
     local ui = ensure_mapper_ui_config()
     ui.links = true
-    ui.hover = true
-    ui.visited = true
     ui.chips = true
     if snd and snd.saveState then
       snd.saveState()
@@ -467,9 +465,19 @@ local function handle_command_inline(line)
     return true
   end
 
-  local ui_flag, ui_mode = line:match("^mapper ui (links|hover|visited|chips)%s*(on|off)?$")
-  if ui_flag then
-    set_mapper_ui_flag(ui_flag, ui_mode)
+  local ui_args = line:match("^mapper ui%s+(.+)$")
+  if ui_args then
+    local ui_flag, ui_mode = ui_args:match("^(%S+)%s*(.-)$")
+    if (ui_flag ~= "links" and ui_flag ~= "chips" and ui_flag ~= "hover" and ui_flag ~= "visited")
+        or (ui_mode ~= "" and ui_mode ~= "on" and ui_mode ~= "off") then
+      mm.warn("Usage: mapper ui [status|reset] or mapper ui links/chips [on|off] (omit on/off to toggle)")
+      return true
+    end
+    if ui_flag == "hover" or ui_flag == "visited" then
+      mm.warn("mapper ui " .. ui_flag .. " has no effect: this styling was never implemented. Available settings: mapper ui links/chips [on|off].")
+      return true
+    end
+    set_mapper_ui_flag(ui_flag, ui_mode ~= "" and ui_mode or nil)
     return true
   end
 
@@ -894,6 +902,14 @@ local function handle_command_inline(line)
   end
   if guarded_arg then local ok, err = mm.guarded_room(guarded_arg); if not ok then mm.warn(err) end; return true end
 
+  local analyzelanding_arg = line:match("^mapper analyzelanding%s+(.+)$")
+    or line:match("^mapper analyzeportal%s+(.+)$")
+  if line == "mapper analyzelanding" or line == "mapper analyzeportal" or analyzelanding_arg then
+    local ok, err = mm.analyze_landing(analyzelanding_arg)
+    if not ok then mm.warn(err) end
+    return true
+  end
+
   local where_arg = line:match("^mapper where%s+(.+)$")
   if line == "mapper where" then mm.warn("Usage: mapper where <room id>"); return true end
   if where_arg then local ok, err = mm.where_room(where_arg); if not ok then mm.warn(err) end; return true end
@@ -1261,6 +1277,8 @@ mm.alias_specs = {
   {"^mapper guarded%s*(.*)$", function(m) local ok, err = mm.guarded_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper areaguard%s*(.*)$", function(m) local ok, err = mm.guarded_room(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper where%s*(.*)$", function(m) local ok, err = mm.where_room(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper analyzelanding%s+(.+)$", function(m) local ok, err = mm.analyze_landing(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper analyzeportal%s+(.+)$", function(m) local ok, err = mm.analyze_landing(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper exits(?:%s+(%d+))?$", function(m) local ok, err = mm.print_room_exits(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper area%s+(.+)$", function(m) local ok, err = mm.search_text("area", m[2]); if not ok then mm.warn(err) end end},
   {"^mapper find%s+(.+)$", function(m) local ok, err = mm.search_text("find", m[2]); if not ok then mm.warn(err) end end},
