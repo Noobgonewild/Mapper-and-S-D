@@ -183,7 +183,10 @@ Mini map:
 
 <img width="341" height="454" alt="2026-04-16 22_04_14-Aardwolf - Mudlet 4 20 1" src="https://github.com/user-attachments/assets/d5142888-bd23-4593-b501-89c02ecd19e7" />
 
-CLASSIC!
+
+mapper analyzelanding output, used to see what paths a potential chaos portal would improve:
+
+<img width="1263" height="811" alt="2026-09-04 22_38_14-Aardwolf - Mudlet 4 22 0" src="https://github.com/user-attachments/assets/0757a2f8-b2af-476e-969b-e92710614b62" />
 
 
 To anyone who has made it this far: While these addons have many many improvements, including navigation and path discovery, bugs may still be arround! Be sure to use at your own risk!
