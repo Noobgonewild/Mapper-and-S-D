@@ -1,147 +1,254 @@
-NOTE: Mapper had a loading step that i didn't include in the install notes. I fixed it so it is no longer required, it should load fine now!
+# MMapper + Search & Destroy for Aardwolf (Mudlet)
 
-**This was made for my personal use! I am sharing in case someone else finds it useful; I know 99% of people are die hard Mush veterans!**
+This repository contains a Mudlet mapper and Search & Destroy (S&D) for Aardwolf.
 
-**Mapper + Search and Destroy Database Guide (Mudlet)**
+> [!IMPORTANT]
+> Your Mudlet profile does **not** have to be named `Aardwolf`.
+>
+> The code uses `getMudletHomeDir()`, so it loads files from whichever Mudlet profile is currently open. If your profile is named `Bob`, install into the `Bob` profile directory. `Aardwolf.db` is the required default **database filename**, not the required profile name.
 
-This guide explains where to place your database files, how to name them, and which commands to use to inspect/import/convert/rebuild map data for both mapper and Search and Destroy (S&D).
+> [!WARNING]
+> **DO NOT RENAME THE ADDON FOLDERS.** They must be named exactly **`mmapper`** and **`SearchAndDestroy`** or the loaders will not find the Lua files.
 
-**1) What each database is for**
+## Quick installation
 
-Mapper DB (Aardwolf.db by default)
+1. Download this repository with **Code > Download ZIP**, then extract the ZIP somewhere temporary.
+2. Open the Mudlet profile in which you want to use the addons.
+3. Enter this in Mudlet's command line to display that profile's exact directory:
 
-Used by mapper features for room/exit data and for building/rebuilding your Mudlet map from a SQLite source database. The default configured names in mapper state is Aardwolf.db.
-You can copy this file from mush client. It is located in the root directory of mush client.
+   ```text
+   lua getMudletHomeDir()
+   ```
 
-S&D DB (SnDdb.db by default)
+   On Mudlet 4.20 or newer, this also opens the directory in your file manager:
 
-Used by Search and Destroy to store mob sightings, area start rooms, keyword exceptions, and history. Default path is getMudletHomeDir() .. "/SnDdb.db".
+   ```text
+   lua openMudletHomeDir()
+   ```
 
-You can copy this file from mush client. It is located in the root directory of mush client.
+4. Close Mudlet before copying folders or databases.
+5. Copy the complete **`mmapper`** and **`SearchAndDestroy`** folders from the extracted repository directly into the profile directory shown in step 3. **Do not rename either folder.**
+6. If you are bringing data from MUSHclient, also copy `Aardwolf.db` and `SnDdb.db` into that same profile directory. See [Moving your old MUSHclient databases](#moving-your-old-mushclient-databases).
+7. Reopen that Mudlet profile.
+8. Open Mudlet's **Package Manager** (`Alt+O`) and choose **Install New Package**. Install these files in this order:
 
-**2) Where to put the files**
+   1. `mmapper/mm_package.xml`
+   2. `SearchAndDestroy/SearchAndDestroy.xml`
 
-Mudlet profile base location
+   S&D depends on MMapper, which is why the mapper is installed first. Do not use the repository ZIP itself as the Mudlet package.
+9. Save the Mudlet profile.
+10. Run the checks in [Verify the installation](#verify-the-installation).
 
-Both modules resolve relative DB names from your Mudlet profile directory (getMudletHomeDir()). Mapper resolves relative native DB paths as getMudletHomeDir() .. "/<filename>".
+## Required directory layout
 
-Suggested placement
+The two addon folders and both databases belong directly inside the active Mudlet profile directory:
 
-Put your DB files directly in your Mudlet profile folder:
+```text
+<Mudlet profile directory>/
+├── Aardwolf.db                         optional, but recommended for existing map data
+├── SnDdb.db                            optional, but recommended for existing S&D data
+├── mmapper/
+│   ├── mm_package.xml
+│   ├── mm_init.lua
+│   ├── mm_core.lua
+│   └── ...the rest of the mapper files
+└── SearchAndDestroy/
+    ├── SearchAndDestroy.xml
+    ├── snd_main.lua
+    ├── snd_database.lua
+    ├── ...the rest of the S&D files
+    └── ...the supplied S&D sound files
+```
 
-C:\Users\username\.config\mudlet\profiles\Aardwolf
+The folder names are case-sensitive on Linux and macOS and must be exactly:
 
-Aardwolf.db (mapper source SQLite DB)
+- `mmapper` — not `mapper`
+- `SearchAndDestroy` — not `snd`, `S&D`, or `Search-And-Destroy`
 
-SnDdb.db (Search and destroy database file)
+Common incorrect layouts include:
 
-S&D and mapper location:
+```text
+<profile>/Mapper-and-S-D-main/mmapper/...
+<profile>/mmapper/mmapper/...
+<profile>/SearchAndDestroy/SearchAndDestroy/...
+```
 
-SearchAndDestroy and mapper go under your Mudlet profile path.
+After extracting the GitHub ZIP, copy the two folders **out of** the outer `Mapper-and-S-D-main` folder. Do not place that outer folder in the Mudlet profile.
 
-You then import SearchAndDestroy.xml and mm_package.xml
+### Typical profile locations
 
-**3) Naming conventions (recommended)**
+The exact path printed by `lua getMudletHomeDir()` is authoritative. Default locations usually look like:
 
-Mapper source SQLite DB: Aardwolf.db (default expected name).
+- Windows: `C:\Users\<you>\.config\mudlet\profiles\<profile-name>`
+- Linux: `/home/<you>/.config/mudlet/profiles/<profile-name>`
+- macOS: `/Users/<you>/.config/mudlet/profiles/<profile-name>`
 
-S&D DB: SnDdb.db by default, but any filename/path works if set via command (snd db <path>).
+## Moving your old MUSHclient databases
 
-**4) Mapper commands you will actually use**
+The public repository contains the addon code but does not contain populated mapper or S&D databases. You may either bring your existing MUSHclient data or let the Mudlet addons create new, empty databases.
 
-Check/set database paths
+### What to copy
 
-mapper database → show current source DB (map_db).
+The MUSHclient versions store their databases in the MUSHclient application directory (the directory returned by MUSHclient's `GetInfo(66)`, normally the folder containing `MUSHclient.exe`):
 
-mapper native db → show native map DB path.
+| MUSHclient file | Mudlet destination | Contains |
+| --- | --- | --- |
+| `Aardwolf.db` | `<Mudlet profile>/Aardwolf.db` | Mapper rooms, exits, portals, and related map data |
+| `SnDdb.db` | `<Mudlet profile>/SnDdb.db` | S&D areas, mob sightings, keywords, and history |
 
-mapper native db <path> → set native map DB path if needed
+If your MUSHclient mapper uses a different database name, enter `mapper database` in MUSHclient to see its current filename. Copy that database to Mudlet and name the destination file `Aardwolf.db`.
 
-Validate source SQLite before import
+Use the exact destination names shown above. In particular, `SnDdb.db` has capital `S`, `D`, and `D`; filename case matters on Linux and macOS.
 
-mapper native inspect or mapper native inspect <path>
+### Safe migration procedure
 
-Checks compatibility and counts. Can skip this step if you copy from mush client.
+1. Exit MUSHclient completely so SQLite finishes writing its database files.
+2. Exit Mudlet completely.
+3. Copy the old databases into the target Mudlet profile directory using the exact names `Aardwolf.db` and `SnDdb.db`.
+4. Reopen Mudlet and load the target profile.
 
-Convert/import SQLite into Mudlet map
+Do not copy databases while either client is using them. After a clean shutdown, copy the main `.db` files; temporary `-wal` and `-shm` files should not be needed.
 
-mapper native convert → this will import rooms from Aardwolf.db into the visual map (big map)
+On first load, the current mapper and S&D code inspect recognized older schemas and upgrade them automatically when necessary. Before a migration, the code creates a timestamped backup in:
 
-Converts SQLite rooms/exits into Mudlet map data and saves map export (default: mmapper_converted_map.dat).
+```text
+<Mudlet profile>/db_backups/
+```
 
-Rebuild/import shortcut commands
+Unrecognized or invalid databases are reported and left untouched.
 
-mapper rebuild map (it takes time. The client will temporarily freeze)
+### If Mudlet already created empty databases
 
-mapper import rooms (it takes time. The client will temporarily freeze)
+When either default database is missing, the addons create a valid but empty replacement. That lets a new user start collecting data, but it does not contain the old map or S&D history.
 
-Both run conversion from current map_db and then re-center player view if possible.
+If you installed the packages before copying your MUSHclient data:
 
-mapper rebuild layout → run this is big map doesn't look ok. This will fix it. Sometimes an area will look slightly off. Running this command will fix it.
+1. Run `mapper database` and `snd db` to confirm that the reported databases contain zero rooms/exits or zero mobs/areas.
+2. Exit Mudlet completely.
+3. Rename the empty files as backups, for example `Aardwolf.db.empty` and `SnDdb.db.empty`.
+4. Copy the populated MUSHclient files into the profile directory with the exact default names.
+5. Reopen Mudlet and check the counts again.
 
-More mapper commands for building/rebuilding/coloring map are found under "mapper help config"
+Never overwrite an open database.
 
-**5) S&D database commands**
+## Verify the installation
 
-Show DB status/path
+After installing both XML packages, connect to Aardwolf and run:
 
-snd db → shows current path, file exists/not found, connection status, tables, and profile dir.
+```text
+mapper database
+snd db
+```
 
-Point S&D to a different DB file
+Expected results:
 
-snd db /full/path/to/snd.db
+- `mapper database` reports the resolved path inside the active profile, a valid schema/integrity result, and nonzero room/exit counts if you copied a populated map database.
+- `snd db` reports the resolved database and profile paths, `FOUND`, an open connection, valid schema/integrity results, and nonzero mob/area counts if you copied a populated S&D database.
 
-This sets snd.db.file and immediately initializes the DB connection.
+If the current room is not detected after connecting, enter:
 
-Default behavior if DB is missing
+```text
+look
+```
 
-If configured S&D DB file is not found, S&D prints an error and tells you to copy DB into your Mudlet home dir.
+This refreshes the mapper's current-room information.
 
-**6) Typical first-time setup workflow**
+## Build the visual Mudlet map
 
-Install/load mapper + S&D modules in Mudlet.
+`Aardwolf.db` is a live SQLite database used by MMapper for room and route data. Mudlet's native visual map uses a different file format.
 
-Copy your old SQLite mapper DB into Mudlet profile as Aardwolf.db (recommended to use this name because it is preconfigured).
+After copying a populated `Aardwolf.db`, build the native visual map once with:
 
-Run mapper set database Aardwolf.db (should not be needed).
+```text
+mapper rebuild map
+```
 
-Run mapper native inspect to validate schema/counts before import.
+Let the rebuild finish. It creates the default native map file:
 
-Run mapper rebuild map (or mapper native convert) to import rooms/exits into Mudlet format.
+```text
+<Mudlet profile>/mmapper_converted_map.dat
+```
 
-If needed, run mapper native db mmapper_converted_map.dat and mapper native load to load the converted file explicitly.
+The rebuild replaces the current contents of Mudlet's internal map. Export or back up an existing Mudlet map first if you need to keep it.
 
-Place/copy S&D DB as SnDdb.db in Mudlet profile (or keep custom path).
+If an area's layout later looks wrong, stand in that area and run:
 
-Run snd db to verify S&D path and connection, then snd db /path/to/your/snd.db if you want a different file.
+```text
+mapper rebuild layout
+```
 
-**7) Quick troubleshooting**
+Do **not** run `mapper native load Aardwolf.db` or set `mapper native db` to `Aardwolf.db`. The code deliberately rejects that: `Aardwolf.db` is SQLite, while `mapper native load` expects a converted Mudlet map such as `mmapper_converted_map.dat`.
 
-mapper native load fails with “looks like SQLite” / not a Mudlet map file
+## First commands
 
-You attempted to load a raw SQLite DB. Use mapper native convert (or mapper rebuild map) first, then load the resulting map export if needed.
+Use these commands after installation:
 
-mapper native inspect says schema mismatch
+```text
+mapper help          show mapper help topics
+mapper help all      show all mapper commands
+snd                  show the main S&D help
+xhelp                show detailed S&D command help
+snd window           toggle the S&D window
+```
 
-Your source DB doesn’t have required room/exit columns. Verify source DB comes from compatible Aard/MUSHclient mapper schema.
+## Troubleshooting
 
-S&D says DB file not found
+### The addon says files or modules are missing
 
-Wrong path or filename. Either copy DB into Mudlet profile as SnDdb.db or run snd db /full/path/file.db to point to it.
+Read the required location printed by the warning and compare it with `lua getMudletHomeDir()`.
 
-snd db shows file exists but no useful data
+- The complete mapper folder must be `<profile>/mmapper`.
+- The complete S&D folder must be `<profile>/SearchAndDestroy`.
+- Remove any extra `Mapper-and-S-D-main`, `mmapper`, or `SearchAndDestroy` nesting level.
+- Do not copy only the XML files; the XML loaders execute the accompanying loose `.lua` files.
 
-Open snd db output and check tables/contents count; your file may be an unexpected schema or empty DB.
+After correcting either folder, reload the profile.
 
-Import commands do nothing / no mapper responses
+### S&D reports that MMapper did not become ready
 
-Verify mapper module is loaded and use path display commands (mapper database, mapper native db) to confirm the file being referenced is the one you expect.
+S&D requires MMapper. Confirm that `mm_package.xml` is installed and that MMapper did not print a missing-file or module error, then reload the profile. Install MMapper before S&D on a fresh profile.
 
-Nothing is working
+### The database exists but the counts are zero
+
+An empty database was probably created before the old MUSHclient file was copied, or the populated file was copied into a different profile. Use `mapper database` and `snd db` to read the exact paths currently in use, then follow [If Mudlet already created empty databases](#if-mudlet-already-created-empty-databases).
+
+### The copied S&D database is ignored
+
+Check the filename carefully. The default is `SnDdb.db`, not `Snddb.db`, `snd.db`, or `SnD.db`. Also confirm that it is directly in the active profile directory, not inside `SearchAndDestroy`.
+
+### A custom database path works only until a reload
+
+For the most reliable setup, use `Aardwolf.db` and `SnDdb.db` directly in the profile directory. The diagnostic commands can point the running session at other paths, but the current loaders restore their default database locations on a full profile reload.
+
+### `mapper native load` says the file looks like SQLite
+
+You tried to load `Aardwolf.db` as a native Mudlet map. Run `mapper rebuild map` to convert it, then use the generated `mmapper_converted_map.dat` if a native map file is requested.
+
+### Migration fails
+
+Copy the exact error message and the output of `mapper database` or `snd db`. Do not repeatedly rename unrelated databases to the expected filename: the code validates SQLite integrity and schema before changing recognized data.
+
+## Updating the addons
+
+Back up `Aardwolf.db`, `SnDdb.db`, and the profile's `persistence` directory before a major update. Then replace the two addon source folders with complete copies from the new release and reinstall both XML packages through Mudlet's Package Manager so changes to triggers, aliases, and loaders are also applied.
+
+Do not replace your databases or the profile-level `persistence` directory with files from the source archive.
+
+## Useful references
+
+- [Mudlet Package Manager](https://wiki.mudlet.org/w/Manual%3APackage_Manager)
+- [Mudlet `getMudletHomeDir()` documentation](https://wiki.mudlet.org/w/Manual%3AMiscellaneous_Functions#getMudletHomeDir)
+- [Mudlet profile file locations](https://wiki.mudlet.org/w/Mudlet_File_Locations)
+- [MUSHclient `GetInfo()` documentation](https://www.mushclient.com/mushclient/functions/GetInfo.html)
+
+These addons were originally made for personal use and are shared in case other Aardwolf players find them useful. Back up important profile and database data, and report reproducible problems with the exact warning text and diagnostic command output.
+
+
+If nothing is working....
 
 Close Mudlet and use Mushclient :)
 
-A few screenshots on S&D and Mmapper in action!
+A few screenshots on S&D and mmapper in action but their features are much much MUCH richer!
 
 <img width="3440" height="1400" alt="2026-04-16 23_22_08-NVIDIA GeForce Overlay" src="https://github.com/user-attachments/assets/d4bdcf57-3c3b-4eaa-8c4b-978059d11f46" />
 
