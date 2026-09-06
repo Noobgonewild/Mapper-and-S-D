@@ -1459,6 +1459,9 @@ function snd.triggers.scanEnd()
     if snd.scan and type(snd.scan.finishSmartNxScan) == "function" then
         snd.scan.finishSmartNxScan()
     end
+    if snd.scan and type(snd.scan.finishQuickWhereSmartScan) == "function" then
+        snd.scan.finishQuickWhereSmartScan("scan-complete")
+    end
 end
 
 function snd.triggers.scanCurrentLocation()

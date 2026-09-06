@@ -1,6 +1,6 @@
 mm = mm or {}
 -- Increment for each distributed mapper build; report the loaded code, not disk state.
-mm.build_number = 2026090408
+mm.build_number = 2026090604
 
 mm.state = mm.state or {
   quick_mode = true,
@@ -1952,7 +1952,7 @@ local function open_mapper_db(path)
   return env, conn
 end
 
-local MAPPER_SCHEMA_VERSION = 11
+local MAPPER_SCHEMA_VERSION = 12
 local MAPPER_CORE_TABLES = { "areas", "environments", "rooms", "exits" }
 local MAPPER_REQUIRED_COLUMNS = {
   areas = { "uid", "name", "texture", "color", "flags" },
@@ -2044,12 +2044,17 @@ local MAPPER_SCHEMA_SQL = {
       touid TEXT NOT NULL,
       observed_key TEXT NOT NULL,
       observed_key_normalized TEXT NOT NULL,
-      resolved_key_name TEXT,
+      resolved_key_name TEXT NOT NULL,
+      key_keywords TEXT NOT NULL,
+      key_keyword_signature TEXT NOT NULL,
+      key_level REAL,
+      key_source_room_uid TEXT,
+      key_source_area TEXT,
       door_direction TEXT,
       seen_count INTEGER NOT NULL DEFAULT 0,
       first_seen_at INTEGER NOT NULL,
       last_seen_at INTEGER NOT NULL,
-      PRIMARY KEY(fromuid, dir, touid, observed_key_normalized))]],
+      PRIMARY KEY(fromuid, dir, touid, key_keyword_signature))]],
   [[CREATE TABLE IF NOT EXISTS bookmarks(
       uid TEXT NOT NULL,
       notes TEXT,
@@ -2270,6 +2275,11 @@ local function migrate_mapper_database(conn, source, plan)
   end
 
   local ok, err = execute_statement(conn, "BEGIN IMMEDIATE")
+  if ok and plan.from_version < 12 then
+    -- Schema 11 observations only knew the name printed by the unlock line.
+    -- They cannot be upgraded safely when different keys share that name.
+    ok, err = execute_statement(conn, "DROP TABLE IF EXISTS cexit_key_observations")
+  end
   if ok then
     for _, addition in ipairs(plan.additions) do
       ok, err = execute_statement(conn, string.format(
@@ -2285,6 +2295,12 @@ local function migrate_mapper_database(conn, source, plan)
       ok, err = execute_statement(conn, sql)
       if not ok then break end
     end
+  end
+  if ok and plan.from_version < 12 then
+    -- Name-only conditional keys are equally unsafe. Keep only definitions
+    -- that already contain a full, identified keyword set.
+    ok, err = execute_statement(conn,
+      "DELETE FROM cexit_key_alternates WHERE trim(COALESCE(key_keywords, '')) = ''")
   end
   if ok and plan.rooms_lookup_missing then
     ok, err = execute_statement(conn,
@@ -2648,6 +2664,11 @@ function mm.ensure_cexit_key_alternates_table()
   )
   if not indexed then return false, index_err end
 
+  local invalid_cleaned, invalid_cleanup_err = mm.exec_mapper_db(
+    "DELETE FROM cexit_key_alternates WHERE trim(COALESCE(key_keywords, '')) = ''"
+  )
+  if not invalid_cleaned then return false, invalid_cleanup_err end
+
   local orphan_rows, orphan_err = mm.query_mapper_db([[
     SELECT COUNT(*) AS cnt
     FROM cexit_key_alternates AS cka
@@ -2683,12 +2704,17 @@ function mm.ensure_cexit_key_observations_table()
       touid TEXT NOT NULL,
       observed_key TEXT NOT NULL,
       observed_key_normalized TEXT NOT NULL,
-      resolved_key_name TEXT,
+      resolved_key_name TEXT NOT NULL,
+      key_keywords TEXT NOT NULL,
+      key_keyword_signature TEXT NOT NULL,
+      key_level REAL,
+      key_source_room_uid TEXT,
+      key_source_area TEXT,
       door_direction TEXT,
       seen_count INTEGER NOT NULL DEFAULT 0,
       first_seen_at INTEGER NOT NULL,
       last_seen_at INTEGER NOT NULL,
-      PRIMARY KEY(fromuid, dir, touid, observed_key_normalized))
+      PRIMARY KEY(fromuid, dir, touid, key_keyword_signature))
   ]])
   if not ok then return false, err end
 
@@ -2701,6 +2727,13 @@ function mm.ensure_cexit_key_observations_table()
     "CREATE INDEX IF NOT EXISTS cexit_key_observations_last_seen_index ON cexit_key_observations(last_seen_at)"
   )
   if not last_seen_indexed then return false, last_seen_index_err end
+
+  local invalid_cleaned, invalid_cleanup_err = mm.exec_mapper_db([[
+    DELETE FROM cexit_key_observations
+    WHERE trim(COALESCE(key_keywords, '')) = ''
+       OR trim(COALESCE(key_keyword_signature, '')) = ''
+  ]])
+  if not invalid_cleaned then return false, invalid_cleanup_err end
 
   return mm.exec_mapper_db([[
     DELETE FROM cexit_key_observations
@@ -2728,6 +2761,21 @@ local function normalize_keyword_signature(value)
   return cleaned:lower():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
 end
 
+local function canonical_keyword_signature(value)
+  local tokens = {}
+  local seen = {}
+  local cleaned = tostring(value or "")
+  if mm.strip_ansi then cleaned = mm.strip_ansi(cleaned) end
+  for token in cleaned:lower():gmatch("[^,%s]+") do
+    if not seen[token] then
+      seen[token] = true
+      table.insert(tokens, token)
+    end
+  end
+  table.sort(tokens)
+  return table.concat(tokens, " ")
+end
+
 local function without_leading_article(value)
   for _, article in ipairs({"a ", "an ", "the "}) do
     if value:sub(1, #article) == article then return value:sub(#article + 1) end
@@ -2737,9 +2785,9 @@ end
 
 local function delete_cexit_key_observation_record(row)
   return mm.exec_mapper_db(string.format(
-    "DELETE FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s AND observed_key_normalized=%s",
+    "DELETE FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s AND key_keyword_signature=%s",
     mm.sql_escape(row.fromuid), mm.sql_escape(row.dir), mm.sql_escape(row.touid),
-    mm.sql_escape(row.observed_key_normalized)
+    mm.sql_escape(row.key_keyword_signature)
   ))
 end
 
@@ -2756,7 +2804,7 @@ local function remove_configured_cexit_key_observations(fromuid, dir, touid)
   local ensured, ensure_err = mm.ensure_cexit_key_observations_table()
   if not ensured then return false, ensure_err end
   local rows, query_err = mm.query_mapper_db(string.format(
-    "SELECT fromuid, dir, touid, observed_key, observed_key_normalized, resolved_key_name FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s",
+    "SELECT fromuid, dir, touid, observed_key, observed_key_normalized, resolved_key_name, key_keyword_signature FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s",
     mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid)
   ))
   if not rows then return false, query_err end
@@ -3370,7 +3418,11 @@ function mm.resolve_observed_dinv_key(observed_key)
   local ok, result = pcall(api.getKeys, {
     source = "live",
     includeIgnored = true,
-    fields = {"id", "name", "normalizedName", "keywords", "type", "flags", "location", "container", "worn"},
+    fields = {
+      "id", "name", "normalizedName", "keywords", "identifyLevel", "level",
+      "type", "flags", "location", "container", "worn",
+      "knownKeySourceRoom", "knownKeySourceArea",
+    },
   })
   if not ok or type(result) ~= "table" or result.ok ~= true then
     return nil, {reason = type(result) == "table" and tostring(result.message or result.code or "DINV key query failed") or tostring(result)}
@@ -3379,7 +3431,7 @@ function mm.resolve_observed_dinv_key(observed_key)
     return nil, {reason = "DINV getKeys API does not support isKey-or-Type-Key queries"}
   end
 
-  local matched_names = {}
+  local matched_definitions = {}
   local matched_items = {}
   for _, item in ipairs(type(result.items) == "table" and result.items or {}) do
     local normalized_name = normalize_observed_key(item.normalizedName or item.name)
@@ -3394,27 +3446,43 @@ function mm.resolve_observed_dinv_key(observed_key)
         end
       end
     end
-    if name_matches or keyword_matches then
-      local identity = normalized_name ~= "" and normalized_name or normalize_observed_key(item.name)
-      if identity ~= "" then
-        matched_names[identity] = tostring(item.name or observed_key)
+    if (name_matches or keyword_matches) and tostring(item.identifyLevel or ""):lower() == "full" then
+      local keywords = normalize_keyword_signature(item.keywords)
+      local signature = canonical_keyword_signature(keywords)
+      if signature ~= "" then
+        matched_definitions[signature] = matched_definitions[signature] or {
+          name = tostring(item.name or observed_key),
+          keywords = keywords,
+          signature = signature,
+          level = tonumber(item.level),
+          source_room_uid = trim(item.knownKeySourceRoom),
+          source_area = trim(item.knownKeySourceArea),
+        }
         table.insert(matched_items, item)
       end
     end
   end
 
   local identities = {}
-  for identity in pairs(matched_names) do table.insert(identities, identity) end
+  for identity in pairs(matched_definitions) do table.insert(identities, identity) end
   table.sort(identities)
   if #identities == 1 then
-    return matched_names[identities[1]], {
-      normalized_name = identities[1],
+    local definition = matched_definitions[identities[1]]
+    return definition.name, {
+      normalized_name = normalize_observed_key(definition.name),
+      key_keywords = definition.keywords,
+      keyword_signature = definition.signature,
+      key_level = definition.level,
+      key_source_room_uid = definition.source_room_uid,
+      key_source_area = definition.source_area,
       items = matched_items,
       count = #matched_items,
     }
   end
   return nil, {
-    reason = #identities == 0 and "no live DINV key matched the unlock text" or "multiple DINV key names matched the unlock text",
+    reason = #identities == 0
+      and "no fully identified DINV key matched the unlock text"
+      or "multiple exact DINV key definitions matched the unlock text",
     items = matched_items,
     count = #matched_items,
   }
@@ -3495,6 +3563,15 @@ function mm.observe_cexit_key_unlock(observed_key)
   end
 
   local resolved_key_name, resolution = mm.resolve_observed_dinv_key(observed)
+  if not resolved_key_name or not resolution
+      or canonical_keyword_signature(resolution.key_keywords) == "" then
+    local reason = resolution and resolution.reason or "exact key keywords are unavailable"
+    mm.debug(string.format(
+      "CEXIT KEY OBSERVE DEBUG: rejected name-only key='%s' reason='%s'",
+      observed, tostring(reason)
+    ))
+    return false, reason
+  end
   local edge = candidates[1]
   local pending = {
     execution_serial = context.execution_serial,
@@ -3505,6 +3582,11 @@ function mm.observe_cexit_key_unlock(observed_key)
     observed_key = observed,
     observed_key_normalized = observed_normalized,
     resolved_key_name = resolved_key_name,
+    key_keywords = resolution.key_keywords,
+    key_keyword_signature = resolution.keyword_signature,
+    key_level = resolution.key_level,
+    key_source_room_uid = resolution.key_source_room_uid,
+    key_source_area = resolution.key_source_area,
     door_direction = edge.door_direction,
   }
   mm.runtime.pending_cexit_key_unlocks = mm.runtime.pending_cexit_key_unlocks or {}
@@ -3525,7 +3607,13 @@ function mm.record_cexit_key_observation(entry)
   local dir = trim(entry.dir)
   local observed_key = trim(entry.observed_key)
   local observed_normalized = normalize_observed_key(entry.observed_key_normalized or observed_key)
-  if not fromuid or not touid or dir == "" or observed_key == "" or observed_normalized == "" then
+  local resolved_key_name = trim(entry.resolved_key_name)
+  local key_keywords = normalize_keyword_signature(entry.key_keywords)
+  local key_keyword_signature = canonical_keyword_signature(
+    entry.key_keyword_signature or key_keywords
+  )
+  if not fromuid or not touid or dir == "" or observed_key == "" or observed_normalized == ""
+      or resolved_key_name == "" or key_keywords == "" or key_keyword_signature == "" then
     return false, "incomplete cexit key observation"
   end
   if fromuid == "*" or fromuid == "**" or is_cardinal_cexit_dir(dir) then
@@ -3549,12 +3637,10 @@ function mm.record_cexit_key_observation(entry)
   if configured == nil then return false, configured_key_err end
   local configured_key = trim(configured.key_name)
   if normalize_keyword_signature(configured.key_keywords) ~= "" then
-    local deleted, delete_err = delete_cexit_key_observation_record({
-      fromuid = fromuid,
-      dir = dir,
-      touid = touid,
-      observed_key_normalized = observed_normalized,
-    })
+    local deleted, delete_err = mm.exec_mapper_db(string.format(
+      "DELETE FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s",
+      mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid)
+    ))
     if not deleted then return false, delete_err end
     mm.runtime.cexit_key_observation_last_rows = {}
     mm.debug(string.format(
@@ -3564,8 +3650,8 @@ function mm.record_cexit_key_observation(entry)
     return false, "this cexit/key pair is already configured"
   end
   local existing, existing_err = mm.query_mapper_db(string.format(
-    "SELECT seen_count, first_seen_at, resolved_key_name, door_direction FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s AND observed_key_normalized=%s LIMIT 1",
-    mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid), mm.sql_escape(observed_normalized)
+    "SELECT seen_count, first_seen_at, resolved_key_name, door_direction, key_level, key_source_room_uid, key_source_area FROM cexit_key_observations WHERE fromuid=%s AND dir=%s AND touid=%s AND key_keyword_signature=%s LIMIT 1",
+    mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid), mm.sql_escape(key_keyword_signature)
   ))
   if not existing then return false, existing_err end
 
@@ -3573,16 +3659,23 @@ function mm.record_cexit_key_observation(entry)
   local now = tonumber(entry.observed_at) or os.time()
   local first_seen = tonumber(previous.first_seen_at) or now
   local seen_count = (tonumber(previous.seen_count) or 0) + 1
-  local resolved_key_name = trim(entry.resolved_key_name)
-  if resolved_key_name == "" then resolved_key_name = trim(previous.resolved_key_name) end
   local door_direction = trim(entry.door_direction)
   if door_direction == "" then door_direction = trim(previous.door_direction) end
+  local key_level = tonumber(entry.key_level) or tonumber(previous.key_level)
+  local key_source_room_uid = trim(entry.key_source_room_uid)
+  if key_source_room_uid == "" then key_source_room_uid = trim(previous.key_source_room_uid) end
+  local key_source_area = trim(entry.key_source_area)
+  if key_source_area == "" then key_source_area = trim(previous.key_source_area) end
+  local key_level_sql = key_level and tostring(key_level) or "NULL"
 
   local ok, write_err = mm.exec_mapper_db(string.format(
-    "INSERT OR REPLACE INTO cexit_key_observations (fromuid, dir, touid, observed_key, observed_key_normalized, resolved_key_name, door_direction, seen_count, first_seen_at, last_seen_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %d, %d, %d)",
+    "INSERT OR REPLACE INTO cexit_key_observations (fromuid, dir, touid, observed_key, observed_key_normalized, resolved_key_name, key_keywords, key_keyword_signature, key_level, key_source_room_uid, key_source_area, door_direction, seen_count, first_seen_at, last_seen_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %d, %d, %d)",
     mm.sql_escape(fromuid), mm.sql_escape(dir), mm.sql_escape(touid),
     mm.sql_escape(observed_key), mm.sql_escape(observed_normalized),
-    mm.sql_escape(resolved_key_name), mm.sql_escape(door_direction),
+    mm.sql_escape(resolved_key_name), mm.sql_escape(key_keywords),
+    mm.sql_escape(key_keyword_signature), key_level_sql,
+    mm.sql_escape(key_source_room_uid), mm.sql_escape(key_source_area),
+    mm.sql_escape(door_direction),
     seen_count, first_seen, now
   ))
   if not ok then return false, write_err end
@@ -3642,6 +3735,13 @@ local function print_cexit_key_observations(rows)
       trim(row.door_direction) ~= "" and tostring(row.door_direction) or "-",
       tonumber(row.seen_count) or 0, key_name, tostring(row.dir or ""), last_text
     ))
+    cecho(string.format(
+      "<gray>    keywords={%s}  key source=%s/%s  level=%s<reset>\n",
+      tostring(row.key_keywords or ""),
+      trim(row.key_source_area) ~= "" and tostring(row.key_source_area) or "?",
+      trim(row.key_source_room_uid) ~= "" and tostring(row.key_source_room_uid) or "?",
+      row.key_level ~= nil and tostring(row.key_level) or "?"
+    ))
   end
 end
 
@@ -3657,10 +3757,10 @@ function mm.list_cexit_key_observations(scope_arg)
     if not room then return false, "current room is unknown; try LOOK first" end
     where = "o.fromuid=" .. mm.sql_escape(room)
   elseif scope ~= "" then
-    return false, "Usage: mapper cexitkeys [thisroom]"
+    return false, "Usage: mapper cexitkeys [thisroom] | mapper cexitkeys accept <row> | mapper cexitkeys delete <row>"
   end
   local rows, err = mm.query_mapper_db(
-    "SELECT o.fromuid, o.dir, o.touid, o.observed_key, o.observed_key_normalized, o.resolved_key_name, o.door_direction, o.seen_count, o.first_seen_at, o.last_seen_at, a.key_name AS configured_key_name, a.key_keywords AS configured_key_keywords "
+    "SELECT o.fromuid, o.dir, o.touid, o.observed_key, o.observed_key_normalized, o.resolved_key_name, o.key_keywords, o.key_keyword_signature, o.key_level, o.key_source_room_uid, o.key_source_area, o.door_direction, o.seen_count, o.first_seen_at, o.last_seen_at, a.key_name AS configured_key_name, a.key_keywords AS configured_key_keywords "
       .. "FROM cexit_key_observations AS o LEFT JOIN cexit_key_alternates AS a "
       .. "ON a.fromuid=o.fromuid AND a.dir=o.dir AND a.touid=o.touid WHERE "
       .. where .. " ORDER BY o.seen_count DESC, o.last_seen_at DESC, o.fromuid, o.dir"
@@ -3702,6 +3802,35 @@ function mm.delete_cexit_key_observation(index)
     trim(row.resolved_key_name) ~= "" and tostring(row.resolved_key_name) or tostring(row.observed_key)
   ))
   return true
+end
+
+function mm.accept_cexit_key_observation(index)
+  local row_number = tonumber(index)
+  local row = row_number and (mm.runtime.cexit_key_observation_last_rows or {})[row_number] or nil
+  if not row then
+    return false, "cexit key observation row is out of range for the last mapper cexitkeys list"
+  end
+
+  local key_keywords = normalize_keyword_signature(row.key_keywords)
+  local key_signature = canonical_keyword_signature(row.key_keyword_signature or key_keywords)
+  if key_keywords == "" or key_signature == ""
+      or key_signature ~= canonical_keyword_signature(key_keywords) then
+    return false, "this observation has no exact identified key keywords and cannot be accepted"
+  end
+
+  local door_direction = trim(row.door_direction):lower()
+  if not ({n=true, s=true, e=true, w=true, u=true, d=true})[door_direction] then
+    return false, "the door direction could not be inferred; this observation cannot be accepted automatically"
+  end
+
+  return save_cexitif_target({
+    row = row,
+    row_number = row_number,
+    fromuid = row.fromuid,
+    dir = row.dir,
+    touid = row.touid,
+    alternate_command = door_direction,
+  }, trim(row.resolved_key_name) ~= "" and row.resolved_key_name or row.observed_key, key_keywords)
 end
 
 local function parse_portal_command(dir)
@@ -4982,6 +5111,113 @@ function mm.set_cexit_wait(seconds)
   end
   mm.state.temp_cexit_delay = n
   mm.note(string.format("cexit_wait set to %s seconds for next mapper cexit", tostring(n)))
+  return true
+end
+
+local EXIT_TO_DIRECTIONS = {
+  n = "n",
+  north = "n",
+  e = "e",
+  east = "e",
+  s = "s",
+  south = "s",
+  w = "w",
+  west = "w",
+  u = "u",
+  up = "u",
+  d = "d",
+  down = "d",
+}
+
+local function normalize_exit_to_text(value)
+  value = mm.strip_ansi(tostring(value or ""))
+  return value:gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " "):lower()
+end
+
+local function clear_exit_to_request(request)
+  if type(request) ~= "table" then return end
+  if request.trigger_id and type(killTrigger) == "function" then
+    pcall(killTrigger, request.trigger_id)
+    request.trigger_id = nil
+  end
+  if request.timeout_id and type(killTimer) == "function" then
+    pcall(killTimer, request.timeout_id)
+    request.timeout_id = nil
+  end
+  if mm.runtime and mm.runtime.exit_to_request == request then
+    mm.runtime.exit_to_request = nil
+  end
+end
+
+function mm.cancel_exit_to(silent)
+  mm.runtime = mm.runtime or {}
+  local request = mm.runtime.exit_to_request
+  if not request then return false end
+  clear_exit_to_request(request)
+  if not silent then
+    mm.warn("EXIT_TO cancelled while looking for '" .. tostring(request.target or "") .. "'.")
+  end
+  return true
+end
+
+function mm.exit_to(raw_target)
+  local target = tostring(raw_target or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if target == "" then return false, "Usage: mapper exit_to <exact room name>" end
+  if tonumber(target) then
+    return false, "EXIT_TO FAILED: Room IDs are not supported. Use the exact destination name shown by 'exits'."
+  end
+  if type(send) ~= "function" then return false, "EXIT_TO FAILED: Mudlet send() is unavailable." end
+
+  mm.runtime = mm.runtime or {}
+  mm.cancel_exit_to(true)
+
+  if type(tempRegexTrigger) ~= "function" or type(tempTimer) ~= "function" then
+    return false, "EXIT_TO FAILED: Mudlet temporary trigger/timer APIs are unavailable."
+  end
+
+  mm.runtime.exit_to_serial = (tonumber(mm.runtime.exit_to_serial) or 0) + 1
+  local request = {
+    serial = mm.runtime.exit_to_serial,
+    target = target,
+    normalized_target = normalize_exit_to_text(target),
+  }
+  mm.runtime.exit_to_request = request
+
+  local function is_current()
+    return mm.runtime and mm.runtime.exit_to_request == request
+      and mm.runtime.exit_to_serial == request.serial
+  end
+
+  request.trigger_id = tempRegexTrigger(
+    "^\\s*(North|East|South|West|Up|Down)\\s*:\\s*(.*?)\\s*$",
+    function()
+      if not is_current() then return end
+      local trigger_matches = matches or {}
+      local direction = EXIT_TO_DIRECTIONS[normalize_exit_to_text(trigger_matches[2])]
+      local exit_name = tostring(trigger_matches[3] or "")
+      if direction and normalize_exit_to_text(exit_name) == request.normalized_target then
+        clear_exit_to_request(request)
+        mm.debug(string.format("EXIT_TO: '%s' is %s", target, direction))
+        send(direction, false)
+      end
+    end
+  )
+
+  if not request.trigger_id then
+    clear_exit_to_request(request)
+    return false, "EXIT_TO FAILED: Could not create the exits-output trigger."
+  end
+
+  request.timeout_id = tempTimer(2, function()
+    if not is_current() then return end
+    clear_exit_to_request(request)
+    mm.warn(string.format(
+      "EXIT_TO FAILED: No visible cardinal exit named '%s' was found. The room name must match the exits output.",
+      target
+    ))
+  end)
+
+  send("exits", false)
   return true
 end
 

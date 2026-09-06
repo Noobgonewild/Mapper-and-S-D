@@ -121,7 +121,9 @@ mm.help_table = {
       { cmd = "mapper restorecexit <number|last>", desc = "Restore one deleted custom exit by row number, or restorecexit last" },
       { cmd = "mapper cexit <command>", desc = "Follow and link a custom exit (ex: 'mapper cexit ride bucket') Stacked mapper walkto commands hold later steps until that room is confirmed. To insert a pause, use wait(<seconds>). Stack commands with ; or ;; (ex: 'mapper cexit open south;south')" },
       { cmd = "mapper cexit_wait <seconds>", desc = "Set the next cexit's base confirmation window from cexit start instead of the standard 2 seconds; wait() values extend it (between 2 and 40)" },
-      { cmd = "mapper cexitkeys [thisroom]", desc = "List unresolved observed key uses; pairs already configured with cexitif are removed" },
+      { cmd = "mapper exit_to", desc = "Take a changing cardinal exit by its displayed destination name", help_topic = "exit_to" },
+      { cmd = "mapper cexitkeys [thisroom]", desc = "List unresolved observed key uses that include an exact, identified keyword set; invalid legacy name-only rows are removed" },
+      { cmd = "mapper cexitkeys accept <row>", desc = "Accept an observed key use from the last list, using its stored exact keywords and inferred door direction" },
       { cmd = "mapper cexitkeys delete <row>", desc = "Delete one row from the last mapper cexitkeys list" },
       { cmd = "mapper cexitif <row> keyid <id> do {<alternate command>}", desc = "Add or replace an alternate using a current key ID; Mapper stores its full keywords and later identifies newly looted items with that key name" },
       { cmd = "mapper cexitif <row> key {<exact keywords>} do {<alternate command>}", desc = "Add or replace an alternate using an exact full-identify keyword set" },
@@ -134,6 +136,19 @@ mm.help_table = {
       { cmd = "mapper lockexit <n|s|e|w|u|d> [level]", desc = "Set the selected cardinal direction and unlocked (level 0) cexits to the same destination. Existing nonzero cexit levels are preserved. Without level, sets 999." },
       { cmd = "mapper lockexit <n|s|e|w|u|d> off", desc = "Set exits.level to 0 for only the selected cardinal direction." },
       { cmd = "mapper fullcexit {<command>} <source> <destination> <level> (quiet)", desc = "Set all cexit aspects without running it. The command inside braces is stored exactly as entered." },
+    }
+  },
+  ['exit_to'] = {
+    header = "EXIT_TO",
+    rows = {
+      { text = "EXIT_TO resolves one changing cardinal exit in your current room. It sends 'exits', finds the exact displayed destination name, and moves in that direction. It does not walk around or solve a multi-room maze." },
+      { cmd = "mapper exit_to <exact room name>", desc = "Take the currently visible north, east, south, west, up, or down exit with that destination name" },
+      { cmd = "exit_to <exact room name>", desc = "Short form, primarily for use inside a stacked mapper cexit command" },
+      { text = "Examples:" },
+      { cmd = "mapper cexit exit_to Before the Grand Gates of Castle Vlad-Shamir;;wait(0.3)", desc = "Run in Castle Vlad room 15973; records the changing exit to room 16020" },
+      { cmd = "mapper cexit s;;exit_to The Imaginarium;;wait(0.3)", desc = "Run in Prosper room 28256, Entering the Theater; leaves through room 28257 and records the exit to room 2010" },
+      { cmd = "mapper cexit exit_to A peasant's home;;wait(0.3)", desc = "Run in Ruins room 16853; records the changing exit to room 16828" },
+      { text = "The destination must appear in the current 'exits' output. The trailing wait gives the asynchronous exits lookup and movement time to complete before the cexit finishes." },
     }
   },
   ['portals'] = {
@@ -287,7 +302,19 @@ local function print_help_row(row, command_width, details_width)
     for i = 1, total do
       local cmd = cmd_lines[i] or ""
       local desc = desc_lines[i] or ""
-      cecho(string.format("<cyan>%-" .. command_width .. "s<reset>  <light_grey>%s<reset>\n", cmd, desc))
+      local padded_command = string.format("%-" .. command_width .. "s", cmd)
+      if i == 1 and row.help_topic and type(echoLink) == "function" then
+        cecho("<cyan>")
+        echoLink(
+          padded_command,
+          string.format("mm.show_help(%q)", row.help_topic),
+          "Show mapper help " .. tostring(row.help_topic),
+          true
+        )
+        cecho(string.format("<reset>  <light_grey>%s<reset>\n", desc))
+      else
+        cecho(string.format("<cyan>%s<reset>  <light_grey>%s<reset>\n", padded_command, desc))
+      end
     end
     return
   end

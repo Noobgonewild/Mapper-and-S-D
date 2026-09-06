@@ -935,6 +935,12 @@ local function handle_command_inline(line)
     if not ok then mm.warn(err) end
     return true
   end
+  local accept_cexitkey_row = line:match("^mapper cexitkeys%s+accept%s+(%d+)$")
+  if accept_cexitkey_row then
+    local ok, err = mm.accept_cexit_key_observation(accept_cexitkey_row)
+    if not ok then mm.warn(err) end
+    return true
+  end
   local cexitkeys_scope = line:match("^mapper cexitkeys%s+(%S+)$")
   if line == "mapper cexitkeys" or cexitkeys_scope then
     local ok, err = mm.list_cexit_key_observations(cexitkeys_scope)
@@ -942,7 +948,7 @@ local function handle_command_inline(line)
     return true
   end
   if line:find("^mapper cexitkeys") then
-    mm.warn("Usage: mapper cexitkeys [thisroom] | mapper cexitkeys delete <row>")
+    mm.warn("Usage: mapper cexitkeys [thisroom] | mapper cexitkeys accept <row> | mapper cexitkeys delete <row>")
     return true
   end
 
@@ -1318,11 +1324,16 @@ mm.alias_specs = {
   {"^mapper cexits(?:%s+(.+))?$", function(m) local ok, err = mm.list_cexits(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexit_wait%s+(.+)$", function(m) local ok, err = mm.set_cexit_wait(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexitkeys%s+delete%s+(%d+)$", function(m) local ok, err = mm.delete_cexit_key_observation(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper cexitkeys%s+accept%s+(%d+)$", function(m) local ok, err = mm.accept_cexit_key_observation(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexitkeys%s*(%S*)$", function(m) local ok, err = mm.list_cexit_key_observations(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexitif%s+(%d+)%s+keyid%s+(%d+)%s+do%s+{(.*)}$", function(m) local ok, err = mm.set_cexitif_keyid(m[2], m[3], m[4]); if not ok then mm.warn(err) end end},
   {"^mapper cexitif%s+(%d+)%s+key%s+{([^}]*)}%s+do%s+{(.*)}$", function(m) local ok, err = mm.set_cexitif_keywords(m[2], m[3], m[4]); if not ok then mm.warn(err) end end},
   {"^mapper cexitif%s+(%d+)%s+test$", function(m) local ok, err = mm.test_cexitif(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexitif%s+(%d+)%s+off$", function(m) local ok, err = mm.remove_cexitif(m[2]); if not ok then mm.warn(err) end end},
+  {"^mapper exit_to$", function() local ok, err = mm.exit_to(""); if not ok then mm.warn(err) end end},
+  {"^mapper exit_to%s+(.+)$", function(m) local ok, err = mm.exit_to(m[2]); if not ok then mm.warn(err) end end},
+  {"^exit_to$", function() local ok, err = mm.exit_to(""); if not ok then mm.warn(err) end end},
+  {"^exit_to%s+(.+)$", function(m) local ok, err = mm.exit_to(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper cexit%s+(.+)$", function(m) local ok, err = mm.cexit(m[2]); if not ok then mm.warn(err) end end},
   {"^mapper randomcexits area%s+(.+)$", function(m) local ok, err = mm.list_random_cexits("area " .. m[2]); if not ok then mm.warn(err) end end},
   {"^mapper randomcexits%s+(.+)$", function(m) local ok, err = mm.list_random_cexits(m[2]); if not ok then mm.warn(err) end end},
@@ -1560,7 +1571,7 @@ function mm.register_aliases()
     pcall(killAlias, mm._alias)
     mm._alias = nil
   end
-  mm._alias = tempAlias("^(mapper|mapper .+|bookmarks?(?: .+)?|bookmarkwin(?: .+)?|maptype .+|mapshow .+|updatecolors(?: .+)?|resetaard|recon?)$", function()
+  mm._alias = tempAlias("^(mapper|mapper .+|bookmarks?(?: .+)?|bookmarkwin(?: .+)?|exit_to(?: .+)?|maptype .+|mapshow .+|updatecolors(?: .+)?|resetaard|recon?)$", function()
     -- Raw command text preserves ";;" for mapper parsing and persistence.
     local line = command or matches[2] or matches[1]
     if mm.handle_command(line) then return end

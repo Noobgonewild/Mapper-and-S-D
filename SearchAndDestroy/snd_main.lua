@@ -714,8 +714,9 @@ function snd.scan.resolveSmartScanTarget(options)
     return nil
 end
 
-function snd.scan.smartScan()
-    local target = snd.scan.resolveSmartScanTarget({select = true})
+function snd.scan.smartScan(options)
+    local opts = type(options) == "table" and options or {}
+    local target = opts.target or snd.scan.resolveSmartScanTarget({select = true})
     local keyword = ""
     if target and snd.commands and type(snd.commands.resolveTargetCommandSelector) == "function" then
         keyword = snd.commands.resolveTargetCommandSelector(target, "kill", {
@@ -839,6 +840,129 @@ function snd.scan.smartNxTargetSnapshot(target)
     }
 end
 
+local QUICK_WHERE_SMART_SCAN_TIMEOUT = 2
+
+local function quickWhereSmartScanMatchesCurrent(pending)
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    local snapshot = snd.scan.smartNxTargetSnapshot()
+    if not pending or not quickWhere or not snapshot then return false end
+    return tostring(pending.targetKey or "") == tostring(snapshot.targetKey or "")
+        and tostring(pending.targetName or "") == tostring(snapshot.targetName or "")
+        and tonumber(pending.passGeneration) == tonumber(quickWhere.passGeneration)
+        and tostring(pending.originRoom or "") == tostring(snd.scan.currentRoomId())
+end
+
+function snd.scan.cancelQuickWhereSmartScan(reason)
+    local pending = snd.scan.quickWhereSmartScan
+    if not pending then return false end
+    if pending.timer then
+        pcall(function() killTimer(pending.timer) end)
+        pending.timer = nil
+    end
+    snd.scan.quickWhereSmartScan = nil
+    snd.utils.debugNote("Smart NX: cancelled post-QW scan (" .. tostring(reason or "cancelled") .. ").")
+    return true
+end
+
+function snd.scan.finishQuickWhereSmartScan(reason)
+    local pending = snd.scan.quickWhereSmartScan
+    if not pending then return false end
+    local stillCurrent = quickWhereSmartScanMatchesCurrent(pending)
+    local continueNx = stillCurrent and pending.nxQueued == true
+    if pending.timer then
+        pcall(function() killTimer(pending.timer) end)
+        pending.timer = nil
+    end
+    snd.scan.quickWhereSmartScan = nil
+
+    if continueNx and snd.commands and type(snd.commands.nx) == "function" then
+        snd.utils.debugNote("Smart NX: continuing nx after post-QW scan (" .. tostring(reason or "complete") .. ").")
+        snd.commands.nx()
+    end
+    return stillCurrent
+end
+
+
+function snd.scan.deferNxForQuickWhereSmartScan()
+    local pending = snd.scan.quickWhereSmartScan
+    if not pending then return false end
+    if not quickWhereSmartScanMatchesCurrent(pending) then
+        snd.scan.cancelQuickWhereSmartScan("stale-before-nx")
+        return false
+    end
+    if pending.nxQueued ~= true then
+        pending.nxQueued = true
+        snd.utils.infoNote("Smart NX scan is in progress; nx will continue automatically.")
+    end
+    return true
+end
+
+-- QW can install a new room pass without causing a mapper arrival. Scan that
+-- unchanged origin once so live directional evidence can precede list order.
+function snd.scan.startQuickWhereSmartScan()
+    if not (snd.config and snd.config.smartNx == true) then return false end
+    if snd.normalizeNxAction(snd.config.nxAction) ~= "smartscan" then return false end
+
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    if not quickWhere or quickWhere.processed ~= true or quickWhere.active ~= true
+        or type(quickWhere.rooms) ~= "table" or #quickWhere.rooms == 0
+    then
+        return false
+    end
+    if snd.scan.smartNxSession then return false end
+    if (snd.nav and snd.nav.goingToRoom ~= nil)
+        or (snd.mapper and snd.mapper.goingToRoom ~= nil)
+        or (snd.mapper and snd.mapper.pathExecutionActive == true)
+    then
+        return false
+    end
+    if type(snd.isCurrentRoomSafe) == "function" and snd.isCurrentRoomSafe() then return false end
+
+    local characterState = gmcp and gmcp.char and gmcp.char.status and gmcp.char.status.state or nil
+    if characterState == nil or tostring(characterState) == "" then
+        characterState = snd.char and snd.char.state or nil
+    end
+    characterState = tostring(characterState or "0")
+    if characterState == "8" or characterState == "9" then return false end
+    if not snd.scan.currentTargetMatchesSmartScan() then return false end
+
+    local snapshot = snd.scan.smartNxTargetSnapshot()
+    local originRoom = tonumber(snd.scan.currentRoomId())
+    if not snapshot or not originRoom or originRoom <= 0 then return false end
+
+    if snd.scan.quickWhereSmartScan then
+        if quickWhereSmartScanMatchesCurrent(snd.scan.quickWhereSmartScan) then
+            return false
+        end
+        snd.scan.cancelQuickWhereSmartScan("replaced")
+    end
+
+    local pending = {
+        targetKey = snapshot.targetKey,
+        targetName = snapshot.targetName,
+        passGeneration = tonumber(quickWhere.passGeneration) or 0,
+        originRoom = math.floor(originRoom),
+        nxQueued = false,
+    }
+    snd.scan.quickWhereSmartScan = pending
+
+    if snd.scan.smartScan({target = snd.targets and snd.targets.current or nil}) ~= true then
+        snd.scan.cancelQuickWhereSmartScan("send-failed")
+        return false
+    end
+
+    if type(tempTimer) == "function" then
+        pending.timer = tempTimer(QUICK_WHERE_SMART_SCAN_TIMEOUT, function()
+            if snd.scan and snd.scan.quickWhereSmartScan == pending then
+                pending.timer = nil
+                snd.scan.finishQuickWhereSmartScan("timeout")
+            end
+        end)
+    end
+    snd.utils.debugNote("Smart NX: scanning after fresh QW room list.")
+    return true
+end
+
 function snd.scan.clearSmartNxSuggestion(reason)
     if snd.scan.smartNxSuggestion then
         snd.utils.debugNote("Smart NX: cleared scan suggestion (" .. tostring(reason or "cleared") .. ").")
@@ -852,6 +976,9 @@ local function smartNxRoomPassGeneration()
 end
 
 function snd.scan.resetSmartNxPass(reason)
+    if type(snd.scan.cancelQuickWhereSmartScan) == "function" then
+        snd.scan.cancelQuickWhereSmartScan(reason or "pass-reset")
+    end
     if snd.scan.smartNxPass then
         snd.utils.debugNote("Smart NX: reset room coverage (" .. tostring(reason or "reset") .. ").")
     end
@@ -997,7 +1124,7 @@ function snd.scan.resolveSmartNxRoom(originRoom, direction, distance)
         return nil
     end
     steps = math.floor(steps)
-    if steps < 0 or steps > 2 then return nil end
+    if steps < 0 or steps > 3 then return nil end
     roomId = math.floor(roomId)
     for _ = 1, steps do
         roomId = smartNxMappedExit(roomId, normalizedDirection)
@@ -1009,7 +1136,7 @@ end
 local function smartNxLineOfSightRooms(originRoom)
     local rooms = {}
     for _, direction in ipairs({"n", "e", "s", "w", "u", "d"}) do
-        for distance = 1, 2 do
+        for distance = 1, 3 do
             local roomId = snd.scan.resolveSmartNxRoom(originRoom, direction, distance)
             if not roomId then break end
             rooms[math.floor(roomId)] = true

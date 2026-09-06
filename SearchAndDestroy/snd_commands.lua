@@ -2530,6 +2530,12 @@ function snd.commands.nx()
         end
     end
 
+    if snd.scan and type(snd.scan.deferNxForQuickWhereSmartScan) == "function"
+        and snd.scan.deferNxForQuickWhereSmartScan()
+    then
+        return
+    end
+
     local smartNxRoomId = nil
     local smartNxSuggestion = nil
     if snd.scan and type(snd.scan.consumeSmartNxSuggestion) == "function" then
@@ -3770,6 +3776,12 @@ function snd.commands.processQuickWhereResult()
     finishXcpCycleRefresh(restartsNxCycle, #quickWhereRooms > 0)
 
     snd.triggers.disableQuickWhereTriggers()
+
+    if #quickWhereRooms > 0
+        and snd.scan and type(snd.scan.startQuickWhereSmartScan) == "function"
+    then
+        snd.scan.startQuickWhereSmartScan()
+    end
 
 end
 
