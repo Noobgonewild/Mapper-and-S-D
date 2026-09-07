@@ -123,7 +123,7 @@ mm.help_table = {
       { cmd = "mapper cexit_wait <seconds>", desc = "Set the next cexit's base confirmation window from cexit start instead of the standard 2 seconds; wait() values extend it (between 2 and 40)" },
       { cmd = "mapper exit_to", desc = "Take a changing cardinal exit by its displayed destination name", help_topic = "exit_to" },
       { cmd = "mapper cexitkeys [thisroom]", desc = "List unresolved observed key uses that include an exact, identified keyword set; invalid legacy name-only rows are removed" },
-      { cmd = "mapper cexitkeys accept <row>", desc = "Accept an observed key use from the last list, using its stored exact keywords and inferred door direction" },
+      { cmd = "mapper cexitkeys accept <row>", desc = "Accept an observed key use from the last list, using its exact keywords and the cexit's final open-and-move commands" },
       { cmd = "mapper cexitkeys delete <row>", desc = "Delete one row from the last mapper cexitkeys list" },
       { cmd = "mapper cexitif <row> keyid <id> do {<alternate command>}", desc = "Add or replace an alternate using a current key ID; Mapper stores its full keywords and later identifies newly looted items with that key name" },
       { cmd = "mapper cexitif <row> key {<exact keywords>} do {<alternate command>}", desc = "Add or replace an alternate using an exact full-identify keyword set" },

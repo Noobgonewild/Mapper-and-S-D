@@ -1,6 +1,6 @@
 mm = mm or {}
 -- Increment for each distributed mapper build; report the loaded code, not disk state.
-mm.build_number = 2026090604
+mm.build_number = 2026090701
 
 mm.state = mm.state or {
   quick_mode = true,
@@ -2630,6 +2630,39 @@ function mm.ensure_random_cexits_table()
   )
 end
 
+local CEXIT_DIRECTION_ALIASES = {
+  n = "n", north = "n", s = "s", south = "s",
+  e = "e", east = "e", w = "w", west = "w",
+  u = "u", up = "u", d = "d", down = "d",
+}
+
+local CEXIT_OPEN_VERBS = {o = true, op = true, ope = true, open = true}
+
+local function normalize_cexit_direction(value)
+  local token = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+  return CEXIT_DIRECTION_ALIASES[token]
+end
+
+local function cexit_door_traversal_suffix(command, expected_direction)
+  local operations = {}
+  for operation in tostring(command or ""):gmatch("[^;]+") do
+    operation = operation:gsub("^%s+", ""):gsub("%s+$", "")
+    if operation ~= "" then table.insert(operations, operation) end
+  end
+  if #operations < 2 then return nil end
+
+  local open_operation = operations[#operations - 1]
+  local verb, argument = open_operation:lower():match("^(%S+)%s+(%S+)%s*$")
+  local opened_direction = CEXIT_OPEN_VERBS[verb] and CEXIT_DIRECTION_ALIASES[argument] or nil
+  local moved_direction = normalize_cexit_direction(operations[#operations])
+  local wanted_direction = normalize_cexit_direction(expected_direction)
+  if not opened_direction or opened_direction ~= moved_direction
+      or (wanted_direction and opened_direction ~= wanted_direction) then
+    return nil
+  end
+  return open_operation .. ";" .. operations[#operations], opened_direction
+end
+
 function mm.ensure_cexit_key_alternates_table()
   local ok, err = mm.exec_mapper_db([[
     CREATE TABLE IF NOT EXISTS cexit_key_alternates(
@@ -2692,6 +2725,44 @@ function mm.ensure_cexit_key_alternates_table()
     if not cleaned then return false, cleanup_err end
     mm.warn(string.format("Removed %d orphaned conditional cexit record%s.",
       orphan_count, orphan_count == 1 and "" or "s"))
+  end
+
+  -- Builds that first supported accepting observations stored only the inferred
+  -- direction. Recover those rows from the original cexit's final open+move pair.
+  mm.runtime = mm.runtime or {}
+  if not mm.runtime.cexit_key_open_suffix_repair_checked then
+    local legacy_rows, legacy_err = mm.query_mapper_db([[
+      SELECT cka.fromuid, cka.dir, cka.touid, cka.alternate_command
+      FROM cexit_key_alternates AS cka
+      INNER JOIN exits
+        ON exits.fromuid = cka.fromuid
+       AND exits.dir = cka.dir
+       AND exits.touid = cka.touid
+    ]])
+    if not legacy_rows then return false, legacy_err end
+    local repaired_count = 0
+    for _, row in ipairs(legacy_rows) do
+      local bare_direction = normalize_cexit_direction(row.alternate_command)
+      if bare_direction then
+        local replacement = cexit_door_traversal_suffix(row.dir, bare_direction)
+        if replacement then
+          local repaired, repair_err = mm.exec_mapper_db(string.format(
+            "UPDATE cexit_key_alternates SET alternate_command=%s WHERE fromuid=%s AND dir=%s AND touid=%s AND alternate_command=%s",
+            mm.sql_escape(replacement), mm.sql_escape(row.fromuid), mm.sql_escape(row.dir),
+            mm.sql_escape(row.touid), mm.sql_escape(row.alternate_command)
+          ))
+          if not repaired then return false, repair_err end
+          repaired_count = repaired_count + 1
+        end
+      end
+    end
+    mm.runtime.cexit_key_open_suffix_repair_checked = true
+    if repaired_count > 0 then
+      mm.note(string.format(
+        "Repaired %d conditional cexit%s to open the door before moving.",
+        repaired_count, repaired_count == 1 and "" or "s"
+      ))
+    end
   end
   return true
 end
@@ -3390,17 +3461,12 @@ end
 local CEXIT_KEY_OBSERVATION_MAX_AGE = 60
 
 local function infer_cexit_door_direction(command)
-  local aliases = {
-    n = "n", north = "n", s = "s", south = "s",
-    e = "e", east = "e", w = "w", west = "w",
-    u = "u", up = "u", d = "d", down = "d",
-  }
   local inferred
   for token in tostring(command or ""):gmatch("[^;]+") do
     local verb, argument = token:lower():match("^%s*(%S+)%s+(%S+)")
     if verb == "o" or verb == "op" or verb == "ope" or verb == "open"
         or verb == "unlock" then
-      inferred = aliases[argument] or inferred
+      inferred = CEXIT_DIRECTION_ALIASES[argument] or inferred
     end
   end
   return inferred
@@ -3823,13 +3889,18 @@ function mm.accept_cexit_key_observation(index)
     return false, "the door direction could not be inferred; this observation cannot be accepted automatically"
   end
 
+  local alternate_command = cexit_door_traversal_suffix(row.dir, door_direction)
+  if not alternate_command then
+    return false, "the cexit does not end with a matching 'open <direction>;<direction>' sequence; configure its conditional alternate manually"
+  end
+
   return save_cexitif_target({
     row = row,
     row_number = row_number,
     fromuid = row.fromuid,
     dir = row.dir,
     touid = row.touid,
-    alternate_command = door_direction,
+    alternate_command = alternate_command,
   }, trim(row.resolved_key_name) ~= "" and row.resolved_key_name or row.observed_key, key_keywords)
 end
 
