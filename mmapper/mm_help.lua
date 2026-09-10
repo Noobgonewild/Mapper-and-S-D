@@ -154,6 +154,7 @@ mm.help_table = {
   ['portals'] = {
     header = "Portal Actions",
     rows = {
+      { cmd = "mapper portal <command> level <number>", desc = "Link a handheld portal to the current room as a special exit from everywhere else. The level suffix is required (ex: 'mapper portal recall level 50'). To stack commands use ;; as separator (ex: 'mapper portal hold amulet;;enter level 50')." },
       { cmd = "mapper portals", desc = "List known hand-held portals; click/right-click a bracketed portal row to report or copy it" },
       { cmd = "mapper portalstats [count|all]", desc = "Show current portals ranked by used/tried, followed by unused portals in mapper order (default 20); click/right-click a portal ID to report or copy it" },
       { cmd = "mapper portalstats unused [count|all]", desc = "Show only current portals that have never been attempted" },
@@ -165,7 +166,6 @@ mm.help_table = {
       { cmd = "mapper portalguard <portal-id> [guard-level]", desc = "Add a per-portal effective-level surcharge (default +20); recall portals cannot be guarded" },
       { cmd = "mapper portalguard <portal-id> off", desc = "Remove the individual guard from a DINV portal; xrtforce bypasses guards" },
       { cmd = "mapper portals here/<area>", desc = "List known hand-held portals only to this or another area (by area keyword)." },
-      { cmd = "mapper portal <command> level <number>", desc = "Link a handheld portal to the current room as a special exit from everwhere else. The level suffix is required (ex: 'mapper portal recall level 50'). To stack commands use ;; as separator (ex: 'mapper portal hold amulet;;enter level 50')." },
       { cmd = "mapper fullportal {<command>} {<room_id>} <level> (quiet)", desc = "Set all portal aspects in one command without being there." },
       { cmd = "mapper portalrecall <index>", desc = "Flag/unflag a portal as using a recall or home command, to avoid using it in identified norecall rooms. Find the indices with 'mapper portals'" },
       { cmd = "mapper chaosportal <index>", desc = "Toggle chaos flag on a non-recall portal. Chaos portals are ignored while actively on global quest and cannot be set as recall/bounce portals. Find the indices with 'mapper portals'" },
@@ -247,7 +247,7 @@ mm.help_table = {
       { cmd = "mapper next", desc = "Visit the next room in the most recent list of results." },
       { cmd = "mapper next <index>", desc = "Ditto, but skip to the given result index." },
       { cmd = "mapper where <room id>", desc = "Show directions to a room number" },
-      { cmd = "mapper analyzelanding <room id>[,room id,...]", desc = "Analyze one or more portal landing rooms (e.g. 16600, 2199). Each landing shows its travel comparison and a table containing only other area starts made shorter by the new portal" },
+      { cmd = "mapper analyzelanding <room id>[,room id,...]", desc = "Analyze one or more portal landing rooms (e.g. 16600, 2199). Reports landing-room savings separately from savings across improved area starts, including the landing area's own start" },
       { cmd = "mapper guarded <room id>", desc = "Preview the xrt route with AreaGuard forced on; does not move you (alias: mapper areaguard)" },
     }
   },

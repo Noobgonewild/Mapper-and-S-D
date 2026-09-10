@@ -5,14 +5,6 @@ local function trim(s)
   return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
-local function now_millis()
-  if type(getEpoch) == "function" then
-    local v = tonumber(getEpoch())
-    if v then return v end
-  end
-  return math.floor((os.clock() or 0) * 1000)
-end
-
 function mm.get_room_packet()
   if gmcp and gmcp.room then
     return gmcp.room

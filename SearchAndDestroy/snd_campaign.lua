@@ -542,6 +542,33 @@ function snd.cp.endCpCheck()
 end
 
 function snd.cp.buildTargetListFromCheck()
+    local deferredCarry = {}
+    local function carryText(value)
+        local text = tostring(value or "")
+        if snd.utils and type(snd.utils.trim) == "function" then
+            text = snd.utils.trim(text)
+        else
+            text = text:match("^%s*(.-)%s*$") or text
+        end
+        return text:lower():gsub("%s+", " ")
+    end
+    local function carryKey(mob, loc)
+        return table.concat({
+            carryText(mob),
+            carryText(loc),
+        }, "|")
+    end
+    for _, target in ipairs(snd.campaign.targets or {}) do
+        if target.deferred == true then
+            local key = carryKey(target.mob, target.lastCheckLoc or target.resolutionLoc or target.loc)
+            deferredCarry[key] = deferredCarry[key] or {}
+            table.insert(deferredCarry[key], {
+                order = target.deferredOrder,
+                reason = target.deferredReason,
+                session = target.deferredSession,
+            })
+        end
+    end
     snd.campaign.targets = {}
 
     for i, check in ipairs(snd.campaign.checkList) do
@@ -550,7 +577,7 @@ function snd.cp.buildTargetListFromCheck()
             areaKey = snd.db.getAreaKeyFromName(check.loc) or ""
         end
 
-        table.insert(snd.campaign.targets, {
+        local rebuilt = {
             mob = check.mob,
             loc = check.loc,
             resolutionLoc = check.loc,
@@ -561,7 +588,16 @@ function snd.cp.buildTargetListFromCheck()
             killed = false,
             campaignIndex = i,
             keyword = snd.gmcp.guessMobKeyword(check.mob, areaKey),
-        })
+        }
+        local carry = deferredCarry[carryKey(check.mob, check.loc)]
+        local preserved = carry and table.remove(carry, 1) or nil
+        if preserved then
+            rebuilt.deferred = true
+            rebuilt.deferredOrder = preserved.order
+            rebuilt.deferredReason = preserved.reason
+            rebuilt.deferredSession = preserved.session
+        end
+        table.insert(snd.campaign.targets, rebuilt)
     end
     
     snd.campaign.active = #snd.campaign.targets > 0
@@ -1102,6 +1138,10 @@ function snd.cp.buildMainTargetList()
                 lowConfidence = zone.fromMapper == true,
                 duplicates = total,
                 dupIndex = j,
+                deferred = target.deferred == true,
+                deferredOrder = target.deferredOrder,
+                deferredReason = target.deferredReason,
+                deferredSession = target.deferredSession,
             }
 
             if zone.tags then
@@ -1412,6 +1452,9 @@ function snd.cp.onMobKilled()
     if canonical and not canonical.killed then
         canonical.dead = true
         canonical.killed = true
+        if snd.commands and snd.commands.clearTargetDeferral then
+            snd.commands.clearTargetDeferral("cp", killedCampaignIndex)
+        end
         local killedWasSelected = selectedCampaignIndex ~= nil
             and tonumber(selectedCampaignIndex) == tonumber(killedCampaignIndex)
         snd.cp.updateTargetStatus()
@@ -1419,7 +1462,7 @@ function snd.cp.onMobKilled()
             snd.clearTarget({refresh = false})
         end
         if type(raiseEvent) == "function" then
-            local roomId = snd.room and snd.room.current and snd.room.current.id or nil
+            local roomId = snd.room and snd.room.current and snd.room.current.rmid or nil
             raiseEvent("snd.kill.confirmed", canonical.mob or killedName, roomId)
         end
 
@@ -1814,6 +1857,12 @@ function snd.cp.selectTarget(index, options)
         areaName = target.loc or "",    -- Area display name
         index = index,
         activity = "cp",
+        campaignIndex = target.campaignIndex,
+        dupIndex = target.dupIndex,
+        deferred = target.deferred == true,
+        deferredOrder = target.deferredOrder,
+        deferredReason = target.deferredReason,
+        deferredSession = target.deferredSession,
         express = target.express == true,
         expressRoomId = target.expressRoomId,
         expressKillCount = target.expressKillCount,

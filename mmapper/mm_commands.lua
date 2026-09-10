@@ -520,10 +520,14 @@ local function handle_command_inline(line)
       mm.warn("Also see 'mapper help portals' for command usage.")
       return true
     end
+    local added
     if is_recall then
-      nav.addRecallPortal(command, level)
+      added = nav.addRecallPortal(command, level)
     else
-      nav.addPortal(command, level)
+      added = nav.addPortal(command, level)
+    end
+    if added then
+      rebuild_portals_if_available()
     end
     return true
   end
@@ -1453,13 +1457,15 @@ mm.alias_specs = {
       end
     end},
   {"^mapper set database (.+)$", function(m)
-      local path = tostring(m[2] or ""):gsub("^%s+", ""):gsub("%s+$", "")
-      if path == "" then
-        mm.warn("Mapper database path cannot be blank. Required default filename: Aardwolf.db")
+      if not mm.set_mapper_db then
+        mm.warn("Mapper database switcher is unavailable.")
         return
       end
-      mm.state.map_db = path
-      mm.note("Mapper database configured value set to: " .. path)
+      local ok, res = mm.set_mapper_db(m[2])
+      if not ok then
+        mm.warn(res)
+        return
+      end
       if mm.print_mapper_database_status then mm.print_mapper_database_status() end
     end},
   {"^mapper native db$", function() mm.note("Native mapper DB: " .. tostring(mm.resolve_native_mapper_db(mm.state.native_mapper_db))) end},

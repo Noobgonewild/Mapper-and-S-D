@@ -268,7 +268,8 @@ function snd.utils.convertLevel(actualLevel)
         tier = tier - 1
     end
     
-    local remort = math.floor((actualLevel - (tier * 7 * 201)) / 202) + 1
+    local remortOffset = actualLevel - (tier * 7 * 201)
+    local remort = math.floor((remortOffset - 1) / 201) + 1
     
     local level = actualLevel % 201
     if level == 0 then
@@ -670,34 +671,6 @@ function snd.utils.buildMobCommandSelector(targetName, knownNames, options)
     return candidates[1] or "", "fallback"
 end
 
-local validMobTargetModes = {
-    auto = true,
-    skill = true,
-    cast = true,
-    raw = true,
-}
-
--- "pro" is retained as an alias for the older Consider-window terminology.
-function snd.utils.normalizeMobTargetMode(mode)
-    local normalized = snd.utils.trim(tostring(mode or "")):lower()
-    if normalized == "pro" then normalized = "raw" end
-    if validMobTargetModes[normalized] then return normalized end
-    return nil
-end
-
--- Cast numbers go inside quotes; skill numbers go outside. Cast aliases must
--- select cast mode because their expansion is not visible here.
-function snd.utils.resolveMobTargetMode(command, requestedMode)
-    local mode = snd.utils.normalizeMobTargetMode(requestedMode) or "auto"
-    if mode ~= "auto" then return mode end
-
-    local verb = snd.utils.trim(tostring(command or "")):lower():match("^(%S+)") or ""
-    if verb == "cast" or verb == "c" then
-        return "cast"
-    end
-    return "skill"
-end
-
 local function unwrapMobTargetQuotes(value)
     local text = snd.utils.trim(tostring(value or ""))
     local quote = text:sub(1, 1)
@@ -707,52 +680,46 @@ local function unwrapMobTargetQuotes(value)
     return text
 end
 
--- Accept raw, skill, and cast forms: 2.strong guard, 2.'strong guard', '2.strong guard'.
+-- Accept canonical logical and command forms: 2.strong guard and 2.'strong guard'.
 function snd.utils.parseMobCommandTarget(target)
-    local text = unwrapMobTargetQuotes(target)
+    local text = snd.utils.trim(tostring(target or ""))
     local indexText, keyword = text:match("^(%d+)%.(.+)$")
     if indexText then
         keyword = unwrapMobTargetQuotes(keyword)
     else
-        keyword = text
+        -- Strip grouping quotes only after looking for the ordinal. This keeps
+        -- '2.strong guard' from being reinterpreted as a numbered target.
+        keyword = unwrapMobTargetQuotes(text)
     end
     keyword = snd.utils.trim(tostring(keyword or ""):gsub("%s+", " "))
     return keyword, indexText and tonumber(indexText) or nil
 end
 
--- Multi-word selectors use the server's distinct skill/cast quoting rules.
-function snd.utils.formatMobCommandTarget(selector, requestedMode, command)
+-- Aardwolf uses one canonical numbered-target form for skills and spells:
+-- the occurrence stays outside quotes that group a multi-word mob keyword.
+function snd.utils.formatMobCommandTarget(selector)
     local rawSelector = snd.utils.trim(tostring(selector or ""))
-    if rawSelector == "" then return "", snd.utils.resolveMobTargetMode(command, requestedMode) end
-
-    local resolvedMode = snd.utils.resolveMobTargetMode(command, requestedMode)
-    if resolvedMode == "raw" then
-        return rawSelector, resolvedMode
-    end
+    if rawSelector == "" then return "" end
 
     local keyword, index = snd.utils.parseMobCommandTarget(rawSelector)
-    if keyword == "" then return "", resolvedMode end
+    if keyword == "" then return "" end
 
     local indexedSelector = index and (tostring(index) .. "." .. keyword) or keyword
     if not keyword:find("%s") then
-        return indexedSelector, resolvedMode
-    end
-
-    if resolvedMode == "cast" then
-        return "'" .. indexedSelector .. "'", resolvedMode
+        return indexedSelector
     end
     if index then
-        return tostring(index) .. ".'" .. keyword .. "'", resolvedMode
+        return tostring(index) .. ".'" .. keyword .. "'"
     end
-    return "'" .. keyword .. "'", resolvedMode
+    return "'" .. keyword .. "'"
 end
 
-function snd.utils.buildMobTargetCommand(command, selector, requestedMode)
+function snd.utils.buildMobTargetCommand(command, selector)
     local base = snd.utils.trim(tostring(command or ""))
-    if base == "" then return "", snd.utils.resolveMobTargetMode(base, requestedMode) end
-    local target, resolvedMode = snd.utils.formatMobCommandTarget(selector, requestedMode, base)
-    if target == "" then return "", resolvedMode end
-    return base .. " " .. target, resolvedMode
+    if base == "" then return "" end
+    local target = snd.utils.formatMobCommandTarget(selector)
+    if target == "" then return "" end
+    return base .. " " .. target
 end
 
 function snd.utils.ifc(condition, trueVal, falseVal)

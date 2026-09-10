@@ -1,7 +1,7 @@
 snd = snd or {}
 
 
-snd.version = "7.1.2"
+snd.version = "7.1.6"
 snd.schemaVersion = 7
 snd.fullVersion = "Search & Destroy v" .. snd.version
 
@@ -31,6 +31,14 @@ local function mergeTables(target, source)
         end
     end
     return target
+end
+
+local function removeRetiredTargetModeSettings(config)
+    if type(config) ~= "table" then return end
+    config.killTargetMode = nil
+    if type(config.conwin) == "table" then
+        config.conwin.targetMode = nil
+    end
 end
 
 local function loadPersistedStateEarly()
@@ -68,8 +76,6 @@ local defaultConfig = {
     },
     
     killCommand = "kill",
-    -- Target syntax: auto, skill, cast, or legacy raw.
-    killTargetMode = "auto",
     
     anex = {
         automatic = true,
@@ -148,6 +154,7 @@ end
 if persistedStateEarly and type(persistedStateEarly.config) == "table" then
     mergeTables(snd.config, persistedStateEarly.config)
 end
+removeRetiredTargetModeSettings(snd.config)
 
 local removedNxActionFallbacks = {
     con = "none",
@@ -406,6 +413,7 @@ snd.targets = snd.targets or {
     lastAutoRefresh = 0, -- Timestamp for auto-refreshing target sources
     lineTriggerIds = nil, -- Target line triggers
 }
+snd.targets.deferSequence = tonumber(snd.targets.deferSequence) or 0
 
 
 snd.express = snd.express or {}
@@ -573,7 +581,7 @@ function snd.scan.hasActivityTarget()
         return true
     end
 
-    if snd.gq and snd.gq.targets and next(snd.gq.targets) ~= nil then
+    if snd.gquest and snd.gquest.targets and next(snd.gquest.targets) ~= nil then
         return true
     end
 
@@ -1737,6 +1745,7 @@ function snd.loadState()
         mergeTables(snd.config, state.config)
         snd.config.nxAction = snd.normalizeNxAction(snd.config.nxAction)
     end
+    removeRetiredTargetModeSettings(snd.config)
     
     if state.colors then
         for k, v in pairs(state.colors) do
@@ -1901,7 +1910,10 @@ function snd.refreshTargetProximity(reason)
         target._proximityAreaKey = nil
 
         local activity = tostring(target.activity or ""):lower()
-        if (activity == "cp" or activity == "gq") and snd.scan.targetIsAlive(target) then
+        if (activity == "cp" or activity == "gq")
+            and snd.scan.targetIsAlive(target)
+            and target.deferred ~= true
+        then
             local areaKey = normalizedTargetArea(target)
             local confidence = (target.lowConfidence == true or target.unlikely == true) and "low" or "high"
             local groupKey = table.concat({activity, confidence, areaKey}, "|")
@@ -2052,6 +2064,23 @@ function snd.sortTargetsByPriority(options)
         local aliveB = snd.scan.targetIsAlive(b)
         if aliveA ~= aliveB then
             return aliveA
+        end
+
+        -- A conclusive failed live lookup makes an otherwise living CP/GQ target
+        -- a later target. Deferred targets keep their original deferral order and
+        -- never re-enter current-area, confidence, or distance ordering.
+        local deferredA = aliveA and a.deferred == true
+        local deferredB = aliveB and b.deferred == true
+        if deferredA ~= deferredB then
+            return not deferredA
+        end
+        if deferredA and deferredB then
+            local orderA = tonumber(a.deferredOrder) or math.huge
+            local orderB = tonumber(b.deferredOrder) or math.huge
+            if orderA ~= orderB then
+                return orderA < orderB
+            end
+            return (a._sortOrdinal or 0) < (b._sortOrdinal or 0)
         end
 
         local currentAreaA = aliveA and snd.scan.targetIsInCurrentArea(a)

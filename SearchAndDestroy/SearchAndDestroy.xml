@@ -32,11 +32,11 @@
             
             <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
                 <name>cp_mob_killed</name>
-                <script>snd.triggers.cpMobKilled()</script>
+                <script>snd.triggers.cpMobKilled() snd.triggers.targetKilledSound()</script>
                 <mCommand></mCommand>
                 <packageName></packageName>
                 <regexCodeList>
-                    <string>^Congratulations, that was one of your CAMPAIGN mobs\!$</string>
+                    <string>^[Cc][Oo][Nn][Gg][Rr][Aa][Tt][Uu][Ll][Aa][Tt][Ii][Oo][Nn][Ss], that was one of your CAMPAIGN mobs\!$</string>
                 </regexCodeList>
                 <regexCodePropertyList>
                     <integer>1</integer>
@@ -475,31 +475,6 @@
                 </regexCodePropertyList>
             </Trigger>
             
-            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
-                <name>campaign_mob_killed</name>
-                <script>snd.triggers.targetKilledSound()</script>
-                <mCommand></mCommand>
-                <packageName></packageName>
-                <regexCodeList>
-                    <string>^[Cc][Oo][Nn][Gg][Rr][Aa][Tt][Uu][Ll][Aa][Tt][Ii][Oo][Nn][Ss], that was one of your CAMPAIGN mobs\!$</string>
-                </regexCodeList>
-                <regexCodePropertyList>
-                    <integer>1</integer>
-                </regexCodePropertyList>
-            </Trigger>
-
-            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
-                <name>campaign_return_to_questmaster</name>
-                <script>snd.triggers.targetKilledSound()</script>
-                <mCommand></mCommand>
-                <packageName></packageName>
-                <regexCodeList>
-                    <string>^Return to the questmaster before your time runs out\.$</string>
-                </regexCodeList>
-                <regexCodePropertyList>
-                    <integer>1</integer>
-                </regexCodePropertyList>
-            </Trigger>
 
             <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
                 <name>gq_mob_killed</name>
@@ -691,6 +666,18 @@
                 <packageName></packageName>
                 <regexCodeList>
                     <string>^You get lucky and gain an extra (\d+) quest points\.$</string>
+                </regexCodeList>
+                <regexCodePropertyList>
+                    <integer>1</integer>
+                </regexCodePropertyList>
+            </Trigger>
+            <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+                <name>quest_return_to_questmaster</name>
+                <script>snd.triggers.targetKilledSound()</script>
+                <mCommand></mCommand>
+                <packageName></packageName>
+                <regexCodeList>
+                    <string>^Return to the questmaster before your time runs out\.$</string>
                 </regexCodeList>
                 <regexCodePropertyList>
                     <integer>1</integer>

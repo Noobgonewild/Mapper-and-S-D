@@ -1,6 +1,6 @@
 mm = mm or {}
 -- Increment for each distributed mapper build; report the loaded code, not disk state.
-mm.build_number = 2026090701
+mm.build_number = 2026091002
 
 mm.state = mm.state or {
   quick_mode = true,
@@ -236,6 +236,12 @@ function mm.load_persistence_chunk(filename)
     return chunk, primary
   end
 
+  local previous = primary .. ".previous"
+  chunk = loadfile(previous)
+  if chunk then
+    return chunk, previous
+  end
+
   local legacy = mm.legacy_persistence_path(filename)
   chunk = loadfile(legacy)
   if chunk then
@@ -270,6 +276,9 @@ function mm.load_settings_persistence()
 
   local ok, data = pcall(chunk)
   if not ok or type(data) ~= "table" then return false end
+  if type(data.map_db) == "string" and data.map_db ~= "" then
+    mm.state.map_db = data.map_db
+  end
   if type(data.autostop_enabled) == "boolean" then
     mm.state.autostop_enabled = data.autostop_enabled
   end
@@ -305,14 +314,19 @@ function mm.load_settings_persistence()
 end
 
 function mm.save_settings_persistence()
-  local f = mm.open_persistence_file(SETTINGS_PERSIST_FILE, "wb")
+  local temp_name = SETTINGS_PERSIST_FILE .. ".tmp"
+  local temp_path = mm.persistence_path(temp_name)
+  local final_path = mm.persistence_path(SETTINGS_PERSIST_FILE)
+  local backup_path = final_path .. ".previous"
+  local f = mm.open_persistence_file(temp_name, "wb")
   if not f then
     return false, "unable to open mapper settings persistence file for writing"
   end
-  f:write("return " .. serialize_value({
+  local payload = "return " .. serialize_value({
     -- Compatibility: old builds also start with global guard off.
     portal_guard_enabled = false,
     autostop_enabled = mm.state.autostop_enabled ~= false,
+    map_db = mm.state.map_db or "Aardwolf.db",
     native_mapper_db = mm.state.native_mapper_db or "mmapper_converted_map.dat",
     native_mapper_preload_enabled = mm.state.native_mapper_preload_enabled == true,
     auto_locate = mm.state.auto_locate ~= false,
@@ -322,9 +336,148 @@ function mm.save_settings_persistence()
       local_room_size = tonumber(mm.state.minimap and mm.state.minimap.local_room_size) or 15,
       local_zoom = tonumber(mm.state.minimap and mm.state.minimap.local_zoom) or 100,
     },
-  }))
-  f:close()
+  })
+
+  local write_ok, write_result, write_err = pcall(f.write, f, payload)
+  if not write_ok or not write_result then
+    pcall(f.close, f)
+    pcall(os.remove, temp_path)
+    return false, "unable to write mapper settings persistence file: " .. tostring(write_err or write_result)
+  end
+
+  local close_ok, close_result, close_err = pcall(f.close, f)
+  if not close_ok or not close_result then
+    pcall(os.remove, temp_path)
+    return false, "unable to close mapper settings persistence file: " .. tostring(close_err or close_result)
+  end
+
+  local function rename_file(from_path, to_path)
+    local ok, result, err = pcall(os.rename, from_path, to_path)
+    if not ok then return false, tostring(result) end
+    if not result then return false, tostring(err or "rename failed") end
+    return true
+  end
+
+  local installed, install_err = rename_file(temp_path, final_path)
+  if installed then
+    pcall(os.remove, backup_path)
+    return true
+  end
+
+  if not mm.path_exists(final_path) then
+    pcall(os.remove, temp_path)
+    return false, "unable to install mapper settings persistence file: " .. tostring(install_err)
+  end
+
+  pcall(os.remove, backup_path)
+  local backed_up, backup_err = rename_file(final_path, backup_path)
+  if not backed_up then
+    pcall(os.remove, temp_path)
+    return false, "unable to preserve previous mapper settings: " .. tostring(backup_err)
+  end
+
+  installed, install_err = rename_file(temp_path, final_path)
+  if not installed then
+    local restored, restore_err = rename_file(backup_path, final_path)
+    pcall(os.remove, temp_path)
+    if not restored then
+      return false, "unable to install mapper settings and restore the previous file: " ..
+        tostring(install_err) .. "; restore failed: " .. tostring(restore_err)
+    end
+    return false, "unable to install mapper settings persistence file: " .. tostring(install_err)
+  end
+
+  pcall(os.remove, backup_path)
   return true
+end
+
+function mm.set_mapper_db(candidate_path)
+  local p = tostring(candidate_path or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if p == "" then
+    return false, "Mapper database path cannot be blank. Required default filename: Aardwolf.db"
+  end
+
+  local resolved = mm.resolve_mapper_db(p)
+  if not resolved or not mm.path_exists(resolved) then
+    return false, "Mapper database file not found: " .. tostring(resolved)
+  end
+
+  if not mm.looks_like_sqlite(resolved) then
+    return false, "Specified file is not a valid SQLite database: " .. tostring(resolved)
+  end
+
+  if type(mm.inspect_mapper_database) ~= "function" then
+    return false, "Mapper database validator is unavailable."
+  end
+  local inspection = mm.inspect_mapper_database(resolved)
+  if not inspection or inspection.state ~= "FOUND" then
+    return false, "Specified SQLite file is not a valid mapper database: " ..
+      tostring(inspection and (inspection.error or inspection.state) or "inspection failed")
+  end
+
+  local nav = (mm and mm.nav) or (snd and snd.mapper)
+  if nav and type(nav.hasActiveNavigation) == "function" and nav.hasActiveNavigation() then
+    return false, "Cannot switch database during active navigation. Stop navigation first."
+  end
+  if mm.runtime and mm.runtime.cexit_execution_active then
+    return false, "Cannot switch database while a custom-exit recording is active."
+  end
+
+  local old_configured = mm.state.map_db
+  local old_nav_file = nav and nav.db and nav.db.file or nil
+  local old_nav_was_open = nav and nav.db and nav.db.isOpen == true or false
+  local nav_switched = false
+
+  if nav and type(nav.setMapperDb) == "function" then
+    local ok, nav_err = nav.setMapperDb(resolved)
+    if not ok then
+      return false, "Failed to switch navigation database: " .. tostring(nav_err)
+    end
+    nav_switched = true
+  end
+
+  mm.state.map_db = resolved
+  local saved, save_err = mm.save_settings_persistence()
+  if not saved then
+    local rollback_state = old_nav_was_open and old_nav_file or old_configured
+    mm.state.map_db = rollback_state
+    local rollback_ok, rollback_err = true, nil
+    if nav_switched and nav and nav.db then
+      if old_nav_was_open and old_nav_file then
+        rollback_ok, rollback_err = nav.setMapperDb(old_nav_file)
+      else
+        if type(nav.db.close) == "function" then nav.db.close() end
+        nav.db.file = old_nav_file
+      end
+    end
+    if not rollback_ok then
+      local active_path = nav and nav.db and nav.db.file or resolved
+      mm.state.map_db = active_path
+      return false, "Failed to persist mapper database setting and navigation rollback failed: " ..
+        tostring(save_err) .. "; rollback: " .. tostring(rollback_err)
+    end
+    return false, "Failed to persist mapper database setting: " .. tostring(save_err)
+  end
+
+  if nav and type(nav.clearDistanceCache) == "function" then
+    nav.clearDistanceCache("db_switch")
+  end
+  if mm.import and type(mm.import.invalidate_layout_cache) == "function" then
+    mm.import.invalidate_layout_cache()
+  end
+  if mm.invalidate_room_notes_cache then
+    mm.invalidate_room_notes_cache()
+  end
+  if mm.load_room_notes_cache then
+    mm.load_room_notes_cache()
+  end
+  if mm.rebuild_portals_from_db then
+    mm.rebuild_portals_from_db()
+  end
+
+  mm.note("Mapper database set to: " .. tostring(resolved))
+  mm.warn("The native Mudlet map widget is not automatically regenerated from the new database. Use 'mapper native load' if using native/hybrid display.")
+  return true, resolved
 end
 
 function mm.portal_guard_status_text()
@@ -1103,12 +1256,10 @@ function mm.ensure_dir(path)
 end
 
 local function resolved_map_db_path()
-  local p = tostring(mm.state.map_db or "")
-  if p == "" then return nil end
-  if p:sub(1, 1) == "/" or p:match("^%a:[/\\]") then
-    return p
+  if type(mm.resolve_mapper_db) == "function" then
+    return mm.resolve_mapper_db(mm.state and mm.state.map_db)
   end
-  return getMudletHomeDir() .. "/" .. p
+  return nil
 end
 
 local function backup_dir_path()
@@ -1149,7 +1300,8 @@ function mm.create_backup(force, quiet_override)
   end
 
   local stamp = os.date("!%Y%m%d_%H%M%S")
-  local base = tostring(mm.state.map_db or "mapper.db"):gsub("[/\\:*?\"<>|]", "_")
+  local base = tostring(source):match("([^/\\]+)$") or "mapper.db"
+  base = base:gsub("[/\\:*?\"<>|]", "_")
   local backupPath = string.format("%s/%s.%s.bak", dir, base, stamp)
   local suffix = 1
   while mm.path_exists(backupPath) do
@@ -1652,6 +1804,20 @@ function mm.print_room_exits(room, opts)
   return true
 end
 
+function mm.area_level_text(area)
+  local refs = mm.area_references
+  local ref = refs and type(refs.get) == "function" and refs.get(area) or nil
+  if not ref then return nil end
+
+  local minimum = tonumber(ref.min or ref.minlvl)
+  local maximum = tonumber(ref.max or ref.maxlvl)
+  if not minimum and not maximum then return nil end
+  minimum = math.floor(minimum or maximum)
+  maximum = math.floor(maximum or minimum)
+  if minimum == maximum then return tostring(minimum) end
+  return string.format("%d-%d", minimum, maximum)
+end
+
 function mm.print_room_details(room)
   room = tonumber(room) or mm.current_room()
   if not room then
@@ -1666,11 +1832,13 @@ function mm.print_room_details(room)
   local info = mm.get_room_info and mm.get_room_info()
   if info then
     mm.note("Name: " .. tostring(info.name or "?"))
-    mm.note("Area: " .. tostring(info.zone or info.area or "?"))
+    local area = tostring(info.zone or info.area or "?")
+    local area_level = mm.area_level_text(area)
+    mm.note("Area: " .. area .. (area_level and " (level " .. area_level .. ")" or ""))
     mm.note("Terrain: " .. tostring(info.terrain or "?"))
   end
 
-  local rows = mm.query_mapper_db(string.format("SELECT noportal, norecall, info FROM rooms WHERE uid = %d LIMIT 1", room), "Aardwolf.db") or {}
+  local rows = mm.query_mapper_db(string.format("SELECT noportal, norecall, info FROM rooms WHERE uid = %d LIMIT 1", room), mm.state and mm.state.map_db or "Aardwolf.db") or {}
   if rows[1] then
     local noportal = tonumber(rows[1].noportal) == 1 and "yes" or "no"
     local norecall = tonumber(rows[1].norecall) == 1 and "yes" or "no"
@@ -1720,7 +1888,7 @@ function mm.set_room_flag(flag, arg)
 
   local rows, read_err = mm.query_mapper_db(
     string.format("SELECT name, %s FROM rooms WHERE uid = %d LIMIT 1", safe_flag, room),
-    "Aardwolf.db"
+    mm.state and mm.state.map_db or "Aardwolf.db"
   )
   if not rows then
     return false, read_err
@@ -1743,7 +1911,7 @@ function mm.set_room_flag(flag, arg)
 
   local ok, write_err = mm.exec_mapper_db(
     string.format("UPDATE rooms SET %s = %d WHERE uid = %d", safe_flag, next_value and 1 or 0, room),
-    "Aardwolf.db"
+    mm.state and mm.state.map_db or "Aardwolf.db"
   )
   if not ok then
     return false, write_err
@@ -1754,7 +1922,7 @@ function mm.set_room_flag(flag, arg)
   return true
 end
 
-local NOTES_DB_NAME = "Aardwolf.db"
+local function notes_db_name() return mm.state and mm.state.map_db or "Aardwolf.db" end
 mm.room_notes_cache = mm.room_notes_cache or {}
 mm.room_notes_cache_loaded = mm.room_notes_cache_loaded == true
 
@@ -1772,7 +1940,7 @@ function mm.load_room_notes_cache()
   if not rows and type(mm.query_mapper_db) == "function" then
     rows, err = mm.query_mapper_db(
       "SELECT uid, notes FROM bookmarks WHERE notes IS NOT NULL AND notes <> ''",
-      NOTES_DB_NAME)
+      notes_db_name())
   end
   if not rows then
     mm.room_notes_cache_loaded = false
@@ -1831,7 +1999,7 @@ function mm.add_note(note_text)
   existing_note = tostring(existing_note)
   local combined_note = existing_note ~= "" and (existing_note .. "\n" .. note) or note
   local sql = string.format("INSERT OR REPLACE INTO bookmarks (uid, notes) VALUES (%d, %s)", room, mm.sql_escape(combined_note))
-  local ok, err = mm.exec_mapper_db(sql, NOTES_DB_NAME)
+  local ok, err = mm.exec_mapper_db(sql, notes_db_name())
   if not ok then
     return false, err
   end
@@ -1871,7 +2039,7 @@ function mm.delete_note(note_selector)
   end
 
   if selector:lower() == "all" then
-    local ok, err = mm.exec_mapper_db(string.format("DELETE FROM bookmarks WHERE uid=%d", room), NOTES_DB_NAME)
+    local ok, err = mm.exec_mapper_db(string.format("DELETE FROM bookmarks WHERE uid=%d", room), notes_db_name())
     if not ok then
       return false, err
     end
@@ -1902,7 +2070,7 @@ function mm.delete_note(note_selector)
     )
   end
 
-  local ok, err = mm.exec_mapper_db(sql, NOTES_DB_NAME)
+  local ok, err = mm.exec_mapper_db(sql, notes_db_name())
   if not ok then
     return false, err
   end
@@ -1923,7 +2091,7 @@ function mm.get_room_note(room_id)
   end
 
   local sql = string.format("SELECT notes FROM bookmarks WHERE uid = %d LIMIT 1", rid)
-  local rows, err = mm.query_mapper_db(sql, NOTES_DB_NAME)
+  local rows, err = mm.query_mapper_db(sql, notes_db_name())
   if not rows then
     return nil, err
   end
@@ -2089,12 +2257,33 @@ local function trim_db_path(value)
 end
 
 function mm.resolve_mapper_db(path)
-  local p = trim_db_path(path ~= nil and path or (mm.state and mm.state.map_db))
-  if p == "" then return nil end
-  if p:sub(1, 1) == "/" or p:match("^%a:[/\\]") then
-    return p
+  local raw = trim_db_path(path ~= nil and path or (mm.state and mm.state.map_db))
+  if raw == "" then raw = "Aardwolf.db" end
+
+  if raw:sub(1, 1) == "/" or raw:match("^%a:[/\\]") then
+    return raw
   end
-  return getMudletHomeDir() .. "/" .. p
+
+  local profile_dir = getMudletHomeDir()
+
+  if raw ~= "Aardwolf.db" then
+    return profile_dir .. "/" .. raw
+  end
+
+  local default_candidates = {
+    profile_dir .. "/Aardwolf.db",
+    profile_dir .. "/map/Aardwolf.db",
+    profile_dir .. "/../Aardwolf.db",
+  }
+  for _, candidate in ipairs(default_candidates) do
+    local f = io.open(candidate, "r")
+    if f then
+      f:close()
+      return candidate
+    end
+  end
+
+  return profile_dir .. "/Aardwolf.db"
 end
 
 local function close_cursor(cursor)
@@ -4584,7 +4773,7 @@ function mm.search_notes(area_arg)
   end
   sql = sql .. " ORDER BY rooms.area, rooms.name"
 
-  local rows, err = mm.query_mapper_db(sql, NOTES_DB_NAME)
+  local rows, err = mm.query_mapper_db(sql, notes_db_name())
   if not rows then return false, err end
   mm.print_search_results(rows, "notes search")
   return true
@@ -4599,7 +4788,7 @@ function mm.search_notes_text(raw_text)
     mm.sql_escape("%" .. text:lower() .. "%")
   )
 
-  local rows, err = mm.query_mapper_db(sql, NOTES_DB_NAME)
+  local rows, err = mm.query_mapper_db(sql, notes_db_name())
   if not rows then return false, err end
   set_search_results(rows)
 
@@ -4751,13 +4940,7 @@ local function portal_analysis_area_key(value)
 end
 
 local function portal_analysis_area_level(value)
-  local refs = mm.area_references
-  local ref = refs and refs.get and refs.get(value)
-  local minimum = ref and tonumber(ref.min) or nil
-  local maximum = ref and tonumber(ref.max) or nil
-  if not minimum or not maximum then return "?" end
-  if minimum == maximum then return tostring(minimum) end
-  return string.format("%d-%d", minimum, maximum)
+  return mm.area_level_text(value) or "?"
 end
 
 local function portal_analysis_targets()
@@ -4849,13 +5032,11 @@ local function portal_analysis_report(context, landing)
   local maximumUsefulDepth = -1
   local requiresExhaustiveSearch = false
   for _, area in ipairs(context.targets) do
-    if area.key ~= landingArea then
-      local old = existing[area.uid]
-      if old == nil then
-        requiresExhaustiveSearch = true
-      else
-        maximumUsefulDepth = math.max(maximumUsefulDepth, old - portalCost - 1)
-      end
+    local old = existing[area.uid]
+    if old == nil then
+      requiresExhaustiveSearch = true
+    else
+      maximumUsefulDepth = math.max(maximumUsefulDepth, old - portalCost - 1)
     end
   end
 
@@ -4887,8 +5068,16 @@ local function portal_analysis_report(context, landing)
     local via = onward and portalCost + onward or nil
     if area.key == landingArea then
       report.ownArea = {
-        name = area.name, uid = area.uid, areaLevel = area.areaLevel, existing = old, via = via,
+        name = area.name, uid = area.uid, areaLevel = area.areaLevel,
+        existing = old, fromLanding = onward, via = via, saved = old and via and old - via or nil,
       }
+      if via and (old == nil or via < old) then
+        report.rows[#report.rows + 1] = {
+          name = area.name, uid = area.uid, areaLevel = area.areaLevel,
+          existing = old, fromLanding = onward, via = via, saved = old and old - via or nil,
+          landingArea = true,
+        }
+      end
     else
       if old ~= nil then report.compared = report.compared + 1 end
       if via and (old == nil or via < old) then
@@ -4916,7 +5105,6 @@ local function portal_analysis_report(context, landing)
       report.newRouteCount = report.newRouteCount + 1
     end
   end
-  report.totalPotentialStepsSaved = report.totalStepsSaved + (report.landingSaved or 0)
   return report
 end
 
@@ -5002,31 +5190,31 @@ function mm.analyze_landing(dest)
       report.landing, landingArea, report.areaLevel, number(report.landingDistance)))
     cecho(string.format("<yellow>%19s<reset>  <green>%11s<reset>\n",
       number(report.portalCost), number(report.landingSaved)))
-    cecho("\n  <yellow>Other destinations improved through this landing:<reset>\n")
+    cecho("\n  <yellow>Area starts improved through this landing:<reset>\n")
     if #report.rows > 0 then
       cecho("  <deep_sky_blue>Steps saved to                 Area start room  Area level  Steps now  Steps with portal  Steps saved<reset>\n")
       for _, row in ipairs(report.rows) do
         echo(string.format("  %-30s %15s  %-10s %10s  ",
-          label(row.name, 30), row.uid, row.areaLevel, number(row.existing)))
+          label(row.name .. (row.landingArea and " (landing area)" or ""), 30),
+          row.uid, row.areaLevel, number(row.existing)))
         cecho(string.format("<yellow>%17s<reset>  <green>%11s<reset>\n",
           number(row.via), row.saved and tostring(row.saved) or "new"))
       end
     else
-      cecho("  <light_grey>No shorter paths to other area starts.<reset>\n")
+      cecho("  <light_grey>No shorter paths to area starts.<reset>\n")
     end
     if report.landingSaved ~= nil then
-      if report.savedAreaCount > 0 then
-        cecho(string.format("  <green>Total potential steps saved: <white>%d<reset><green> across the landing and %d other destination%s.<reset>\n",
-          report.totalPotentialStepsSaved, report.savedAreaCount,
-          report.savedAreaCount == 1 and "" or "s"))
-      else
-        cecho(string.format("  <green>Total potential steps saved: <white>%d<reset><green> for the landing.<reset>\n",
-          report.totalPotentialStepsSaved))
-      end
+      cecho(string.format("  <green>Direct landing-room steps saved: <white>%d<reset><green>.<reset>\n",
+        report.landingSaved))
     else
-      cecho(string.format("  <green>Total potential steps saved: <white>%d<reset><green> across %d other destination%s; the landing had no current route.<reset>\n",
-        report.totalPotentialStepsSaved, report.savedAreaCount,
+      cecho("  <light_grey>Direct landing-room steps saved: --; the landing room had no current route.<reset>\n")
+    end
+    if report.savedAreaCount > 0 then
+      cecho(string.format("  <green>Potential area-start steps saved: <white>%d<reset><green> across %d improved start%s.<reset>\n",
+        report.totalStepsSaved, report.savedAreaCount,
         report.savedAreaCount == 1 and "" or "s"))
+    else
+      cecho("  <light_grey>Potential area-start steps saved: 0; no area starts are shorter.<reset>\n")
     end
     if report.newRouteCount > 0 then
       cecho(string.format("  <green>%d additional area%s become%s reachable.<reset>\n",
@@ -5158,6 +5346,18 @@ local function is_cardinal_dir(dir)
   local d = tostring(dir or ""):lower()
   return d == "n" or d == "s" or d == "e" or d == "w" or d == "u" or d == "d" or
     d == "north" or d == "south" or d == "east" or d == "west" or d == "up" or d == "down"
+end
+
+local function is_effective_bare_cardinal(command)
+  local only_step = nil
+  for part in tostring(command or ""):gmatch("([^;]+)") do
+    local step = part:gsub("^%s+", ""):gsub("%s+$", "")
+    if step ~= "" then
+      if only_step ~= nil then return false end
+      only_step = step
+    end
+  end
+  return only_step ~= nil and is_cardinal_dir(only_step)
 end
 
 function mm.normalize_stacked_command(command)
@@ -5311,6 +5511,9 @@ function mm.add_full_cexit(command, src, dst, level, quiet, opts)
   if (not srcIsNomap and not src) or (not dstIsNomap and not dst) then
     return false, "source and destination room ids are required"
   end
+  if is_effective_bare_cardinal(command) then
+    return false, "Custom exits cannot use bare cardinal directions. Use standard map connections instead."
+  end
   if src == dst then return false, "start room and destination room should be different" end
 
   local random_ready, random_err = mm.ensure_random_cexits_table()
@@ -5349,9 +5552,7 @@ function mm.add_full_cexit(command, src, dst, level, quiet, opts)
 
   -- Bigmap APIs require numeric IDs; skip nomap_ rooms.
   if not srcIsNomap and not dstIsNomap then
-    if is_cardinal_dir(command) and type(setExit) == "function" then
-      pcall(setExit, src, dst, command)
-    elseif type(addSpecialExit) == "function" then
+    if type(addSpecialExit) == "function" then
       pcall(addSpecialExit, src, dst, command)
     end
   end
@@ -5469,21 +5670,20 @@ function mm.cexit(command)
   if not src then return false, "CEXIT FAILED: No room received yet. Try LOOK first." end
   local original_command = tostring(command or ""):gsub("^%s+", ""):gsub("%s+$", "")
   if original_command == "" then return false, "Nothing to do" end
+  if is_effective_bare_cardinal(original_command) then
+    return false, "Custom exits cannot use bare cardinal directions. Use standard map movement or compound commands (e.g. 'open n; n') instead."
+  end
 
   mm.debug(string.format("CEXIT DEBUG: src=%s command='%s'", tostring(src), original_command))
-  local added_waits = 0
-  for wait_secs in string.gmatch(original_command, "wait%((%d*.?%d+)%)") do
-    added_waits = added_waits + (tonumber(wait_secs) or 0)
-  end
-  mm.debug(string.format("CEXIT DEBUG: added_waits=%s", tostring(added_waits)))
   mm.note("CEXIT: WAIT FOR CONFIRMATION BEFORE MOVING.")
   mm.debug(string.format("CEXIT DEBUG: sending='%s'", original_command))
 
-  local confirmation_delay = (tonumber(mm.state.temp_cexit_delay) or 2) + added_waits
+  local confirmation_delay = tonumber(mm.state.temp_cexit_delay) or 2
   mm.state.temp_cexit_delay = nil
   mm.runtime = mm.runtime or {}
   mm.runtime.cexit_execution_serial = (tonumber(mm.runtime.cexit_execution_serial) or 0) + 1
   local execution_serial = mm.runtime.cexit_execution_serial
+  mm.runtime.cexit_execution_active = true
 
   local function split_stacked_commands(raw)
     local parts = {}
@@ -5520,13 +5720,17 @@ function mm.cexit(command)
     end
   end
 
+  local confirmation_scheduled = false
   local function schedule_cexit_confirmation()
+    if confirmation_scheduled then return end
+    confirmation_scheduled = true
     mm.debug(string.format(
-      "CEXIT DEBUG: confirmation window=%.2fs from cexit start",
+      "CEXIT DEBUG: confirmation window=%.2fs after command sequence",
       confirmation_delay
     ))
     schedule(confirmation_delay, function()
       if not is_execution_current() then return end
+      mm.runtime.cexit_execution_active = false
       local dst = mm.current_room()
       if not dst then mm.warn("CEXIT FAILED: Need to know where we ended up."); return end
       mm.debug(string.format("CEXIT DEBUG: post-delay src=%s dst=%s command='%s'", tostring(src), tostring(dst), original_command))
@@ -5544,7 +5748,8 @@ function mm.cexit(command)
     if not is_execution_current() then return end
     local step = steps[index]
     if not step then
-      mm.debug("CEXIT DEBUG: command sequence fully released")
+      mm.debug("CEXIT DEBUG: all client-side steps released; scheduling confirmation")
+      schedule_cexit_confirmation()
       return
     end
 
@@ -5566,22 +5771,55 @@ function mm.cexit(command)
       ))
       local ok, err = mm.walkto_room(walkto_target)
       if not ok then
+        mm.runtime.cexit_execution_active = false
         mm.warn(string.format("CEXIT FAILED at step[%d] '%s': %s", index, step, tostring(err)))
         return
       end
 
+      local walk_start_time = now_millis() / 1000
+      local last_seen_room = mm.current_room()
+      local last_progress_time = walk_start_time
+
       local function await_arrival()
         if not is_execution_current() then return end
         local current_room = mm.current_room()
-        if tostring(current_room or "") == tostring(walkto_target) then
+        local arrived = tostring(current_room or "") == tostring(walkto_target)
+        if arrived then
           mm.debug(string.format(
-            "CEXIT DEBUG: walkto confirmed room=%s; releasing step[%d]",
+            "CEXIT DEBUG: walkto confirmed room=%s (current=%s); releasing step[%d]",
             tostring(walkto_target),
+            tostring(current_room),
             index + 1
           ))
           schedule(step_gap, function() run_from(index + 1) end)
           return
         end
+
+        local now = now_millis() / 1000
+        if current_room ~= last_seen_room then
+          last_seen_room = current_room
+          last_progress_time = now
+        end
+
+        local nav_active = snd and snd.mapper and snd.mapper.hasActiveNavigation and snd.mapper.hasActiveNavigation()
+        local stalled = (now - last_progress_time) > 30
+        local total_exceeded = (now - walk_start_time) > 120
+
+        if not nav_active or stalled or total_exceeded then
+          mm.runtime.cexit_execution_active = false
+          mm.runtime.cexit_execution_serial = (tonumber(mm.runtime.cexit_execution_serial) or 0) + 1
+          if nav_active and snd and snd.mapper and snd.mapper.abortFailedNavigation then
+            snd.mapper.abortFailedNavigation("cexit_walkto_timeout")
+          end
+          local reason = not nav_active and "navigation stopped before reaching target"
+            or (stalled and "stalled for 30s without room progress" or "exceeded 120s limit")
+          mm.warn(string.format(
+            "CEXIT FAILED at step[%d] '%s': %s (expected %s, current %s)",
+            index, step, reason, tostring(walkto_target), tostring(current_room)
+          ))
+          return
+        end
+
         schedule(0.1, await_arrival)
       end
       await_arrival()
@@ -5593,7 +5831,6 @@ function mm.cexit(command)
     schedule(step_gap, function() run_from(index + 1) end)
   end
 
-  schedule_cexit_confirmation()
   run_from(1)
   return true
 end
@@ -5804,7 +6041,7 @@ function mm.delete_cexits_here()
   if not room then return false, "EXIT DELETE ERROR: unknown current room; try LOOK" end
 
   local ok, err = mm.exec_mapper_db(string.format(
-    "DELETE FROM exits WHERE fromuid=%s AND dir NOT IN ('n','s','e','w','u','d')",
+    "DELETE FROM exits WHERE fromuid=%s AND lower(dir) NOT IN ('n','s','e','w','u','d','north','south','east','west','up','down')",
     mm.sql_escape(room)
   ))
   if not ok then return false, err end
@@ -5872,6 +6109,9 @@ function mm.delete_cexit(index)
   local entry = cexit_row_to_entry(row)
   if entry.fromuid == "" or entry.dir == "" or entry.touid == "" then
     return false, "DELETE CEXIT ERROR: selected cexit row is missing required fields"
+  end
+  if is_cardinal_dir(entry.dir) then
+    return false, "Cannot delete cardinal direction exit as a cexit."
   end
 
   local timing_enabled = mm.state and mm.state.debug
@@ -5976,6 +6216,9 @@ function mm.restore_cexit(which)
   if not pick then return false, "Usage: mapper restorecexit <number|last>" end
   if pick < 1 or pick > #rows then return false, "RESTORE CEXIT ERROR: index out of range" end
   local row = rows[pick]
+  if is_effective_bare_cardinal(row.dir) then
+    return false, "Cannot restore a bare cardinal direction as a custom exit."
+  end
   local level = tonumber(row.level) or 0
   local ok, err = mm.exec_mapper_db(string.format(
     "INSERT OR REPLACE INTO exits (fromuid, dir, touid, level) VALUES (%s, %s, %s, %d)",

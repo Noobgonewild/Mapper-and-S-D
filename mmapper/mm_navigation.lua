@@ -88,6 +88,17 @@ ensureAreaReferencesLoaded()
 
 local luasql = require "luasql.sqlite3"
 
+local function getWallTime()
+    if type(getEpoch) == "function" then
+        local epoch = tonumber(getEpoch())
+        if epoch then
+            return epoch < 10000000000 and epoch or (epoch / 1000)
+        end
+    end
+    return os.time()
+end
+snd.mapper.getWallTime = getWallTime
+
 mm.nav = snd.mapper
 
 snd.mapper.db = {
@@ -98,13 +109,19 @@ snd.mapper.db = {
 }
 
 function snd.mapper.db.getMapperDbPath()
+    if mm and mm.resolve_mapper_db then
+        local resolved = mm.resolve_mapper_db(mm.state and mm.state.map_db)
+        if resolved and resolved ~= "" then
+            return resolved
+        end
+    end
     local profile_dir = getMudletHomeDir()
     local possible_paths = {
         profile_dir .. "/Aardwolf.db",
         profile_dir .. "/map/Aardwolf.db",
         profile_dir .. "/../Aardwolf.db",
     }
-    
+
     for _, path in ipairs(possible_paths) do
         local f = io.open(path, "r")
         if f then
@@ -112,7 +129,7 @@ function snd.mapper.db.getMapperDbPath()
             return path
         end
     end
-    
+
     return profile_dir .. "/Aardwolf.db"
 end
 
@@ -2774,16 +2791,20 @@ end
 
 function snd.mapper.getPortals(filter)
     filter = filter or "%"
-    
+    local areaWhere = ""
+    if filter ~= "%" then
+        areaWhere = "AND rooms.area LIKE " .. snd.mapper.db.escape(filter)
+    end
+
     local sql = string.format([[
-        SELECT rooms.area, rooms.name, exits.touid, exits.fromuid, exits.dir, exits.level 
-        FROM exits 
-        LEFT OUTER JOIN rooms ON rooms.uid = exits.touid 
-        WHERE exits.fromuid IN ('*', '**') 
-        AND rooms.area LIKE %s 
+        SELECT rooms.area, rooms.name, exits.touid, exits.fromuid, exits.dir, exits.level
+        FROM exits
+        LEFT OUTER JOIN rooms ON rooms.uid = exits.touid
+        WHERE exits.fromuid IN ('*', '**')
+        %s
         ORDER BY rooms.area, exits.touid
-    ]], snd.mapper.db.escape(filter))
-    
+    ]], areaWhere)
+
     return snd.mapper.db.query(sql) or {}
 end
 
@@ -3262,31 +3283,23 @@ function snd.mapper.findPath(
     local roomSets = {}
     local roomsList = {snd.mapper.db.escape(dst)}
     local frontierSet = {[dst] = true}
-    local visited = ""
     local visitedSet = {}
     local found = false
     local foundDepth = 0
     local foundFrom = nil
     local srcRoomInfo = snd.mapper.getRoomInfo(src)
-    
-    local visitedList = {}
+
     if noPortals then
-        table.insert(visitedList, snd.mapper.db.escape("*"))
         visitedSet["*"] = true
     end
     if noRecalls then
-        table.insert(visitedList, snd.mapper.db.escape("**"))
         visitedSet["**"] = true
     end
-    for _, room in ipairs(roomsList) do
-        table.insert(visitedList, room)
-    end
     visitedSet[dst] = true
-    visited = table.concat(visitedList, ",")
-    
+
     while not found and (exhaustive or depth < maxDepth) do
         depth = depth + 1
-        
+
         if depth > 1 then
             local prevSet = roomSets[depth - 1] or {}
             roomsList = {}
@@ -3296,25 +3309,16 @@ function snd.mapper.findPath(
                 frontierSet[tostring(v.fromuid)] = true
             end
         end
-        
+
         if #roomsList == 0 then
             break
         end
-        
-        local newVisited = table.concat(roomsList, ",")
-        if newVisited ~= "" then
-            if visited == "" then
-                visited = newVisited
-            else
-                visited = visited .. "," .. newVisited
-            end
-        end
+
         for roomId in pairs(frontierSet) do visitedSet[roomId] = true end
-        
+
         local sql = string.format([[
             SELECT fromuid, touid, dir, chaos FROM exits
-            WHERE touid IN (%s) 
-            AND fromuid NOT IN (%s) 
+            WHERE touid IN (%s)
             AND %s
             AND %s
             AND %s
@@ -3323,7 +3327,6 @@ function snd.mapper.findPath(
             ORDER BY %s
         ]],
             table.concat(roomsList, ","),
-            visited,
             levelWhere,
             portalGuardWhere,
             chaosWhere,
@@ -3331,7 +3334,7 @@ function snd.mapper.findPath(
             areaToWhere,
             snd.mapper.exitPreferenceOrderSql("dir")
         )
-        
+
         local results = snd.mapper.db.query(sql) or {}
         for _, row in ipairs(randomCexits) do
             if frontierSet[tostring(row.touid)] and not visitedSet[tostring(row.fromuid)] then
@@ -3353,6 +3356,7 @@ function snd.mapper.findPath(
         }
 
         for idx, row in ipairs(results) do
+            if not visitedSet[tostring(row.fromuid)] then
             -- Prefer custom cexits over bare cardinals from the same room.
             local existingStep = roomSets[depth][row.fromuid]
             if snd.mapper.shouldPreferExitDir(row.dir, existingStep and existingStep.dir) then
@@ -3383,6 +3387,7 @@ function snd.mapper.findPath(
                 then
                     depthCandidates.recall = {dirLen = dirLen, order = idx}
                 end
+            end
             end
         end
 
@@ -4638,11 +4643,42 @@ function snd.mapper.executeConditionalPath(path, conditionalByIndex, opts)
 
         local config = conditionalByIndex[conditionalIndex]
         local prefix = clone_path_slice(path, cursor, conditionalIndex - 1)
+        local conditionalStallTimeout = 15
+        for _, prefixStep in ipairs(prefix) do
+            for token in tostring(prefixStep.dir or ""):gmatch("[^;]+") do
+                if mm and mm.mapper_walkto_target and mm.mapper_walkto_target(token) then
+                    conditionalStallTimeout = 30
+                    break
+                end
+            end
+            if conditionalStallTimeout == 30 then break end
+        end
+        local condStartTime = nil
+        local condLastRoom = nil
+        local condLastProgressTime = nil
         local function awaitConditionalSource()
             if not currentExecution() then return end
             local currentRoom = tostring(snd.mapper.currentRoomUid(false) or "-1")
             local wantedRoom = tostring(config.source_room or config.fromuid or "-1")
             if currentRoom ~= wantedRoom then
+                local now = getWallTime()
+                if not condStartTime then
+                    condStartTime = now
+                    condLastRoom = currentRoom
+                    condLastProgressTime = now
+                elseif currentRoom ~= condLastRoom then
+                    condLastRoom = currentRoom
+                    condLastProgressTime = now
+                end
+
+                if (now - condLastProgressTime > conditionalStallTimeout) or (now - condStartTime > 120) then
+                    local reason = (now - condStartTime > 120) and "exceeded 120s limit"
+                        or string.format("stalled for %ds without room progress", conditionalStallTimeout)
+                    snd.utils.errorNote(string.format("Navigation conditional cexit timed out: %s waiting for room %s (current %s).", reason, wantedRoom, currentRoom))
+                    snd.mapper.abortFailedNavigation("conditional_source_timeout")
+                    return
+                end
+
                 snd.mapper.pathExecutionActive = true
                 snd.mapper.pathExecutionHasPendingGroups = true
                 tempTimer(0.1, awaitConditionalSource)
@@ -4914,6 +4950,7 @@ function snd.mapper.executePath(path, opts)
                         waitRoomId = nil,
                         executeRoomId = walktoTarget,
                         trustedSource = false,
+                        hasEmbeddedWalkto = true,
                     }
 
                 else
@@ -5038,6 +5075,8 @@ function snd.mapper.executePath(path, opts)
     
     -- Execute groups serially; combat may hold an expired wait.
     local heldGroupNotices = {}
+    local heldGroupState = {}
+    local canSendWaitStart = {}
     local function finishRandomCexit()
         snd.mapper.pathExecutionSerial = (tonumber(snd.mapper.pathExecutionSerial) or executionSerial) + 1
         snd.mapper.pathExecutionActive = false
@@ -5069,17 +5108,46 @@ function snd.mapper.executePath(path, opts)
             snd.mapper.pathExecutionHasPendingGroups = index < #groups
 
             if snd.mapper.canSendCommands and not snd.mapper.canSendCommands() then
+                canSendWaitStart[index] = canSendWaitStart[index] or getWallTime()
+                if (getWallTime() - canSendWaitStart[index]) > 30 then
+                    snd.utils.errorNote("Navigation aborted: character state remained unsendable for 30s.")
+                    snd.mapper.abortFailedNavigation("unsendable_character_state")
+                    return
+                end
                 tempTimer(0.25, function()
                     if not isExecutionCurrent() then return end
                     runFrom(index)
                 end)
                 return
             end
+            canSendWaitStart[index] = nil
 
             local executeRoomId = tostring(grp.executeRoomId or "-1")
             if executeRoomId ~= "" and executeRoomId ~= "-1" then
                 local currentRoomId = getCurrentRoomId()
                 if currentRoomId ~= executeRoomId then
+                    local now = getWallTime()
+                    local holdState = heldGroupState[index]
+                    if not holdState then
+                        holdState = {
+                            startTime = now,
+                            lastRoom = currentRoomId,
+                            lastProgressTime = now,
+                        }
+                        heldGroupState[index] = holdState
+                    elseif currentRoomId ~= holdState.lastRoom then
+                        holdState.lastRoom = currentRoomId
+                        holdState.lastProgressTime = now
+                    end
+
+                    local stallTimeout = (grp.hasEmbeddedWalkto == true) and 30 or 15
+                    if (now - holdState.lastProgressTime > stallTimeout) or (now - holdState.startTime > 120) then
+                        local reason = (now - holdState.startTime > 120) and "exceeded 120s limit" or string.format("stalled for %ds without room progress", stallTimeout)
+                        snd.utils.errorNote(string.format("Navigation held group timed out: %s waiting for room %s (current %s).", reason, executeRoomId, tostring(currentRoomId)))
+                        snd.mapper.abortFailedNavigation("held_group_timeout")
+                        return
+                    end
+
                     local noticeKey = tostring(index) .. ":" .. executeRoomId
                     if not heldGroupNotices[noticeKey] then
                         heldGroupNotices[noticeKey] = true
@@ -5993,7 +6061,7 @@ function snd.mapper.deletePortal(index)
     
     local portals = snd.mapper.getPortals()
     if index < 1 or index > #portals then
-        snd.utils.errorNote("Invalid portal index. Use 'snd portals' to see list.")
+        snd.utils.errorNote("Invalid portal index. Use 'mapper portals' to see list.")
         return false
     end
     
@@ -6058,7 +6126,7 @@ function snd.mapper.setBouncePortalByIndex(index)
     
     local portals = snd.mapper.getPortals()
     if index < 1 or index > #portals then
-        snd.utils.errorNote("Invalid portal index. Use 'snd portals' to see list.")
+        snd.utils.errorNote("Invalid portal index. Use 'mapper portals' to see list.")
         return false
     end
     
@@ -6112,7 +6180,7 @@ function snd.mapper.setBounceRecallByIndex(index)
     
     local portals = snd.mapper.getPortals()
     if index < 1 or index > #portals then
-        snd.utils.errorNote("Invalid portal index. Use 'snd portals' to see list.")
+        snd.utils.errorNote("Invalid portal index. Use 'mapper portals' to see list.")
         return false
     end
     
@@ -6169,17 +6237,38 @@ function snd.mapper.showDbInfo()
 end
 
 function snd.mapper.setMapperDb(path)
-    snd.mapper.db.close()
-    snd.mapper.db.file = path
-    if snd.mapper.db.open() then
+    local previousFile = snd.mapper.db.file
+    local wasOpen = snd.mapper.db.isOpen
+    local function reloadRoomNotes()
         if mm and mm.load_room_notes_cache then
             local loaded, load_err = mm.load_room_notes_cache()
             if not loaded then
                 snd.utils.debugNote("Room-note cache reload failed after mapper DB switch: " .. tostring(load_err))
             end
         end
-        snd.utils.infoNote("Mapper database set to: " .. path)
     end
+    snd.mapper.db.close()
+    snd.mapper.db.file = path
+    if not snd.mapper.db.open() then
+        snd.mapper.db.close()
+        snd.mapper.db.file = previousFile
+        if wasOpen and previousFile then
+            if not snd.mapper.db.open() then
+                snd.mapper.db.close()
+                snd.mapper.db.file = previousFile
+                return false, "failed to open mapper database and restore previous database: " ..
+                    tostring(path) .. "; previous: " .. tostring(previousFile)
+            end
+            reloadRoomNotes()
+        end
+        return false, "failed to open mapper database: " .. tostring(path)
+    end
+    if snd.mapper.clearDistanceCache then
+        snd.mapper.clearDistanceCache("db_switch")
+    end
+    reloadRoomNotes()
+    snd.utils.infoNote("Mapper database set to: " .. path)
+    return true
 end
 
 function snd.mapper.debugXrtDecision(destInput, resolvedRoom, reason)

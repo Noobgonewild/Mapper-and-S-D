@@ -109,6 +109,44 @@ function snd.gq.endGqInfo()
         return
     end
 
+    local deferredCarry = {}
+    local function carryText(value)
+        local text = tostring(value or "")
+        if snd.utils and type(snd.utils.trim) == "function" then
+            text = snd.utils.trim(text)
+        else
+            text = text:match("^%s*(.-)%s*$") or text
+        end
+        return text:lower():gsub("%s+", " ")
+    end
+    local function carryKey(target)
+        return table.concat({
+            carryText(target and target.mob or ""),
+            carryText(target and target.loc or ""),
+        }, "|")
+    end
+    for _, target in ipairs(snd.gquest.targets or {}) do
+        if target.deferred == true and tostring(target.deferredSession or "") == currentId then
+            local key = carryKey(target)
+            deferredCarry[key] = deferredCarry[key] or {}
+            table.insert(deferredCarry[key], {
+                order = target.deferredOrder,
+                reason = target.deferredReason,
+                session = target.deferredSession,
+            })
+        end
+    end
+    for _, target in ipairs(snd.gq.parsing.tempTargets or {}) do
+        local carry = deferredCarry[carryKey(target)]
+        local preserved = carry and table.remove(carry, 1) or nil
+        if preserved then
+            target.deferred = true
+            target.deferredOrder = preserved.order
+            target.deferredReason = preserved.reason
+            target.deferredSession = preserved.session
+        end
+    end
+
     snd.gquest.targets = snd.gq.parsing.tempTargets
     snd.gquest.active = #snd.gquest.targets > 0
     -- Preserve joined/started state established by their event handlers.
@@ -282,6 +320,10 @@ function snd.gq.buildMainTargetList()
             activity = "gq",
             keyword = target.keyword or snd.gmcp.guessMobKeyword(target.mob, ""),
             hasMobData = hasMobData,
+            deferred = target.deferred == true,
+            deferredOrder = target.deferredOrder,
+            deferredReason = target.deferredReason,
+            deferredSession = target.deferredSession,
         }
         local tags = snd.db and snd.db.getMobTags and snd.db.getMobTags(target.mob, target.arid) or nil
         if tags then
@@ -603,6 +645,9 @@ function snd.gq.onMobKilled()
             canonical.remaining = math.max(0, remaining - 1)
             canonical.dead = canonical.remaining == 0
             markedTargetKilled = true
+            if snd.commands and snd.commands.clearTargetDeferral then
+                snd.commands.clearTargetDeferral("gq", killedSourceIndex)
+            end
             for _, entry in ipairs((snd.targets and snd.targets.list) or {}) do
                 if entry.activity == "gq"
                     and tonumber(entry.sourceIndex) == tonumber(killedSourceIndex)
@@ -620,7 +665,7 @@ function snd.gq.onMobKilled()
                 snd.clearTarget({refresh = false})
             end
             if type(raiseEvent) == "function" then
-                local roomId = snd.room and snd.room.current and snd.room.current.id or nil
+                local roomId = snd.room and snd.room.current and snd.room.current.rmid or nil
                 raiseEvent("snd.kill.confirmed", canonical.mob or killedName, roomId)
             end
         end
@@ -828,6 +873,11 @@ function snd.gq.selectTarget(index, options)
         areaName = target.loc or "",
         index = index,
         activity = "gq",
+        sourceIndex = target.sourceIndex,
+        deferred = target.deferred == true,
+        deferredOrder = target.deferredOrder,
+        deferredReason = target.deferredReason,
+        deferredSession = target.deferredSession,
         express = target.express == true,
         expressRoomId = target.expressRoomId,
         expressKillCount = target.expressKillCount,

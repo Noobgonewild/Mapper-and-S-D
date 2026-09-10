@@ -820,6 +820,7 @@ local TC = {
     unknownDead = "<maroon>",
     unlikely    = "<dim_gray>",
     unlikelyTag = "<medium_blue>",
+    deferredTag = "<orange>",
     questAvail  = "<steel_blue>",
     questDone   = "<lawn_green>",
     questWait   = "<light_coral>",
@@ -863,6 +864,7 @@ local function targetListSignature()
             tostring(target.roomId or ""), tostring(target.roomName or ""),
             tostring(target.dead == true), tostring(target.killed == true),
             tostring(target.unlikely == true), tostring(target.lowConfidence == true),
+            tostring(target.deferred == true), tostring(target.deferredOrder or ""),
             tostring(target.remaining or target.qty or ""),
             tostring(target.displayIndex or target.cpListIndex or target.index or ""),
             tostring(target.duplicates or ""), tostring(target.dupIndex or ""),
@@ -1040,9 +1042,9 @@ function snd.gui.updateTargetList(force)
             elseif area ~= "" then
                 locStr = " - " .. area
             end
-            local selectCommand = [[snd.commands.selectQuestTargetAndKill()]]
+            local selectCommand = [[snd.commands.selectQuestTargetAndGo()]]
             writeTargetText(color .. " 1) ")
-            local okLink = writeTargetLink(mob, selectCommand, "Click to go and xkill quest target")
+            local okLink = writeTargetLink(mob, selectCommand, "Click to go to quest target")
             if not okLink then
                 writeTargetText(mob)
             end
@@ -1184,7 +1186,9 @@ function snd.gui.updateTargetList(force)
                 end
 
                 local prefix = ""
-                if v.unlikely then
+                if v.deferred then
+                    prefix = TC.deferredTag .. "(Deferred) "
+                elseif v.unlikely then
                     prefix = TC.unlikelyTag .. "(Unlikely) "
                 end
 

@@ -113,7 +113,6 @@ local function cfg()
         mode = "consider", -- consider | off
         strictFocusIdOnly = false, -- When true, ambiguous duplicate targets require currentEnemyMobId for HP overlay/death mark.
         killCommand = "kill",
-        targetMode = "auto", -- auto | skill | cast | raw
         repopulate = 3, -- Refresh window after N confirmed kills (0 = disabled)
         clearOnSafe = true,
         clearOnEmptyRoomchars = true,
@@ -126,17 +125,6 @@ local function cfg()
         mode = "consider"
     end
     snd.config.conwin.mode = mode
-    local targetMode
-    if snd.utils and type(snd.utils.normalizeMobTargetMode) == "function" then
-        targetMode = snd.utils.normalizeMobTargetMode(snd.config.conwin.targetMode or "auto")
-    else
-        targetMode = tostring(snd.config.conwin.targetMode or "auto"):lower()
-        if targetMode == "pro" then targetMode = "raw" end
-        if targetMode ~= "auto" and targetMode ~= "skill" and targetMode ~= "cast" and targetMode ~= "raw" then
-            targetMode = nil
-        end
-    end
-    snd.config.conwin.targetMode = targetMode or "auto"
     return snd.config.conwin
 end
 
@@ -1379,7 +1367,7 @@ function CW.killCommandFor(index)
     local base = trim(cfg().killCommand)
     if base == "" then base = "kill" end
     if snd.utils and type(snd.utils.buildMobTargetCommand) == "function" then
-        return snd.utils.buildMobTargetCommand(base, selector, cfg().targetMode or "auto")
+        return snd.utils.buildMobTargetCommand(base, selector)
     end
     return string.format("%s %s", base, selector)
 end
@@ -1421,17 +1409,23 @@ function CW.attack(index)
 end
 
 function CW.onHotkey(index)
-    if not cfg().enabled then return end
     index = tonumber(index)
     if not index or index < 1 then return end
-    if not CW.mobs[index] then return end
+    if not cfg().enabled then
+        send(tostring(index))
+        return
+    end
+    if not CW.mobs or not CW.mobs[index] then return end
     if CW.mobs[index].dead then
+        local foundAlive = false
         for i, m in ipairs(CW.mobs) do
             if not m.dead then
                 index = i
+                foundAlive = true
                 break
             end
         end
+        if not foundAlive then return end
     end
     CW.attack(index)
 end
@@ -1587,7 +1581,6 @@ local function renderSignature()
         tostring(cfg().alignTags == true),
         tostring(cfg().strictFocusIdOnly == true),
         tostring(cfg().killCommand or ""),
-        tostring(cfg().targetMode or "auto"),
     }
     for _, mob in ipairs(CW.mobs or {}) do
         parts[#parts + 1] = table.concat({
@@ -2402,24 +2395,6 @@ function CW.setKillCommand(command)
     return true
 end
 
-function CW.setTargetMode(mode)
-    local normalized
-    if snd.utils and type(snd.utils.normalizeMobTargetMode) == "function" then
-        normalized = snd.utils.normalizeMobTargetMode(mode)
-    else
-        normalized = tostring(mode or ""):lower()
-        if normalized == "pro" then normalized = "raw" end
-        if normalized ~= "auto" and normalized ~= "skill" and normalized ~= "cast" and normalized ~= "raw" then
-            normalized = nil
-        end
-    end
-    if not normalized then return false end
-    cfg().targetMode = normalized
-    CW.render()
-    snd.saveState()
-    return true
-end
-
 function CW.setRepopulate(n)
     n = tonumber(n)
     if not n then return false end
@@ -2477,8 +2452,8 @@ function CW.install()
         deleteLine()
         if not CW.captureInFlight then CW.finishCapture() end
     end)
-    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^You see no one here but yourself!$", "snd.conwin.onEmptyConsiderResult")
-    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^Not while you are fighting!$", "snd.conwin.onConsiderRejected")
+    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^You see no one here but yourself!$", function() CW.onEmptyConsiderResult() end)
+    CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger("^Not while you are fighting!$", function() CW.onConsiderRejected() end)
     CW.ids.triggers[#CW.ids.triggers + 1] = tempRegexTrigger(
         [=[^\s*\[\d+\]\s+(.+?)\s+\[[^\]]+\]\s*$]=],
         function()

@@ -331,7 +331,7 @@ function snd.gmcp.onQuestStart(q)
     if snd.quest.target.mob ~= "" then
         snd.quest.target.keyword = snd.gmcp.guessMobKeyword(
             snd.quest.target.mob,
-            snd.quest.target.area
+            snd.quest.target.arid ~= "" and snd.quest.target.arid or snd.quest.target.area
         )
     end
     
@@ -765,7 +765,7 @@ function snd.gmcp.onQuestStatus(q)
         if snd.quest.target.mob ~= "" then
             snd.quest.target.keyword = snd.gmcp.guessMobKeyword(
                 snd.quest.target.mob,
-                snd.quest.target.area
+                snd.quest.target.arid ~= "" and snd.quest.target.arid or snd.quest.target.area
             )
         end
         

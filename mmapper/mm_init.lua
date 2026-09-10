@@ -289,6 +289,9 @@ function mm.initialize()
       return
     end
     mapper_db_ready = true
+    if result and result.path then
+      mm.state.map_db = result.path
+    end
     if result and result.created then
       mm.note("Created new empty mapper database: " .. tostring(result.path))
       mm.warn("The new Aardwolf.db has 0 rooms and 0 exits. Replace it manually with the supplied populated Aardwolf.db if you want preloaded map data.")

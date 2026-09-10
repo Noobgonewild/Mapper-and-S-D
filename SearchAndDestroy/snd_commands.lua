@@ -131,6 +131,159 @@ function snd.commands.bindTargetSelection(selection, entry)
     return selection
 end
 
+local function targetDeferralIndex(target, activity)
+    if type(target) ~= "table" then return nil end
+    if activity == "cp" then
+        return tonumber(target.campaignIndex)
+    elseif activity == "gq" then
+        return tonumber(target.sourceIndex)
+    end
+    return nil
+end
+
+local function setTargetDeferral(target, order, reason, session)
+    if type(target) ~= "table" then return end
+    target.deferred = true
+    target.deferredOrder = order
+    target.deferredReason = tostring(reason or "live-lookup-unavailable")
+    target.deferredSession = tostring(session or "")
+end
+
+local function clearTargetDeferralFields(target)
+    if type(target) ~= "table" then return end
+    target.deferred = nil
+    target.deferredOrder = nil
+    target.deferredReason = nil
+    target.deferredSession = nil
+end
+
+local function targetDeferralSession(activity)
+    if activity == "gq" then
+        return tostring((snd.gquest and (snd.gquest.joined or snd.gquest.started)) or "")
+    elseif activity == "cp" then
+        return tostring((snd.campaign and (snd.campaign.completeBy or snd.campaign.historyId)) or "")
+    end
+    return ""
+end
+
+--- Demote the selected CP/GQ target after a conclusive exact live-where failure.
+--- This changes ordering only: deferred targets remain living and selectable.
+function snd.commands.deferCurrentQuickWhereTarget(reason)
+    local quickWhere = snd.nav and snd.nav.quickWhere or nil
+    local current = snd.targets and snd.targets.current or nil
+    local activity = tostring(current and current.activity or ""):lower()
+    if not quickWhere or not current or (activity ~= "cp" and activity ~= "gq") then
+        return false
+    end
+    if quickWhere.isAdhoc == true
+        or snd.utils.trim(quickWhere.exactTargetName or "") == ""
+    then
+        return false
+    end
+
+    local entry = snd.commands.findTargetSelectionEntry(current, snd.targets.list or {})
+    local sourceIndex = targetDeferralIndex(entry, activity)
+        or targetDeferralIndex(current, activity)
+    if not sourceIndex then
+        return false
+    end
+
+    local canonical = nil
+    if activity == "cp" then
+        canonical = snd.campaign and snd.campaign.targets
+            and snd.campaign.targets[sourceIndex] or nil
+    else
+        canonical = snd.gquest and snd.gquest.targets
+            and snd.gquest.targets[sourceIndex] or nil
+    end
+
+    local existingOrder = tonumber(canonical and canonical.deferredOrder)
+        or tonumber(entry and entry.deferredOrder)
+        or tonumber(current.deferredOrder)
+    local newlyDeferred = existingOrder == nil
+    local order = existingOrder
+    snd.targets.deferSequence = tonumber(snd.targets.deferSequence) or 0
+    if not order then
+        snd.targets.deferSequence = snd.targets.deferSequence + 1
+        order = snd.targets.deferSequence
+    end
+    local session = targetDeferralSession(activity)
+
+    setTargetDeferral(canonical, order, reason, session)
+    for _, candidate in ipairs(snd.targets.list or {}) do
+        if candidate.activity == activity
+            and targetDeferralIndex(candidate, activity) == sourceIndex
+        then
+            setTargetDeferral(candidate, order, reason, session)
+        end
+    end
+
+    current.campaignIndex = activity == "cp" and sourceIndex or current.campaignIndex
+    current.sourceIndex = activity == "gq" and sourceIndex or current.sourceIndex
+    setTargetDeferral(current, order, reason, session)
+    if snd.targets.scoped then
+        snd.targets.scoped[activity] = snd.utils.deepcopy(current)
+    end
+
+    if snd.sortTargetsByPriority then
+        snd.sortTargetsByPriority({reason = "target_deferred"})
+    end
+    if snd.gui then
+        if snd.gui.requestRefresh then snd.gui.requestRefresh()
+        elseif snd.gui.refresh then snd.gui.refresh() end
+    end
+    if newlyDeferred then
+        local label = activity == "gq" and "GQ" or "CP"
+        snd.utils.infoNote(string.format(
+            "%s deferred to the end of the %s target list.",
+            tostring(current.name or current.mob or "Target"),
+            label
+        ))
+    end
+    return true
+end
+
+--- Clear sticky deferral after a confirmed kill. Callers already re-sort status.
+function snd.commands.clearTargetDeferral(activity, sourceIndex)
+    local normalized = tostring(activity or ""):lower()
+    local numericIndex = tonumber(sourceIndex)
+    if (normalized ~= "cp" and normalized ~= "gq") or not numericIndex then
+        return false
+    end
+
+    local cleared = false
+    local canonical = nil
+    if normalized == "cp" then
+        canonical = snd.campaign and snd.campaign.targets
+            and snd.campaign.targets[numericIndex] or nil
+    else
+        canonical = snd.gquest and snd.gquest.targets
+            and snd.gquest.targets[numericIndex] or nil
+    end
+    if canonical and canonical.deferred == true then
+        clearTargetDeferralFields(canonical)
+        cleared = true
+    end
+    for _, candidate in ipairs((snd.targets and snd.targets.list) or {}) do
+        if candidate.activity == normalized
+            and targetDeferralIndex(candidate, normalized) == numericIndex
+        then
+            if candidate.deferred == true then cleared = true end
+            clearTargetDeferralFields(candidate)
+        end
+    end
+    local function clearSelection(selection)
+        if selection and selection.activity == normalized
+            and targetDeferralIndex(selection, normalized) == numericIndex
+        then
+            clearTargetDeferralFields(selection)
+        end
+    end
+    clearSelection(snd.targets and snd.targets.current or nil)
+    clearSelection(snd.targets and snd.targets.scoped and snd.targets.scoped[normalized] or nil)
+    return cleared
+end
+
 local function getScopedActivity()
     if snd and snd.getActiveTab then
         local tab = snd.getActiveTab()
@@ -1991,22 +2144,6 @@ function snd.commands.conwin(args)
     elseif args == "killcommand" then
         local current = (snd.config and snd.config.conwin and snd.config.conwin.killCommand) or "kill"
         snd.utils.infoNote("ConWin kill command: " .. tostring(current))
-    elseif args:match("^killmode%s+") then
-        local mode = snd.utils.trim(args:match("^killmode%s+(.+)$") or "")
-        if snd.conwin.setTargetMode and snd.conwin.setTargetMode(mode) then
-            local stored = (snd.config and snd.config.conwin and snd.config.conwin.targetMode) or "auto"
-            snd.utils.infoNote("ConWin target syntax set to: " .. stored)
-        else
-            snd.utils.infoNote("Usage: snd conwin killmode <auto|skill|cast|raw>")
-        end
-    elseif args == "killmode" then
-        local current = (snd.config and snd.config.conwin and snd.config.conwin.targetMode) or "auto"
-        local command = (snd.config and snd.config.conwin and snd.config.conwin.killCommand) or "kill"
-        local resolved = current
-        if snd.utils and type(snd.utils.resolveMobTargetMode) == "function" then
-            resolved = snd.utils.resolveMobTargetMode(command, current)
-        end
-        snd.utils.infoNote("ConWin target syntax: " .. tostring(current) .. " (resolves to " .. tostring(resolved) .. ")")
     elseif args:match("^repopulate%s+%d+$") then
         local count = tonumber(args:match("^repopulate%s+(%d+)$"))
         if snd.conwin.setRepopulate and snd.conwin.setRepopulate(count) then
@@ -3305,8 +3442,8 @@ function snd.commands.processQuickWhereResult()
             quickWhere.awaitingCommandEcho = false
             quickWhere.probePending = false
     quickWhere.commandInFlight = false
-    if wasQuestEnumeration then
-        restoreQuestHybridAfterEnumeration("combat")
+    if isQuestHybridEnumeration then
+        restoreQuestHybridAfterEnumeration("empty")
     end
             finishXcpCycleRefresh(restartsNxCycle, false)
         end
@@ -3686,6 +3823,9 @@ function snd.commands.processQuickWhereResult()
                 areaSuffix
             ))
             syncCurrentTargetScope()
+            if snd.commands.deferCurrentQuickWhereTarget then
+                snd.commands.deferCurrentQuickWhereTarget("qw-unmapped")
+            end
         end
     end
 
@@ -3834,6 +3974,10 @@ function snd.commands.processQuickWhereNoMatch(options)
             snd.utils.infoNote("No exact live quest matches found; stored room cycle remains available.")
         end
         return true
+    end
+
+    if opts.conclusive == true and snd.commands.deferCurrentQuickWhereTarget then
+        snd.commands.deferCurrentQuickWhereTarget("qw-no-match")
     end
 
     local mobName = snd.utils.trim(current.name or current.mob or "")
@@ -4409,11 +4553,7 @@ function snd.commands.xkill(options)
     -- Quote only at send time; stored selectors remain logical and unquoted.
     local fullCmd = killCmd .. " " .. normalizedKeyword
     if snd.utils and type(snd.utils.buildMobTargetCommand) == "function" then
-        fullCmd = snd.utils.buildMobTargetCommand(
-            killCmd,
-            normalizedKeyword,
-            snd.config.killTargetMode or "auto"
-        )
+        fullCmd = snd.utils.buildMobTargetCommand(killCmd, normalizedKeyword)
     end
     if not fullCmd or fullCmd == "" then return end
     snd.utils.debugNote("xkill: " .. fullCmd)
@@ -4433,54 +4573,17 @@ end
 
 function snd.commands.xcmd(args)
     args = snd.utils.trim(args or "")
-    local configuredMode = snd.config.killTargetMode or "auto"
-    local function normalizeMode(value)
-        if snd.utils and type(snd.utils.normalizeMobTargetMode) == "function" then
-            return snd.utils.normalizeMobTargetMode(value)
-        end
-        local mode = tostring(value or ""):lower()
-        if mode == "pro" then mode = "raw" end
-        if mode == "auto" or mode == "skill" or mode == "cast" or mode == "raw" then
-            return mode
-        end
-        return nil
-    end
-    local function resolvedMode()
-        if snd.utils and type(snd.utils.resolveMobTargetMode) == "function" then
-            return snd.utils.resolveMobTargetMode(snd.config.killCommand or "kill", configuredMode)
-        end
-        return configuredMode == "auto" and "skill" or configuredMode
-    end
-    
+
     if args == "" then
         cecho("\n<cyan>Current xkill command:<reset> " .. (snd.config.killCommand or "kill") .. "\n")
-        cecho("<cyan>Target syntax:<reset> " .. configuredMode .. " <dim_gray>(resolves to " .. resolvedMode() .. ")<reset>\n")
-        cecho("<dim_gray>Usage: xcmd <command> | xcmd mode <auto|skill|cast|raw><reset>\n")
+        cecho("<dim_gray>Usage: xcmd <command><reset>\n")
         cecho("<dim_gray>Examples:<reset>\n")
         cecho("  <yellow>xcmd kill<reset>                 - Use 'kill <target>'\n")
         cecho("  <yellow>xcmd cast 'lightning bolt'<reset> - Use 'cast 'lightning bolt' <target>'\n")
         cecho("  <yellow>xcmd backstab<reset>             - Use 'backstab <target>'\n")
-        cecho("  <yellow>xcmd mode cast<reset>            - Force cast-style target quoting for an alias\n")
         return
     end
 
-    local lowered = args:lower()
-    if lowered == "mode" then
-        snd.utils.infoNote("xkill target syntax: " .. configuredMode .. " (resolves to " .. resolvedMode() .. ")")
-        return
-    elseif lowered:match("^mode%s+") then
-        local requested = snd.utils.trim(args:match("^%S+%s+(.+)$") or "")
-        local normalized = normalizeMode(requested)
-        if not normalized then
-            snd.utils.infoNote("Usage: xcmd mode <auto|skill|cast|raw>")
-            return
-        end
-        snd.config.killTargetMode = normalized
-        snd.utils.infoNote("xkill target syntax set to: " .. normalized)
-        if snd.saveState then snd.saveState() end
-        return
-    end
-    
     snd.config.killCommand = args
     snd.utils.infoNote("Kill command set to: " .. args)
     
@@ -5307,7 +5410,6 @@ function snd.commands.showHelp()
     emitLinkedHelpRow("xkill", "xkill", "Kill current target", "Kill current target with precise temporary selector")
     emitLinkedHelpRow("xset kw <keyword> [mob]", "xset kw help", "Set an area target keyword", "Persist a keyword for xkill, qw, and ht; quote multiword keywords")
     emitLinkedHelpRow("xcmd <command>", "xcmd", "Show or set xkill command", "Show or set the command used by xkill")
-    emitLinkedHelpRow("xcmd mode <auto|skill|cast|raw>", "xcmd mode", "Set xkill target syntax", "Auto-detect direct casts or force a target quoting style")
 
     emitHelpSection("Navigation & Search")
     emitLinkedHelpRow("qw [mob]", "qw", "Quick where", "Live where + mapper room list")
@@ -5351,9 +5453,8 @@ function snd.commands.showConwinHelp()
     local enabled = (snd.config and snd.config.conwin and snd.config.conwin.enabled) and "on" or "off"
     local repopulate = (snd.config and snd.config.conwin and snd.config.conwin.repopulate) or 3
     local focusMode = ((snd.config and snd.config.conwin and snd.config.conwin.strictFocusIdOnly) and "strict" or "fallback")
-    local targetMode = (snd.config and snd.config.conwin and snd.config.conwin.targetMode) or "auto"
     emitHelpTitle("Search and Destroy - ConWin Commands")
-    cecho(string.format("  <dim_gray>Status:<reset> enabled=<cyan>%s<reset>, mode=<cyan>%s<reset>, killmode=<cyan>%s<reset>, repopulate=<cyan>%s<reset>, focusid=<cyan>%s<reset>\n", enabled, mode, targetMode, tostring(repopulate), focusMode))
+    cecho(string.format("  <dim_gray>Status:<reset> enabled=<cyan>%s<reset>, mode=<cyan>%s<reset>, repopulate=<cyan>%s<reset>, focusid=<cyan>%s<reset>\n", enabled, mode, tostring(repopulate), focusMode))
     emitLinkedHelpRow("snd conwin help", "snd conwin help", "Show conwin help", "Show this help")
     emitLinkedHelpRow("snd conwin on|off|toggle", "snd conwin toggle", "Toggle ConWin", "Enable/disable/toggle ConWin")
     emitLinkedHelpRow("snd conwin refresh", "snd conwin refresh", "Run consider all now", "Run consider all and refresh list")
@@ -5361,7 +5462,6 @@ function snd.commands.showConwinHelp()
     emitLinkedHelpRow("snd conwin mode <consider|off>", "snd conwin mode off", "Set room-action mode", "Action on room change")
     emitLinkedHelpRow("snd conwin fontsize <n>", "snd conwin fontsize 10", "Set ConWin font size", "Set ConWin font size (6-24)")
     emitLinkedHelpRow("snd conwin killcommand <command>", "snd conwin killcommand", "Show current kill command", "Show current kill command; append <command> to set")
-    emitLinkedHelpRow("snd conwin killmode <auto|skill|cast|raw>", "snd conwin killmode", "Set target syntax", "Auto-detect direct casts or force a target quoting style")
     emitLinkedHelpRow("snd conwin repopulate <n>", "snd conwin repopulate 3", "Refresh list after N kills", "Refresh list after N kills; 0 disables")
     emitLinkedHelpRow("snd conwin focusid <strict|fallback>", "snd conwin focusid", "Show current focus-id mode", "Show focus-id mode; strict requires explicit duplicate selection")
     emitLinkedHelpRow("snd conwin aligntags <on|off>", "snd conwin aligntags", "Show alignment tag display setting", "Show alignment tags setting ((G)/(E) prefixes)")
@@ -5393,7 +5493,6 @@ function snd.commands.showCommandHelp()
     emitPlainHelpRow("xset kw <keyword> [mob]", "Persist an area keyword for xkill/qw/ht; quote multiword keywords and mob names")
     emitPlainHelpRow("xset startroom", "Set area start room")
     emitPlainHelpRow("xcmd <command>", "Set the command used by xkill")
-    emitPlainHelpRow("xcmd mode <auto|skill|cast|raw>", "Set xkill target quoting; auto recognizes direct cast commands")
 
     emitHelpSection("History & Reporting")
     emitPlainHelpRow("snd channel", "Show current S&D report channel")
@@ -5462,6 +5561,13 @@ function snd.commands.showKillWordHelp()
 end
 
 local function sndHasAlias(name)
+    if type(exists) == "function" then
+        local ok, id = pcall(exists, name, "alias")
+        if ok and type(id) == "number" and id > 0 then
+            return true
+        end
+    end
+
     if type(getAlias) == "function" then
         local ok, alias = pcall(getAlias, name)
         if ok and alias ~= nil then
@@ -5542,8 +5648,7 @@ function snd.commands.showConfig()
     cecho(string.format("  <cyan>window<reset>      %s\n", snd.config.window.enabled and "ON" or "OFF"))
     cecho(string.format("  <cyan>sound<reset>       %s (volume=%d%%)\n", snd.config.soundEnabled and "ON" or "OFF", tonumber(snd.config.soundVolume) or 100))
     cecho(string.format("  <cyan>areacolors<reset>  %s\n", snd.config.areaColors ~= false and "ON" or "OFF"))
-    cecho(string.format("  <cyan>xkill<reset>       %s (target syntax=%s)\n",
-        tostring(snd.config.killCommand or "kill"), tostring(snd.config.killTargetMode or "auto")))
+    cecho(string.format("  <cyan>xkill<reset>       %s\n", tostring(snd.config.killCommand or "kill")))
     cecho("<gray>----------------------------------------<reset>\n")
 end
 
@@ -5922,14 +6027,16 @@ function snd.commands.selectQuestTarget(options)
     return false
 end
 
-function snd.commands.selectQuestTargetAndKill()
-    snd.commands.selectQuestTarget()
+function snd.commands.selectQuestTargetAndGo()
+    if not snd.commands.selectQuestTarget() then return false end
     tempTimer(0.1, function()
         snd.commands.gotoTarget()
     end)
-    tempTimer(0.2, function()
-        snd.commands.xkill()
-    end)
+    return true
+end
+
+function snd.commands.selectQuestTargetAndKill()
+    return snd.commands.selectQuestTargetAndGo()
 end
 
 function snd.commands.selectAndGo(index, activity)

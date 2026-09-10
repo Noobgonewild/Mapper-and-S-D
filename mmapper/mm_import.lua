@@ -63,7 +63,7 @@ local function has_col(cols, name)
 end
 
 function mm.import.inspect_sqlite(source_path)
-  local source = mm.resolve_native_mapper_db(source_path)
+  local source = mm.resolve_mapper_db(source_path)
   if not source or not mm.path_exists(source) then
     return false, "source DB not found: " .. tostring(source)
   end
@@ -1022,7 +1022,7 @@ function mm.import.get_layout_area_snapshot(room_id, source_path)
   if not rid then return nil, "room id must be numeric" end
 
   local requested_source = source_path or (mm.state and mm.state.map_db) or "Aardwolf.db"
-  local resolved_source = mm.resolve_native_mapper_db(requested_source)
+  local resolved_source = mm.resolve_mapper_db(requested_source)
   local cache = mm.import._layout_area_cache
   if not cache or cache.source ~= resolved_source then
     cache = { source = resolved_source, by_room = {} }
@@ -1048,7 +1048,7 @@ function mm.import.get_compiled_layout_area_snapshot(room_id, source_path)
   if not rid then return nil, "room id must be numeric" end
 
   local requested_source = source_path or (mm.state and mm.state.map_db) or "Aardwolf.db"
-  local resolved_source = mm.resolve_native_mapper_db(requested_source)
+  local resolved_source = mm.resolve_mapper_db(requested_source)
   local cache = mm.import._compiled_layout_area_cache
   if not cache or cache.source ~= resolved_source then
     cache = { source = resolved_source, by_room = {}, unavailable_error = nil }
@@ -2144,7 +2144,7 @@ function mm.import.recalculate_all_layouts(source_path)
 end
 
 function mm.import.apply_environment_colors_from_sqlite(source_path)
-  local source = mm.resolve_native_mapper_db(source_path or mm.state.map_db)
+  local source = mm.resolve_mapper_db(source_path or mm.state.map_db)
   if not source or not mm.path_exists(source) then
     return false, "source DB not found: " .. tostring(source)
   end
@@ -2182,7 +2182,7 @@ function mm.import.apply_environment_colors_from_sqlite(source_path)
 end
 
 function mm.import.update_room_colors_from_sqlite(source_path)
-  local source = mm.resolve_native_mapper_db(source_path or mm.state.map_db)
+  local source = mm.resolve_mapper_db(source_path or mm.state.map_db)
   if not source or not mm.path_exists(source) then
     return false, "source DB not found: " .. tostring(source)
   end

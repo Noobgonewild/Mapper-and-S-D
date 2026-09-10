@@ -1273,7 +1273,10 @@ function snd.triggers.qwNoMatch()
         end
         local handledByDb = false
         if snd.commands and snd.commands.processQuickWhereNoMatch then
-            local ok, result = pcall(snd.commands.processQuickWhereNoMatch)
+            local ok, result = pcall(snd.commands.processQuickWhereNoMatch, {
+                conclusive = true,
+                reason = "serverNoMatch",
+            })
             handledByDb = ok and result == true
             if not ok then
                 snd.utils.errorNote("QW DEBUG: processing no-match fallback failed: " .. tostring(result))
