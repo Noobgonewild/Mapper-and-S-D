@@ -2,8 +2,6 @@
 
 Mudlet mapper and Search & Destroy (S&D) add-ons for Aardwolf MUD, distributed as native Mudlet packages.
 
-Public Repository: [Noobgonewild/Mapper-and-S-D](https://github.com/Noobgonewild/Mapper-and-S-D)
-
 ---
 
 ## Key Highlights
@@ -22,7 +20,7 @@ Public Repository: [Noobgonewild/Mapper-and-S-D](https://github.com/Noobgonewild
 
 ### Step 1: Download the Packages
 
-Download the two `.mpackage` files from [Noobgonewild/Mapper-and-S-D](https://github.com/Noobgonewild/Mapper-and-S-D) to anywhere on your system:
+Download the `.mpackage` files to anywhere on your computer (such as your `Downloads` folder or Desktop):
 
 - [`mmapper.mpackage`](https://raw.githubusercontent.com/Noobgonewild/Mapper-and-S-D/main/mmapper.mpackage) — MMapper add-on
 - [`SearchAndDestroy.mpackage`](https://raw.githubusercontent.com/Noobgonewild/Mapper-and-S-D/main/SearchAndDestroy.mpackage) — Search & Destroy add-on
@@ -212,35 +210,6 @@ Because Mudlet will not overwrite an existing package via drag-and-drop or direc
 
 ---
 
-## Manual / Developer Setup (From Source)
-
-If you are cloning or modifying the source repository directly rather than installing `.mpackage` files:
-
-```text
-<Mudlet profile directory>/
-├── Aardwolf.db
-├── SnDdb.db
-├── mmapper/
-│   ├── mm_package.xml
-│   ├── mm_init.lua
-│   └── ...all other mapper files
-└── SearchAndDestroy/
-    ├── SearchAndDestroy.xml
-    ├── snd_main.lua
-    └── ...all other S&D files and sounds
-```
-
-1. Clone or extract the repository.
-2. Place the `mmapper` and `SearchAndDestroy` folders directly into your active Mudlet profile directory (`lua openMudletHomeDir()`).
-3. Open Package Manager (`Alt+O`) and install:
-   - `<profile>/mmapper/mm_package.xml`
-   - `<profile>/SearchAndDestroy/SearchAndDestroy.xml`
-
-> [!WARNING]
-> Folder names must match exactly: `mmapper` (not `mapper`) and `SearchAndDestroy` (not `snd` or `Search-And-Destroy`).
-
----
-
 ## Troubleshooting
 
 ### S&D reports MMapper did not become ready
@@ -259,9 +228,10 @@ Do not load `Aardwolf.db` with `mapper native load`. Run `mapper rebuild map` in
 
 ## Useful References
 
-- [Noobgonewild/Mapper-and-S-D GitHub Repository](https://github.com/Noobgonewild/Mapper-and-S-D)
 - [Mudlet Package Manager Documentation](https://wiki.mudlet.org/w/Manual%3APackage_Manager)
 - [Mudlet File Locations](https://wiki.mudlet.org/w/Mudlet_File_Locations)
+- [DINV Repository](https://github.com/Noobgonewild/Mudlet-DINV)
+- [Mudlet Scripts Repository](https://github.com/Noobgonewild/Mudlet-scripts)
 - [MCheck Addon Index](https://raw.githubusercontent.com/Noobgonewild/Mudlet-scripts/main/mcheck-index.json)
 
 ---
