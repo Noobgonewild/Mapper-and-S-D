@@ -8,7 +8,9 @@ Mudlet mapper and Search & Destroy (S&D) add-ons for Aardwolf MUD, distributed a
 
 > [!NOTE]
 > **Download anywhere, install from anywhere!**
-> You can download the package files (`.mpackage`) to **any folder on your computer** (such as your `Downloads` folder or Desktop). There is **no need** to move the package files into your Mudlet directory before installing, and you do **not** need to unzip or extract them. Mudlet handles package extraction and setup automatically.
+> You can download the package files (`.mpackage`) to **any folder on your computer** (such as your `Downloads` folder or Desktop). There is **no need** to move the files into your Mudlet directory before installing.
+> - If you download the `.mpackage` files directly, you do **not** need to extract them; Mudlet handles package installation automatically.
+> - If you downloaded the repository archive via GitHub's **`Code` > `Download ZIP`**, **unzip / extract** that ZIP archive first on your computer to reveal the `.mpackage` files inside. Do **not** import the repository ZIP file itself into Mudlet.
 
 > [!IMPORTANT]
 > **Your Mudlet profile does not have to be named `Aardwolf`.**
@@ -20,13 +22,17 @@ Mudlet mapper and Search & Destroy (S&D) add-ons for Aardwolf MUD, distributed a
 
 ### Step 1: Download the Packages
 
-Download the `.mpackage` files to anywhere on your computer (such as your `Downloads` folder or Desktop):
+You can obtain the packages in either of two ways:
 
-- [`mmapper.mpackage`](https://raw.githubusercontent.com/Noobgonewild/Mapper-and-S-D/main/mmapper.mpackage) — MMapper add-on
-- [`SearchAndDestroy.mpackage`](https://raw.githubusercontent.com/Noobgonewild/Mapper-and-S-D/main/SearchAndDestroy.mpackage) — Search & Destroy add-on
+- **Direct Download (Recommended):** Click the direct links below to download the `.mpackage` files to anywhere on your computer (such as your `Downloads` folder or Desktop):
+  - [`mmapper.mpackage`](https://raw.githubusercontent.com/Noobgonewild/Mapper-and-S-D/main/mmapper.mpackage) — MMapper add-on
+  - [`SearchAndDestroy.mpackage`](https://raw.githubusercontent.com/Noobgonewild/Mapper-and-S-D/main/SearchAndDestroy.mpackage) — Search & Destroy add-on
 
-> [!TIP]
-> Keep the files wherever your browser saved them (e.g., `Downloads`). Do not extract them; `.mpackage` files are native Mudlet packages.
+- **GitHub ZIP (`Code` > `Download ZIP`):** If you downloaded the repository as a ZIP archive (`Mapper-and-S-D-main.zip`), **unzip / extract** the archive first. The `.mpackage` files are located inside the extracted folder.
+
+> [!IMPORTANT]
+> **Do not import the repository ZIP file into Mudlet.** Mudlet only installs `.mpackage` files.
+> Once you have the `.mpackage` files, do **not** unzip or extract the `.mpackage` files themselves — Mudlet installs them directly.
 
 ---
 
